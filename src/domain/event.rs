@@ -289,6 +289,12 @@ pub struct SyncState {
     /// Agent identifier
     pub agent_id: AgentId,
 
+    /// Tenant identifier
+    pub tenant_id: TenantId,
+
+    /// Store identifier
+    pub store_id: StoreId,
+
     /// Last sequence number pushed to remote
     pub last_pushed_sequence: u64,
 
@@ -303,9 +309,11 @@ pub struct SyncState {
 }
 
 impl SyncState {
-    pub fn new(agent_id: AgentId) -> Self {
+    pub fn new(agent_id: AgentId, tenant_id: TenantId, store_id: StoreId) -> Self {
         Self {
             agent_id,
+            tenant_id,
+            store_id,
             last_pushed_sequence: 0,
             last_pulled_sequence: 0,
             head_sequence: 0,

@@ -726,23 +726,16 @@ async fn create_commitment(
     let tenant_id = TenantId::from_uuid(request.tenant_id);
     let store_id = StoreId::from_uuid(request.store_id);
 
-    // Create the commitment
+    // Create and store the commitment atomically.
     let commitment = state
         .commitment_engine
-        .create_commitment(
+        .create_and_store_commitment(
             &tenant_id,
             &store_id,
             (request.sequence_start, request.sequence_end),
         )
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-
-    // Store it
-    state
-        .commitment_engine
-        .store_commitment(&commitment)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(Json(serde_json::json!({
         "batch_id": commitment.batch_id,

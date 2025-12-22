@@ -296,6 +296,32 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             });
         }
 
+        let entity_type = event.entity_type.as_str();
+        if entity_type.is_empty() || entity_type.len() > 64 {
+            return Some(VesRejectedEvent {
+                event_id: event.event_id,
+                reason: VesRejectionReason::SchemaValidation("entity_type".to_string()),
+                message: "entity_type must be 1-64 characters".to_string(),
+            });
+        }
+
+        if event.entity_id.is_empty() || event.entity_id.len() > 256 {
+            return Some(VesRejectedEvent {
+                event_id: event.event_id,
+                reason: VesRejectionReason::SchemaValidation("entity_id".to_string()),
+                message: "entity_id must be 1-256 characters".to_string(),
+            });
+        }
+
+        let event_type = event.event_type.as_str();
+        if event_type.is_empty() || event_type.len() > 64 {
+            return Some(VesRejectedEvent {
+                event_id: event.event_id,
+                reason: VesRejectionReason::SchemaValidation("event_type".to_string()),
+                message: "event_type must be 1-64 characters".to_string(),
+            });
+        }
+
         // 2. Validate payload hash
         if !event.verify_payload_hash() {
             let reason = if event.is_plaintext() {
@@ -560,23 +586,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         let mut assigned_sequence_end: Option<u64> = None;
         let mut new_events_accepted: u32 = 0;
 
-        // Command dedupe is intent-level: allow multiple events per command within this batch,
-        // but reject if the command_id already exists from a prior ingestion.
-        let command_ids: Vec<Uuid> = events.iter().filter_map(|e| e.command_id).collect();
-        let existing_command_ids: HashSet<Uuid> = if command_ids.is_empty() {
-            HashSet::new()
-        } else {
-            let rows: Vec<(Uuid,)> =
-                sqlx::query_as(r#"SELECT command_id FROM ves_events WHERE command_id = ANY($1)"#)
-                    .bind(&command_ids)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            rows.into_iter().map(|(id,)| id).collect()
-        };
+        let mut pending = Vec::new();
 
-        // Validate each event
+        // Idempotency: return stored receipts for already-seen events.
         for event in events {
-            // Idempotency: if event exists, return the stored receipt.
             if let Some(_seq) = self.get_existing_sequence(&mut tx, event.event_id).await? {
                 if let Some(receipt) = self.get_existing_receipt(&mut tx, event.event_id).await? {
                     receipts.push(receipt);
@@ -591,9 +604,51 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 continue;
             }
 
-            // Check for duplicate command_id
+            pending.push(event);
+        }
+
+        let mut candidates = Vec::new();
+        let mut command_ids = HashSet::new();
+
+        for event in pending {
+            // Validate signature and hashes
+            if let Some(rejection) = self.validate_event(&event).await {
+                rejected.push(rejection);
+                continue;
+            }
+
             if let Some(cmd_id) = event.command_id {
-                if existing_command_ids.contains(&cmd_id) {
+                command_ids.insert(cmd_id);
+            }
+
+            candidates.push(event);
+        }
+
+        // Reserve command_ids atomically to prevent concurrent duplicates.
+        let mut duplicate_command_ids = HashSet::new();
+        for cmd_id in &command_ids {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO ves_command_dedupe (tenant_id, store_id, command_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(tenant_id.0)
+            .bind(store_id.0)
+            .bind(cmd_id)
+            .execute(&mut *tx)
+            .await?;
+
+            if result.rows_affected() == 0 {
+                duplicate_command_ids.insert(*cmd_id);
+            }
+        }
+
+        let mut valid_events = Vec::new();
+        for event in candidates {
+            if let Some(cmd_id) = event.command_id {
+                if duplicate_command_ids.contains(&cmd_id) {
                     rejected.push(VesRejectedEvent {
                         event_id: event.event_id,
                         reason: VesRejectionReason::DuplicateCommandId,
@@ -603,12 +658,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 }
             }
 
-            // Validate signature and hashes
-            if let Some(rejection) = self.validate_event(&event).await {
-                rejected.push(rejection);
-                continue;
-            }
+            valid_events.push(event);
+        }
 
+        for event in valid_events {
             let next_seq = head.saturating_add(1);
             let sequenced = SequencedVesEvent::new(event, next_seq);
 
@@ -713,6 +766,34 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_ves_events_agent ON ves_events (tenant_id, source_agent_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Command dedupe table for VES events (intent-level idempotency)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS ves_command_dedupe (
+                tenant_id UUID NOT NULL,
+                store_id UUID NOT NULL,
+                command_id UUID NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, store_id, command_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Best-effort backfill from existing VES events.
+        sqlx::query(
+            r#"
+            INSERT INTO ves_command_dedupe (tenant_id, store_id, command_id)
+            SELECT tenant_id, store_id, command_id
+            FROM ves_events
+            WHERE command_id IS NOT NULL
+            ON CONFLICT DO NOTHING
+            "#,
         )
         .execute(&self.pool)
         .await?;

@@ -269,6 +269,20 @@ impl SqliteOutbox {
             .map(AgentId::from_uuid)
             .unwrap_or_else(AgentId::new);
 
+        let tenant_id = self
+            .get_sync_state("tenant_id")
+            .await?
+            .and_then(|s| Uuid::parse_str(&s).ok())
+            .map(TenantId::from_uuid)
+            .unwrap_or_else(|| TenantId::from_uuid(Uuid::nil()));
+
+        let store_id = self
+            .get_sync_state("store_id")
+            .await?
+            .and_then(|s| Uuid::parse_str(&s).ok())
+            .map(StoreId::from_uuid)
+            .unwrap_or_else(|| StoreId::from_uuid(Uuid::nil()));
+
         let last_pushed = self
             .get_sync_state("last_pushed_sequence")
             .await?
@@ -296,6 +310,8 @@ impl SqliteOutbox {
 
         Ok(SyncState {
             agent_id,
+            tenant_id,
+            store_id,
             last_pushed_sequence: last_pushed,
             last_pulled_sequence: last_pulled,
             head_sequence: head,
@@ -310,6 +326,8 @@ impl SqliteOutbox {
 
         for (key, value) in [
             ("agent_id", state.agent_id.0.to_string()),
+            ("tenant_id", state.tenant_id.0.to_string()),
+            ("store_id", state.store_id.0.to_string()),
             (
                 "last_pushed_sequence",
                 state.last_pushed_sequence.to_string(),

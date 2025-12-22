@@ -7,14 +7,15 @@ use async_trait::async_trait;
 use rs_merkle::{algorithms::Sha256, MerkleTree};
 use sha2::{Digest, Sha256 as Sha256Hasher};
 use sqlx::postgres::PgPool;
+use sqlx::{Postgres, Transaction};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::crypto::legacy_commitment_leaf_hash;
+use crate::crypto::{compute_stream_id, legacy_commitment_leaf_hash};
 use crate::domain::{BatchCommitment, Hash256, MerkleProof, StoreId, TenantId};
 use crate::infra::{CommitmentEngine, PayloadEncryption, Result, SequencerError};
 
-use super::postgres::PgEventStore;
+use super::postgres::{LeafInput, PgEventStore};
 
 /// PostgreSQL-backed commitment engine
 pub struct PgCommitmentEngine {
@@ -92,6 +93,196 @@ impl PgCommitmentEngine {
 
         Ok(())
     }
+
+    fn stream_lock_key(tenant_id: &TenantId, store_id: &StoreId) -> i64 {
+        let stream_id = compute_stream_id(&tenant_id.0, &store_id.0);
+        let bytes: [u8; 8] = stream_id[..8]
+            .try_into()
+            .expect("stream_id is always 32 bytes");
+        i64::from_be_bytes(bytes)
+    }
+
+    async fn fetch_leaf_inputs_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<LeafInput>> {
+        let rows: Vec<(i64, Vec<u8>, String, String)> = sqlx::query_as(
+            r#"
+            SELECT sequence_number, payload_hash, entity_type, entity_id
+            FROM events
+            WHERE tenant_id = $1 AND store_id = $2
+              AND sequence_number >= $3 AND sequence_number <= $4
+            ORDER BY sequence_number ASC
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(start as i64)
+        .bind(end as i64)
+        .fetch_all(&mut **tx)
+        .await?;
+
+        rows.into_iter()
+            .map(|(seq, hash, entity_type, entity_id)| {
+                let hash_arr: Hash256 = hash
+                    .try_into()
+                    .map_err(|_| SequencerError::Internal("Invalid hash length".to_string()))?;
+                Ok(LeafInput {
+                    sequence_number: seq as u64,
+                    payload_hash: hash_arr,
+                    entity_type,
+                    entity_id,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn create_and_store_commitment(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        sequence_range: (u64, u64),
+    ) -> Result<BatchCommitment> {
+        let (start, end) = sequence_range;
+        if end < start {
+            return Err(SequencerError::Internal(
+                "Invalid sequence range".to_string(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(Self::stream_lock_key(tenant_id, store_id))
+            .execute(&mut *tx)
+            .await?;
+
+        let last_row: Option<CommitmentRow> = sqlx::query_as(
+            r#"
+            SELECT batch_id, tenant_id, store_id,
+                   prev_state_root, new_state_root, events_root,
+                   sequence_start, sequence_end, event_count,
+                   committed_at, chain_tx_hash
+            FROM commitments
+            WHERE tenant_id = $1 AND store_id = $2
+            ORDER BY sequence_end DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let prev_state_root = if let Some(row) = last_row {
+            let last_commitment = BatchCommitment::try_from(row)?;
+            let expected_start = last_commitment
+                .sequence_range
+                .1
+                .checked_add(1)
+                .ok_or_else(|| SequencerError::Internal("commitment sequence overflow".to_string()))?;
+            if start != expected_start {
+                return Err(SequencerError::Internal(format!(
+                    "Commitment range must start at {} (next after last committed sequence {})",
+                    expected_start, last_commitment.sequence_range.1
+                )));
+            }
+
+            last_commitment.new_state_root
+        } else {
+            [0u8; 32]
+        };
+
+        let leaf_inputs =
+            Self::fetch_leaf_inputs_tx(&mut tx, tenant_id, store_id, start, end).await?;
+
+        if leaf_inputs.is_empty() {
+            return Err(SequencerError::Internal(
+                "No events in range for commitment".to_string(),
+            ));
+        }
+
+        let expected_len = end
+            .checked_sub(start)
+            .and_then(|d| d.checked_add(1))
+            .ok_or_else(|| SequencerError::Internal("Invalid sequence range".to_string()))?;
+
+        if leaf_inputs.len() as u64 != expected_len {
+            return Err(SequencerError::Internal(format!(
+                "Commitment range {}..={} contains {} events but expected {}",
+                start,
+                end,
+                leaf_inputs.len(),
+                expected_len
+            )));
+        }
+
+        for (idx, input) in leaf_inputs.iter().enumerate() {
+            let expected_seq = start + idx as u64;
+            if input.sequence_number != expected_seq {
+                return Err(SequencerError::Internal(format!(
+                    "Non-contiguous sequence in commitment range: expected {}, found {}",
+                    expected_seq, input.sequence_number
+                )));
+            }
+        }
+
+        let leaves: Vec<Hash256> = leaf_inputs
+            .iter()
+            .map(|input| {
+                legacy_commitment_leaf_hash(
+                    &tenant_id.0,
+                    &store_id.0,
+                    input.sequence_number,
+                    &input.payload_hash,
+                    &input.entity_type,
+                    &input.entity_id,
+                )
+            })
+            .collect();
+
+        let events_root = self.compute_events_root(&leaves);
+        let new_state_root = self.compute_state_root(tenant_id, store_id).await?;
+
+        let commitment = BatchCommitment::new(
+            tenant_id.clone(),
+            store_id.clone(),
+            prev_state_root,
+            new_state_root,
+            events_root,
+            leaves.len() as u32,
+            sequence_range,
+        );
+
+        sqlx::query(
+            r#"
+            INSERT INTO commitments (
+                batch_id, tenant_id, store_id,
+                prev_state_root, new_state_root, events_root,
+                sequence_start, sequence_end, event_count,
+                committed_at, chain_tx_hash
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            "#,
+        )
+        .bind(commitment.batch_id)
+        .bind(commitment.tenant_id.0)
+        .bind(commitment.store_id.0)
+        .bind(&commitment.prev_state_root[..])
+        .bind(&commitment.new_state_root[..])
+        .bind(&commitment.events_root[..])
+        .bind(commitment.sequence_range.0 as i64)
+        .bind(commitment.sequence_range.1 as i64)
+        .bind(commitment.event_count as i32)
+        .bind(commitment.committed_at)
+        .bind(commitment.chain_tx_hash.map(|h| h.to_vec()))
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(commitment)
+    }
 }
 
 #[async_trait]
@@ -153,9 +344,27 @@ impl CommitmentEngine for PgCommitmentEngine {
         sequence_range: (u64, u64),
     ) -> Result<BatchCommitment> {
         let (start, end) = sequence_range;
+        if end < start {
+            return Err(SequencerError::Internal(
+                "Invalid sequence range".to_string(),
+            ));
+        }
 
         // Get the previous state root
         let prev_commitment = self.get_last_commitment(tenant_id, store_id).await?;
+        if let Some(prev) = &prev_commitment {
+            let expected_start = prev
+                .sequence_range
+                .1
+                .checked_add(1)
+                .ok_or_else(|| SequencerError::Internal("commitment sequence overflow".to_string()))?;
+            if start != expected_start {
+                return Err(SequencerError::Internal(format!(
+                    "Commitment range must start at {} (next after last committed sequence {})",
+                    expected_start, prev.sequence_range.1
+                )));
+            }
+        }
         let prev_state_root = prev_commitment
             .map(|c| c.new_state_root)
             .unwrap_or([0u8; 32]);
@@ -229,6 +438,46 @@ impl CommitmentEngine for PgCommitmentEngine {
     }
 
     async fn store_commitment(&self, commitment: &BatchCommitment) -> Result<()> {
+        let (start, end) = commitment.sequence_range;
+        if end < start {
+            return Err(SequencerError::Internal(
+                "Invalid sequence range".to_string(),
+            ));
+        }
+
+        let expected_len = end
+            .checked_sub(start)
+            .and_then(|d| d.checked_add(1))
+            .ok_or_else(|| SequencerError::Internal("Invalid sequence range".to_string()))?;
+        if commitment.event_count as u64 != expected_len {
+            return Err(SequencerError::Internal(format!(
+                "Commitment event_count {} does not match range length {}",
+                commitment.event_count, expected_len
+            )));
+        }
+
+        if let Some(last) = self
+            .get_last_commitment(&commitment.tenant_id, &commitment.store_id)
+            .await?
+        {
+            let expected_start = last
+                .sequence_range
+                .1
+                .checked_add(1)
+                .ok_or_else(|| SequencerError::Internal("commitment sequence overflow".to_string()))?;
+            if start != expected_start {
+                return Err(SequencerError::Internal(format!(
+                    "Commitment range must start at {} (next after last committed sequence {})",
+                    expected_start, last.sequence_range.1
+                )));
+            }
+            if commitment.prev_state_root != last.new_state_root {
+                return Err(SequencerError::Internal(
+                    "Commitment prev_state_root does not match last new_state_root".to_string(),
+                ));
+            }
+        }
+
         sqlx::query(
             r#"
             INSERT INTO commitments (

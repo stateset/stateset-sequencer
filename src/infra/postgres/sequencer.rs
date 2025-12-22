@@ -128,36 +128,22 @@ impl PgSequencer {
         Ok((start, end))
     }
 
-    async fn check_duplicates_tx(
+    async fn fetch_existing_event_ids_tx(
         tx: &mut Transaction<'_, Postgres>,
         events: &[EventEnvelope],
-    ) -> Result<(HashSet<Uuid>, HashSet<Uuid>)> {
+    ) -> Result<HashSet<Uuid>> {
         let event_ids: Vec<Uuid> = events.iter().map(|e| e.event_id).collect();
-        let command_ids: Vec<Uuid> = events.iter().filter_map(|e| e.command_id).collect();
 
-        let existing_event_ids: HashSet<Uuid> = if event_ids.is_empty() {
-            HashSet::new()
-        } else {
-            let rows: Vec<(Uuid,)> =
-                sqlx::query_as(r#"SELECT event_id FROM events WHERE event_id = ANY($1)"#)
-                    .bind(&event_ids)
-                    .fetch_all(&mut **tx)
-                    .await?;
-            rows.into_iter().map(|(id,)| id).collect()
-        };
+        if event_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
 
-        let existing_command_ids: HashSet<Uuid> = if command_ids.is_empty() {
-            HashSet::new()
-        } else {
-            let rows: Vec<(Uuid,)> =
-                sqlx::query_as(r#"SELECT command_id FROM events WHERE command_id = ANY($1)"#)
-                    .bind(&command_ids)
-                    .fetch_all(&mut **tx)
-                    .await?;
-            rows.into_iter().map(|(id,)| id).collect()
-        };
-
-        Ok((existing_event_ids, existing_command_ids))
+        let rows: Vec<(Uuid,)> =
+            sqlx::query_as(r#"SELECT event_id FROM events WHERE event_id = ANY($1)"#)
+                .bind(&event_ids)
+                .fetch_all(&mut **tx)
+                .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 
     /// Validate event schema and payload hash
@@ -171,7 +157,32 @@ impl PgSequencer {
             });
         }
 
-        // TODO: Add schema validation based on entity_type and event_type
+        let entity_type = event.entity_type.as_str();
+        if entity_type.is_empty() || entity_type.len() > 64 {
+            return Some(RejectedEvent {
+                event_id: event.event_id,
+                reason: RejectionReason::SchemaValidation,
+                message: "entity_type must be 1-64 characters".to_string(),
+            });
+        }
+
+        if event.entity_id.is_empty() || event.entity_id.len() > 256 {
+            return Some(RejectedEvent {
+                event_id: event.event_id,
+                reason: RejectionReason::SchemaValidation,
+                message: "entity_id must be 1-256 characters".to_string(),
+            });
+        }
+
+        let event_type = event.event_type.as_str();
+        if event_type.is_empty() || event_type.len() > 64 {
+            return Some(RejectedEvent {
+                event_id: event.event_id,
+                reason: RejectionReason::SchemaValidation,
+                message: "event_type must be 1-64 characters".to_string(),
+            });
+        }
+
         None
     }
 
@@ -303,13 +314,14 @@ impl IngestService for PgSequencer {
 
         // Serialize ingest per (tenant_id, store_id) and keep counters + inserts atomic.
         let mut head = Self::lock_sequence_counter(&mut tx, &tenant_id, &store_id).await?;
-        let (existing_event_ids, existing_command_ids) =
-            Self::check_duplicates_tx(&mut tx, &batch.events).await?;
+        let existing_event_ids = Self::fetch_existing_event_ids_tx(&mut tx, &batch.events).await?;
 
         let mut rejected = Vec::new();
+        let mut candidates = Vec::new();
+        let mut command_ids = HashSet::new();
 
-        // Validate each event
-        for event in &batch.events {
+        // Validate each event (schema + payload hash + duplicates).
+        for event in batch.events {
             if existing_event_ids.contains(&event.event_id) {
                 rejected.push(RejectedEvent {
                     event_id: event.event_id,
@@ -319,8 +331,43 @@ impl IngestService for PgSequencer {
                 continue;
             }
 
+            if let Some(rejection) = self.validate_event(&event) {
+                rejected.push(rejection);
+                continue;
+            }
+
             if let Some(cmd_id) = event.command_id {
-                if existing_command_ids.contains(&cmd_id) {
+                command_ids.insert(cmd_id);
+            }
+
+            candidates.push(event);
+        }
+
+        // Reserve command_ids atomically to prevent concurrent duplicates.
+        let mut duplicate_command_ids = HashSet::new();
+        for cmd_id in &command_ids {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO event_command_dedupe (tenant_id, store_id, command_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT DO NOTHING
+                "#,
+            )
+            .bind(tenant_id.0)
+            .bind(store_id.0)
+            .bind(cmd_id)
+            .execute(&mut *tx)
+            .await?;
+
+            if result.rows_affected() == 0 {
+                duplicate_command_ids.insert(*cmd_id);
+            }
+        }
+
+        let mut valid_events = Vec::new();
+        for event in candidates {
+            if let Some(cmd_id) = event.command_id {
+                if duplicate_command_ids.contains(&cmd_id) {
                     rejected.push(RejectedEvent {
                         event_id: event.event_id,
                         reason: RejectionReason::DuplicateCommandId,
@@ -329,20 +376,8 @@ impl IngestService for PgSequencer {
                     continue;
                 }
             }
-
-            if let Some(rejection) = self.validate_event(event) {
-                rejected.push(rejection);
-            }
+            valid_events.push(event);
         }
-
-        // Filter out rejected events
-        let rejected_ids: std::collections::HashSet<_> =
-            rejected.iter().map(|r| r.event_id).collect();
-        let valid_events: Vec<_> = batch
-            .events
-            .into_iter()
-            .filter(|e| !rejected_ids.contains(&e.event_id))
-            .collect();
 
         if valid_events.is_empty() {
             let head = self.head(&tenant_id, &store_id).await?;
@@ -419,30 +454,46 @@ impl IngestService for PgSequencer {
                     .await?;
                 Ok(SyncState {
                     agent_id: agent_id.clone(),
+                    tenant_id: TenantId::from_uuid(tenant_id),
+                    store_id: StoreId::from_uuid(store_id),
                     last_pushed_sequence: pushed as u64,
                     last_pulled_sequence: pulled as u64,
                     head_sequence: head,
                     last_sync_at: last_sync,
                 })
             }
-            None => Ok(SyncState::new(agent_id.clone())),
+            None => Ok(SyncState::new(
+                agent_id.clone(),
+                TenantId::from_uuid(Uuid::nil()),
+                StoreId::from_uuid(Uuid::nil()),
+            )),
         }
     }
 
     async fn update_sync_state(&self, state: &SyncState) -> Result<()> {
-        // We need tenant_id and store_id to update, but SyncState doesn't have them
-        // This is a limitation - in practice, we'd need to look up the agent's tenant/store
-        // For now, we'll just update what we can
+        if state.tenant_id.0.is_nil() || state.store_id.0.is_nil() {
+            return Err(SequencerError::SchemaValidation(
+                "SyncState requires tenant_id and store_id".to_string(),
+            ));
+        }
+
         sqlx::query(
             r#"
-            UPDATE agent_sync_state
-            SET last_pushed_sequence = $2,
-                last_pulled_sequence = $3,
-                last_sync_at = $4
-            WHERE agent_id = $1
+            INSERT INTO agent_sync_state (
+                agent_id, tenant_id, store_id,
+                last_pushed_sequence, last_pulled_sequence, last_sync_at
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (agent_id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                store_id = EXCLUDED.store_id,
+                last_pushed_sequence = EXCLUDED.last_pushed_sequence,
+                last_pulled_sequence = EXCLUDED.last_pulled_sequence,
+                last_sync_at = EXCLUDED.last_sync_at
             "#,
         )
         .bind(state.agent_id.0)
+        .bind(state.tenant_id.0)
+        .bind(state.store_id.0)
         .bind(state.last_pushed_sequence as i64)
         .bind(state.last_pulled_sequence as i64)
         .bind(state.last_sync_at)
@@ -544,6 +595,34 @@ impl PgSequencer {
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_events_command ON events (command_id) WHERE command_id IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Create command dedupe table (intent-level idempotency)
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS event_command_dedupe (
+                tenant_id UUID NOT NULL,
+                store_id UUID NOT NULL,
+                command_id UUID NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (tenant_id, store_id, command_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Best-effort backfill from existing events (safe for dev usage).
+        sqlx::query(
+            r#"
+            INSERT INTO event_command_dedupe (tenant_id, store_id, command_id)
+            SELECT tenant_id, store_id, command_id
+            FROM events
+            WHERE command_id IS NOT NULL
+            ON CONFLICT DO NOTHING
+            "#,
         )
         .execute(&self.pool)
         .await?;

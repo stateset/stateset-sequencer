@@ -45,6 +45,7 @@ fn to_proto_event(event: &crate::domain::SequencedEvent) -> crate::proto::Sequen
     }
 }
 
+use crate::crypto::legacy_commitment_leaf_hash;
 use crate::domain::{AgentId, EntityType, EventBatch, EventType, StoreId, TenantId};
 use crate::infra::{
     CommitmentEngine, EventStore, IngestService, PgCommitmentEngine, PgEventStore, PgSequencer,
@@ -387,9 +388,12 @@ impl SequencerTrait for SequencerService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // Try to get latest commitment
-        // This is a simplified version - in production you'd track the latest commitment per tenant/store
-        let latest_commitment = None; // TODO: implement commitment tracking
+        let latest_commitment = self
+            .commitment_engine
+            .get_last_commitment(&tenant_id, &store_id)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?
+            .map(|c| Self::to_proto_commitment(&c));
 
         Ok(Response::new(GetHeadResponse {
             head_sequence: head,
@@ -435,16 +439,93 @@ impl SequencerTrait for SequencerService {
         // Calculate leaf index within batch
         let leaf_index = (seq - commitment.sequence_range.0) as usize;
 
-        // For Phase 0, we return a simplified proof structure
-        // In Phase 1+, this would be a full Merkle proof
-        // For now, we return the event and commitment info
+        // Build leaves (supporting legacy commitments that used payload hashes directly).
+        let tenant_id = &commitment.tenant_id;
+        let store_id = &commitment.store_id;
+        let start = commitment.sequence_range.0;
+        let end = commitment.sequence_range.1;
+
+        let leaf_inputs = self
+            .event_store
+            .get_leaf_inputs(tenant_id, store_id, start, end)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        if leaf_inputs.is_empty() {
+            return Err(Status::internal("commitment range contains no events"));
+        }
+
+        let expected_len = end
+            .checked_sub(start)
+            .and_then(|d| d.checked_add(1))
+            .ok_or_else(|| Status::invalid_argument("invalid sequence range"))?;
+
+        if leaf_inputs.len() as u64 != expected_len {
+            return Err(Status::internal(format!(
+                "commitment range {}..={} contains {} events but expected {}",
+                start,
+                end,
+                leaf_inputs.len(),
+                expected_len
+            )));
+        }
+
+        if leaf_index >= leaf_inputs.len() {
+            return Err(Status::invalid_argument("invalid leaf index"));
+        }
+
+        if leaf_inputs[leaf_index].sequence_number != seq {
+            return Err(Status::internal(
+                "non-contiguous sequence numbers in commitment range",
+            ));
+        }
+
+        let leaves_v0: Vec<[u8; 32]> = leaf_inputs.iter().map(|i| i.payload_hash).collect();
+        let leaves_v1: Vec<[u8; 32]> = leaf_inputs
+            .iter()
+            .map(|i| {
+                legacy_commitment_leaf_hash(
+                    &tenant_id.0,
+                    &store_id.0,
+                    i.sequence_number,
+                    &i.payload_hash,
+                    &i.entity_type,
+                    &i.entity_id,
+                )
+            })
+            .collect();
+
+        let root_v0 = self.commitment_engine.compute_events_root(&leaves_v0);
+        let root_v1 = self.commitment_engine.compute_events_root(&leaves_v1);
+
+        let leaves = if root_v1 == commitment.events_root {
+            &leaves_v1
+        } else if root_v0 == commitment.events_root {
+            &leaves_v0
+        } else {
+            return Err(Status::internal(
+                "commitment events_root does not match events table",
+            ));
+        };
+
+        let proof = self
+            .commitment_engine
+            .prove_inclusion(leaf_index, leaves);
+
+        let proof_hashes: Vec<Vec<u8>> = proof
+            .proof_path
+            .iter()
+            .map(|h| h.to_vec())
+            .collect();
+
+        // Return the event, commitment info, and full proof path.
         let proof_response = GetInclusionProofResponse {
             event: Some(Self::to_proto_event(&event)),
             proof: Some(InclusionProof {
                 merkle_root: commitment.events_root.to_vec(),
                 leaf_index: leaf_index as u64,
-                proof_hashes: vec![], // TODO: Implement full Merkle proof generation
-                leaf_count: commitment.event_count as u64,
+                proof_hashes,
+                leaf_count: leaves.len() as u64,
             }),
             commitment: Some(Self::to_proto_commitment(&commitment)),
         };
