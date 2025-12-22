@@ -8,6 +8,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  # Minimum coverage threshold (percentage)
+  COVERAGE_THRESHOLD: 70
 
 jobs:
   lint:
@@ -63,6 +65,9 @@ jobs:
       - name: Run integration tests
         run: cargo test --locked -- --ignored
 
+      - name: Run property tests
+        run: cargo test --locked property_test
+
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
@@ -95,14 +100,65 @@ jobs:
       - name: Install cargo-tarpaulin
         run: cargo install cargo-tarpaulin
 
-      - name: Generate coverage
-        run: cargo tarpaulin --out Xml --skip-clean
+      - name: Generate coverage (unit tests)
+        run: |
+          cargo tarpaulin \
+            --out Json \
+            --out Xml \
+            --output-dir coverage \
+            --skip-clean \
+            --exclude-files "target/*" \
+            --exclude-files "tests/*" \
+            --exclude-files "benches/*" \
+            --exclude-files "src/proto/*" \
+            --timeout 300
+
+      - name: Generate coverage (integration tests)
+        run: |
+          cargo tarpaulin \
+            --out Json \
+            --out Xml \
+            --output-dir coverage-integration \
+            --skip-clean \
+            --exclude-files "target/*" \
+            --exclude-files "tests/*" \
+            --exclude-files "benches/*" \
+            --exclude-files "src/proto/*" \
+            --timeout 600 \
+            -- --ignored || true
+
+      - name: Check coverage threshold
+        run: |
+          if [ -f coverage/tarpaulin-report.json ]; then
+            COVERAGE=$(jq -r '.coverage' coverage/tarpaulin-report.json | cut -d'.' -f1)
+            echo "Coverage: ${COVERAGE}%"
+            echo "Threshold: ${COVERAGE_THRESHOLD}%"
+
+            if [ "$COVERAGE" -lt "$COVERAGE_THRESHOLD" ]; then
+              echo "::error::Coverage ${COVERAGE}% is below threshold ${COVERAGE_THRESHOLD}%"
+              exit 1
+            fi
+
+            echo "::notice::Coverage ${COVERAGE}% meets threshold ${COVERAGE_THRESHOLD}%"
+          else
+            echo "::warning::Coverage report not found, skipping threshold check"
+          fi
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
         with:
-          files: cobertura.xml
+          files: coverage/cobertura.xml
           fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            coverage/
+            coverage-integration/
+          retention-days: 7
 
   security:
     name: Security Audit
@@ -152,3 +208,78 @@ jobs:
           name: stateset-sequencer
           path: target/release/stateset-sequencer
           if-no-files-found: error
+
+  # Docker image build and push
+  docker:
+    name: Build & Push Docker
+    runs-on: ubuntu-latest
+    needs: [test, lint, security]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') || github.ref == format('refs/heads/{0}', 'master') }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # All checks must pass
+  all-checks:
+    name: All Checks
+    runs-on: ubuntu-latest
+    needs: [lint, test, coverage, security, build]
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" ]]; then
+            echo "Lint failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test.result }}" != "success" ]]; then
+            echo "Test failed"
+            exit 1
+          fi
+          if [[ "${{ needs.coverage.result }}" != "success" ]]; then
+            echo "Coverage failed"
+            exit 1
+          fi
+          if [[ "${{ needs.security.result }}" != "success" ]]; then
+            echo "Security audit failed"
+            exit 1
+          fi
+          if [[ "${{ needs.build.result }}" != "success" ]]; then
+            echo "Build failed"
+            exit 1
+          fi
+          echo "All checks passed!"
