@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  sequencer:
+    build: .
+    ports:
+      - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - DATABASE_URL=postgres://sequencer:sequencer@postgres:5432/stateset_sequencer
+      - RUST_LOG=info
+      - HOST=0.0.0.0
+      - PORT=8080
+      - MAX_DB_CONNECTIONS=10
+      # Local dev auth bootstrap (keeps AUTH_MODE=required but usable out of the box)
+      - BOOTSTRAP_ADMIN_API_KEY=dev_admin_key
+      # Payload encryption-at-rest for legacy `events` table
+      # WARNING: This is a dev-only test key. Generate a secure 32-byte key for production.
+      - PAYLOAD_ENCRYPTION_MODE=required
+      - PAYLOAD_ENCRYPTION_KEY=0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+      # Anchor service config (connects to local Anvil/Set Chain)
+      - L2_RPC_URL=http://host.docker.internal:8545
+      - SET_REGISTRY_ADDRESS=0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512
+      # WARNING: This is Anvil's well-known dev account #1. NEVER use in production.
+      # See: https://book.getfoundry.sh/reference/anvil/#default-accounts
+      - SEQUENCER_PRIVATE_KEY=0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d
+      - L2_CHAIN_ID=84532001
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5433:5432"
+    environment:
+      - POSTGRES_USER=sequencer
+      - POSTGRES_PASSWORD=sequencer
+      - POSTGRES_DB=stateset_sequencer
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sequencer -d stateset_sequencer"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:

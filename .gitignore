@@ -1,0 +1,43 @@
+# Rust build artifacts
+/target/
+
+# Foundry (Solidity) build artifacts
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Node.js
+node_modules/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+logs/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Claude Code local settings
+.claude/
+
+# Secrets and credentials
+*.pem
+*.key
+secrets/

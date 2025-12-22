@@ -1,0 +1,291 @@
+syntax = "proto3";
+
+package stateset.sequencer.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ============================================================================
+// StateSet Sequencer gRPC Service
+// ============================================================================
+
+// The Sequencer service provides verifiable event sync operations
+service Sequencer {
+  // Push a batch of events for sequencing
+  rpc Push(PushRequest) returns (PushResponse);
+
+  // Pull events starting from a cursor (streaming)
+  rpc Pull(PullRequest) returns (stream PullResponse);
+
+  // Get the current head sequence number
+  rpc GetHead(GetHeadRequest) returns (GetHeadResponse);
+
+  // Get Merkle inclusion proof for an event
+  rpc GetInclusionProof(GetInclusionProofRequest) returns (GetInclusionProofResponse);
+
+  // Get a batch commitment by ID
+  rpc GetCommitment(GetCommitmentRequest) returns (GetCommitmentResponse);
+
+  // Get entity event history
+  rpc GetEntityHistory(GetEntityHistoryRequest) returns (GetEntityHistoryResponse);
+}
+
+// ============================================================================
+// Common Types
+// ============================================================================
+
+// Tenant identifier
+message TenantId {
+  string value = 1;
+}
+
+// Store identifier
+message StoreId {
+  string value = 1;
+}
+
+// Agent identifier
+message AgentId {
+  string value = 1;
+}
+
+// Event envelope for ingestion
+message EventEnvelope {
+  // Unique event identifier (UUIDv4)
+  string event_id = 1;
+
+  // Optional command ID for idempotency
+  string command_id = 2;
+
+  // Tenant context
+  string tenant_id = 3;
+  string store_id = 4;
+
+  // Entity being affected
+  string entity_type = 5;
+  string entity_id = 6;
+
+  // Event details
+  string event_type = 7;
+
+  // JSON payload
+  bytes payload = 8;
+
+  // SHA-256 hash of canonical JSON payload
+  bytes payload_hash = 9;
+
+  // Expected entity version (optimistic concurrency)
+  uint64 base_version = 10;
+
+  // Event creation timestamp
+  google.protobuf.Timestamp created_at = 11;
+
+  // Source agent
+  string source_agent = 12;
+
+  // Optional cryptographic signature
+  bytes signature = 13;
+}
+
+// Sequenced event (after ordering)
+message SequencedEvent {
+  // Original event envelope
+  EventEnvelope envelope = 1;
+
+  // Assigned global sequence number
+  uint64 sequence_number = 2;
+
+  // When the sequencer assigned the sequence number
+  google.protobuf.Timestamp sequenced_at = 3;
+}
+
+// Rejection details for failed events
+message RejectedEvent {
+  // Original event ID
+  string event_id = 1;
+
+  // Rejection reason code
+  string reason_code = 2;
+
+  // Human-readable message
+  string message = 3;
+}
+
+// Merkle inclusion proof
+message InclusionProof {
+  // Merkle root hash
+  bytes merkle_root = 1;
+
+  // Leaf index
+  uint64 leaf_index = 2;
+
+  // Proof hashes (from leaf to root)
+  repeated bytes proof_hashes = 3;
+
+  // Total number of leaves in the tree
+  uint64 leaf_count = 4;
+}
+
+// Batch commitment
+message BatchCommitment {
+  // Batch ID
+  string batch_id = 1;
+
+  // Merkle root of events in batch
+  bytes merkle_root = 2;
+
+  // Sequence range
+  uint64 start_sequence = 3;
+  uint64 end_sequence = 4;
+
+  // Number of events
+  uint32 event_count = 5;
+
+  // When commitment was created
+  google.protobuf.Timestamp committed_at = 6;
+}
+
+// ============================================================================
+// Push (Batch Ingest)
+// ============================================================================
+
+message PushRequest {
+  // Agent submitting the batch
+  string agent_id = 1;
+
+  // Events to ingest
+  repeated EventEnvelope events = 2;
+}
+
+message PushResponse {
+  // Unique batch identifier
+  string batch_id = 1;
+
+  // Processing results
+  uint32 events_accepted = 2;
+  repeated RejectedEvent events_rejected = 3;
+
+  // Assigned sequence range (if events accepted)
+  uint64 assigned_sequence_start = 4;
+  uint64 assigned_sequence_end = 5;
+
+  // Current head after processing
+  uint64 head_sequence = 6;
+
+  // Batch commitment (computed immediately)
+  BatchCommitment commitment = 7;
+}
+
+// ============================================================================
+// Pull (Streaming Read)
+// ============================================================================
+
+message PullRequest {
+  // Tenant/store context
+  string tenant_id = 1;
+  string store_id = 2;
+
+  // Starting cursor (sequence number)
+  uint64 from_sequence = 3;
+
+  // Maximum events per response chunk
+  uint32 batch_size = 4;
+
+  // Optional: filter by entity type
+  string entity_type_filter = 5;
+
+  // Optional: filter by entity ID
+  string entity_id_filter = 6;
+
+  // Whether to wait for new events (long-poll mode)
+  bool wait_for_new = 7;
+
+  // Maximum wait time in milliseconds (for wait_for_new)
+  uint32 wait_timeout_ms = 8;
+}
+
+message PullResponse {
+  // Batch of sequenced events
+  repeated SequencedEvent events = 1;
+
+  // Cursor for next pull
+  uint64 next_sequence = 2;
+
+  // Whether more events are available immediately
+  bool has_more = 3;
+
+  // Current head sequence
+  uint64 head_sequence = 4;
+}
+
+// ============================================================================
+// GetHead
+// ============================================================================
+
+message GetHeadRequest {
+  string tenant_id = 1;
+  string store_id = 2;
+}
+
+message GetHeadResponse {
+  // Current head sequence number
+  uint64 head_sequence = 1;
+
+  // Latest commitment (if available)
+  BatchCommitment latest_commitment = 2;
+}
+
+// ============================================================================
+// GetInclusionProof
+// ============================================================================
+
+message GetInclusionProofRequest {
+  // Batch ID containing the event
+  string batch_id = 1;
+
+  // Event ID to prove
+  string event_id = 2;
+}
+
+message GetInclusionProofResponse {
+  // The event being proved
+  SequencedEvent event = 1;
+
+  // Merkle inclusion proof
+  InclusionProof proof = 2;
+
+  // Batch commitment
+  BatchCommitment commitment = 3;
+}
+
+// ============================================================================
+// GetCommitment
+// ============================================================================
+
+message GetCommitmentRequest {
+  // Batch ID
+  string batch_id = 1;
+}
+
+message GetCommitmentResponse {
+  BatchCommitment commitment = 1;
+}
+
+// ============================================================================
+// GetEntityHistory
+// ============================================================================
+
+message GetEntityHistoryRequest {
+  string tenant_id = 1;
+  string store_id = 2;
+  string entity_type = 3;
+  string entity_id = 4;
+
+  // Optional version range
+  uint64 from_version = 5;
+  uint64 to_version = 6;
+}
+
+message GetEntityHistoryResponse {
+  repeated SequencedEvent events = 1;
+  uint64 current_version = 2;
+}
