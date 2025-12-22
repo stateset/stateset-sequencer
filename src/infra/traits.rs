@@ -1,6 +1,8 @@
 //! Trait definitions for StateSet Sequencer core services
 
 use async_trait::async_trait;
+#[cfg(test)]
+use mockall::automock;
 use uuid::Uuid;
 
 use crate::domain::{
@@ -13,6 +15,7 @@ use super::Result;
 /// Ingest service accepts events from CLI agents and production writers.
 ///
 /// Invariant: No writes bypass the event log.
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait IngestService: Send + Sync {
     /// Ingest a batch of events
@@ -33,6 +36,7 @@ pub trait IngestService: Send + Sync {
 /// Sequencer assigns canonical ordering to events.
 ///
 /// This is the "truth clock" - only sequence_number defines canonical order.
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Sequencer: Send + Sync {
     /// Assign sequence numbers to events
@@ -45,6 +49,7 @@ pub trait Sequencer: Send + Sync {
 }
 
 /// Event store provides append-only encrypted storage for sequenced events.
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait EventStore: Send + Sync {
     /// Append sequenced events to the store
@@ -82,6 +87,7 @@ pub trait EventStore: Send + Sync {
 ///
 /// Conflicts are handled deterministically at apply-time, not by rejecting
 /// batches due to root mismatch.
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Projector: Send + Sync {
     /// Project events to production state
@@ -119,6 +125,7 @@ pub trait Projector: Send + Sync {
 /// Commitment engine computes Merkle roots and state roots.
 ///
 /// Proofs are generated on demand (no pre-stored proof table).
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait CommitmentEngine: Send + Sync {
     /// Compute events Merkle root from leaf hashes
@@ -184,6 +191,7 @@ impl ComponentHealth {
 }
 
 /// Health check trait
+#[cfg_attr(test, automock)]
 #[async_trait]
 pub trait HealthCheck: Send + Sync {
     /// Check health of all components

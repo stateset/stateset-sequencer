@@ -17,7 +17,7 @@ use tower_http::cors::AllowOrigin;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, Level};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use uuid::Uuid;
 
 use crate::anchor::{AnchorConfig, AnchorService};
@@ -31,6 +31,7 @@ use crate::infra::{
     PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore, Sequencer,
     VesSequencer,
 };
+use crate::metrics::MetricsRegistry;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -85,6 +86,7 @@ pub struct AppState {
     pub anchor_service: Option<Arc<AnchorService>>,
     pub ves_sequencer: Arc<VesSequencer<PgAgentKeyRegistry>>,
     pub agent_key_registry: Arc<PgAgentKeyRegistry>,
+    pub metrics: Arc<MetricsRegistry>,
 }
 
 /// Start the HTTP server.
@@ -214,6 +216,10 @@ pub async fn run() -> anyhow::Result<()> {
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
 
+    // Initialize metrics registry
+    let metrics = Arc::new(MetricsRegistry::new());
+    info!("Metrics registry initialized");
+
     // Initialize anchor service (optional - only if env vars are set)
     let anchor_service = match AnchorConfig::from_env() {
         Some(anchor_config) => {
@@ -242,6 +248,7 @@ pub async fn run() -> anyhow::Result<()> {
         anchor_service,
         ves_sequencer,
         agent_key_registry,
+        metrics,
     };
 
     // Build router
@@ -261,11 +268,76 @@ fn init_tracing() {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(Level::INFO.to_string()));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_target(true)
-        .with_thread_ids(true)
+    let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
+    let otel_enabled = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok();
+
+    // Base formatting layer
+    let fmt_layer = if log_format.to_lowercase() == "json" {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_file(true)
+            .with_line_number(true)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_thread_ids(true)
+            .boxed()
+    };
+
+    // Build the subscriber with optional OpenTelemetry
+    if otel_enabled {
+        // Initialize OpenTelemetry tracer
+        match init_opentelemetry_tracer() {
+            Ok(tracer) => {
+                let telemetry_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+                tracing_subscriber::registry()
+                    .with(env_filter)
+                    .with(fmt_layer)
+                    .with(telemetry_layer)
+                    .init();
+                return;
+            }
+            Err(e) => {
+                eprintln!("Failed to initialize OpenTelemetry: {e}. Falling back to basic tracing.");
+            }
+        }
+    }
+
+    // Fallback: basic tracing without OpenTelemetry
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
         .init();
+}
+
+/// Initialize OpenTelemetry tracer with OTLP exporter
+fn init_opentelemetry_tracer() -> Result<opentelemetry_sdk::trace::Tracer, opentelemetry::trace::TraceError> {
+    use opentelemetry::trace::TracerProvider;
+    use opentelemetry_otlp::WithExportConfig;
+
+    let exporter = opentelemetry_otlp::new_exporter()
+        .tonic()
+        .with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:4317".to_string()),
+        );
+
+    let provider = opentelemetry_otlp::new_pipeline()
+        .tracing()
+        .with_exporter(exporter)
+        .with_trace_config(
+            opentelemetry_sdk::trace::Config::default()
+                .with_resource(opentelemetry_sdk::Resource::new(vec![
+                    opentelemetry::KeyValue::new("service.name", "stateset-sequencer"),
+                    opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+                ])),
+        )
+        .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+
+    Ok(provider.tracer("stateset-sequencer"))
 }
 
 fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppState>> {
@@ -283,6 +355,7 @@ fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppSta
         .nest("/api", api)
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
+        .route("/metrics", get(metrics_handler))
         .layer(TraceLayer::new_for_http());
 
     if let Some(cors_layer) = cors_layer_from_env()? {
@@ -360,4 +433,15 @@ async fn readiness_check(
             format!("Database unavailable: {}", e),
         )),
     }
+}
+
+/// Prometheus metrics endpoint.
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+    let metrics = state.metrics.to_prometheus().await;
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        metrics,
+    )
 }

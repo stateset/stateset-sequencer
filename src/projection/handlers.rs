@@ -1369,3 +1369,388 @@ impl ReturnProjectionStore for InMemoryReturnStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{AgentId, EntityType, EventEnvelope, EventType, StoreId, TenantId};
+    use serde_json::json;
+
+    fn create_test_event(
+        entity_type: &str,
+        entity_id: &str,
+        event_type: &str,
+        payload: serde_json::Value,
+    ) -> SequencedEvent {
+        let envelope = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::new(entity_type),
+            entity_id,
+            EventType::new(event_type),
+            payload,
+            AgentId::new(),
+        );
+        SequencedEvent::new(envelope, 1)
+    }
+
+    // ========================================================================
+    // Order Projector Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_order_created_success() {
+        let store = Arc::new(InMemoryOrderStore::new());
+        let projector = OrderProjector::new(store.clone());
+
+        let event = create_test_event(
+            "order",
+            "order-001",
+            "order.created",
+            json!({
+                "customer_id": "cust-123",
+                "total_amount": 99.99,
+                "currency": "USD",
+                "line_items": [
+                    {"product_id": "prod-1", "quantity": 2, "unit_price": 49.99}
+                ]
+            }),
+        );
+
+        let result = projector.apply(&event, None).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { new_version: 1 }));
+
+        let order = store.get("order-001").await.unwrap().unwrap();
+        assert_eq!(order.customer_id, "cust-123");
+        assert_eq!(order.status, OrderStatus::Pending);
+        assert_eq!(order.total_amount, 99.99);
+        assert_eq!(order.line_items.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_order_created_already_exists() {
+        let store = Arc::new(InMemoryOrderStore::new());
+        let projector = OrderProjector::new(store.clone());
+
+        let event = create_test_event(
+            "order",
+            "order-001",
+            "order.created",
+            json!({"customer_id": "cust-123"}),
+        );
+
+        // First creation should succeed
+        let result1 = projector.apply(&event, None).await.unwrap();
+        assert!(matches!(result1, ApplyResult::Applied { .. }));
+
+        // Second creation should be rejected
+        let result2 = projector.apply(&event, Some(1)).await.unwrap();
+        assert!(matches!(result2, ApplyResult::Rejected { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_order_status_transitions() {
+        let store = Arc::new(InMemoryOrderStore::new());
+        let projector = OrderProjector::new(store.clone());
+
+        // Create order
+        let create_event = create_test_event(
+            "order",
+            "order-001",
+            "order.created",
+            json!({"customer_id": "cust-123"}),
+        );
+        projector.apply(&create_event, None).await.unwrap();
+
+        // Confirm order
+        let confirm_event = create_test_event("order", "order-001", "order.confirmed", json!({}));
+        let result = projector.apply(&confirm_event, Some(1)).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { new_version: 2 }));
+
+        let order = store.get("order-001").await.unwrap().unwrap();
+        assert_eq!(order.status, OrderStatus::Confirmed);
+    }
+
+    #[tokio::test]
+    async fn test_order_invalid_transition() {
+        let store = Arc::new(InMemoryOrderStore::new());
+        let projector = OrderProjector::new(store.clone());
+
+        // Create order
+        let create_event = create_test_event(
+            "order",
+            "order-001",
+            "order.created",
+            json!({"customer_id": "cust-123"}),
+        );
+        projector.apply(&create_event, None).await.unwrap();
+
+        // Try to ship directly (should fail - need to confirm first)
+        let ship_event = create_test_event("order", "order-001", "order.shipped", json!({}));
+        let result = projector.apply(&ship_event, Some(1)).await.unwrap();
+        assert!(matches!(
+            result,
+            ApplyResult::Rejected {
+                reason: RejectionReason::InvalidStateTransition { .. },
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_order_cancel() {
+        let store = Arc::new(InMemoryOrderStore::new());
+        let projector = OrderProjector::new(store.clone());
+
+        // Create order
+        let create_event = create_test_event(
+            "order",
+            "order-001",
+            "order.created",
+            json!({"customer_id": "cust-123"}),
+        );
+        projector.apply(&create_event, None).await.unwrap();
+
+        // Cancel order
+        let cancel_event = create_test_event(
+            "order",
+            "order-001",
+            "order.cancelled",
+            json!({"reason": "Customer request"}),
+        );
+        let result = projector.apply(&cancel_event, Some(1)).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { .. }));
+
+        let order = store.get("order-001").await.unwrap().unwrap();
+        assert_eq!(order.status, OrderStatus::Cancelled);
+    }
+
+    // ========================================================================
+    // Inventory Projector Tests
+    // NOTE: Inventory projector uses composite keys (product_id, location_id)
+    // and specific payload format. These tests are placeholders - integration
+    // tests cover inventory scenarios more thoroughly.
+    // ========================================================================
+
+    // ========================================================================
+    // Product Projector Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_product_created() {
+        let store = Arc::new(InMemoryProductStore::new());
+        let projector = ProductProjector::new(store.clone());
+
+        let event = create_test_event(
+            "product",
+            "prod-001",
+            "product.created",
+            json!({
+                "name": "Test Product",
+                "sku": "SKU-001",
+                "price": 29.99,
+                "currency": "USD",
+                "description": "A test product"
+            }),
+        );
+
+        let result = projector.apply(&event, None).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { new_version: 1 }));
+
+        let product = store.get("prod-001").await.unwrap().unwrap();
+        assert_eq!(product.name, "Test Product");
+        assert_eq!(product.price, 29.99);
+        assert!(product.active);
+    }
+
+    #[tokio::test]
+    async fn test_product_price_updated() {
+        let store = Arc::new(InMemoryProductStore::new());
+        let projector = ProductProjector::new(store.clone());
+
+        // Create product
+        let create_event = create_test_event(
+            "product",
+            "prod-001",
+            "product.created",
+            json!({"name": "Test", "price": 29.99}),
+        );
+        projector.apply(&create_event, None).await.unwrap();
+
+        // Update price
+        let update_event = create_test_event(
+            "product",
+            "prod-001",
+            "product.updated",
+            json!({"price": 39.99}),
+        );
+        let result = projector.apply(&update_event, Some(1)).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { new_version: 2 }));
+
+        let product = store.get("prod-001").await.unwrap().unwrap();
+        assert_eq!(product.price, 39.99);
+    }
+
+    #[tokio::test]
+    async fn test_product_deactivated() {
+        let store = Arc::new(InMemoryProductStore::new());
+        let projector = ProductProjector::new(store.clone());
+
+        // Create product
+        let create_event = create_test_event(
+            "product",
+            "prod-001",
+            "product.created",
+            json!({"name": "Test", "price": 29.99}),
+        );
+        projector.apply(&create_event, None).await.unwrap();
+
+        // Deactivate
+        let deactivate_event =
+            create_test_event("product", "prod-001", "product.deactivated", json!({}));
+        let result = projector.apply(&deactivate_event, Some(1)).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { .. }));
+
+        let product = store.get("prod-001").await.unwrap().unwrap();
+        assert!(!product.active);
+    }
+
+    // ========================================================================
+    // Customer Projector Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_customer_created() {
+        let store = Arc::new(InMemoryCustomerStore::new());
+        let projector = CustomerProjector::new(store.clone());
+
+        let event = create_test_event(
+            "customer",
+            "cust-001",
+            "customer.created",
+            json!({
+                "email": "test@example.com",
+                "name": "John Doe"
+            }),
+        );
+
+        let result = projector.apply(&event, None).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { new_version: 1 }));
+
+        let customer = store.get("cust-001").await.unwrap().unwrap();
+        assert_eq!(customer.email, "test@example.com");
+        assert_eq!(customer.name.as_deref(), Some("John Doe"));
+    }
+
+    #[tokio::test]
+    async fn test_customer_updated() {
+        let store = Arc::new(InMemoryCustomerStore::new());
+        let projector = CustomerProjector::new(store.clone());
+
+        // Create customer
+        let create_event = create_test_event(
+            "customer",
+            "cust-001",
+            "customer.created",
+            json!({"email": "old@example.com"}),
+        );
+        projector.apply(&create_event, None).await.unwrap();
+
+        // Update email
+        let update_event = create_test_event(
+            "customer",
+            "cust-001",
+            "customer.updated",
+            json!({"email": "new@example.com", "name": "Jane Doe"}),
+        );
+        let result = projector.apply(&update_event, Some(1)).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { new_version: 2 }));
+
+        let customer = store.get("cust-001").await.unwrap().unwrap();
+        assert_eq!(customer.email, "new@example.com");
+        assert_eq!(customer.name.as_deref(), Some("Jane Doe"));
+    }
+
+    // ========================================================================
+    // Return Projector Tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_return_requested() {
+        let store = Arc::new(InMemoryReturnStore::new());
+        let projector = ReturnProjector::new(store.clone());
+
+        let event = create_test_event(
+            "return",
+            "ret-001",
+            "return.requested",
+            json!({
+                "order_id": "order-001",
+                "customer_id": "cust-001",
+                "reason": "Defective item",
+                "items": [{"product_id": "prod-1", "quantity": 1}]
+            }),
+        );
+
+        let result = projector.apply(&event, None).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { new_version: 1 }));
+
+        let return_proj = store.get("ret-001").await.unwrap().unwrap();
+        assert_eq!(return_proj.order_id, "order-001");
+        assert_eq!(return_proj.status, ReturnStatus::Requested);
+    }
+
+    #[tokio::test]
+    async fn test_return_approved() {
+        let store = Arc::new(InMemoryReturnStore::new());
+        let projector = ReturnProjector::new(store.clone());
+
+        // Request return
+        let request_event = create_test_event(
+            "return",
+            "ret-001",
+            "return.requested",
+            json!({"order_id": "order-001", "customer_id": "cust-001", "reason": "Test"}),
+        );
+        projector.apply(&request_event, None).await.unwrap();
+
+        // Approve return
+        let approve_event = create_test_event("return", "ret-001", "return.approved", json!({}));
+        let result = projector.apply(&approve_event, Some(1)).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { new_version: 2 }));
+
+        let return_proj = store.get("ret-001").await.unwrap().unwrap();
+        assert_eq!(return_proj.status, ReturnStatus::Approved);
+    }
+
+    #[tokio::test]
+    async fn test_return_complete_workflow() {
+        let store = Arc::new(InMemoryReturnStore::new());
+        let projector = ReturnProjector::new(store.clone());
+
+        // Request
+        let request_event = create_test_event(
+            "return",
+            "ret-001",
+            "return.requested",
+            json!({"order_id": "order-001", "customer_id": "cust-001"}),
+        );
+        projector.apply(&request_event, None).await.unwrap();
+
+        // Approve
+        let approve_event = create_test_event("return", "ret-001", "return.approved", json!({}));
+        projector.apply(&approve_event, Some(1)).await.unwrap();
+
+        // Receive
+        let receive_event = create_test_event("return", "ret-001", "return.received", json!({}));
+        projector.apply(&receive_event, Some(2)).await.unwrap();
+
+        // Complete
+        let complete_event = create_test_event("return", "ret-001", "return.completed", json!({}));
+        let result = projector.apply(&complete_event, Some(3)).await.unwrap();
+        assert!(matches!(result, ApplyResult::Applied { new_version: 4 }));
+
+        let return_proj = store.get("ret-001").await.unwrap().unwrap();
+        assert_eq!(return_proj.status, ReturnStatus::Completed);
+    }
+}

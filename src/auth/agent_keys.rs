@@ -190,6 +190,7 @@ impl AgentKeyLookup {
 /// Agent Key Registry trait per VES v1.0 Section 9
 ///
 /// Implementations must provide key lookup and management operations.
+#[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait AgentKeyRegistry: Send + Sync {
     /// Get the public key for a (tenant, agent, key_id) triple

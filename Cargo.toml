@@ -51,7 +51,13 @@ async-trait = "0.1"
 
 # Logging and tracing
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# OpenTelemetry observability
+opentelemetry = { version = "0.24", features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.17", features = ["metrics", "trace", "tonic"] }
+tracing-opentelemetry = "0.25"
 
 # Configuration
 config = "0.14"
@@ -77,6 +83,8 @@ serial_test = "3"
 fake = { version = "2", features = ["derive", "uuid", "chrono"] }
 proptest = "1"
 http-body-util = "0.1"
+mockall = "0.13"
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 [lib]
 name = "stateset_sequencer"
@@ -93,3 +101,7 @@ path = "src/bin/admin.rs"
 [profile.release]
 lto = true
 codegen-units = 1
+
+[[bench]]
+name = "sequencer_bench"
+harness = false
