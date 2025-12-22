@@ -1,0 +1,132 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-chain-1/transaction-confirmed.json",
+  "title": "VES-CHAIN-1 Transaction Confirmed",
+  "description": "Transaction confirmation event payload per VES-CHAIN-1 specification",
+  "type": "object",
+  "required": [
+    "intent_id",
+    "chain",
+    "network",
+    "tx_hash",
+    "status",
+    "confirmed_at"
+  ],
+  "properties": {
+    "intent_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Reference to payment intent"
+    },
+    "chain": {
+      "type": "string",
+      "enum": ["solana", "near", "stellar", "cardano", "polkadot", "cosmos", "algorand", "aptos", "sui", "tezos"],
+      "description": "Blockchain where transaction was confirmed"
+    },
+    "network": {
+      "type": "string",
+      "description": "Network identifier"
+    },
+    "tx_hash": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Transaction hash/signature"
+    },
+    "tx_signature": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{128}$",
+      "description": "64-byte transaction signature, hex with 0x prefix"
+    },
+    "block_number": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Block number (or slot for Solana)"
+    },
+    "block_hash": {
+      "type": "string",
+      "description": "Block hash"
+    },
+    "block_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Block timestamp (RFC 3339)"
+    },
+    "confirmations": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of confirmations"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "confirmed", "finalized", "failed"],
+      "description": "Confirmation status"
+    },
+    "fee": {
+      "type": "object",
+      "description": "Transaction fee",
+      "required": ["amount", "currency"],
+      "properties": {
+        "amount": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "currency": {
+          "type": "string"
+        }
+      }
+    },
+    "gas_used": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Gas/compute units used"
+    },
+    "confirmed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When confirmation was recorded (RFC 3339)"
+    },
+    "solana_specific": {
+      "type": "object",
+      "description": "Solana-specific fields",
+      "properties": {
+        "slot": {
+          "type": "integer"
+        },
+        "commitment": {
+          "type": "string",
+          "enum": ["processed", "confirmed", "finalized"]
+        }
+      }
+    },
+    "near_specific": {
+      "type": "object",
+      "description": "NEAR-specific fields",
+      "properties": {
+        "receipts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "outcome": {
+          "type": "object"
+        }
+      }
+    },
+    "cosmos_specific": {
+      "type": "object",
+      "description": "Cosmos-specific fields",
+      "properties": {
+        "height": {
+          "type": "integer"
+        },
+        "code": {
+          "type": "integer"
+        },
+        "raw_log": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

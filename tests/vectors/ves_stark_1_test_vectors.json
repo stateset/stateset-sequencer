@@ -1,0 +1,386 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VES-STARK-1 Test Vectors",
+  "description": "Test vectors for VES-STARK-1 validity proofs",
+  "version": "1.0.0",
+  "test_cases": {
+    "public_inputs": {
+      "description": "Public input validation test vectors",
+      "vectors": [
+        {
+          "name": "valid_batch_100_events",
+          "input": {
+            "tenant_id": "0x550e8400e29b41d4a716446655440000",
+            "store_id": "0x6ba7b8109dad11d180b400c04fd430c8",
+            "batch_size": 100,
+            "sequence_start": 1,
+            "sequence_end": 100,
+            "prev_events_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "new_events_root": "0x7f8c9d2e1a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d"
+          },
+          "expected": {
+            "valid": true,
+            "state_commitment": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+          }
+        },
+        {
+          "name": "invalid_sequence_range",
+          "input": {
+            "batch_size": 100,
+            "sequence_start": 50,
+            "sequence_end": 100
+          },
+          "expected": {
+            "valid": false,
+            "error": "SEQUENCE_BATCH_SIZE_MISMATCH",
+            "message": "batch_size (100) != sequence_end (100) - sequence_start (50) + 1 (51)"
+          }
+        },
+        {
+          "name": "invalid_sequence_order",
+          "input": {
+            "sequence_start": 100,
+            "sequence_end": 50
+          },
+          "expected": {
+            "valid": false,
+            "error": "INVALID_SEQUENCE_ORDER",
+            "message": "sequence_end must be >= sequence_start"
+          }
+        }
+      ]
+    },
+    "execution_trace": {
+      "description": "Execution trace generation test vectors",
+      "vectors": [
+        {
+          "name": "trace_5_events",
+          "input": {
+            "events": [
+              {
+                "sequence": 1,
+                "event_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "signature_valid": true
+              },
+              {
+                "sequence": 2,
+                "event_hash": "0x2222222222222222222222222222222222222222222222222222222222222222",
+                "signature_valid": true
+              },
+              {
+                "sequence": 3,
+                "event_hash": "0x3333333333333333333333333333333333333333333333333333333333333333",
+                "signature_valid": true
+              },
+              {
+                "sequence": 4,
+                "event_hash": "0x4444444444444444444444444444444444444444444444444444444444444444",
+                "signature_valid": true
+              },
+              {
+                "sequence": 5,
+                "event_hash": "0x5555555555555555555555555555555555555555555555555555555555555555",
+                "signature_valid": true
+              }
+            ]
+          },
+          "expected": {
+            "trace_length": 8,
+            "note": "Padded to next power of 2",
+            "columns": {
+              "sequence": [1, 2, 3, 4, 5, 0, 0, 0],
+              "hash_low": ["...", "...", "...", "...", "...", "0", "0", "0"],
+              "sig_valid": [1, 1, 1, 1, 1, 0, 0, 0],
+              "padding_flag": [0, 0, 0, 0, 0, 1, 1, 1]
+            }
+          }
+        },
+        {
+          "name": "trace_padding_1000_events",
+          "input": {
+            "event_count": 1000
+          },
+          "expected": {
+            "trace_length": 1024,
+            "padding_rows": 24,
+            "note": "Next power of 2 after 1000"
+          }
+        }
+      ]
+    },
+    "air_constraints": {
+      "description": "AIR constraint evaluation test vectors",
+      "vectors": [
+        {
+          "name": "sequence_increment_valid",
+          "input": {
+            "current_row": {
+              "sequence": 5,
+              "padding_flag": 0
+            },
+            "next_row": {
+              "sequence": 6,
+              "padding_flag": 0
+            }
+          },
+          "constraint": "next.sequence - current.sequence - 1 = 0",
+          "expected": {
+            "constraint_value": 0,
+            "satisfied": true
+          }
+        },
+        {
+          "name": "sequence_increment_invalid",
+          "input": {
+            "current_row": {
+              "sequence": 5,
+              "padding_flag": 0
+            },
+            "next_row": {
+              "sequence": 7,
+              "padding_flag": 0
+            }
+          },
+          "constraint": "next.sequence - current.sequence - 1 = 0",
+          "expected": {
+            "constraint_value": 1,
+            "satisfied": false,
+            "error": "SEQUENCE_GAP_DETECTED"
+          }
+        },
+        {
+          "name": "signature_validity_constraint",
+          "input": {
+            "row": {
+              "sig_valid": 1,
+              "padding_flag": 0
+            }
+          },
+          "constraint": "(1 - padding_flag) * sig_valid = (1 - padding_flag)",
+          "expected": {
+            "left_side": 1,
+            "right_side": 1,
+            "satisfied": true
+          }
+        },
+        {
+          "name": "signature_invalid_rejected",
+          "input": {
+            "row": {
+              "sig_valid": 0,
+              "padding_flag": 0
+            }
+          },
+          "constraint": "(1 - padding_flag) * sig_valid = (1 - padding_flag)",
+          "expected": {
+            "left_side": 0,
+            "right_side": 1,
+            "satisfied": false,
+            "error": "INVALID_SIGNATURE_IN_BATCH"
+          }
+        },
+        {
+          "name": "padding_row_exempt",
+          "input": {
+            "row": {
+              "sig_valid": 0,
+              "padding_flag": 1
+            }
+          },
+          "constraint": "(1 - padding_flag) * sig_valid = (1 - padding_flag)",
+          "expected": {
+            "left_side": 0,
+            "right_side": 0,
+            "satisfied": true,
+            "note": "Padding rows are exempt from signature check"
+          }
+        }
+      ]
+    },
+    "fri_protocol": {
+      "description": "FRI protocol test vectors",
+      "vectors": [
+        {
+          "name": "fri_layer_folding",
+          "input": {
+            "layer_0_size": 8192,
+            "folding_factor": 4
+          },
+          "expected": {
+            "layer_sizes": [8192, 2048, 512, 128, 32],
+            "num_layers": 5,
+            "final_poly_degree": 31
+          }
+        },
+        {
+          "name": "fri_commitment_chain",
+          "input": {
+            "trace_commitment": "0x1111111111111111111111111111111111111111111111111111111111111111",
+            "composition_commitment": "0x2222222222222222222222222222222222222222222222222222222222222222",
+            "layer_commitments": [
+              "0x3333333333333333333333333333333333333333333333333333333333333333",
+              "0x4444444444444444444444444444444444444444444444444444444444444444",
+              "0x5555555555555555555555555555555555555555555555555555555555555555"
+            ]
+          },
+          "expected": {
+            "commitment_chain_valid": true,
+            "hash_function": "blake3"
+          }
+        },
+        {
+          "name": "fri_query_response",
+          "input": {
+            "query_index": 1234,
+            "layer": 0,
+            "domain_size": 8192
+          },
+          "expected": {
+            "coset_indices": [1234, 5330],
+            "note": "Query and sibling in coset"
+          }
+        }
+      ]
+    },
+    "proof_verification": {
+      "description": "Full proof verification test vectors",
+      "vectors": [
+        {
+          "name": "valid_proof_100_events",
+          "input": {
+            "batch_size": 100,
+            "proof_size_bytes": 45000,
+            "num_queries": 32,
+            "blowup_factor": 8
+          },
+          "expected": {
+            "verification_result": true,
+            "verification_time_ms_max": 100,
+            "security_level_bits": 100
+          }
+        },
+        {
+          "name": "valid_proof_1000_events",
+          "input": {
+            "batch_size": 1000,
+            "proof_size_bytes": 98000,
+            "num_queries": 32,
+            "blowup_factor": 8
+          },
+          "expected": {
+            "verification_result": true,
+            "verification_time_ms_max": 200
+          }
+        },
+        {
+          "name": "invalid_query_response",
+          "input": {
+            "query_index": 1234,
+            "claimed_value": "0xabcd",
+            "merkle_proof": ["0x1111", "0x2222", "0x3333"],
+            "expected_root": "0x5555555555555555555555555555555555555555555555555555555555555555"
+          },
+          "expected": {
+            "verification_result": false,
+            "error": "QUERY_AUTHENTICATION_FAILED",
+            "message": "Merkle path does not match commitment"
+          }
+        },
+        {
+          "name": "invalid_fri_consistency",
+          "input": {
+            "layer_0_value_at_x": "0x1234",
+            "layer_1_value_at_x_squared": "0x5678",
+            "alpha": "0xabcd"
+          },
+          "expected": {
+            "verification_result": false,
+            "error": "FRI_CONSISTENCY_CHECK_FAILED",
+            "message": "Layer folding verification failed"
+          }
+        }
+      ]
+    },
+    "on_chain_verification": {
+      "description": "On-chain verification test vectors",
+      "vectors": [
+        {
+          "name": "solana_verification",
+          "input": {
+            "chain": "solana",
+            "batch_size": 1000,
+            "proof_components": {
+              "public_inputs_size": 256,
+              "fri_final_size": 128,
+              "query_proofs_count": 8
+            }
+          },
+          "expected": {
+            "compute_units": 200000,
+            "transaction_fee_lamports": 5000,
+            "fits_single_tx": true
+          }
+        },
+        {
+          "name": "ethereum_verification",
+          "input": {
+            "chain": "ethereum",
+            "batch_size": 1000
+          },
+          "expected": {
+            "gas_estimate": 400000,
+            "calldata_bytes": 2000,
+            "verification_contract": "VESStarkVerifier"
+          }
+        }
+      ]
+    },
+    "cost_analysis": {
+      "description": "Cost comparison test vectors",
+      "vectors": [
+        {
+          "name": "batch_vs_individual_1000",
+          "input": {
+            "batch_size": 1000,
+            "chain": "solana",
+            "individual_tx_cost_lamports": 5000,
+            "batch_proof_cost_lamports": 10000
+          },
+          "expected": {
+            "individual_total_cost": 5000000,
+            "batch_total_cost": 10000,
+            "savings_percentage": 99.8,
+            "cost_per_event_individual": 5000,
+            "cost_per_event_batch": 10
+          }
+        },
+        {
+          "name": "break_even_analysis",
+          "input": {
+            "chain": "solana",
+            "individual_tx_cost": 5000,
+            "batch_fixed_cost": 10000,
+            "batch_marginal_cost": 0
+          },
+          "expected": {
+            "break_even_batch_size": 3,
+            "note": "Batching is cost-effective for 3+ events"
+          }
+        }
+      ]
+    }
+  },
+  "implementation_notes": {
+    "field": "Goldilocks (p = 2^64 - 2^32 + 1)",
+    "hash_functions": ["blake3", "poseidon"],
+    "extension_field_degree": 2,
+    "standard_parameters": {
+      "blowup_factor": 8,
+      "num_queries": 32,
+      "fri_folding_factor": 4,
+      "grinding_factor": 16
+    },
+    "security_level": "100 bits",
+    "prover_library": "winterfell"
+  }
+}

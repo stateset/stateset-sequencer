@@ -1,0 +1,135 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-chain-1/payment-intent.json",
+  "title": "VES-CHAIN-1 Payment Intent",
+  "description": "Payment intent event payload per VES-CHAIN-1 specification",
+  "type": "object",
+  "required": [
+    "intent_id",
+    "chain",
+    "network",
+    "operation",
+    "from_address",
+    "amount",
+    "currency"
+  ],
+  "properties": {
+    "intent_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique payment intent identifier"
+    },
+    "chain": {
+      "type": "string",
+      "enum": ["solana", "near", "stellar", "cardano", "polkadot", "cosmos", "algorand", "aptos", "sui", "tezos"],
+      "description": "Target blockchain"
+    },
+    "network": {
+      "type": "string",
+      "description": "Network identifier (mainnet-beta, testnet, devnet, etc.)"
+    },
+    "operation": {
+      "type": "string",
+      "enum": ["transfer", "token_transfer", "contract_call", "batch_transfer", "cross_chain_transfer", "stake", "unstake", "delegate"],
+      "description": "Type of blockchain operation"
+    },
+    "from_address": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Source address"
+    },
+    "to_address": {
+      "type": "string",
+      "description": "Destination address (optional for some operations)"
+    },
+    "amount": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "description": "Amount in smallest denomination (lamports, yoctoNEAR, etc.)"
+    },
+    "currency": {
+      "type": "string",
+      "description": "Currency identifier (lamports, yoctoNEAR, uatom, etc.)"
+    },
+    "token_mint": {
+      "type": "string",
+      "description": "Token mint/contract address for token transfers"
+    },
+    "token_decimals": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18,
+      "description": "Token decimal places"
+    },
+    "memo": {
+      "type": "string",
+      "maxLength": 256,
+      "description": "Optional transaction memo"
+    },
+    "idempotency_key": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Idempotency key for duplicate prevention"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this intent expires (RFC 3339)"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Additional application-specific metadata",
+      "properties": {
+        "invoice_id": {
+          "type": "string"
+        },
+        "customer_id": {
+          "type": "string"
+        },
+        "order_id": {
+          "type": "string"
+        },
+        "reference": {
+          "type": "string"
+        }
+      }
+    },
+    "batch_info": {
+      "type": "object",
+      "description": "Batch payment information",
+      "properties": {
+        "batch_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "batch_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "cross_chain_info": {
+      "type": "object",
+      "description": "Cross-chain transfer information",
+      "properties": {
+        "source_chain": {
+          "type": "string"
+        },
+        "dest_chain": {
+          "type": "string"
+        },
+        "bridge_protocol": {
+          "type": "string",
+          "enum": ["wormhole", "layerzero", "axelar", "ibc"]
+        },
+        "dest_address": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

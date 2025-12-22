@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-contract-1/escrow.json",
+  "title": "VES-CONTRACT-1 Escrow",
+  "description": "Escrow contract state per VES-CONTRACT-1 specification",
+  "type": "object",
+  "required": [
+    "escrow_id",
+    "buyer",
+    "seller",
+    "token_mint",
+    "amount",
+    "release_conditions",
+    "status",
+    "created_at"
+  ],
+  "properties": {
+    "escrow_id": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "32-byte escrow identifier"
+    },
+    "buyer": {
+      "type": "string",
+      "description": "Buyer address"
+    },
+    "seller": {
+      "type": "string",
+      "description": "Seller address"
+    },
+    "token_mint": {
+      "type": "string",
+      "description": "Token mint address"
+    },
+    "amount": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "description": "Escrow amount in token base units"
+    },
+    "release_conditions": {
+      "type": "object",
+      "required": [
+        "event_type",
+        "entity_type",
+        "entity_id"
+      ],
+      "properties": {
+        "event_type": {
+          "type": "string",
+          "description": "VES event type that triggers release (e.g., 'DeliveryConfirmed')"
+        },
+        "entity_type": {
+          "type": "string",
+          "description": "VES entity type (e.g., 'Order')"
+        },
+        "entity_id": {
+          "type": "string",
+          "description": "VES entity ID (e.g., 'ORD-2025-001234')"
+        }
+      }
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Seconds until escrow can be refunded"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "released", "refunded", "disputed"],
+      "description": "Current escrow status"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "timeout_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "released_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "refunded_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "release_proof": {
+      "$ref": "ves-proof.json",
+      "description": "VES proof that triggered release"
+    },
+    "release_tx": {
+      "type": "string",
+      "description": "Transaction hash of release"
+    }
+  }
+}

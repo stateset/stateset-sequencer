@@ -1,0 +1,109 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-enc-1/payload-encrypted.json",
+  "title": "VES-ENC-1 Encrypted Payload",
+  "description": "Encrypted payload structure per VES-ENC-1 specification",
+  "type": "object",
+  "required": [
+    "enc_version",
+    "aead",
+    "nonce_b64u",
+    "ciphertext_b64u",
+    "tag_b64u",
+    "hpke",
+    "recipients"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "enc_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Encryption version, must be 1 for VES-ENC-1"
+    },
+    "aead": {
+      "type": "string",
+      "const": "AES-256-GCM",
+      "description": "AEAD algorithm identifier"
+    },
+    "nonce_b64u": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{16}$",
+      "description": "12-byte nonce, base64url encoded without padding"
+    },
+    "ciphertext_b64u": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "minLength": 1,
+      "description": "Encrypted salt || JCS(payload), base64url encoded"
+    },
+    "tag_b64u": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22}$",
+      "description": "16-byte authentication tag, base64url encoded without padding"
+    },
+    "hpke": {
+      "$ref": "#/definitions/HpkeParams"
+    },
+    "recipients": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/definitions/Recipient"
+      },
+      "description": "Recipient list, MUST be sorted by recipient_kid ascending"
+    }
+  },
+  "definitions": {
+    "HpkeParams": {
+      "type": "object",
+      "required": ["mode", "kem", "kdf", "aead"],
+      "additionalProperties": false,
+      "description": "HPKE algorithm parameters per RFC 9180",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "const": "base",
+          "description": "HPKE mode: Base (0x00)"
+        },
+        "kem": {
+          "type": "string",
+          "const": "X25519-HKDF-SHA256",
+          "description": "KEM: DHKEM(X25519, HKDF-SHA256) - 0x0020"
+        },
+        "kdf": {
+          "type": "string",
+          "const": "HKDF-SHA256",
+          "description": "KDF: HKDF-SHA256 - 0x0001"
+        },
+        "aead": {
+          "type": "string",
+          "const": "AES-256-GCM",
+          "description": "AEAD: AES-256-GCM - 0x0002"
+        }
+      }
+    },
+    "Recipient": {
+      "type": "object",
+      "required": ["recipient_kid", "enc_b64u", "ct_b64u"],
+      "additionalProperties": false,
+      "description": "Per-recipient wrapped DEK entry",
+      "properties": {
+        "recipient_kid": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Recipient key ID in the encryption key registry"
+        },
+        "enc_b64u": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{43}$",
+          "description": "32-byte HPKE encapsulated key, base64url encoded"
+        },
+        "ct_b64u": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{64}$",
+          "description": "48-byte wrapped DEK (32 + 16 GCM tag), base64url encoded"
+        }
+      }
+    }
+  }
+}

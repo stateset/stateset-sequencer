@@ -1,0 +1,114 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-enc-1/encrypted-event.json",
+  "title": "VES v1.0 Encrypted Event",
+  "description": "Complete VES v1.0 event with encrypted payload (payload_kind = 1)",
+  "type": "object",
+  "required": [
+    "ves_version",
+    "event_id",
+    "tenant_id",
+    "store_id",
+    "source_agent_id",
+    "agent_key_id",
+    "entity_type",
+    "entity_id",
+    "event_type",
+    "created_at",
+    "payload_kind",
+    "payload_encrypted",
+    "payload_plain_hash",
+    "payload_cipher_hash",
+    "agent_signature"
+  ],
+  "properties": {
+    "ves_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "VES protocol version"
+    },
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique event identifier"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Tenant identifier"
+    },
+    "store_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Store identifier within tenant"
+    },
+    "source_agent_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Agent that created this event"
+    },
+    "agent_key_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Key ID used for signing"
+    },
+    "entity_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Type of entity (e.g., InventoryItem, Order)"
+    },
+    "entity_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifier of the entity"
+    },
+    "event_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Type of event (e.g., Created, Updated, Adjusted)"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp when agent created the event"
+    },
+    "payload_kind": {
+      "type": "integer",
+      "const": 1,
+      "description": "Payload kind: 1 = encrypted"
+    },
+    "payload_encrypted": {
+      "$ref": "payload-encrypted.json",
+      "description": "Encrypted payload structure"
+    },
+    "payload_plain_hash": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "SHA-256 hash of domain || salt || JCS(payload)"
+    },
+    "payload_cipher_hash": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "SHA-256 hash of ciphertext structure"
+    },
+    "agent_signature": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{128}$",
+      "description": "Ed25519 signature (64 bytes)"
+    },
+    "sequence_number": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sequencer-assigned sequence number"
+    },
+    "sequenced_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp when sequencer processed the event"
+    },
+    "sequencer_receipt": {
+      "type": "object",
+      "description": "Optional sequencer receipt for non-repudiation"
+    }
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-chain-1/anchor-commitment.json",
+  "title": "VES-CHAIN-1 Anchor Commitment",
+  "description": "On-chain anchor commitment per VES-CHAIN-1 specification",
+  "type": "object",
+  "required": [
+    "stream_id",
+    "sequence_start",
+    "sequence_end",
+    "events_root",
+    "prev_events_root"
+  ],
+  "properties": {
+    "stream_id": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "32-byte stream identifier (SHA256 of tenant_id || store_id)"
+    },
+    "sequence_start": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "First sequence number in this commitment"
+    },
+    "sequence_end": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Last sequence number in this commitment"
+    },
+    "events_root": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "32-byte Merkle root of events in this batch"
+    },
+    "prev_events_root": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "32-byte Merkle root of previous batch (zeros for genesis)"
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unix timestamp when commitment was created"
+    },
+    "anchor_tx": {
+      "type": "object",
+      "description": "On-chain anchor transaction details",
+      "required": ["chain", "network", "tx_hash"],
+      "properties": {
+        "chain": {
+          "type": "string",
+          "enum": ["solana", "near", "stellar", "cosmos"]
+        },
+        "network": {
+          "type": "string"
+        },
+        "tx_hash": {
+          "type": "string"
+        },
+        "block_number": {
+          "type": "integer"
+        },
+        "anchor_address": {
+          "type": "string",
+          "description": "Address of anchor account/contract"
+        },
+        "anchored_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  },
+  "additionalProperties": false
+}

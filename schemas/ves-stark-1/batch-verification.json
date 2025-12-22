@@ -1,0 +1,118 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-stark-1/batch-verification.json",
+  "title": "VES-STARK-1 Batch Verification Record",
+  "description": "Record of verified STARK proof per VES-STARK-1 specification",
+  "type": "object",
+  "required": [
+    "verification_id",
+    "tenant_id",
+    "store_id",
+    "batch_size",
+    "sequence_start",
+    "sequence_end",
+    "events_root",
+    "state_commitment",
+    "proof_hash",
+    "chain_verification",
+    "verified_at"
+  ],
+  "properties": {
+    "verification_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "store_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "batch_size": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "sequence_start": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sequence_end": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "prev_events_root": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$"
+    },
+    "events_root": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$"
+    },
+    "state_commitment": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$"
+    },
+    "proof_hash": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "SHA-256 hash of the proof"
+    },
+    "proof_size_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "proving_time_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "chain_verification": {
+      "type": "object",
+      "required": [
+        "chain",
+        "network",
+        "tx_hash",
+        "status"
+      ],
+      "properties": {
+        "chain": {
+          "type": "string",
+          "enum": ["solana", "starknet", "ethereum", "cosmos"]
+        },
+        "network": {
+          "type": "string"
+        },
+        "tx_hash": {
+          "type": "string"
+        },
+        "block_number": {
+          "type": "integer"
+        },
+        "verification_cost": {
+          "type": "object",
+          "properties": {
+            "compute_units": { "type": "integer" },
+            "gas_used": { "type": "integer" },
+            "fee_amount": { "type": "string" },
+            "fee_currency": { "type": "string" }
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": ["pending", "verified", "failed"]
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "verified_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "prover_id": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,169 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-multi-1/proposal.json",
+  "title": "VES-MULTI-1 Proposal",
+  "description": "Multi-agent proposal for collective authorization per VES-MULTI-1 specification",
+  "type": "object",
+  "required": [
+    "proposal_id",
+    "group_id",
+    "type",
+    "title",
+    "action",
+    "proposed_by",
+    "proposed_at",
+    "required_approvals",
+    "deadline",
+    "status"
+  ],
+  "properties": {
+    "proposal_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "group_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "payment",
+        "token_transfer",
+        "contract_call",
+        "policy_change",
+        "member_add",
+        "member_remove",
+        "threshold_change",
+        "key_rotation",
+        "custom"
+      ]
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "proposed_by": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Agent ID of proposer"
+    },
+    "proposed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "action": {
+      "type": "object",
+      "description": "Action to execute if approved",
+      "properties": {
+        "payment": {
+          "type": "object",
+          "properties": {
+            "chain": { "type": "string" },
+            "recipient": { "type": "string" },
+            "amount": { "type": "string" },
+            "currency": { "type": "string" },
+            "memo": { "type": "string" }
+          }
+        },
+        "policy_change": {
+          "type": "object",
+          "properties": {
+            "policy_id": { "type": "string" },
+            "old_value": {},
+            "new_value": {}
+          }
+        },
+        "member_op": {
+          "type": "object",
+          "properties": {
+            "operation": { "type": "string", "enum": ["add", "remove"] },
+            "agent_id": { "type": "string", "format": "uuid" },
+            "role": { "type": "string" }
+          }
+        },
+        "custom": {
+          "type": "object",
+          "properties": {
+            "action_type": { "type": "string" },
+            "data": {}
+          }
+        }
+      }
+    },
+    "votes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/vote"
+      }
+    },
+    "required_approvals": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "deadline": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "approved", "rejected", "executed", "expired", "failed"]
+    },
+    "executed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "executed_by": {
+      "type": "array",
+      "items": { "type": "string", "format": "uuid" },
+      "description": "Agents who participated in signing"
+    },
+    "execution_tx_hash": {
+      "type": "string"
+    }
+  },
+  "definitions": {
+    "vote": {
+      "type": "object",
+      "required": [
+        "vote_id",
+        "proposal_id",
+        "voter_id",
+        "decision",
+        "voted_at"
+      ],
+      "properties": {
+        "vote_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "proposal_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "voter_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "decision": {
+          "type": "string",
+          "enum": ["approve", "reject", "abstain"]
+        },
+        "reason": {
+          "type": "string"
+        },
+        "signature": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{128}$"
+        },
+        "voted_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

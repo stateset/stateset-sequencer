@@ -1,0 +1,460 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VES-CHAIN-1 Test Vectors",
+  "description": "Test vectors for VES-CHAIN-1 blockchain integration specification",
+  "version": "1.0.0",
+  "generated": "2025-12-22",
+
+  "bip39_mnemonic": {
+    "description": "BIP-39 test mnemonic (DO NOT USE IN PRODUCTION)",
+    "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    "seed_hex": "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc19a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4",
+    "note": "Standard test mnemonic from BIP-39 specification"
+  },
+
+  "uuid_to_index": {
+    "description": "UUID to derivation index conversion test vectors",
+    "vectors": [
+      {
+        "uuid": "00000000-0000-0000-0000-000000000000",
+        "expected_index": 0,
+        "note": "Nil UUID"
+      },
+      {
+        "uuid": "00000000-0000-0000-0000-000000000001",
+        "expected_index": 0,
+        "note": "UUID with only last byte set"
+      },
+      {
+        "uuid": "00000001-0000-0000-0000-000000000000",
+        "expected_index": 1,
+        "note": "First 4 bytes = 0x00000001"
+      },
+      {
+        "uuid": "11111111-1111-1111-1111-111111111111",
+        "expected_index": 286331153,
+        "note": "0x11111111 = 286331153"
+      },
+      {
+        "uuid": "22222222-2222-2222-2222-222222222222",
+        "expected_index": 572662306,
+        "note": "0x22222222 = 572662306"
+      },
+      {
+        "uuid": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+        "expected_index": 2147483647,
+        "note": "0xffffffff masked to 0x7fffffff"
+      }
+    ],
+    "algorithm": "First 4 bytes as big-endian uint32, masked with 0x7FFFFFFF for hardened derivation"
+  },
+
+  "derivation_paths": {
+    "description": "BIP-44 derivation path test vectors",
+    "coin_types": {
+      "ves_signing": 9999,
+      "ves_encryption": 9998,
+      "solana": 501,
+      "near": 397,
+      "stellar": 148,
+      "cardano": 1815,
+      "polkadot": 354,
+      "cosmos": 118,
+      "algorand": 283,
+      "aptos": 637,
+      "sui": 784,
+      "tezos": 1729
+    },
+    "test_derivation": {
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "agent_id": "22222222-2222-2222-2222-222222222222",
+      "tenant_index": 0,
+      "agent_index": 572662306,
+      "expected_paths": {
+        "ves_signing": "m/44'/9999'/0'/572662306'/0",
+        "solana": "m/44'/501'/0'/572662306'/0",
+        "near": "m/44'/397'/0'/572662306'/0",
+        "stellar": "m/44'/148'/0'/572662306'/0",
+        "cosmos": "m/44'/118'/0'/572662306'/0",
+        "aptos": "m/44'/637'/0'/572662306'/0",
+        "sui": "m/44'/784'/0'/572662306'/0"
+      }
+    }
+  },
+
+  "key_derivation": {
+    "description": "HD key derivation test vectors",
+    "test_case": {
+      "mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "agent_id": "22222222-2222-2222-2222-222222222222",
+      "expected_keys": {
+        "note": "These are EXAMPLE values - compute from your implementation",
+        "ves_signing": {
+          "path": "m/44'/9999'/0'/572662306'/0",
+          "private_key_hex": "COMPUTE_FROM_IMPLEMENTATION",
+          "public_key_hex": "COMPUTE_FROM_IMPLEMENTATION"
+        },
+        "solana": {
+          "path": "m/44'/501'/0'/572662306'/0",
+          "private_key_hex": "COMPUTE_FROM_IMPLEMENTATION",
+          "public_key_hex": "COMPUTE_FROM_IMPLEMENTATION",
+          "address": "COMPUTE_FROM_IMPLEMENTATION"
+        }
+      }
+    }
+  },
+
+  "address_derivation": {
+    "description": "Chain-specific address derivation test vectors",
+    "vectors": [
+      {
+        "name": "solana_address",
+        "chain": "solana",
+        "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "expected_address": "FsaLodPu4VmSwXGr3gWfwANe4vKf8XSZcCh1CEeJ3jpD",
+        "algorithm": "base58(public_key)"
+      },
+      {
+        "name": "near_implicit_account",
+        "chain": "near",
+        "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "expected_address": "ed25519:FsaLodPu4VmSwXGr3gWfwANe4vKf8XSZcCh1CEeJ3jpD",
+        "algorithm": "ed25519: + base58(public_key)"
+      },
+      {
+        "name": "cosmos_address",
+        "chain": "cosmos",
+        "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "expected_address": "COMPUTE_FROM_IMPLEMENTATION",
+        "algorithm": "bech32('cosmos', ripemd160(sha256(public_key)))"
+      },
+      {
+        "name": "stellar_address",
+        "chain": "stellar",
+        "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "expected_address": "COMPUTE_FROM_IMPLEMENTATION",
+        "algorithm": "strkey_encode(version_byte=48, public_key, crc16)"
+      },
+      {
+        "name": "aptos_address",
+        "chain": "aptos",
+        "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "expected_address": "COMPUTE_FROM_IMPLEMENTATION",
+        "algorithm": "0x + hex(sha3_256(public_key || 0x00))"
+      },
+      {
+        "name": "sui_address",
+        "chain": "sui",
+        "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "expected_address": "COMPUTE_FROM_IMPLEMENTATION",
+        "algorithm": "0x + hex(blake2b(0x00 || public_key, 32))"
+      }
+    ]
+  },
+
+  "stream_id_computation": {
+    "description": "VES stream ID computation for anchoring",
+    "vectors": [
+      {
+        "tenant_id": "00000000-0000-0000-0000-000000000001",
+        "store_id": "00000000-0000-0000-0000-000000000002",
+        "expected_stream_id_hex": "COMPUTE_FROM_IMPLEMENTATION",
+        "algorithm": "SHA256(tenant_id_bytes || store_id_bytes)"
+      }
+    ]
+  },
+
+  "payment_intent_examples": {
+    "description": "Example payment intent payloads",
+    "solana_transfer": {
+      "intent_id": "11111111-1111-1111-1111-111111111111",
+      "chain": "solana",
+      "network": "mainnet-beta",
+      "operation": "transfer",
+      "from_address": "FsaLodPu4VmSwXGr3gWfwANe4vKf8XSZcCh1CEeJ3jpD",
+      "to_address": "Hf4rPJqfC9CvhKhxFFePGcSqGXWBRJLfpjFvqQ7hPBLe",
+      "amount": "1000000000",
+      "currency": "lamports",
+      "memo": "Invoice #INV-2025-001",
+      "idempotency_key": "22222222-2222-2222-2222-222222222222",
+      "metadata": {
+        "invoice_id": "INV-2025-001",
+        "customer_id": "CUST-001"
+      }
+    },
+    "near_transfer": {
+      "intent_id": "33333333-3333-3333-3333-333333333333",
+      "chain": "near",
+      "network": "mainnet",
+      "operation": "transfer",
+      "from_address": "agent.near",
+      "to_address": "recipient.near",
+      "amount": "1000000000000000000000000",
+      "currency": "yoctoNEAR",
+      "memo": "Payment for services"
+    },
+    "cosmos_transfer": {
+      "intent_id": "44444444-4444-4444-4444-444444444444",
+      "chain": "cosmos",
+      "network": "cosmoshub-4",
+      "operation": "transfer",
+      "from_address": "cosmos1abc...",
+      "to_address": "cosmos1xyz...",
+      "amount": "1000000",
+      "currency": "uatom"
+    },
+    "spl_token_transfer": {
+      "intent_id": "55555555-5555-5555-5555-555555555555",
+      "chain": "solana",
+      "network": "mainnet-beta",
+      "operation": "token_transfer",
+      "from_address": "AgentTokenAccount...",
+      "to_address": "RecipientTokenAccount...",
+      "amount": "1000000",
+      "currency": "USDC",
+      "token_mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "token_decimals": 6
+    },
+    "batch_transfer": {
+      "intent_id": "66666666-6666-6666-6666-666666666666",
+      "chain": "solana",
+      "network": "devnet",
+      "operation": "batch_transfer",
+      "from_address": "BatchSender...",
+      "to_address": "batch",
+      "amount": "5000000000",
+      "currency": "lamports",
+      "batch_info": {
+        "batch_id": "77777777-7777-7777-7777-777777777777",
+        "batch_index": 0,
+        "batch_size": 5
+      }
+    }
+  },
+
+  "transaction_confirmed_examples": {
+    "description": "Example transaction confirmation payloads",
+    "solana_confirmed": {
+      "intent_id": "11111111-1111-1111-1111-111111111111",
+      "chain": "solana",
+      "network": "mainnet-beta",
+      "tx_hash": "5wHu1qwD7q4V9q8KqpTJ2tJ2Cy7h8GYrFkJkVJhjgXmN",
+      "tx_signature": "0x3f8a9b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c",
+      "block_number": 234567890,
+      "block_hash": "9j8h7g6f5e4d3c2b1a0z9y8x7w6v5u4t3s2r1q0p",
+      "block_time": "2025-01-01T12:00:05Z",
+      "confirmations": 32,
+      "status": "finalized",
+      "fee": {
+        "amount": "5000",
+        "currency": "lamports"
+      },
+      "confirmed_at": "2025-01-01T12:00:10Z",
+      "solana_specific": {
+        "slot": 234567890,
+        "commitment": "finalized"
+      }
+    },
+    "near_confirmed": {
+      "intent_id": "33333333-3333-3333-3333-333333333333",
+      "chain": "near",
+      "network": "mainnet",
+      "tx_hash": "8xY7Z6W5V4U3T2S1R0Q9P8O7N6M5L4K3J2I1H0G",
+      "block_number": 98765432,
+      "block_hash": "CvbnM3K4L5J6H7G8F9D0S1A2",
+      "block_time": "2025-01-01T12:00:05Z",
+      "confirmations": 1,
+      "status": "confirmed",
+      "fee": {
+        "amount": "224609375000000000000",
+        "currency": "yoctoNEAR"
+      },
+      "confirmed_at": "2025-01-01T12:00:06Z",
+      "near_specific": {
+        "receipts": ["receipt1...", "receipt2..."],
+        "outcome": {}
+      }
+    }
+  },
+
+  "anchor_commitment_examples": {
+    "description": "Example anchor commitment payloads",
+    "genesis_anchor": {
+      "stream_id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "sequence_start": 0,
+      "sequence_end": 99,
+      "events_root": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+      "prev_events_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "timestamp": 1735689600,
+      "anchor_tx": {
+        "chain": "solana",
+        "network": "mainnet-beta",
+        "tx_hash": "AnchorTxSignature123...",
+        "block_number": 234567900,
+        "anchor_address": "VesAnchor1111111111111111111111111111111111111",
+        "anchored_at": "2025-01-01T12:00:00Z"
+      }
+    },
+    "chained_anchor": {
+      "stream_id": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+      "sequence_start": 100,
+      "sequence_end": 199,
+      "events_root": "0xfedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321",
+      "prev_events_root": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+      "timestamp": 1735776000,
+      "anchor_tx": {
+        "chain": "solana",
+        "network": "mainnet-beta",
+        "tx_hash": "AnchorTxSignature456...",
+        "block_number": 234568000,
+        "anchor_address": "VesAnchor1111111111111111111111111111111111111",
+        "anchored_at": "2025-01-02T12:00:00Z"
+      }
+    }
+  },
+
+  "transaction_signing": {
+    "description": "Ed25519 transaction signing test vectors",
+    "ed25519_test": {
+      "private_key_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "public_key_hex": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "message_hex": "68656c6c6f20776f726c64",
+      "expected_signature_hex": "COMPUTE_FROM_IMPLEMENTATION",
+      "note": "Standard Ed25519 signature test"
+    },
+    "solana_transaction": {
+      "description": "Solana transaction structure",
+      "recent_blockhash": "GfVcyD4kkTrj4bKceuoKw5tMPAT3qpPiZp4BKQvMjF24",
+      "fee_payer": "FsaLodPu4VmSwXGr3gWfwANe4vKf8XSZcCh1CEeJ3jpD",
+      "instructions": [
+        {
+          "program_id": "11111111111111111111111111111111",
+          "accounts": [
+            {"pubkey": "FsaLodPu4VmSwXGr3gWfwANe4vKf8XSZcCh1CEeJ3jpD", "is_signer": true, "is_writable": true},
+            {"pubkey": "Hf4rPJqfC9CvhKhxFFePGcSqGXWBRJLfpjFvqQ7hPBLe", "is_signer": false, "is_writable": true}
+          ],
+          "data_hex": "020000000065cd1d00000000"
+        }
+      ],
+      "note": "System program transfer of 500000000 lamports"
+    }
+  },
+
+  "chain_parameters": {
+    "description": "Chain-specific parameters for reference",
+    "chains": {
+      "solana": {
+        "coin_type": 501,
+        "native_token": "SOL",
+        "decimals": 9,
+        "address_format": "base58",
+        "address_length": 44,
+        "signature_scheme": "ed25519",
+        "networks": ["mainnet-beta", "testnet", "devnet"]
+      },
+      "near": {
+        "coin_type": 397,
+        "native_token": "NEAR",
+        "decimals": 24,
+        "address_format": "named_or_implicit",
+        "signature_scheme": "ed25519",
+        "networks": ["mainnet", "testnet"]
+      },
+      "stellar": {
+        "coin_type": 148,
+        "native_token": "XLM",
+        "decimals": 7,
+        "address_format": "strkey",
+        "address_prefix": "G",
+        "signature_scheme": "ed25519",
+        "networks": ["public", "testnet"]
+      },
+      "cosmos": {
+        "coin_type": 118,
+        "native_token": "ATOM",
+        "decimals": 6,
+        "address_format": "bech32",
+        "address_prefix": "cosmos",
+        "signature_scheme": "ed25519_or_secp256k1",
+        "networks": ["cosmoshub-4", "theta-testnet-001"]
+      },
+      "aptos": {
+        "coin_type": 637,
+        "native_token": "APT",
+        "decimals": 8,
+        "address_format": "hex",
+        "address_prefix": "0x",
+        "signature_scheme": "ed25519",
+        "networks": ["mainnet", "testnet", "devnet"]
+      },
+      "sui": {
+        "coin_type": 784,
+        "native_token": "SUI",
+        "decimals": 9,
+        "address_format": "hex",
+        "address_prefix": "0x",
+        "signature_scheme": "ed25519",
+        "networks": ["mainnet", "testnet", "devnet"]
+      }
+    }
+  },
+
+  "validation_rules": {
+    "description": "Validation rules for VES-CHAIN-1 implementations",
+    "blockchain_key": [
+      "tenant_id MUST be valid UUID",
+      "agent_id MUST be valid UUID",
+      "chain_id MUST be one of supported chains",
+      "derivation_path MUST follow BIP-44 format",
+      "public_key MUST be 32 bytes (64 hex chars)",
+      "address MUST be valid for the specified chain",
+      "status MUST be 'active', 'disabled', or 'compromised'"
+    ],
+    "payment_intent": [
+      "intent_id MUST be valid UUID",
+      "chain MUST be one of supported chains",
+      "operation MUST be valid operation type",
+      "from_address MUST be valid address for chain",
+      "amount MUST be non-negative integer string",
+      "currency MUST be specified",
+      "to_address required for transfer operations"
+    ],
+    "transaction_confirmed": [
+      "intent_id MUST reference existing payment intent",
+      "tx_hash MUST be valid for chain",
+      "block_number MUST be non-negative integer",
+      "status MUST be 'pending', 'confirmed', 'finalized', or 'failed'",
+      "confirmed_at MUST be valid RFC 3339 timestamp"
+    ],
+    "anchor_commitment": [
+      "stream_id MUST be 32 bytes (64 hex chars)",
+      "sequence_start MUST be non-negative integer",
+      "sequence_end MUST be >= sequence_start",
+      "events_root MUST be 32 bytes (64 hex chars)",
+      "prev_events_root MUST be 32 bytes (64 hex chars)",
+      "For genesis, prev_events_root MUST be all zeros",
+      "For chained, sequence_start MUST be prev_sequence_end + 1"
+    ]
+  },
+
+  "error_codes": {
+    "description": "Standard error codes for VES-CHAIN-1 operations",
+    "codes": {
+      "CHAIN_NOT_SUPPORTED": "Chain ID not in supported list",
+      "INVALID_DERIVATION_PATH": "Derivation path does not follow BIP-44 format",
+      "KEY_NOT_FOUND": "Blockchain key not registered for agent",
+      "KEY_DISABLED": "Blockchain key has been disabled",
+      "KEY_COMPROMISED": "Blockchain key marked as compromised",
+      "INSUFFICIENT_BALANCE": "Insufficient balance for transaction",
+      "INVALID_RECIPIENT": "Recipient address invalid for chain",
+      "TRANSACTION_FAILED": "Transaction failed on chain",
+      "TRANSACTION_TIMEOUT": "Transaction confirmation timeout",
+      "INTENT_NOT_FOUND": "Payment intent not found",
+      "INTENT_EXPIRED": "Payment intent has expired",
+      "DUPLICATE_INTENT": "Idempotency key already used",
+      "ANCHOR_CHAIN_MISMATCH": "Previous events root does not match",
+      "ANCHOR_SEQUENCE_GAP": "Sequence number gap in anchor chain"
+    }
+  }
+}

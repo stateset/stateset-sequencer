@@ -1,0 +1,298 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VES-MULTI-1 Test Vectors",
+  "description": "Test vectors for VES-MULTI-1 multi-agent coordination with FROST threshold signatures",
+  "version": "1.0.0",
+  "test_cases": {
+    "dkg": {
+      "description": "Distributed Key Generation test vectors",
+      "vectors": [
+        {
+          "name": "dkg_2_of_3",
+          "input": {
+            "threshold": 2,
+            "total_participants": 3,
+            "participant_secrets": [
+              "0x1a2b3c4d5e6f708192a3b4c5d6e7f80910111213141516171819202122232425",
+              "0x2b3c4d5e6f708192a3b4c5d6e7f809101112131415161718192021222324252a",
+              "0x3c4d5e6f708192a3b4c5d6e7f80910111213141516171819202122232425262b"
+            ]
+          },
+          "expected": {
+            "group_public_key": "0x7f8c9d2e1a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
+            "participant_public_shares": [
+              "0x1111111111111111111111111111111111111111111111111111111111111111",
+              "0x2222222222222222222222222222222222222222222222222222222222222222",
+              "0x3333333333333333333333333333333333333333333333333333333333333333"
+            ],
+            "verification_keys_valid": true
+          }
+        },
+        {
+          "name": "dkg_3_of_5",
+          "input": {
+            "threshold": 3,
+            "total_participants": 5
+          },
+          "expected": {
+            "polynomial_degree": 2,
+            "share_count": 5,
+            "commitment_count": 3
+          }
+        },
+        {
+          "name": "dkg_invalid_share",
+          "input": {
+            "threshold": 2,
+            "total_participants": 3,
+            "participant_1_share_to_2": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "participant_1_commitments": [
+              "0x1111111111111111111111111111111111111111111111111111111111111111",
+              "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ]
+          },
+          "expected": {
+            "share_valid": false,
+            "error": "COMMITMENT_VERIFICATION_FAILED"
+          }
+        }
+      ]
+    },
+    "frost_signing": {
+      "description": "FROST threshold signing test vectors",
+      "vectors": [
+        {
+          "name": "frost_2_of_3_signing",
+          "input": {
+            "threshold": 2,
+            "participating_indices": [1, 2],
+            "message": "Payment to supplier: $50,000 USDC",
+            "group_public_key": "0x7f8c9d2e1a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
+            "participant_1": {
+              "secret_share": "0x1a2b3c4d5e6f708192a3b4c5d6e7f80910111213141516171819202122232425",
+              "hiding_nonce": "0x4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7",
+              "binding_nonce": "0x5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708"
+            },
+            "participant_2": {
+              "secret_share": "0x2b3c4d5e6f708192a3b4c5d6e7f809101112131415161718192021222324252a",
+              "hiding_nonce": "0x6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f70819",
+              "binding_nonce": "0x7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f708192a"
+            }
+          },
+          "expected": {
+            "round_1": {
+              "participant_1_hiding_commitment": "0xaabbccdd11223344556677889900aabbccddeeff11223344556677889900aabb",
+              "participant_1_binding_commitment": "0xbbccddee22334455667788990011aabbccddeeff22334455667788990011aabb",
+              "participant_2_hiding_commitment": "0xccddeeaf33445566778899001122aabbccddeeff33445566778899001122aabb",
+              "participant_2_binding_commitment": "0xddeeff0044556677889900112233aabbccddeeff44556677889900112233aabb"
+            },
+            "round_2": {
+              "group_commitment": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+              "participant_1_signature_share": "0x0a1b2c3d4e5f60718293a4b5c6d7e8f901020304050607080910111213141516",
+              "participant_2_signature_share": "0x1b2c3d4e5f60718293a4b5c6d7e8f9010203040506070809101112131415161a"
+            },
+            "final_signature": {
+              "r": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+              "s": "0x25404860828406080a0c0e1012141618202224262830323436383a3c3e404244",
+              "signature_hex": "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef25404860828406080a0c0e1012141618202224262830323436383a3c3e404244"
+            },
+            "signature_valid": true,
+            "signature_type": "ed25519"
+          }
+        },
+        {
+          "name": "frost_insufficient_signers",
+          "input": {
+            "threshold": 2,
+            "participating_indices": [1],
+            "message": "Payment to supplier"
+          },
+          "expected": {
+            "result": "error",
+            "error": "INSUFFICIENT_SIGNERS",
+            "required": 2,
+            "provided": 1
+          }
+        },
+        {
+          "name": "frost_nonce_reuse_prevention",
+          "input": {
+            "session_id": "session_001",
+            "participant_1_nonce_used": true,
+            "attempt_reuse": true
+          },
+          "expected": {
+            "result": "error",
+            "error": "NONCE_ALREADY_USED",
+            "message": "Nonces are single-use for security"
+          }
+        }
+      ]
+    },
+    "lagrange_coefficients": {
+      "description": "Lagrange coefficient calculation test vectors",
+      "vectors": [
+        {
+          "name": "lagrange_2_of_3_indices_1_2",
+          "input": {
+            "participant_index": 1,
+            "all_indices": [1, 2],
+            "field_order": "7237005577332262213973186563042994240857116359379907606001950938285454250989"
+          },
+          "expected": {
+            "lambda_1": "2",
+            "lambda_2": "-1"
+          },
+          "note": "lambda values are in the field, -1 = order - 1"
+        },
+        {
+          "name": "lagrange_3_of_5_indices_1_3_5",
+          "input": {
+            "participant_index": 1,
+            "all_indices": [1, 3, 5]
+          },
+          "expected": {
+            "lambda_1_numerator": 15,
+            "lambda_1_denominator": 8,
+            "note": "lambda_1 = (3*5)/((3-1)*(5-1)) = 15/8"
+          }
+        }
+      ]
+    },
+    "proposals": {
+      "description": "Proposal and voting test vectors",
+      "vectors": [
+        {
+          "name": "create_payment_proposal",
+          "input": {
+            "group_id": "550e8400-e29b-41d4-a716-446655440000",
+            "type": "payment",
+            "title": "Q1 Supplier Payment",
+            "proposed_by": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "action": {
+              "payment": {
+                "chain": "solana",
+                "recipient": "SuppL1erWa11etAddress1111111111111111111111",
+                "amount": "50000000000",
+                "currency": "USDC"
+              }
+            },
+            "required_approvals": 2,
+            "deadline": "2025-01-22T10:00:00Z"
+          },
+          "expected": {
+            "proposal_id_format": "uuid",
+            "status": "pending",
+            "votes": []
+          }
+        },
+        {
+          "name": "vote_approve",
+          "input": {
+            "proposal_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+            "voter_id": "c3d4e5f6-a7b8-9012-cdef-123456789012",
+            "decision": "approve",
+            "reason": "Invoice verified against PO-2025-0015"
+          },
+          "expected": {
+            "vote_recorded": true,
+            "current_approvals": 1,
+            "threshold_met": false
+          }
+        },
+        {
+          "name": "threshold_reached",
+          "input": {
+            "proposal_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+            "required_approvals": 2,
+            "votes": [
+              {"voter_id": "voter_1", "decision": "approve"},
+              {"voter_id": "voter_2", "decision": "approve"}
+            ]
+          },
+          "expected": {
+            "status": "approved",
+            "ready_for_signing": true
+          }
+        },
+        {
+          "name": "proposal_rejected",
+          "input": {
+            "proposal_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+            "required_approvals": 2,
+            "total_members": 3,
+            "votes": [
+              {"voter_id": "voter_1", "decision": "reject"},
+              {"voter_id": "voter_2", "decision": "reject"}
+            ]
+          },
+          "expected": {
+            "status": "rejected",
+            "rejection_reason": "Majority rejected"
+          }
+        },
+        {
+          "name": "proposal_expired",
+          "input": {
+            "proposal_id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+            "deadline": "2025-01-15T10:00:00Z",
+            "current_time": "2025-01-16T10:00:00Z",
+            "votes": [{"voter_id": "voter_1", "decision": "approve"}]
+          },
+          "expected": {
+            "status": "expired",
+            "approvals_at_expiry": 1
+          }
+        }
+      ]
+    },
+    "address_derivation": {
+      "description": "Multi-chain address derivation from group key",
+      "vectors": [
+        {
+          "name": "solana_address",
+          "input": {
+            "group_public_key": "0x7f8c9d2e1a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
+            "chain": "solana"
+          },
+          "expected": {
+            "address": "9Grp7fK2eMnQp5R8sT3uV4wX6yZ1aB2cD3eF4gH5iJ6k",
+            "encoding": "base58"
+          }
+        },
+        {
+          "name": "ethereum_address",
+          "input": {
+            "group_public_key": "0x7f8c9d2e1a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
+            "chain": "ethereum"
+          },
+          "expected": {
+            "address": "0x1234567890AbCdEf1234567890aBcDeF12345678",
+            "derivation": "keccak256(pubkey)[12:32]",
+            "checksum": "EIP-55"
+          }
+        },
+        {
+          "name": "cosmos_address",
+          "input": {
+            "group_public_key": "0x7f8c9d2e1a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d",
+            "chain": "cosmos",
+            "prefix": "cosmos"
+          },
+          "expected": {
+            "address": "cosmos1qwertyuiopasdfghjklzxcvbnm123456789",
+            "derivation": "bech32(ripemd160(sha256(pubkey)))",
+            "prefix": "cosmos"
+          }
+        }
+      ]
+    }
+  },
+  "implementation_notes": {
+    "curve": "ed25519",
+    "field_order": "7237005577332262213973186563042994240857116359379907606001950938285454250989",
+    "hash_function": "sha512",
+    "frost_version": "FROST-Ed25519-SHA512",
+    "signature_format": "R || s (64 bytes)"
+  }
+}

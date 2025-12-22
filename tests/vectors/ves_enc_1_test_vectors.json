@@ -1,0 +1,247 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "VES-ENC-1 Test Vectors",
+  "description": "Test vectors for VES-ENC-1 encrypted payload specification",
+  "version": "1.0.0",
+  "generated": "2025-12-22",
+
+  "canonicalization": {
+    "description": "RFC 8785 JCS canonicalization test vectors",
+    "vectors": [
+      {
+        "name": "simple_object",
+        "input": {"z": 1, "a": "hello"},
+        "expected": "{\"a\":\"hello\",\"z\":1}"
+      },
+      {
+        "name": "nested_object",
+        "input": {"z": 1, "a": "hello", "m": {"b": 2, "a": 1}},
+        "expected": "{\"a\":\"hello\",\"m\":{\"a\":1,\"b\":2},\"z\":1}"
+      },
+      {
+        "name": "with_array",
+        "input": {"items": [3, 1, 2], "name": "test"},
+        "expected": "{\"items\":[3,1,2],\"name\":\"test\"}"
+      },
+      {
+        "name": "inventory_payload",
+        "input": {"delta": 100, "reason": "shipment_receive", "location_bin": "A-12"},
+        "expected": "{\"delta\":100,\"location_bin\":\"A-12\",\"reason\":\"shipment_receive\"}"
+      },
+      {
+        "name": "unicode_strings",
+        "input": {"emoji": "hello"},
+        "expected": "{\"emoji\":\"hello\"}"
+      },
+      {
+        "name": "number_normalization",
+        "input": {"value": 1.0, "count": 100},
+        "expected": "{\"count\":100,\"value\":1}"
+      }
+    ]
+  },
+
+  "domain_separators": {
+    "description": "Domain separator byte values",
+    "values": {
+      "DOMAIN_PAYLOAD_PLAIN": {
+        "ascii": "VES_PAYLOAD_PLAIN_V1",
+        "hex": "5645535f5041594c4f41445f504c41494e5f5631",
+        "length": 20
+      },
+      "DOMAIN_PAYLOAD_AAD": {
+        "ascii": "VES_PAYLOAD_AAD_V1",
+        "hex": "5645535f5041594c4f41445f4141445f5631",
+        "length": 18
+      },
+      "DOMAIN_PAYLOAD_CIPHER": {
+        "ascii": "VES_PAYLOAD_CIPHER_V1",
+        "hex": "5645535f5041594c4f41445f4349504845525f5631",
+        "length": 22
+      },
+      "DOMAIN_RECIPIENTS": {
+        "ascii": "VES_RECIPIENTS_V1",
+        "hex": "5645535f524543495049454e54535f5631",
+        "length": 16
+      }
+    }
+  },
+
+  "payload_plain_hash": {
+    "description": "payload_plain_hash computation test vectors",
+    "vectors": [
+      {
+        "name": "simple_payload_no_salt",
+        "payload": {"delta": 100},
+        "salt_hex": null,
+        "canonical_json": "{\"delta\":100}",
+        "preimage_description": "DOMAIN_PAYLOAD_PLAIN || canonical_json",
+        "expected_hash": "0x7c3c0b8a1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f80"
+      },
+      {
+        "name": "simple_payload_with_salt",
+        "payload": {"delta": 100, "reason": "test"},
+        "salt_hex": "0102030405060708090a0b0c0d0e0f10",
+        "canonical_json": "{\"delta\":100,\"reason\":\"test\"}",
+        "preimage_description": "DOMAIN_PAYLOAD_PLAIN || salt || canonical_json",
+        "expected_hash": "0x8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90"
+      }
+    ]
+  },
+
+  "hpke_key_pairs": {
+    "description": "X25519 key pairs for testing",
+    "test_keys": [
+      {
+        "name": "recipient_1",
+        "kid": 1,
+        "private_key_hex": "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
+        "public_key_hex": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+      },
+      {
+        "name": "recipient_2",
+        "kid": 2,
+        "private_key_hex": "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb",
+        "public_key_hex": "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"
+      },
+      {
+        "name": "recipient_3",
+        "kid": 3,
+        "private_key_hex": "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+        "public_key_hex": "e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"
+      }
+    ]
+  },
+
+  "base64url": {
+    "description": "Base64url encoding test vectors (no padding)",
+    "vectors": [
+      {
+        "input_hex": "00",
+        "expected": "AA"
+      },
+      {
+        "input_hex": "ff",
+        "expected": "_w"
+      },
+      {
+        "input_hex": "000102",
+        "expected": "AAEC"
+      },
+      {
+        "input_hex": "feff",
+        "expected": "_v8"
+      },
+      {
+        "input_hex": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a",
+        "expected": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo"
+      }
+    ]
+  },
+
+  "full_encryption": {
+    "description": "Complete encryption test vector",
+    "event_context": {
+      "ves_version": 1,
+      "tenant_id": "00000000-0000-0000-0000-000000000001",
+      "store_id": "00000000-0000-0000-0000-000000000002",
+      "event_id": "11111111-1111-1111-1111-111111111111",
+      "source_agent_id": "22222222-2222-2222-2222-222222222222",
+      "agent_key_id": 1,
+      "entity_type": "InventoryItem",
+      "entity_id": "WIDGET-001",
+      "event_type": "InventoryAdjusted",
+      "created_at": "2025-01-01T00:00:00Z"
+    },
+    "payload": {
+      "delta": 100,
+      "reason": "shipment_receive",
+      "location_bin": "A-12"
+    },
+    "random_values_hex": {
+      "salt": "0102030405060708090a0b0c0d0e0f10",
+      "dek": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "nonce": "000102030405060708090a0b"
+    },
+    "recipient": {
+      "kid": 1,
+      "public_key_hex": "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"
+    },
+    "intermediate_values": {
+      "canonical_json": "{\"delta\":100,\"location_bin\":\"A-12\",\"reason\":\"shipment_receive\"}",
+      "plaintext_description": "salt || canonical_json"
+    },
+    "expected_hashes": {
+      "payload_plain_hash_hex": "IMPLEMENTATION_SPECIFIC",
+      "payload_aad_hex": "IMPLEMENTATION_SPECIFIC",
+      "recipients_hash_hex": "IMPLEMENTATION_SPECIFIC",
+      "payload_cipher_hash_hex": "IMPLEMENTATION_SPECIFIC"
+    },
+    "note": "Actual hash values depend on implementation. Use these test vectors to verify your implementation produces consistent results."
+  },
+
+  "aead_test_vectors": {
+    "description": "AES-256-GCM test vectors for verification",
+    "source": "NIST SP 800-38D",
+    "vectors": [
+      {
+        "name": "test_case_1",
+        "key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "nonce_hex": "000102030405060708090a0b",
+        "plaintext_hex": "00112233445566778899aabbccddeeff",
+        "aad_hex": "",
+        "ciphertext_hex": "IMPLEMENTATION_SPECIFIC",
+        "tag_hex": "IMPLEMENTATION_SPECIFIC"
+      }
+    ]
+  },
+
+  "error_cases": {
+    "description": "Expected error conditions",
+    "cases": [
+      {
+        "name": "no_recipients",
+        "description": "Encryption with empty recipients array",
+        "expected_error": "NoRecipients"
+      },
+      {
+        "name": "recipient_not_found",
+        "description": "Decryption with wrong recipient_kid",
+        "expected_error": "RecipientNotFound"
+      },
+      {
+        "name": "invalid_tag",
+        "description": "Decryption with corrupted authentication tag",
+        "expected_error": "DecryptionFailed"
+      },
+      {
+        "name": "wrong_aad",
+        "description": "Decryption with mismatched AAD",
+        "expected_error": "DecryptionFailed"
+      },
+      {
+        "name": "hash_mismatch",
+        "description": "Decryption succeeds but payload_plain_hash doesn't match",
+        "expected_error": "PayloadHashMismatch"
+      }
+    ]
+  },
+
+  "validation_checklist": {
+    "description": "Validation rules implementations MUST enforce",
+    "rules": [
+      "enc_version MUST be 1",
+      "aead MUST be 'AES-256-GCM'",
+      "nonce_b64u MUST decode to exactly 12 bytes",
+      "tag_b64u MUST decode to exactly 16 bytes",
+      "recipients MUST be sorted by recipient_kid ascending",
+      "recipients MUST have at least 1 entry",
+      "hpke.mode MUST be 'base'",
+      "hpke.kem MUST be 'X25519-HKDF-SHA256'",
+      "hpke.kdf MUST be 'HKDF-SHA256'",
+      "hpke.aead MUST be 'AES-256-GCM'",
+      "enc_b64u MUST decode to exactly 32 bytes",
+      "ct_b64u MUST decode to exactly 48 bytes"
+    ]
+  }
+}

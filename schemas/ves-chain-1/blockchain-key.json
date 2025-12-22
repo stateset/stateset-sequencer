@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-chain-1/blockchain-key.json",
+  "title": "VES-CHAIN-1 Agent Blockchain Key",
+  "description": "Agent blockchain key entry per VES-CHAIN-1 specification",
+  "type": "object",
+  "required": [
+    "tenant_id",
+    "agent_id",
+    "chain_id",
+    "network_id",
+    "derivation_path",
+    "public_key",
+    "address",
+    "status",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Tenant identifier"
+    },
+    "agent_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Agent identifier"
+    },
+    "chain_id": {
+      "type": "string",
+      "enum": ["solana", "near", "stellar", "cardano", "polkadot", "cosmos", "algorand", "aptos", "sui", "tezos"],
+      "description": "Blockchain identifier"
+    },
+    "network_id": {
+      "type": "string",
+      "description": "Network identifier (mainnet, testnet, devnet, etc.)"
+    },
+    "derivation_path": {
+      "type": "string",
+      "pattern": "^m(/\\d+'?)+$",
+      "description": "BIP-44 derivation path"
+    },
+    "public_key": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "32-byte Ed25519 public key, lowercase hex with 0x prefix"
+    },
+    "address": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Chain-specific address format"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "disabled", "compromised"],
+      "description": "Current key status"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When key was registered (RFC 3339)"
+    },
+    "disabled_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When key was disabled (RFC 3339)"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "Optional metadata"
+    }
+  }
+}

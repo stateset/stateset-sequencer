@@ -1,0 +1,89 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-sig-1/agent-key.json",
+  "title": "VES-SIG-1 Agent Signing Key",
+  "description": "Agent Ed25519 signing key entry per VES-SIG-1 specification",
+  "type": "object",
+  "required": [
+    "tenant_id",
+    "agent_id",
+    "key_id",
+    "public_key",
+    "status",
+    "created_at"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Tenant identifier"
+    },
+    "agent_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Agent identifier"
+    },
+    "key_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Key version number, incremented on rotation"
+    },
+    "public_key": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "32-byte Ed25519 public key, lowercase hex with 0x prefix"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["active", "revoked", "expired"],
+      "description": "Current key status"
+    },
+    "valid_from": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Start of validity window (RFC 3339)"
+    },
+    "valid_to": {
+      "type": "string",
+      "format": "date-time",
+      "description": "End of validity window (RFC 3339)"
+    },
+    "expires_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When key expires (RFC 3339)"
+    },
+    "grace_until": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Grace period end after expiry (RFC 3339)"
+    },
+    "revoked_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When key was revoked (RFC 3339)"
+    },
+    "rotation_reason": {
+      "type": "string",
+      "enum": [
+        "age_limit",
+        "usage_limit",
+        "manual",
+        "expiry",
+        "compromise",
+        "policy_change"
+      ],
+      "description": "Reason for key rotation/revocation"
+    },
+    "metadata": {
+      "type": "string",
+      "description": "Optional metadata (JSON string or description)"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When key was registered (RFC 3339)"
+    }
+  }
+}

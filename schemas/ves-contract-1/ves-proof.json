@@ -1,0 +1,153 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-contract-1/ves-proof.json",
+  "title": "VES-CONTRACT-1 Merkle Proof",
+  "description": "Merkle inclusion proof for VES events per VES-CONTRACT-1 specification",
+  "type": "object",
+  "required": [
+    "event",
+    "merkle_proof",
+    "anchor"
+  ],
+  "properties": {
+    "event": {
+      "type": "object",
+      "required": [
+        "event_id",
+        "tenant_id",
+        "store_id",
+        "entity_type",
+        "entity_id",
+        "event_type",
+        "created_at",
+        "payload_hash",
+        "agent_signature"
+      ],
+      "properties": {
+        "event_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "tenant_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "store_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "entity_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "entity_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "event_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "payload_hash": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$"
+        },
+        "agent_signature": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{128}$"
+        },
+        "sequence_number": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "signing_hash": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$"
+        },
+        "agent_public_key": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$"
+        }
+      }
+    },
+    "merkle_proof": {
+      "type": "object",
+      "required": [
+        "leaf_hash",
+        "proof_path",
+        "proof_indices",
+        "root"
+      ],
+      "properties": {
+        "leaf_hash": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$",
+          "description": "Hash of the event leaf"
+        },
+        "proof_path": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^0x[a-f0-9]{64}$"
+          },
+          "description": "Sibling hashes from leaf to root"
+        },
+        "proof_indices": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "enum": [0, 1]
+          },
+          "description": "Position indicators (0=left, 1=right)"
+        },
+        "root": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$",
+          "description": "Expected Merkle root"
+        }
+      }
+    },
+    "anchor": {
+      "type": "object",
+      "required": [
+        "chain",
+        "anchor_tx",
+        "sequence_start",
+        "sequence_end"
+      ],
+      "properties": {
+        "chain": {
+          "type": "string",
+          "enum": ["solana", "near", "cosmos", "ethereum"]
+        },
+        "network": {
+          "type": "string"
+        },
+        "anchor_tx": {
+          "type": "string",
+          "description": "Transaction hash that anchored this root"
+        },
+        "anchor_address": {
+          "type": "string",
+          "description": "Address of anchor contract/account"
+        },
+        "sequence_start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sequence_end": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "anchored_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

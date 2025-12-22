@@ -1,0 +1,166 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-sig-1/signed-event.json",
+  "title": "VES-SIG-1 Signed Event",
+  "description": "Complete VES v1.0 event with agent signature per VES-SIG-1 specification",
+  "type": "object",
+  "required": [
+    "ves_version",
+    "event_id",
+    "tenant_id",
+    "store_id",
+    "source_agent_id",
+    "agent_key_id",
+    "entity_type",
+    "entity_id",
+    "event_type",
+    "created_at",
+    "payload_kind",
+    "payload_plain_hash",
+    "payload_cipher_hash",
+    "agent_signature"
+  ],
+  "properties": {
+    "ves_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "VES protocol version, must be 1"
+    },
+    "event_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique event identifier"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Tenant identifier"
+    },
+    "store_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Store identifier within tenant"
+    },
+    "source_agent_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Agent that created this event"
+    },
+    "agent_key_id": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Key ID used for signing"
+    },
+    "entity_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Type of entity (e.g., InventoryItem, Order)"
+    },
+    "entity_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifier of the entity"
+    },
+    "event_type": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Type of event (e.g., Created, Updated, Adjusted)"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp when agent created the event"
+    },
+    "payload_kind": {
+      "type": "integer",
+      "enum": [0, 1],
+      "description": "Payload kind: 0 = plaintext, 1 = encrypted"
+    },
+    "payload": {
+      "type": "object",
+      "description": "Plaintext payload (present when payload_kind = 0)"
+    },
+    "payload_encrypted": {
+      "$ref": "../ves-enc-1/payload-encrypted.json",
+      "description": "Encrypted payload (present when payload_kind = 1)"
+    },
+    "payload_plain_hash": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "SHA-256 hash of domain || salt? || JCS(payload)"
+    },
+    "payload_cipher_hash": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "SHA-256 hash of ciphertext structure (zeros for plaintext)"
+    },
+    "agent_signature": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{128}$",
+      "description": "64-byte Ed25519 signature, lowercase hex with 0x prefix"
+    },
+    "sequence_number": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sequencer-assigned sequence number"
+    },
+    "sequenced_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp when sequencer processed the event"
+    },
+    "sequencer_receipt": {
+      "type": "object",
+      "description": "Optional sequencer receipt for non-repudiation",
+      "properties": {
+        "sequencer_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "sequence_number": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sequenced_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "receipt_hash": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$"
+        },
+        "signature_alg": {
+          "type": "string",
+          "enum": ["ed25519", "secp256k1"]
+        },
+        "sequencer_signature": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{128}$"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "payload_kind": { "const": 0 } }
+      },
+      "then": {
+        "required": ["payload"],
+        "properties": {
+          "payload_cipher_hash": {
+            "const": "0x0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "payload_kind": { "const": 1 } }
+      },
+      "then": {
+        "required": ["payload_encrypted"]
+      }
+    }
+  ]
+}

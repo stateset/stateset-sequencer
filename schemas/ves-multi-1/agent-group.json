@@ -1,0 +1,150 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-multi-1/agent-group.json",
+  "title": "VES-MULTI-1 Agent Group",
+  "description": "Multi-agent group for threshold signatures per VES-MULTI-1 specification",
+  "type": "object",
+  "required": [
+    "group_id",
+    "name",
+    "tenant_id",
+    "threshold",
+    "total_members",
+    "members",
+    "status",
+    "created_at"
+  ],
+  "properties": {
+    "group_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique group identifier"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable group name"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Parent tenant"
+    },
+    "threshold": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Minimum signers required (t in t-of-n)"
+    },
+    "total_members": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Total group members (n in t-of-n)"
+    },
+    "members": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/group_member"
+      },
+      "minItems": 1
+    },
+    "group_public_key": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{64}$",
+      "description": "Derived group Ed25519 public key"
+    },
+    "blockchain_addresses": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Per-chain addresses derived from group key"
+    },
+    "policies": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/group_policy"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending_dkg", "active", "suspended", "dissolved"],
+      "description": "Group status"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "dkg_completed_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "definitions": {
+    "group_member": {
+      "type": "object",
+      "required": [
+        "agent_id",
+        "share_index",
+        "public_share",
+        "role",
+        "added_at"
+      ],
+      "properties": {
+        "agent_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "share_index": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "public_share": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin", "signer", "observer"]
+        },
+        "added_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "added_by": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    },
+    "group_policy": {
+      "type": "object",
+      "required": [
+        "policy_id",
+        "name",
+        "condition",
+        "action"
+      ],
+      "properties": {
+        "policy_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "name": {
+          "type": "string"
+        },
+        "condition": {
+          "type": "string",
+          "description": "Condition expression"
+        },
+        "action": {
+          "type": "string",
+          "enum": ["allow", "deny", "require_additional_approval"]
+        },
+        "additional_threshold": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

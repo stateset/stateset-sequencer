@@ -1,0 +1,236 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-stark-1/stark-proof.json",
+  "title": "VES-STARK-1 Validity Proof",
+  "description": "STARK validity proof for VES event batches per VES-STARK-1 specification",
+  "type": "object",
+  "required": [
+    "version",
+    "public_inputs",
+    "stark_proof",
+    "auxiliary"
+  ],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "const": 1
+    },
+    "prover_id": {
+      "type": "string",
+      "description": "Identifier of the proving service"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "public_inputs": {
+      "type": "object",
+      "required": [
+        "prev_events_root",
+        "new_events_root",
+        "batch_size",
+        "sequence_start",
+        "sequence_end",
+        "state_commitment",
+        "tenant_id",
+        "store_id"
+      ],
+      "properties": {
+        "prev_events_root": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$",
+          "description": "Previous Merkle root (32 bytes)"
+        },
+        "new_events_root": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$",
+          "description": "New Merkle root (32 bytes)"
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of events in batch"
+        },
+        "sequence_start": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "First sequence number in batch"
+        },
+        "sequence_end": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Last sequence number in batch"
+        },
+        "state_commitment": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$",
+          "description": "Final state commitment (32 bytes)"
+        },
+        "tenant_id": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{32}$",
+          "description": "Tenant identifier (16 bytes)"
+        },
+        "store_id": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{32}$",
+          "description": "Store identifier (16 bytes)"
+        }
+      }
+    },
+    "stark_proof": {
+      "type": "object",
+      "required": [
+        "trace_commitment",
+        "composition_commitment",
+        "fri_layers",
+        "query_responses"
+      ],
+      "properties": {
+        "trace_commitment": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^0x[a-f0-9]{64}$"
+          },
+          "description": "Merkle commitments to trace columns"
+        },
+        "composition_commitment": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$",
+          "description": "Commitment to composition polynomial"
+        },
+        "fri_layers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/fri_layer"
+          },
+          "description": "FRI protocol layers"
+        },
+        "query_responses": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/query_response"
+          },
+          "description": "Query phase responses"
+        },
+        "final_poly": {
+          "type": "string",
+          "description": "Final constant polynomial (base64)"
+        }
+      }
+    },
+    "auxiliary": {
+      "type": "object",
+      "required": [
+        "blowup_factor",
+        "num_queries",
+        "fri_fold_factor",
+        "hash_function"
+      ],
+      "properties": {
+        "blowup_factor": {
+          "type": "integer",
+          "minimum": 2,
+          "description": "LDE blowup factor (typically 8-16)"
+        },
+        "num_queries": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Number of query positions"
+        },
+        "fri_fold_factor": {
+          "type": "integer",
+          "minimum": 2,
+          "description": "FRI folding factor"
+        },
+        "hash_function": {
+          "type": "string",
+          "enum": ["blake3", "poseidon", "rescue", "sha256"],
+          "description": "Hash function used"
+        },
+        "field_modulus": {
+          "type": "string",
+          "description": "Field modulus (decimal string)"
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "proving_time_ms": {
+          "type": "integer",
+          "description": "Time to generate proof in milliseconds"
+        },
+        "proof_size_bytes": {
+          "type": "integer",
+          "description": "Proof size in bytes"
+        },
+        "trace_length": {
+          "type": "integer",
+          "description": "Execution trace length"
+        },
+        "constraint_count": {
+          "type": "integer",
+          "description": "Number of constraints"
+        }
+      }
+    }
+  },
+  "definitions": {
+    "fri_layer": {
+      "type": "object",
+      "required": [
+        "commitment",
+        "evaluations"
+      ],
+      "properties": {
+        "commitment": {
+          "type": "string",
+          "pattern": "^0x[a-f0-9]{64}$",
+          "description": "Merkle commitment for this layer"
+        },
+        "evaluations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Polynomial evaluations (base64)"
+        }
+      }
+    },
+    "query_response": {
+      "type": "object",
+      "required": [
+        "index",
+        "trace_values",
+        "authentication_paths"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Query position index"
+        },
+        "trace_values": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Trace column values at query position"
+        },
+        "authentication_paths": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^0x[a-f0-9]{64}$"
+            }
+          },
+          "description": "Merkle authentication paths"
+        }
+      }
+    }
+  }
+}

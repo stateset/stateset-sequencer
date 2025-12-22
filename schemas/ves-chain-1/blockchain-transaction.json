@@ -1,0 +1,156 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://stateset.com/schemas/ves-chain-1/blockchain-transaction.json",
+  "title": "VES-CHAIN-1 Blockchain Transaction Record",
+  "description": "Complete blockchain transaction record per VES-CHAIN-1 specification",
+  "type": "object",
+  "required": [
+    "id",
+    "tenant_id",
+    "store_id",
+    "agent_id",
+    "intent_id",
+    "chain_id",
+    "network_id",
+    "from_address",
+    "operation_type",
+    "status",
+    "created_at"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Unique record identifier"
+    },
+    "tenant_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Tenant identifier"
+    },
+    "store_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Store identifier"
+    },
+    "agent_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Agent that executed the transaction"
+    },
+    "intent_id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Payment intent identifier"
+    },
+    "chain_id": {
+      "type": "string",
+      "enum": ["solana", "near", "stellar", "cardano", "polkadot", "cosmos", "algorand", "aptos", "sui", "tezos"],
+      "description": "Blockchain identifier"
+    },
+    "network_id": {
+      "type": "string",
+      "description": "Network identifier"
+    },
+    "tx_hash": {
+      "type": "string",
+      "description": "Transaction hash/signature"
+    },
+    "tx_signature": {
+      "type": "string",
+      "pattern": "^0x[a-f0-9]{128}$",
+      "description": "64-byte Ed25519 signature"
+    },
+    "from_address": {
+      "type": "string",
+      "description": "Source address"
+    },
+    "to_address": {
+      "type": "string",
+      "description": "Destination address"
+    },
+    "amount": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "description": "Amount in smallest denomination"
+    },
+    "currency": {
+      "type": "string",
+      "description": "Currency identifier"
+    },
+    "token_address": {
+      "type": "string",
+      "description": "Token mint/contract address"
+    },
+    "operation_type": {
+      "type": "string",
+      "enum": ["transfer", "token_transfer", "contract_call", "batch_transfer", "cross_chain_transfer", "stake", "unstake", "delegate", "anchor"],
+      "description": "Type of operation"
+    },
+    "operation_data": {
+      "type": "object",
+      "description": "Operation-specific data"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "signed", "submitted", "confirmed", "finalized", "failed", "cancelled"],
+      "description": "Transaction status"
+    },
+    "block_number": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Block number when confirmed"
+    },
+    "block_hash": {
+      "type": "string",
+      "description": "Block hash"
+    },
+    "block_time": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Block timestamp"
+    },
+    "confirmations": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of confirmations"
+    },
+    "error_message": {
+      "type": "string",
+      "description": "Error message if failed"
+    },
+    "fee_amount": {
+      "type": "string",
+      "pattern": "^[0-9]+$",
+      "description": "Transaction fee amount"
+    },
+    "fee_currency": {
+      "type": "string",
+      "description": "Fee currency"
+    },
+    "ves_event_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "format": "uuid"
+      },
+      "description": "Associated VES event identifiers"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When record was created"
+    },
+    "submitted_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When transaction was submitted"
+    },
+    "confirmed_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When transaction was confirmed"
+    }
+  },
+  "additionalProperties": false
+}
