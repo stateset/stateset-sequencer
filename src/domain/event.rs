@@ -375,4 +375,305 @@ mod tests {
         let sequenced = SequencedEvent::new(envelope, 42);
         assert_eq!(sequenced.sequence_number(), 42);
     }
+
+    #[test]
+    fn test_payload_hash_key_order_independence() {
+        // Canonical JSON should produce same hash regardless of key order
+        let payload1 = serde_json::json!({
+            "a": 1,
+            "b": 2,
+            "c": 3
+        });
+
+        let payload2 = serde_json::json!({
+            "c": 3,
+            "b": 2,
+            "a": 1
+        });
+
+        let hash1 = EventEnvelope::compute_payload_hash(&payload1);
+        let hash2 = EventEnvelope::compute_payload_hash(&payload2);
+
+        assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_payload_hash_different_values() {
+        let payload1 = serde_json::json!({"value": 1});
+        let payload2 = serde_json::json!({"value": 2});
+
+        let hash1 = EventEnvelope::compute_payload_hash(&payload1);
+        let hash2 = EventEnvelope::compute_payload_hash(&payload2);
+
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_event_envelope_with_command_id() {
+        let cmd_id = Uuid::new_v4();
+        let envelope = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({}),
+            AgentId::new(),
+        )
+        .with_command_id(cmd_id);
+
+        assert_eq!(envelope.command_id, Some(cmd_id));
+    }
+
+    #[test]
+    fn test_event_envelope_with_base_version() {
+        let envelope = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({}),
+            AgentId::new(),
+        )
+        .with_base_version(5);
+
+        assert_eq!(envelope.base_version, Some(5));
+    }
+
+    #[test]
+    fn test_signing_bytes_deterministic() {
+        let tenant_id = TenantId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        let store_id = StoreId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
+        let event_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let agent_id = AgentId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap());
+
+        let envelope = EventEnvelope {
+            event_id,
+            command_id: None,
+            tenant_id,
+            store_id,
+            entity_type: EntityType::order(),
+            entity_id: "order-123".to_string(),
+            event_type: EventType::from(EventType::ORDER_CREATED),
+            payload: serde_json::json!({}),
+            payload_hash: [0u8; 32],
+            base_version: None,
+            created_at: chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z").unwrap().with_timezone(&Utc),
+            sequence_number: None,
+            source_agent: agent_id,
+            signature: None,
+        };
+
+        let bytes1 = envelope.signing_bytes();
+        let bytes2 = envelope.signing_bytes();
+
+        assert_eq!(bytes1, bytes2);
+    }
+
+    #[test]
+    fn test_signing_bytes_includes_command_id() {
+        let envelope_without_cmd = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({}),
+            AgentId::new(),
+        );
+
+        let envelope_with_cmd = EventEnvelope {
+            command_id: Some(Uuid::new_v4()),
+            ..envelope_without_cmd.clone()
+        };
+
+        // Signing bytes should be different with command_id
+        assert_ne!(envelope_without_cmd.signing_bytes(), envelope_with_cmd.signing_bytes());
+    }
+
+    #[test]
+    fn test_verify_payload_hash_with_modified_payload() {
+        let mut envelope = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({"original": true}),
+            AgentId::new(),
+        );
+
+        assert!(envelope.verify_payload_hash());
+
+        // Modify payload without updating hash
+        envelope.payload = serde_json::json!({"modified": true});
+        assert!(!envelope.verify_payload_hash());
+    }
+
+    #[test]
+    fn test_event_batch_operations() {
+        let agent_id = AgentId::new();
+        let events = vec![
+            EventEnvelope::new(
+                TenantId::new(),
+                StoreId::new(),
+                EntityType::order(),
+                "order-1",
+                EventType::from(EventType::ORDER_CREATED),
+                serde_json::json!({}),
+                agent_id.clone(),
+            ),
+            EventEnvelope::new(
+                TenantId::new(),
+                StoreId::new(),
+                EntityType::order(),
+                "order-2",
+                EventType::from(EventType::ORDER_CREATED),
+                serde_json::json!({}),
+                agent_id.clone(),
+            ),
+        ];
+
+        let batch = EventBatch::new(agent_id, events);
+        assert_eq!(batch.len(), 2);
+        assert!(!batch.is_empty());
+    }
+
+    #[test]
+    fn test_empty_event_batch() {
+        let batch = EventBatch::new(AgentId::new(), vec![]);
+        assert_eq!(batch.len(), 0);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn test_sequenced_event_accessors() {
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+        let entity_type = EntityType::order();
+        let entity_id = "order-123";
+        let event_type = EventType::from(EventType::ORDER_CREATED);
+        let payload = serde_json::json!({"amount": 100});
+
+        let envelope = EventEnvelope::new(
+            tenant_id.clone(),
+            store_id.clone(),
+            entity_type.clone(),
+            entity_id,
+            event_type.clone(),
+            payload.clone(),
+            AgentId::new(),
+        )
+        .with_base_version(5);
+
+        let sequenced = SequencedEvent::new(envelope, 42);
+
+        assert_eq!(sequenced.sequence_number(), 42);
+        assert_eq!(sequenced.entity_type(), &entity_type);
+        assert_eq!(sequenced.entity_id(), entity_id);
+        assert_eq!(sequenced.event_type(), &event_type);
+        assert_eq!(sequenced.payload(), &payload);
+        assert_eq!(sequenced.base_version(), Some(5));
+    }
+
+    #[test]
+    fn test_sync_state_creation() {
+        let agent_id = AgentId::new();
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+
+        let state = SyncState::new(agent_id.clone(), tenant_id.clone(), store_id.clone());
+
+        assert_eq!(state.agent_id, agent_id);
+        assert_eq!(state.tenant_id, tenant_id);
+        assert_eq!(state.store_id, store_id);
+        assert_eq!(state.last_pushed_sequence, 0);
+        assert_eq!(state.last_pulled_sequence, 0);
+        assert_eq!(state.head_sequence, 0);
+    }
+
+    #[test]
+    fn test_sync_state_lag_calculation() {
+        let mut state = SyncState::new(AgentId::new(), TenantId::new(), StoreId::new());
+
+        // No lag initially
+        assert_eq!(state.lag(), 0);
+
+        // Set head ahead of pulled
+        state.head_sequence = 100;
+        state.last_pulled_sequence = 75;
+        assert_eq!(state.lag(), 25);
+
+        // Caught up
+        state.last_pulled_sequence = 100;
+        assert_eq!(state.lag(), 0);
+    }
+
+    #[test]
+    fn test_rejection_reason_serialization() {
+        let reasons = vec![
+            RejectionReason::DuplicateEventId,
+            RejectionReason::DuplicateCommandId,
+            RejectionReason::SchemaValidation,
+            RejectionReason::Unauthorized,
+            RejectionReason::RateLimited,
+            RejectionReason::InvalidPayloadHash,
+            RejectionReason::Other,
+        ];
+
+        for reason in reasons {
+            let json = serde_json::to_string(&reason).unwrap();
+            let parsed: RejectionReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(format!("{:?}", reason), format!("{:?}", parsed));
+        }
+    }
+
+    #[test]
+    fn test_ingest_receipt_with_rejections() {
+        let receipt = IngestReceipt {
+            batch_id: Uuid::new_v4(),
+            events_accepted: 5,
+            events_rejected: vec![
+                RejectedEvent {
+                    event_id: Uuid::new_v4(),
+                    reason: RejectionReason::DuplicateEventId,
+                    message: "Event already exists".to_string(),
+                },
+            ],
+            assigned_sequence_start: Some(1),
+            assigned_sequence_end: Some(5),
+            head_sequence: 10,
+        };
+
+        assert_eq!(receipt.events_accepted, 5);
+        assert_eq!(receipt.events_rejected.len(), 1);
+        assert_eq!(receipt.assigned_sequence_start, Some(1));
+        assert_eq!(receipt.assigned_sequence_end, Some(5));
+    }
+
+    #[test]
+    fn test_envelope_serialization_roundtrip() {
+        let envelope = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({"customer_id": "cust-456", "total": 99.99}),
+            AgentId::new(),
+        )
+        .with_command_id(Uuid::new_v4())
+        .with_base_version(3);
+
+        let json = serde_json::to_string(&envelope).unwrap();
+        let parsed: EventEnvelope = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(envelope.event_id, parsed.event_id);
+        assert_eq!(envelope.command_id, parsed.command_id);
+        assert_eq!(envelope.entity_type, parsed.entity_type);
+        assert_eq!(envelope.entity_id, parsed.entity_id);
+        assert_eq!(envelope.base_version, parsed.base_version);
+        assert_eq!(envelope.payload_hash, parsed.payload_hash);
+    }
 }

@@ -357,4 +357,232 @@ mod tests {
         // Signature from key1 should not verify with key2's public key
         assert!(key2.public_key().verify(&message, &signature).is_err());
     }
+
+    #[test]
+    fn test_invalid_signature_format() {
+        // Invalid hex string
+        assert!(signature_from_hex("not_hex").is_err());
+
+        // Wrong length (too short)
+        assert!(signature_from_hex("0x1234").is_err());
+
+        // Wrong length (too long)
+        let long_hex = "0x".to_string() + &"ab".repeat(65);
+        assert!(signature_from_hex(&long_hex).is_err());
+    }
+
+    #[test]
+    fn test_invalid_public_key_format() {
+        // Invalid hex string
+        assert!(public_key_from_hex("not_hex").is_err());
+
+        // Wrong length (too short)
+        assert!(public_key_from_hex("0x1234").is_err());
+
+        // Wrong length (too long)
+        let long_hex = "0x".to_string() + &"ab".repeat(33);
+        assert!(public_key_from_hex(&long_hex).is_err());
+    }
+
+    #[test]
+    fn test_verifying_key_from_bytes_roundtrip() {
+        // Generate a valid key and verify roundtrip works
+        let signing_key = AgentSigningKey::generate();
+        let public_bytes = signing_key.public_key_bytes();
+
+        let verifying_key = AgentVerifyingKey::from_bytes(&public_bytes).unwrap();
+        assert_eq!(verifying_key.to_bytes(), public_bytes);
+
+        // Verify the key can be used for verification
+        let message = [42u8; 32];
+        let signature = signing_key.sign(&message);
+        assert!(verifying_key.verify(&message, &signature).is_ok());
+    }
+
+    #[test]
+    fn test_sign_message_utility() {
+        let signing_key = AgentSigningKey::generate();
+        let secret_bytes = signing_key.to_bytes();
+        let message = [42u8; 32];
+
+        let sig1 = signing_key.sign(&message);
+        let sig2 = sign_message(&secret_bytes, &message).unwrap();
+
+        assert_eq!(sig1, sig2);
+    }
+
+    #[test]
+    fn test_verify_signature_utility() {
+        let signing_key = AgentSigningKey::generate();
+        let public_key = signing_key.public_key_bytes();
+        let message = [42u8; 32];
+        let signature = signing_key.sign(&message);
+
+        // Should verify successfully
+        assert!(verify_signature(&public_key, &message, &signature).is_ok());
+
+        // Wrong message should fail
+        let wrong_message = [0u8; 32];
+        assert!(verify_signature(&public_key, &wrong_message, &signature).is_err());
+    }
+
+    #[test]
+    fn test_modified_event_signature_fails() {
+        let signing_key = AgentSigningKey::generate();
+        let verifying_key = signing_key.public_key();
+
+        let tenant = Uuid::new_v4();
+        let store = Uuid::new_v4();
+        let event = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let plain_hash = [0u8; 32];
+        let cipher_hash = [0u8; 32];
+
+        let params = EventSigningParams {
+            ves_version: 1,
+            tenant_id: &tenant,
+            store_id: &store,
+            event_id: &event,
+            source_agent_id: &agent,
+            agent_key_id: 1,
+            entity_type: "order",
+            entity_id: "order-123",
+            event_type: "order.created",
+            created_at: "2025-12-20T18:31:22.123Z",
+            payload_kind: 0,
+            payload_plain_hash: &plain_hash,
+            payload_cipher_hash: &cipher_hash,
+        };
+
+        let signature = signing_key.sign_event(&params);
+
+        // Modify the event_type - signature should fail
+        let modified_params = EventSigningParams {
+            ves_version: 1,
+            tenant_id: &tenant,
+            store_id: &store,
+            event_id: &event,
+            source_agent_id: &agent,
+            agent_key_id: 1,
+            entity_type: "order",
+            entity_id: "order-123",
+            event_type: "order.cancelled", // Changed!
+            created_at: "2025-12-20T18:31:22.123Z",
+            payload_kind: 0,
+            payload_plain_hash: &plain_hash,
+            payload_cipher_hash: &cipher_hash,
+        };
+
+        assert!(verifying_key.verify_event(&modified_params, &signature).is_err());
+    }
+
+    #[test]
+    fn test_different_ves_versions_produce_different_signatures() {
+        let signing_key = AgentSigningKey::generate();
+
+        let tenant = Uuid::new_v4();
+        let store = Uuid::new_v4();
+        let event = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let plain_hash = [1u8; 32];
+        let cipher_hash = [2u8; 32];
+
+        let params_v1 = EventSigningParams {
+            ves_version: 1,
+            tenant_id: &tenant,
+            store_id: &store,
+            event_id: &event,
+            source_agent_id: &agent,
+            agent_key_id: 1,
+            entity_type: "order",
+            entity_id: "order-123",
+            event_type: "order.created",
+            created_at: "2025-12-20T18:31:22.123Z",
+            payload_kind: 0,
+            payload_plain_hash: &plain_hash,
+            payload_cipher_hash: &cipher_hash,
+        };
+
+        let params_v2 = EventSigningParams {
+            ves_version: 2, // Different version
+            tenant_id: &tenant,
+            store_id: &store,
+            event_id: &event,
+            source_agent_id: &agent,
+            agent_key_id: 1,
+            entity_type: "order",
+            entity_id: "order-123",
+            event_type: "order.created",
+            created_at: "2025-12-20T18:31:22.123Z",
+            payload_kind: 0,
+            payload_plain_hash: &plain_hash,
+            payload_cipher_hash: &cipher_hash,
+        };
+
+        let sig_v1 = signing_key.sign_event(&params_v1);
+        let sig_v2 = signing_key.sign_event(&params_v2);
+
+        // Different VES versions should produce different signatures
+        assert_ne!(sig_v1, sig_v2);
+    }
+
+    #[test]
+    fn test_agent_signing_key_debug_hides_secret() {
+        let key = AgentSigningKey::generate();
+        let debug_str = format!("{:?}", key);
+
+        // Should show public key but not secret
+        assert!(debug_str.contains("AgentSigningKey"));
+        assert!(debug_str.contains("public_key"));
+        // The secret key bytes should not appear (64 hex chars for 32 bytes)
+        let secret_hex = hex::encode(key.to_bytes());
+        assert!(!debug_str.contains(&secret_hex));
+    }
+
+    #[test]
+    fn test_signature_with_empty_fields() {
+        let signing_key = AgentSigningKey::generate();
+        let verifying_key = signing_key.public_key();
+
+        let tenant = Uuid::new_v4();
+        let store = Uuid::new_v4();
+        let event = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let plain_hash = [0u8; 32];
+        let cipher_hash = [0u8; 32];
+
+        // Empty strings should still work
+        let params = EventSigningParams {
+            ves_version: 1,
+            tenant_id: &tenant,
+            store_id: &store,
+            event_id: &event,
+            source_agent_id: &agent,
+            agent_key_id: 1,
+            entity_type: "",
+            entity_id: "",
+            event_type: "",
+            created_at: "",
+            payload_kind: 0,
+            payload_plain_hash: &plain_hash,
+            payload_cipher_hash: &cipher_hash,
+        };
+
+        let signature = signing_key.sign_event(&params);
+        assert!(verifying_key.verify_event(&params, &signature).is_ok());
+    }
+
+    #[test]
+    fn test_corrupted_signature_fails() {
+        let signing_key = AgentSigningKey::generate();
+        let verifying_key = signing_key.public_key();
+
+        let message = [42u8; 32];
+        let mut signature = signing_key.sign(&message);
+
+        // Corrupt one byte
+        signature[0] ^= 0xFF;
+
+        assert!(verifying_key.verify(&message, &signature).is_err());
+    }
 }

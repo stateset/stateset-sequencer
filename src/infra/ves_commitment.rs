@@ -906,7 +906,7 @@ impl TryFrom<VesCommitmentRow> for VesBatchCommitment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::{compute_node_hash, pad_leaf};
+    use crate::crypto::{compute_node_hash, next_power_of_two, pad_leaf};
     use sqlx::postgres::PgPoolOptions;
 
     fn engine() -> PgVesCommitmentEngine {
@@ -917,10 +917,42 @@ mod tests {
         PgVesCommitmentEngine::new(pool)
     }
 
+    // ============================================================================
+    // Merkle Root Tests
+    // ============================================================================
+
     #[tokio::test]
     async fn merkle_root_empty_is_zero() {
         let engine = engine();
         assert_eq!(engine.compute_merkle_root(&[]), [0u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn merkle_root_single_leaf() {
+        let engine = engine();
+        let leaf = [42u8; 32];
+        let leaves = vec![leaf];
+
+        // Single leaf - verify it produces a deterministic root
+        let root = engine.compute_merkle_root(&leaves);
+
+        // Should be deterministic
+        assert_eq!(root, engine.compute_merkle_root(&leaves));
+
+        // And different from empty
+        assert_ne!(root, [0u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn merkle_root_two_leaves() {
+        let engine = engine();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let leaves = vec![a, b];
+
+        // Two leaves, no padding needed
+        let expected = compute_node_hash(&a, &b);
+        assert_eq!(engine.compute_merkle_root(&leaves), expected);
     }
 
     #[tokio::test]
@@ -941,6 +973,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merkle_root_four_leaves() {
+        let engine = engine();
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        let c = [3u8; 32];
+        let d = [4u8; 32];
+        let leaves = vec![a, b, c, d];
+
+        let expected = {
+            let left = compute_node_hash(&a, &b);
+            let right = compute_node_hash(&c, &d);
+            compute_node_hash(&left, &right)
+        };
+
+        assert_eq!(engine.compute_merkle_root(&leaves), expected);
+    }
+
+    #[tokio::test]
+    async fn merkle_root_is_deterministic() {
+        let engine = engine();
+        let leaves: Vec<Hash256> = (0u8..7u8).map(|b| [b; 32]).collect();
+
+        let root1 = engine.compute_merkle_root(&leaves);
+        let root2 = engine.compute_merkle_root(&leaves);
+
+        assert_eq!(root1, root2);
+    }
+
+    #[tokio::test]
+    async fn merkle_root_different_leaves_produce_different_roots() {
+        let engine = engine();
+        let leaves1: Vec<Hash256> = (0u8..4u8).map(|b| [b; 32]).collect();
+        let leaves2: Vec<Hash256> = (1u8..5u8).map(|b| [b; 32]).collect();
+
+        let root1 = engine.compute_merkle_root(&leaves1);
+        let root2 = engine.compute_merkle_root(&leaves2);
+
+        assert_ne!(root1, root2);
+    }
+
+    // ============================================================================
+    // Merkle Proof Tests
+    // ============================================================================
+
+    #[tokio::test]
     async fn merkle_proof_verifies() {
         let engine = engine();
         let leaves: Vec<Hash256> = (0u8..8u8).map(|b| [b; 32]).collect();
@@ -950,5 +1027,304 @@ mod tests {
             let proof = engine.prove_inclusion(idx, &leaves).unwrap();
             assert!(engine.verify_inclusion(leaves[idx], &proof, root));
         }
+    }
+
+    #[tokio::test]
+    async fn merkle_proof_fails_for_wrong_leaf() {
+        let engine = engine();
+        let leaves: Vec<Hash256> = (0u8..4u8).map(|b| [b; 32]).collect();
+        let root = engine.compute_merkle_root(&leaves);
+
+        let proof = engine.prove_inclusion(0, &leaves).unwrap();
+        let wrong_leaf = [255u8; 32];
+
+        assert!(!engine.verify_inclusion(wrong_leaf, &proof, root));
+    }
+
+    #[tokio::test]
+    async fn merkle_proof_fails_for_wrong_root() {
+        let engine = engine();
+        let leaves: Vec<Hash256> = (0u8..4u8).map(|b| [b; 32]).collect();
+        let root = engine.compute_merkle_root(&leaves);
+
+        let proof = engine.prove_inclusion(0, &leaves).unwrap();
+        let wrong_root = [255u8; 32];
+
+        assert!(engine.verify_inclusion(leaves[0], &proof, root));
+        assert!(!engine.verify_inclusion(leaves[0], &proof, wrong_root));
+    }
+
+    #[tokio::test]
+    async fn merkle_proof_empty_tree_fails() {
+        let engine = engine();
+        let result = engine.prove_inclusion(0, &[]);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn merkle_proof_out_of_bounds_fails() {
+        let engine = engine();
+        let leaves: Vec<Hash256> = vec![[1u8; 32], [2u8; 32]];
+        let result = engine.prove_inclusion(5, &leaves);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn merkle_proof_single_leaf() {
+        let engine = engine();
+        let leaf = [42u8; 32];
+        let leaves = vec![leaf];
+        let root = engine.compute_merkle_root(&leaves);
+
+        let proof = engine.prove_inclusion(0, &leaves).unwrap();
+        assert!(engine.verify_inclusion(leaf, &proof, root));
+    }
+
+    #[tokio::test]
+    async fn merkle_proof_with_padding() {
+        let engine = engine();
+        // 5 leaves -> padded to 8
+        let leaves: Vec<Hash256> = (0u8..5u8).map(|b| [b; 32]).collect();
+        let root = engine.compute_merkle_root(&leaves);
+
+        for idx in 0..leaves.len() {
+            let proof = engine.prove_inclusion(idx, &leaves).unwrap();
+            assert!(
+                engine.verify_inclusion(leaves[idx], &proof, root),
+                "Failed to verify proof for leaf at index {}",
+                idx
+            );
+        }
+    }
+
+    // ============================================================================
+    // Padding Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn pad_leaves_empty_returns_empty() {
+        let engine = engine();
+        let padded = engine.pad_leaves(&[]);
+        assert!(padded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pad_leaves_power_of_two_no_change() {
+        let engine = engine();
+        let leaves: Vec<Hash256> = (0u8..4u8).map(|b| [b; 32]).collect();
+        let padded = engine.pad_leaves(&leaves);
+        assert_eq!(padded.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn pad_leaves_to_next_power_of_two() {
+        let engine = engine();
+        let leaves: Vec<Hash256> = (0u8..5u8).map(|b| [b; 32]).collect();
+        let padded = engine.pad_leaves(&leaves);
+        assert_eq!(padded.len(), 8);
+
+        // First 5 should be original
+        for i in 0..5 {
+            assert_eq!(padded[i], leaves[i]);
+        }
+
+        // Last 3 should be pad leaves
+        for i in 5..8 {
+            assert_eq!(padded[i], pad_leaf());
+        }
+    }
+
+    // ============================================================================
+    // Build Levels Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn build_levels_empty_returns_empty() {
+        let engine = engine();
+        let levels = engine.build_levels(&[]);
+        assert!(levels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn build_levels_single_leaf() {
+        let engine = engine();
+        let leaves = vec![[1u8; 32]];
+        let levels = engine.build_levels(&leaves);
+
+        // Should have at least 1 level
+        assert!(!levels.is_empty());
+
+        // Last level should be the root (single element)
+        assert_eq!(levels.last().unwrap().len(), 1);
+
+        // First level should contain the leaf
+        assert!(levels[0].contains(&[1u8; 32]));
+    }
+
+    #[tokio::test]
+    async fn build_levels_four_leaves() {
+        let engine = engine();
+        let leaves: Vec<Hash256> = (0u8..4u8).map(|b| [b; 32]).collect();
+        let levels = engine.build_levels(&leaves);
+
+        // 4 leaves -> 2 intermediate nodes -> 1 root
+        assert_eq!(levels.len(), 3);
+        assert_eq!(levels[0].len(), 4);
+        assert_eq!(levels[1].len(), 2);
+        assert_eq!(levels[2].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn build_levels_eight_leaves() {
+        let engine = engine();
+        let leaves: Vec<Hash256> = (0u8..8u8).map(|b| [b; 32]).collect();
+        let levels = engine.build_levels(&leaves);
+
+        // 8 -> 4 -> 2 -> 1
+        assert_eq!(levels.len(), 4);
+        assert_eq!(levels[0].len(), 8);
+        assert_eq!(levels[1].len(), 4);
+        assert_eq!(levels[2].len(), 2);
+        assert_eq!(levels[3].len(), 1);
+    }
+
+    // ============================================================================
+    // Stream Lock Key Tests
+    // ============================================================================
+
+    #[test]
+    fn stream_lock_key_is_deterministic() {
+        let tenant_id = TenantId::from_uuid(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
+        let store_id = StoreId::from_uuid(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+
+        let key1 = PgVesCommitmentEngine::stream_lock_key(&tenant_id, &store_id);
+        let key2 = PgVesCommitmentEngine::stream_lock_key(&tenant_id, &store_id);
+
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn stream_lock_key_different_for_different_stores() {
+        let tenant_id = TenantId::from_uuid(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
+        let store_id1 = StoreId::from_uuid(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+        let store_id2 = StoreId::from_uuid(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
+
+        let key1 = PgVesCommitmentEngine::stream_lock_key(&tenant_id, &store_id1);
+        let key2 = PgVesCommitmentEngine::stream_lock_key(&tenant_id, &store_id2);
+
+        assert_ne!(key1, key2);
+    }
+
+    // ============================================================================
+    // Power of Two Helper Tests
+    // ============================================================================
+
+    #[test]
+    fn test_next_power_of_two() {
+        assert_eq!(next_power_of_two(0), 1);
+        assert_eq!(next_power_of_two(1), 1);
+        assert_eq!(next_power_of_two(2), 2);
+        assert_eq!(next_power_of_two(3), 4);
+        assert_eq!(next_power_of_two(4), 4);
+        assert_eq!(next_power_of_two(5), 8);
+        assert_eq!(next_power_of_two(7), 8);
+        assert_eq!(next_power_of_two(8), 8);
+        assert_eq!(next_power_of_two(9), 16);
+        assert_eq!(next_power_of_two(100), 128);
+    }
+
+    // ============================================================================
+    // VesBatchCommitment Conversion Tests
+    // ============================================================================
+
+    #[test]
+    fn ves_commitment_row_conversion() {
+        let batch_id = Uuid::new_v4();
+        let row = VesCommitmentRow {
+            batch_id,
+            tenant_id: Uuid::new_v4(),
+            store_id: Uuid::new_v4(),
+            ves_version: 1,
+            tree_depth: 3,
+            leaf_count: 5,
+            padded_leaf_count: 8,
+            merkle_root: vec![1u8; 32],
+            prev_state_root: vec![2u8; 32],
+            new_state_root: vec![3u8; 32],
+            sequence_start: 10,
+            sequence_end: 14,
+            committed_at: Utc::now(),
+            chain_id: Some(1),
+            chain_tx_hash: Some(vec![4u8; 32]),
+            chain_block_number: Some(12345),
+            anchored_at: Some(Utc::now()),
+        };
+
+        let commitment = VesBatchCommitment::try_from(row).unwrap();
+
+        assert_eq!(commitment.batch_id, batch_id);
+        assert_eq!(commitment.ves_version, 1);
+        assert_eq!(commitment.tree_depth, 3);
+        assert_eq!(commitment.leaf_count, 5);
+        assert_eq!(commitment.padded_leaf_count, 8);
+        assert_eq!(commitment.sequence_range, (10, 14));
+        assert_eq!(commitment.chain_id, Some(1));
+        assert_eq!(commitment.chain_block_number, Some(12345));
+    }
+
+    #[test]
+    fn ves_commitment_row_conversion_invalid_merkle_root() {
+        let row = VesCommitmentRow {
+            batch_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            store_id: Uuid::new_v4(),
+            ves_version: 1,
+            tree_depth: 3,
+            leaf_count: 5,
+            padded_leaf_count: 8,
+            merkle_root: vec![1u8; 31], // Wrong length!
+            prev_state_root: vec![2u8; 32],
+            new_state_root: vec![3u8; 32],
+            sequence_start: 10,
+            sequence_end: 14,
+            committed_at: Utc::now(),
+            chain_id: None,
+            chain_tx_hash: None,
+            chain_block_number: None,
+            anchored_at: None,
+        };
+
+        let result = VesBatchCommitment::try_from(row);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ves_commitment_row_conversion_without_anchor() {
+        let row = VesCommitmentRow {
+            batch_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            store_id: Uuid::new_v4(),
+            ves_version: 1,
+            tree_depth: 2,
+            leaf_count: 3,
+            padded_leaf_count: 4,
+            merkle_root: vec![1u8; 32],
+            prev_state_root: vec![2u8; 32],
+            new_state_root: vec![3u8; 32],
+            sequence_start: 1,
+            sequence_end: 3,
+            committed_at: Utc::now(),
+            chain_id: None,
+            chain_tx_hash: None,
+            chain_block_number: None,
+            anchored_at: None,
+        };
+
+        let commitment = VesBatchCommitment::try_from(row).unwrap();
+
+        assert!(commitment.chain_id.is_none());
+        assert!(commitment.chain_tx_hash.is_none());
+        assert!(commitment.chain_block_number.is_none());
+        assert!(commitment.anchored_at.is_none());
     }
 }
