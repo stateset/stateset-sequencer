@@ -10,8 +10,10 @@ use crate::api::types::{
     IngestRequest, IngestResponse, RejectionInfo, VesIngestRequest, VesIngestResponse,
     VesReceiptResponse,
 };
-use crate::auth::AuthContextExt;
-use crate::domain::{AgentId, EventBatch, EventEnvelope, RejectedEvent, RejectionReason, TenantId};
+use crate::auth::{AuthContextExt, RequestLimits};
+use crate::domain::{
+    AgentId, EventBatch, EventEnvelope, RejectedEvent, RejectionReason, TenantId, VesEventEnvelope,
+};
 use crate::infra::{IngestService, SchemaStore, Sequencer};
 use crate::server::AppState;
 
@@ -132,6 +134,110 @@ async fn validate_events_against_schemas(
     (valid_events, rejected_events)
 }
 
+fn enforce_batch_limit(limits: &RequestLimits, events_len: usize) -> Result<(), (StatusCode, String)> {
+    if events_len > limits.max_events_per_batch {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Batch exceeds max_events_per_batch ({} > {})",
+                events_len, limits.max_events_per_batch
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_payload_limit(
+    limits: &RequestLimits,
+    event_id: Uuid,
+    payload_len: usize,
+) -> Result<(), (StatusCode, String)> {
+    if payload_len > limits.max_event_payload_size {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "Event {} payload exceeds max_event_payload_size ({} > {})",
+                event_id, payload_len, limits.max_event_payload_size
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_legacy_limits(
+    limits: &RequestLimits,
+    events: &[EventEnvelope],
+) -> Result<(), (StatusCode, String)> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    enforce_batch_limit(limits, events.len())?;
+
+    for event in events {
+        let payload_len = serde_json::to_vec(&event.payload)
+            .map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Event {} payload serialization failed: {}", event.event_id, e),
+                )
+            })?
+            .len();
+        enforce_payload_limit(limits, event.event_id, payload_len)?;
+    }
+
+    Ok(())
+}
+
+fn enforce_ves_limits(
+    limits: &RequestLimits,
+    events: &[VesEventEnvelope],
+) -> Result<(), (StatusCode, String)> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    enforce_batch_limit(limits, events.len())?;
+
+    for event in events {
+        let payload_bytes = if event.is_plaintext() {
+            let payload = event.payload.as_ref().ok_or((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Event {} missing payload for plaintext payload_kind",
+                    event.event_id
+                ),
+            ))?;
+            serde_json::to_vec(payload)
+        } else if event.is_encrypted() {
+            let payload = event.payload_encrypted.as_ref().ok_or((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Event {} missing payload_encrypted for encrypted payload_kind",
+                    event.event_id
+                ),
+            ))?;
+            serde_json::to_vec(payload)
+        } else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("Event {} has unsupported payload_kind", event.event_id),
+            ));
+        };
+
+        let payload_bytes = payload_bytes.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Event {} payload serialization failed: {}", event.event_id, e),
+            )
+        })?;
+
+        enforce_payload_limit(limits, event.event_id, payload_bytes.len())?;
+    }
+
+    Ok(())
+}
+
 /// POST /api/v1/events/ingest - Ingest events (legacy API).
 pub async fn ingest_events(
     State(state): State<AppState>,
@@ -164,6 +270,8 @@ pub async fn ingest_events(
 
         ensure_write(&auth, tenant_id, store_id)?;
     }
+
+    enforce_legacy_limits(&state.request_limits, &request.events)?;
 
     // Perform schema validation before sequencing
     let (valid_events, schema_rejections) =
@@ -264,6 +372,8 @@ pub async fn ingest_ves_events(
         ensure_write(&auth, tenant_id, store_id)?;
     }
 
+    enforce_ves_limits(&state.request_limits, &request.events)?;
+
     match state.ves_sequencer.ingest(request.events).await {
         Ok(receipt) => {
             let rejections: Vec<RejectionInfo> = receipt
@@ -286,7 +396,11 @@ pub async fn ingest_ves_events(
                     sequenced_at: r.sequenced_at.to_rfc3339(),
                     receipt_hash: hex::encode(r.receipt_hash),
                     signature_alg: r.signature_alg.clone(),
-                    sequencer_signature: hex::encode(r.sequencer_signature),
+                    sequencer_signature: r
+                        .sequencer_signature
+                        .as_ref()
+                        .map(hex::encode)
+                        .unwrap_or_default(),
                 })
                 .collect();
 

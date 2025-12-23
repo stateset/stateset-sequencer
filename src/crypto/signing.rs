@@ -3,6 +3,7 @@
 //! Provides Ed25519 signature operations for agent event signing
 //! per VES specification Section 8.
 
+use base64::Engine;
 use ed25519_dalek::{
     Signature, Signer, SigningKey, Verifier, VerifyingKey, PUBLIC_KEY_LENGTH, SECRET_KEY_LENGTH,
     SIGNATURE_LENGTH,
@@ -217,6 +218,28 @@ pub fn public_key_from_hex(hex_str: &str) -> Result<PublicKey32, SigningError> {
     bytes
         .try_into()
         .map_err(|_| SigningError::InvalidPublicKeyFormat)
+}
+
+/// Parse secret key from hex or base64 (standard or URL-safe, with or without 0x prefix).
+pub fn secret_key_from_str(value: &str) -> Result<SecretKey32, SigningError> {
+    let trimmed = value.trim();
+    let hex_str = trimmed.strip_prefix("0x").unwrap_or(trimmed);
+
+    if hex_str.len() == 64 && hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
+        let bytes = hex::decode(hex_str).map_err(|_| SigningError::InvalidSecretKeyFormat)?;
+        return bytes
+            .try_into()
+            .map_err(|_| SigningError::InvalidSecretKeyFormat);
+    }
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed))
+        .map_err(|_| SigningError::InvalidSecretKeyFormat)?;
+
+    bytes
+        .try_into()
+        .map_err(|_| SigningError::InvalidSecretKeyFormat)
 }
 
 // ============================================================================

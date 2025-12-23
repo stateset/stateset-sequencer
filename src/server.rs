@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::{HeaderValue, Method};
 use axum::routing::get;
 use axum::Router;
@@ -23,8 +24,9 @@ use uuid::Uuid;
 use crate::anchor::{AnchorConfig, AnchorService};
 use crate::auth::{
     ApiKeyRecord, ApiKeyValidator, AuthMiddlewareState, Authenticator, JwtValidator, Permissions,
-    RateLimiter,
+    RateLimiter, RequestLimits,
 };
+use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::domain::{StoreId, TenantId};
 use crate::infra::{
     PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore, PgSchemaStore,
@@ -90,6 +92,8 @@ pub struct AppState {
     pub metrics: Arc<MetricsRegistry>,
     /// Schema validation mode for event ingestion
     pub schema_validation_mode: SchemaValidationMode,
+    /// Request limits for ingestion and payload sizing
+    pub request_limits: RequestLimits,
 }
 
 /// Start the HTTP server.
@@ -162,6 +166,14 @@ pub async fn run() -> anyhow::Result<()> {
         rate_limiter,
     };
 
+    let request_limits = RequestLimits::from_env();
+    info!(
+        "Request limits: max_body_size={} bytes, max_events_per_batch={}, max_event_payload_size={} bytes",
+        request_limits.max_body_size,
+        request_limits.max_events_per_batch,
+        request_limits.max_event_payload_size
+    );
+
     // Load configuration
     let config = Config::from_env();
     info!("Configuration loaded");
@@ -217,7 +229,14 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Initialize VES v1.0 services
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
-    let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+    let mut ves_sequencer = VesSequencer::new(pool.clone(), agent_key_registry.clone());
+    if let Some(signing_key) = load_ves_sequencer_signing_key()? {
+        info!("VES sequencer receipt signing enabled");
+        ves_sequencer = ves_sequencer.with_signing_key(signing_key);
+    } else {
+        info!("VES sequencer receipt signing disabled (set VES_SEQUENCER_SIGNING_KEY to enable)");
+    }
+    let ves_sequencer = Arc::new(ves_sequencer);
 
     // Initialize schema registry
     let schema_store = Arc::new(PgSchemaStore::new(pool.clone()));
@@ -263,10 +282,13 @@ pub async fn run() -> anyhow::Result<()> {
         schema_store,
         metrics,
         schema_validation_mode,
+        request_limits: request_limits.clone(),
     };
 
     // Build router
-    let app = build_router(auth_state)?.with_state(state);
+    let app = build_router(auth_state)?
+        .with_state(state)
+        .layer(DefaultBodyLimit::max(request_limits.max_body_size));
 
     // Start server
     info!("Starting HTTP server on {}", config.listen_addr);
@@ -325,6 +347,20 @@ fn init_tracing() {
         .with(env_filter)
         .with(fmt_layer)
         .init();
+}
+
+fn load_ves_sequencer_signing_key() -> anyhow::Result<Option<AgentSigningKey>> {
+    let key_value = match std::env::var("VES_SEQUENCER_SIGNING_KEY") {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let secret = secret_key_from_str(&key_value)
+        .map_err(|e| anyhow::anyhow!("invalid VES_SEQUENCER_SIGNING_KEY: {e}"))?;
+    let signing_key = AgentSigningKey::from_bytes(&secret)
+        .map_err(|e| anyhow::anyhow!("invalid VES_SEQUENCER_SIGNING_KEY: {e}"))?;
+
+    Ok(Some(signing_key))
 }
 
 /// Initialize OpenTelemetry tracer with OTLP exporter
@@ -408,7 +444,7 @@ fn cors_layer_from_env() -> anyhow::Result<Option<CorsLayer>> {
     Ok(Some(
         CorsLayer::new()
             .allow_origin(allow_origin)
-            .allow_methods([Method::GET, Method::POST])
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
             .allow_headers([
                 axum::http::header::AUTHORIZATION,
                 axum::http::header::CONTENT_TYPE,

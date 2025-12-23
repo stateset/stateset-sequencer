@@ -425,6 +425,7 @@ receipt_hash = SHA256(receipt_preimage)
 ```
 
 Sequencer signs `receipt_hash` with a published sequencer key (scheme MAY be Ed25519 or secp256k1; specify in deployment metadata).
+If receipt signing is not configured, `signature_alg` is `none` and `sequencer_signature` is empty.
 
 Receipt object:
 

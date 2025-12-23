@@ -107,7 +107,7 @@ pub struct VesSequencerReceipt {
     /// Signature algorithm
     pub signature_alg: String,
     /// Sequencer signature over receipt_hash
-    pub sequencer_signature: Signature64,
+    pub sequencer_signature: Option<Signature64>,
 }
 
 /// VES ingest receipt
@@ -266,10 +266,24 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             .try_into()
             .map_err(|_| SequencerError::Internal("invalid receipt_hash".into()))?;
 
-        let sequencer_signature: Signature64 = sequencer_signature
-            .unwrap_or_else(|| vec![0u8; 64])
-            .try_into()
-            .map_err(|_| SequencerError::Internal("invalid sequencer_signature".into()))?;
+        let sequencer_signature = match sequencer_signature {
+            Some(bytes) => {
+                let sig: Signature64 = bytes
+                    .try_into()
+                    .map_err(|_| SequencerError::Internal("invalid sequencer_signature".into()))?;
+                if sig.iter().all(|b| *b == 0) {
+                    None
+                } else {
+                    Some(sig)
+                }
+            }
+            None => None,
+        };
+        let signature_alg = if sequencer_signature.is_some() {
+            "ed25519".to_string()
+        } else {
+            "none".to_string()
+        };
 
         Ok(Some(VesSequencerReceipt {
             sequencer_id,
@@ -277,7 +291,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             sequence_number: sequence_number as u64,
             sequenced_at,
             receipt_hash,
-            signature_alg: "ed25519".to_string(),
+            signature_alg,
             sequencer_signature,
         }))
     }
@@ -509,7 +523,12 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .bind(receipt.sequence_number as i64)
         .bind(receipt.sequenced_at)
         .bind(receipt.receipt_hash.as_slice())
-        .bind(receipt.sequencer_signature.as_slice())
+        .bind(
+            receipt
+                .sequencer_signature
+                .as_ref()
+                .map(|sig| sig.as_slice()),
+        )
         .execute(&mut **tx)
         .await?;
 
@@ -530,10 +549,11 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         );
 
         // Sign the receipt if we have a signing key
-        let sequencer_signature = if let Some(ref key) = self.sequencer_signing_key {
-            key.sign(&receipt_hash)
+        let (signature_alg, sequencer_signature) = if let Some(ref key) = self.sequencer_signing_key
+        {
+            ("ed25519".to_string(), Some(key.sign(&receipt_hash)))
         } else {
-            [0u8; 64] // Zero signature if no key
+            ("none".to_string(), None)
         };
 
         VesSequencerReceipt {
@@ -542,7 +562,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             sequence_number: event.sequence_number(),
             sequenced_at: event.envelope.sequenced_at.unwrap_or_else(Utc::now),
             receipt_hash,
-            signature_alg: "ed25519".to_string(),
+            signature_alg,
             sequencer_signature,
         }
     }

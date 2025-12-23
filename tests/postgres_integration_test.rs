@@ -14,7 +14,7 @@ use base64::Engine;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use stateset_sequencer::auth::{ApiKeyValidator, AuthMiddlewareState, Authenticator};
+use stateset_sequencer::auth::{ApiKeyValidator, AuthMiddlewareState, Authenticator, RequestLimits};
 use stateset_sequencer::crypto::{is_payload_at_rest_encrypted, StaticKeyManager};
 use stateset_sequencer::domain::{
     AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
@@ -354,6 +354,7 @@ async fn postgres_ves_validity_proofs_rest_flow() {
         schema_store,
         metrics,
         schema_validation_mode: SchemaValidationMode::Disabled,
+        request_limits: RequestLimits::default(),
     };
 
     let api_key_validator = Arc::new(ApiKeyValidator::new());
@@ -644,6 +645,7 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
         schema_store,
         metrics,
         schema_validation_mode: SchemaValidationMode::Disabled,
+        request_limits: RequestLimits::default(),
     };
 
     let api_key_validator = Arc::new(ApiKeyValidator::new());

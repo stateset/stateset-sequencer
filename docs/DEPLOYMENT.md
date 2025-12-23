@@ -483,6 +483,10 @@ Example log format:
 | `PORT` | `8080` | HTTP port |
 | `MAX_DB_CONNECTIONS` | `10` | Connection pool size |
 | `RUST_LOG` | `info` | Log level |
+| `MAX_BODY_SIZE_BYTES` | `10485760` | Max request body size (bytes) |
+| `MAX_EVENTS_PER_BATCH` | `1000` | Max events per ingest batch |
+| `MAX_EVENT_PAYLOAD_SIZE` | `1048576` | Max per-event payload size (bytes) |
+| `VES_SEQUENCER_SIGNING_KEY` | (none) | 32-byte Ed25519 secret key for VES receipt signing (hex or base64) |
 
 ### Anchoring (Optional)
 

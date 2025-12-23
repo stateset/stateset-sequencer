@@ -16,7 +16,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use stateset_sequencer::auth::{
-    ApiKeyRecord, ApiKeyValidator, AuthMiddlewareState, Authenticator, Permissions,
+    ApiKeyRecord, ApiKeyValidator, AuthMiddlewareState, Authenticator, Permissions, RequestLimits,
 };
 use stateset_sequencer::crypto::StaticKeyManager;
 use stateset_sequencer::domain::{
@@ -82,6 +82,7 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
         metrics,
         // Use disabled mode for tests by default (to not break existing tests)
         schema_validation_mode: SchemaValidationMode::Disabled,
+        request_limits: RequestLimits::default(),
     }
 }
 
