@@ -235,6 +235,64 @@ impl PgSequencer {
 
         Ok(result.rows_affected() == 1)
     }
+
+    async fn bump_entity_version_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        event: &SequencedEvent,
+    ) -> Result<()> {
+        let env = &event.envelope;
+        sqlx::query(
+            r#"
+            INSERT INTO entity_versions (
+                tenant_id, store_id, entity_type, entity_id, version, updated_at
+            ) VALUES ($1, $2, $3, $4, 1, NOW())
+            ON CONFLICT (tenant_id, store_id, entity_type, entity_id)
+            DO UPDATE SET
+                version = entity_versions.version + 1,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(env.tenant_id.0)
+        .bind(env.store_id.0)
+        .bind(env.entity_type.as_str())
+        .bind(&env.entity_id)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
+    async fn fetch_existing_command_id_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        event_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let row: Option<(Option<Uuid>,)> =
+            sqlx::query_as("SELECT command_id FROM events WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        Ok(row.and_then(|(cmd_id,)| cmd_id))
+    }
+
+    async fn release_command_id_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        command_id: Uuid,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM event_command_dedupe
+            WHERE tenant_id = $1 AND store_id = $2 AND command_id = $3
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(command_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -319,9 +377,20 @@ impl IngestService for PgSequencer {
         let mut rejected = Vec::new();
         let mut candidates = Vec::new();
         let mut command_ids = HashSet::new();
+        let mut seen_event_ids = HashSet::new();
+        let mut seen_command_ids = HashSet::new();
 
         // Validate each event (schema + payload hash + duplicates).
         for event in batch.events {
+            if !seen_event_ids.insert(event.event_id) {
+                rejected.push(RejectedEvent {
+                    event_id: event.event_id,
+                    reason: RejectionReason::DuplicateEventId,
+                    message: format!("Event {} duplicated in batch", event.event_id),
+                });
+                continue;
+            }
+
             if existing_event_ids.contains(&event.event_id) {
                 rejected.push(RejectedEvent {
                     event_id: event.event_id,
@@ -337,6 +406,14 @@ impl IngestService for PgSequencer {
             }
 
             if let Some(cmd_id) = event.command_id {
+                if !seen_command_ids.insert(cmd_id) {
+                    rejected.push(RejectedEvent {
+                        event_id: event.event_id,
+                        reason: RejectionReason::DuplicateCommandId,
+                        message: format!("Command {} duplicated in batch", cmd_id),
+                    });
+                    continue;
+                }
                 command_ids.insert(cmd_id);
             }
 
@@ -345,6 +422,7 @@ impl IngestService for PgSequencer {
 
         // Reserve command_ids atomically to prevent concurrent duplicates.
         let mut duplicate_command_ids = HashSet::new();
+        let mut reserved_command_ids = HashSet::new();
         for cmd_id in &command_ids {
             let result = sqlx::query(
                 r#"
@@ -361,6 +439,8 @@ impl IngestService for PgSequencer {
 
             if result.rows_affected() == 0 {
                 duplicate_command_ids.insert(*cmd_id);
+            } else {
+                reserved_command_ids.insert(*cmd_id);
             }
         }
 
@@ -402,6 +482,22 @@ impl IngestService for PgSequencer {
             // Insert; if we raced a duplicate event_id (global), reject without advancing.
             let inserted = self.insert_event_tx(&mut tx, &sequenced).await?;
             if !inserted {
+                if let Some(cmd_id) = sequenced.envelope.command_id {
+                    if reserved_command_ids.contains(&cmd_id) {
+                        let existing_cmd_id =
+                            Self::fetch_existing_command_id_tx(&mut tx, sequenced.event_id())
+                                .await?;
+                        if existing_cmd_id != Some(cmd_id) {
+                            Self::release_command_id_tx(
+                                &mut tx,
+                                &tenant_id,
+                                &store_id,
+                                cmd_id,
+                            )
+                            .await?;
+                        }
+                    }
+                }
                 rejected.push(RejectedEvent {
                     event_id: sequenced.event_id(),
                     reason: RejectionReason::DuplicateEventId,
@@ -410,6 +506,7 @@ impl IngestService for PgSequencer {
                 continue;
             }
 
+            Self::bump_entity_version_tx(&mut tx, &sequenced).await?;
             head = next_seq;
             events_accepted += 1;
             assigned_sequence_start.get_or_insert(next_seq);

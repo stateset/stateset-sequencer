@@ -535,6 +535,40 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         Ok(())
     }
 
+    async fn fetch_existing_command_id_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        event_id: Uuid,
+    ) -> Result<Option<Uuid>> {
+        let row: Option<(Option<Uuid>,)> =
+            sqlx::query_as("SELECT command_id FROM ves_events WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_optional(&mut **tx)
+                .await?;
+        Ok(row.and_then(|(cmd_id,)| cmd_id))
+    }
+
+    async fn release_command_id_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        command_id: Uuid,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            DELETE FROM ves_command_dedupe
+            WHERE tenant_id = $1 AND store_id = $2 AND command_id = $3
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(command_id)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
     /// Generate a sequencer receipt for an event
     fn generate_receipt(&self, event: &SequencedVesEvent) -> VesSequencerReceipt {
         let event_signing_hash = event.compute_signing_hash();
@@ -607,9 +641,18 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         let mut new_events_accepted: u32 = 0;
 
         let mut pending = Vec::new();
+        let mut seen_event_ids = HashSet::new();
 
         // Idempotency: return stored receipts for already-seen events.
         for event in events {
+            if !seen_event_ids.insert(event.event_id) {
+                rejected.push(VesRejectedEvent {
+                    event_id: event.event_id,
+                    reason: VesRejectionReason::DuplicateEventId,
+                    message: format!("Event {} duplicated in batch", event.event_id),
+                });
+                continue;
+            }
             if let Some(_seq) = self.get_existing_sequence(&mut tx, event.event_id).await? {
                 if let Some(receipt) = self.get_existing_receipt(&mut tx, event.event_id).await? {
                     receipts.push(receipt);
@@ -629,6 +672,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
         let mut candidates = Vec::new();
         let mut command_ids = HashSet::new();
+        let mut seen_command_ids = HashSet::new();
 
         for event in pending {
             // Validate signature and hashes
@@ -638,6 +682,14 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             }
 
             if let Some(cmd_id) = event.command_id {
+                if !seen_command_ids.insert(cmd_id) {
+                    rejected.push(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::DuplicateCommandId,
+                        message: format!("Command {} duplicated in batch", cmd_id),
+                    });
+                    continue;
+                }
                 command_ids.insert(cmd_id);
             }
 
@@ -646,6 +698,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
         // Reserve command_ids atomically to prevent concurrent duplicates.
         let mut duplicate_command_ids = HashSet::new();
+        let mut reserved_command_ids = HashSet::new();
         for cmd_id in &command_ids {
             let result = sqlx::query(
                 r#"
@@ -662,6 +715,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
             if result.rows_affected() == 0 {
                 duplicate_command_ids.insert(*cmd_id);
+            } else {
+                reserved_command_ids.insert(*cmd_id);
             }
         }
 
@@ -687,6 +742,17 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
             let inserted = self.store_event_tx(&mut tx, &sequenced).await?;
             if !inserted {
+                if let Some(cmd_id) = sequenced.envelope.command_id {
+                    if reserved_command_ids.contains(&cmd_id) {
+                        let existing_cmd_id =
+                            self.fetch_existing_command_id_tx(&mut tx, sequenced.event_id())
+                                .await?;
+                        if existing_cmd_id != Some(cmd_id) {
+                            self.release_command_id_tx(&mut tx, &tenant_id, &store_id, cmd_id)
+                                .await?;
+                        }
+                    }
+                }
                 rejected.push(VesRejectedEvent {
                     event_id: sequenced.event_id(),
                     reason: VesRejectionReason::DuplicateEventId,

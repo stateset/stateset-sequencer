@@ -230,6 +230,12 @@ pub async fn run() -> anyhow::Result<()> {
     // Initialize VES v1.0 services
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let mut ves_sequencer = VesSequencer::new(pool.clone(), agent_key_registry.clone());
+    if let Some(sequencer_id) = load_ves_sequencer_id()? {
+        info!("VES sequencer id configured: {}", sequencer_id);
+        ves_sequencer = ves_sequencer.with_sequencer_id(sequencer_id);
+    } else {
+        info!("VES sequencer id not configured (set VES_SEQUENCER_ID to pin)");
+    }
     if let Some(signing_key) = load_ves_sequencer_signing_key()? {
         info!("VES sequencer receipt signing enabled");
         ves_sequencer = ves_sequencer.with_signing_key(signing_key);
@@ -361,6 +367,17 @@ fn load_ves_sequencer_signing_key() -> anyhow::Result<Option<AgentSigningKey>> {
         .map_err(|e| anyhow::anyhow!("invalid VES_SEQUENCER_SIGNING_KEY: {e}"))?;
 
     Ok(Some(signing_key))
+}
+
+fn load_ves_sequencer_id() -> anyhow::Result<Option<Uuid>> {
+    let value = match std::env::var("VES_SEQUENCER_ID") {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let id = Uuid::parse_str(value.trim())
+        .map_err(|e| anyhow::anyhow!("invalid VES_SEQUENCER_ID: {e}"))?;
+    Ok(Some(id))
 }
 
 /// Initialize OpenTelemetry tracer with OTLP exporter
