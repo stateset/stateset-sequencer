@@ -29,7 +29,7 @@ use crate::domain::{StoreId, TenantId};
 use crate::infra::{
     PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore, PgSchemaStore,
     PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore,
-    Sequencer, VesSequencer,
+    SchemaValidationMode, Sequencer, VesSequencer,
 };
 use crate::metrics::MetricsRegistry;
 
@@ -88,6 +88,8 @@ pub struct AppState {
     pub agent_key_registry: Arc<PgAgentKeyRegistry>,
     pub schema_store: Arc<PgSchemaStore>,
     pub metrics: Arc<MetricsRegistry>,
+    /// Schema validation mode for event ingestion
+    pub schema_validation_mode: SchemaValidationMode,
 }
 
 /// Start the HTTP server.
@@ -222,6 +224,10 @@ pub async fn run() -> anyhow::Result<()> {
     schema_store.initialize().await?;
     info!("Schema registry initialized");
 
+    // Schema validation mode for event ingestion
+    let schema_validation_mode = SchemaValidationMode::from_env();
+    info!("Schema validation mode: {}", schema_validation_mode);
+
     // Initialize metrics registry
     let metrics = Arc::new(MetricsRegistry::new());
     info!("Metrics registry initialized");
@@ -256,6 +262,7 @@ pub async fn run() -> anyhow::Result<()> {
         agent_key_registry,
         schema_store,
         metrics,
+        schema_validation_mode,
     };
 
     // Build router

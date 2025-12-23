@@ -22,7 +22,8 @@ use stateset_sequencer::domain::{
 use stateset_sequencer::infra::{
     EventStore, IngestService, PayloadEncryption, PayloadEncryptionMode, PgAgentKeyRegistry,
     PgCommitmentEngine, PgEventStore, PgSequencer, PgVesCommitmentEngine,
-    PgVesComplianceProofStore, PgVesValidityProofStore, Sequencer, VesSequencer,
+    PgVesComplianceProofStore, PgVesValidityProofStore, SchemaValidationMode, Sequencer,
+    VesSequencer,
 };
 use stateset_sequencer::server::AppState;
 
@@ -352,6 +353,7 @@ async fn postgres_ves_validity_proofs_rest_flow() {
         agent_key_registry,
         schema_store,
         metrics,
+        schema_validation_mode: SchemaValidationMode::Disabled,
     };
 
     let api_key_validator = Arc::new(ApiKeyValidator::new());
@@ -641,6 +643,7 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
         agent_key_registry,
         schema_store,
         metrics,
+        schema_validation_mode: SchemaValidationMode::Disabled,
     };
 
     let api_key_validator = Arc::new(ApiKeyValidator::new());

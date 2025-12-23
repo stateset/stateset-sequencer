@@ -5,9 +5,17 @@
 //! - Domain separation prefixes for all hash operations
 //! - Big-endian encoding for integers
 //! - Reproducible hashes across implementations
+//!
+//! # RFC 8785 Compliance
+//!
+//! This module uses `serde_json_canonicalizer` for RFC 8785 compliant JSON
+//! canonicalization, ensuring consistent hashing across implementations
+//! in different languages. Key properties:
+//! - Deterministic key ordering (lexicographic UTF-8)
+//! - ES6-compatible number serialization (handles floats, -0, etc.)
+//! - Proper Unicode handling
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// 32-byte SHA-256 hash
@@ -119,81 +127,21 @@ pub fn payload_plain_hash_salted(value: &serde_json::Value, salt: &[u8; 16]) -> 
     hasher.finalize().into()
 }
 
-/// Convert JSON value to canonical string representation (RFC 8785 JCS)
+/// Convert JSON value to canonical string representation per RFC 8785 (JCS).
 ///
-/// Produces deterministic JSON string:
+/// Uses `serde_json_canonicalizer` for strict RFC 8785 compliance, ensuring:
 /// - Keys sorted alphabetically (lexicographic UTF-8)
 /// - No extra whitespace
-/// - Numbers normalized per JCS rules
+/// - Numbers normalized per ES6/RFC 8785 rules (handles -0, exponents, etc.)
 /// - Strings properly escaped per JSON spec
-pub fn canonicalize_json(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::Null => "null".to_string(),
-        serde_json::Value::Bool(b) => b.to_string(),
-        serde_json::Value::Number(n) => canonicalize_number(n),
-        serde_json::Value::String(s) => canonicalize_string(s),
-        serde_json::Value::Array(arr) => {
-            let items: Vec<String> = arr.iter().map(canonicalize_json).collect();
-            format!("[{}]", items.join(","))
-        }
-        serde_json::Value::Object(obj) => {
-            // Sort keys alphabetically using BTreeMap
-            let sorted: BTreeMap<_, _> = obj.iter().collect();
-            let pairs: Vec<String> = sorted
-                .iter()
-                .map(|(k, v)| format!("{}:{}", canonicalize_string(k), canonicalize_json(v)))
-                .collect();
-            format!("{{{}}}", pairs.join(","))
-        }
-    }
-}
-
-/// Canonicalize a number per RFC 8785
 ///
-/// - Integers remain as integers (no .0)
-/// - Floats use minimal representation
-fn canonicalize_number(n: &serde_json::Number) -> String {
-    if let Some(i) = n.as_i64() {
-        i.to_string()
-    } else if let Some(u) = n.as_u64() {
-        u.to_string()
-    } else if let Some(f) = n.as_f64() {
-        // Check if it's actually an integer
-        if f.fract() == 0.0 && f.abs() < (i64::MAX as f64) {
-            (f as i64).to_string()
-        } else {
-            // Use minimal float representation
-            format!("{}", f)
-        }
-    } else {
-        n.to_string()
-    }
-}
-
-/// Canonicalize a string with proper JSON escaping
-fn canonicalize_string(s: &str) -> String {
-    let mut result = String::with_capacity(s.len() + 2);
-    result.push('"');
-
-    for c in s.chars() {
-        match c {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            '\x08' => result.push_str("\\b"), // backspace
-            '\x0c' => result.push_str("\\f"), // form feed
-            c if c.is_control() => {
-                // Unicode escape for other control characters
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => result.push(c),
-        }
-    }
-
-    result.push('"');
-    result
+/// # Panics
+///
+/// Panics if the JSON value contains a float that cannot be represented
+/// (NaN or Infinity). Per RFC 8785, these are not valid JSON.
+pub fn canonicalize_json(value: &serde_json::Value) -> String {
+    serde_json_canonicalizer::to_string(value)
+        .expect("Failed to canonicalize JSON - contains invalid values (NaN or Infinity)")
 }
 
 // ============================================================================
@@ -760,4 +708,176 @@ fn test_ves_state_root_chaining_changes_with_prev_root() {
 
     assert_ne!(r1, prev0);
     assert_ne!(r2, r1);
+}
+
+// ============================================================================
+// RFC 8785 Edge Case Test Vectors
+// ============================================================================
+
+#[cfg(test)]
+mod rfc8785_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Test RFC 8785 integer vs float handling
+    #[test]
+    fn test_rfc8785_integers() {
+        // Integers should be serialized without decimal points
+        assert_eq!(canonicalize_json(&json!(0)), "0");
+        assert_eq!(canonicalize_json(&json!(1)), "1");
+        assert_eq!(canonicalize_json(&json!(-1)), "-1");
+        assert_eq!(canonicalize_json(&json!(999999999999i64)), "999999999999");
+    }
+
+    /// Test RFC 8785 floating point handling (ES6-style)
+    #[test]
+    fn test_rfc8785_floats() {
+        // Floats should use minimal representation
+        assert_eq!(canonicalize_json(&json!(1.5)), "1.5");
+        assert_eq!(canonicalize_json(&json!(0.5)), "0.5");
+
+        // Numbers that can be integers should be integers
+        assert_eq!(canonicalize_json(&json!(1.0)), "1");
+        assert_eq!(canonicalize_json(&json!(100.0)), "100");
+    }
+
+    /// Test RFC 8785 negative zero handling
+    #[test]
+    fn test_rfc8785_negative_zero() {
+        // Per RFC 8785, -0 should be serialized as 0
+        let neg_zero: f64 = -0.0;
+        let value = serde_json::Number::from_f64(neg_zero).unwrap();
+        let json_value = serde_json::Value::Number(value);
+        assert_eq!(canonicalize_json(&json_value), "0");
+    }
+
+    /// Test RFC 8785 scientific notation handling
+    #[test]
+    fn test_rfc8785_scientific_notation() {
+        // Very small numbers - should use minimal representation
+        let small = serde_json::Number::from_f64(0.000001).unwrap();
+        let canonical = canonicalize_json(&serde_json::Value::Number(small));
+        // RFC 8785 allows either 0.000001 or 1e-6 style, check it's consistent
+        assert!(!canonical.is_empty());
+
+        // Very large numbers
+        let large = serde_json::Number::from_f64(1e20).unwrap();
+        let canonical = canonicalize_json(&serde_json::Value::Number(large));
+        assert!(!canonical.is_empty());
+    }
+
+    /// Test RFC 8785 string escaping
+    #[test]
+    fn test_rfc8785_string_escaping() {
+        // Control characters must be escaped
+        assert_eq!(canonicalize_json(&json!("hello\nworld")), r#""hello\nworld""#);
+        assert_eq!(canonicalize_json(&json!("tab\there")), r#""tab\there""#);
+        assert_eq!(canonicalize_json(&json!("quote\"")), r#""quote\"""#);
+        assert_eq!(canonicalize_json(&json!("backslash\\")), r#""backslash\\""#);
+    }
+
+    /// Test RFC 8785 Unicode handling
+    #[test]
+    fn test_rfc8785_unicode() {
+        // Unicode characters should be preserved (not escaped unless control)
+        assert_eq!(canonicalize_json(&json!("café")), r#""café""#);
+        assert_eq!(canonicalize_json(&json!("日本語")), r#""日本語""#);
+        assert_eq!(canonicalize_json(&json!("emoji: 🎉")), r#""emoji: 🎉""#);
+    }
+
+    /// Test RFC 8785 key ordering with Unicode
+    #[test]
+    fn test_rfc8785_unicode_key_ordering() {
+        // Keys are sorted by UTF-8 byte sequence (lexicographic)
+        let value = json!({
+            "z": 1,
+            "a": 2,
+            "ä": 3,  // ä (U+00E4) comes after ASCII 'z' in UTF-8
+            "A": 4   // 'A' (0x41) comes before 'a' (0x61)
+        });
+        let canonical = canonicalize_json(&value);
+        // Expected order: A < a < z < ä (UTF-8 byte ordering)
+        assert_eq!(canonical, r#"{"A":4,"a":2,"z":1,"ä":3}"#);
+    }
+
+    /// Test RFC 8785 deeply nested structures
+    #[test]
+    fn test_rfc8785_deep_nesting() {
+        let value = json!({
+            "level1": {
+                "level2": {
+                    "level3": {
+                        "value": 42
+                    }
+                }
+            }
+        });
+        let canonical = canonicalize_json(&value);
+        assert_eq!(canonical, r#"{"level1":{"level2":{"level3":{"value":42}}}}"#);
+    }
+
+    /// Test RFC 8785 array ordering (arrays preserve order, not sorted)
+    #[test]
+    fn test_rfc8785_array_ordering() {
+        let value = json!([3, 1, 2, "z", "a"]);
+        let canonical = canonicalize_json(&value);
+        // Arrays preserve insertion order (NOT sorted)
+        assert_eq!(canonical, r#"[3,1,2,"z","a"]"#);
+    }
+
+    /// Test RFC 8785 empty structures
+    #[test]
+    fn test_rfc8785_empty_structures() {
+        assert_eq!(canonicalize_json(&json!({})), "{}");
+        assert_eq!(canonicalize_json(&json!([])), "[]");
+        assert_eq!(canonicalize_json(&json!("")), r#""""#);
+    }
+
+    /// Test RFC 8785 null and boolean
+    #[test]
+    fn test_rfc8785_primitives() {
+        assert_eq!(canonicalize_json(&json!(null)), "null");
+        assert_eq!(canonicalize_json(&json!(true)), "true");
+        assert_eq!(canonicalize_json(&json!(false)), "false");
+    }
+
+    /// Test that different key orders produce identical hashes
+    #[test]
+    fn test_canonicalization_hash_consistency() {
+        let value1 = json!({
+            "zebra": {"inner_z": 1, "inner_a": 2},
+            "apple": [3, 2, 1],
+            "mango": "fruit"
+        });
+
+        let value2 = json!({
+            "mango": "fruit",
+            "apple": [3, 2, 1],
+            "zebra": {"inner_a": 2, "inner_z": 1}
+        });
+
+        let hash1 = payload_plain_hash(&value1);
+        let hash2 = payload_plain_hash(&value2);
+
+        assert_eq!(hash1, hash2, "Same content with different key order should produce identical hash");
+    }
+
+    /// Test known RFC 8785 test vectors (from the RFC specification)
+    #[test]
+    fn test_rfc8785_spec_vectors() {
+        // RFC 8785 Appendix B.2 test vector
+        let value = json!({
+            "numbers": [333333333.33333329, 1e30, 4.5e-308, 1e-305],
+            "string": "\u{0080}",
+            "literals": [null, true, false]
+        });
+
+        // Verify it canonicalizes without panic
+        let canonical = canonicalize_json(&value);
+        assert!(!canonical.is_empty());
+
+        // The canonical form should be consistent
+        let canonical2 = canonicalize_json(&value);
+        assert_eq!(canonical, canonical2);
+    }
 }

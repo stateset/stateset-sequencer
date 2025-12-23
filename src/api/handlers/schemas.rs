@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use uuid::Uuid;
 
-use crate::api::auth_helpers::ensure_write;
+use crate::api::auth_helpers::{ensure_admin, ensure_read, ensure_write};
 use crate::api::types::{
     RegisterSchemaRequest, RegisterSchemaResponse, SchemaByEventTypeQuery, SchemaListResponse,
     SchemaQuery, SchemaResponse, SchemaVersionQuery, UpdateSchemaStatusRequest,
@@ -98,10 +98,8 @@ pub async fn list_schemas(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Query(query): Query<SchemaQuery>,
 ) -> Result<Json<SchemaListResponse>, (StatusCode, String)> {
-    // Allow read access (schema listing is read-only)
-    if !auth.permissions.read && !auth.permissions.write && !auth.permissions.admin {
-        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
-    }
+    // Verify caller has read access to the requested tenant (store_id not applicable for schemas)
+    ensure_read(&auth, query.tenant_id, Uuid::nil())?;
 
     let tenant_id = TenantId::from_uuid(query.tenant_id);
 
@@ -124,15 +122,15 @@ pub async fn get_schema(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(schema_id): Path<Uuid>,
 ) -> Result<Json<SchemaResponse>, (StatusCode, String)> {
-    // Allow read access
-    if !auth.permissions.read && !auth.permissions.write && !auth.permissions.admin {
-        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
-    }
-
     let schema_id = SchemaId::from_uuid(schema_id);
 
+    // Fetch schema first, then verify tenant ownership
     match state.schema_store.get_by_id(schema_id).await {
-        Ok(Some(schema)) => Ok(Json(schema_to_response(&schema))),
+        Ok(Some(schema)) => {
+            // Verify caller has read access to this schema's tenant
+            ensure_read(&auth, schema.tenant_id.0, Uuid::nil())?;
+            Ok(Json(schema_to_response(&schema)))
+        }
         Ok(None) => Err((StatusCode::NOT_FOUND, "Schema not found".to_string())),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
@@ -145,10 +143,8 @@ pub async fn get_schemas_by_event_type(
     Path(event_type): Path<String>,
     Query(query): Query<SchemaVersionQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Allow read access
-    if !auth.permissions.read && !auth.permissions.write && !auth.permissions.admin {
-        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
-    }
+    // Verify caller has read access to the requested tenant
+    ensure_read(&auth, query.tenant_id, Uuid::nil())?;
 
     let tenant_id = TenantId::from_uuid(query.tenant_id);
     let event_type = EventType::from(event_type.as_str());
@@ -197,10 +193,8 @@ pub async fn get_latest_schema(
     Path(event_type): Path<String>,
     Query(query): Query<SchemaByEventTypeQuery>,
 ) -> Result<Json<SchemaResponse>, (StatusCode, String)> {
-    // Allow read access
-    if !auth.permissions.read && !auth.permissions.write && !auth.permissions.admin {
-        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
-    }
+    // Verify caller has read access to the requested tenant
+    ensure_read(&auth, query.tenant_id, Uuid::nil())?;
 
     let tenant_id = TenantId::from_uuid(query.tenant_id);
     let event_type = EventType::from(event_type.as_str());
@@ -222,12 +216,17 @@ pub async fn update_schema_status(
     Path(schema_id): Path<Uuid>,
     Json(request): Json<UpdateSchemaStatusRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Require admin or write access
-    if !auth.permissions.admin && !auth.permissions.write {
-        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
-    }
-
     let schema_id = SchemaId::from_uuid(schema_id);
+
+    // Fetch schema first to verify tenant ownership
+    let schema = match state.schema_store.get_by_id(schema_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "Schema not found".to_string())),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    // Verify caller has write access to this schema's tenant
+    ensure_write(&auth, schema.tenant_id.0, Uuid::nil())?;
 
     let status = match request.status.as_str() {
         "active" => SchemaStatus::Active,
@@ -257,12 +256,17 @@ pub async fn delete_schema(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(schema_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Require admin access for deletion
-    if !auth.permissions.admin {
-        return Err((StatusCode::FORBIDDEN, "Admin access required".to_string()));
-    }
-
     let schema_id = SchemaId::from_uuid(schema_id);
+
+    // Fetch schema first to verify tenant ownership
+    let schema = match state.schema_store.get_by_id(schema_id).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "Schema not found".to_string())),
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
+
+    // Verify caller has admin access to this schema's tenant
+    ensure_admin(&auth, schema.tenant_id.0, Uuid::nil())?;
 
     match state.schema_store.delete(schema_id).await {
         Ok(()) => Ok(Json(serde_json::json!({
@@ -279,10 +283,8 @@ pub async fn validate_payload(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<ValidatePayloadRequest>,
 ) -> Result<Json<ValidationResponse>, (StatusCode, String)> {
-    // Allow read access for validation
-    if !auth.permissions.read && !auth.permissions.write && !auth.permissions.admin {
-        return Err((StatusCode::FORBIDDEN, "Insufficient permissions".to_string()));
-    }
+    // Verify caller has read access to the requested tenant
+    ensure_read(&auth, request.tenant_id, Uuid::nil())?;
 
     let tenant_id = TenantId::from_uuid(request.tenant_id);
     let event_type = EventType::from(request.event_type.as_str());

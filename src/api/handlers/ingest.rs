@@ -11,9 +11,126 @@ use crate::api::types::{
     VesReceiptResponse,
 };
 use crate::auth::AuthContextExt;
-use crate::domain::{AgentId, EventBatch};
-use crate::infra::IngestService;
+use crate::domain::{AgentId, EventBatch, EventEnvelope, RejectedEvent, RejectionReason, TenantId};
+use crate::infra::{IngestService, SchemaStore, Sequencer};
 use crate::server::AppState;
+
+/// Validate events against registered schemas.
+///
+/// Returns (valid_events, rejected_events) based on schema validation results.
+async fn validate_events_against_schemas(
+    state: &AppState,
+    events: Vec<EventEnvelope>,
+) -> (Vec<EventEnvelope>, Vec<RejectedEvent>) {
+    let validation_mode = state.schema_validation_mode;
+
+    // If validation is disabled, return all events as valid
+    if !validation_mode.should_validate() {
+        return (events, Vec::new());
+    }
+
+    let mut valid_events = Vec::new();
+    let mut rejected_events = Vec::new();
+
+    for event in events {
+        let tenant_id = TenantId::from_uuid(event.tenant_id.0);
+
+        // Validate payload against schema
+        let validation_result = match state
+            .schema_store
+            .validate(&tenant_id, &event.event_type, &event.payload)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                // Schema store error - log and treat as no schema depending on mode
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    error = %e,
+                    "Schema validation error"
+                );
+
+                if validation_mode.should_reject_missing_schema() {
+                    rejected_events.push(RejectedEvent {
+                        event_id: event.event_id,
+                        reason: RejectionReason::SchemaValidation,
+                        message: format!("Schema validation error: {}", e),
+                    });
+                    continue;
+                }
+
+                valid_events.push(event);
+                continue;
+            }
+        };
+
+        // Check if schema exists
+        if validation_result.schema_id.is_none() {
+            // No schema registered for this event type
+            if validation_mode.should_reject_missing_schema() {
+                rejected_events.push(RejectedEvent {
+                    event_id: event.event_id,
+                    reason: RejectionReason::SchemaValidation,
+                    message: format!(
+                        "No schema registered for event type '{}'",
+                        event.event_type.as_str()
+                    ),
+                });
+                continue;
+            }
+
+            // Log warning if in warn mode
+            if matches!(validation_mode, crate::infra::SchemaValidationMode::WarnOnly) {
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    "No schema registered for event type"
+                );
+            }
+
+            valid_events.push(event);
+            continue;
+        }
+
+        // Schema exists, check validation result
+        if validation_result.valid {
+            valid_events.push(event);
+        } else {
+            // Validation failed
+            let error_messages: Vec<String> = validation_result
+                .errors
+                .iter()
+                .map(|e| format!("{}: {}", e.path, e.message))
+                .collect();
+
+            let message = format!(
+                "Schema validation failed for event type '{}': {}",
+                event.event_type.as_str(),
+                error_messages.join("; ")
+            );
+
+            if validation_mode.should_reject_on_failure() {
+                rejected_events.push(RejectedEvent {
+                    event_id: event.event_id,
+                    reason: RejectionReason::SchemaValidation,
+                    message,
+                });
+            } else {
+                // Warn mode - log and accept
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    errors = ?error_messages,
+                    "Schema validation failed (warn mode)"
+                );
+                valid_events.push(event);
+            }
+        }
+    }
+
+    (valid_events, rejected_events)
+}
 
 /// POST /api/v1/events/ingest - Ingest events (legacy API).
 pub async fn ingest_events(
@@ -37,15 +154,58 @@ pub async fn ingest_events(
                 ));
             }
         }
+
+        // If auth is scoped to an agent, require it matches the request agent_id.
+        if let Some(agent_id) = auth.agent_id {
+            if agent_id != request.agent_id {
+                return Err((StatusCode::FORBIDDEN, "Agent mismatch".to_string()));
+            }
+        }
+
         ensure_write(&auth, tenant_id, store_id)?;
     }
 
-    let batch = EventBatch::new(AgentId::from_uuid(request.agent_id), request.events);
+    // Perform schema validation before sequencing
+    let (valid_events, schema_rejections) =
+        validate_events_against_schemas(&state, request.events).await;
+
+    // If all events were rejected by schema validation, return early
+    if valid_events.is_empty() && !schema_rejections.is_empty() {
+        let head = state
+            .sequencer
+            .head(
+                &TenantId::from_uuid(tenant_id),
+                &crate::domain::StoreId::from_uuid(store_id),
+            )
+            .await
+            .unwrap_or(0);
+
+        let rejections: Vec<RejectionInfo> = schema_rejections
+            .iter()
+            .map(|r| RejectionInfo {
+                event_id: r.event_id,
+                reason: format!("{:?}", r.reason),
+                message: r.message.clone(),
+            })
+            .collect();
+
+        return Ok(Json(IngestResponse {
+            batch_id: Uuid::new_v4(),
+            events_accepted: 0,
+            events_rejected: schema_rejections.len() as u32,
+            assigned_sequence_start: None,
+            assigned_sequence_end: None,
+            head_sequence: head,
+            rejections,
+        }));
+    }
+
+    let batch = EventBatch::new(AgentId::from_uuid(request.agent_id), valid_events);
 
     match state.sequencer.ingest(batch).await {
         Ok(receipt) => {
-            let rejections: Vec<RejectionInfo> = receipt
-                .events_rejected
+            // Combine schema rejections with sequencer rejections
+            let mut all_rejections: Vec<RejectionInfo> = schema_rejections
                 .iter()
                 .map(|r| RejectionInfo {
                     event_id: r.event_id,
@@ -54,14 +214,20 @@ pub async fn ingest_events(
                 })
                 .collect();
 
+            all_rejections.extend(receipt.events_rejected.iter().map(|r| RejectionInfo {
+                event_id: r.event_id,
+                reason: format!("{:?}", r.reason),
+                message: r.message.clone(),
+            }));
+
             Ok(Json(IngestResponse {
                 batch_id: receipt.batch_id,
                 events_accepted: receipt.events_accepted,
-                events_rejected: receipt.events_rejected.len() as u32,
+                events_rejected: all_rejections.len() as u32,
                 assigned_sequence_start: receipt.assigned_sequence_start,
                 assigned_sequence_end: receipt.assigned_sequence_end,
                 head_sequence: receipt.head_sequence,
-                rejections,
+                rejections: all_rejections,
             }))
         }
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),

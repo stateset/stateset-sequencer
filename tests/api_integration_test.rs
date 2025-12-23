@@ -25,7 +25,7 @@ use stateset_sequencer::domain::{
 use stateset_sequencer::infra::{
     IngestService, PayloadEncryption, PayloadEncryptionMode, PgAgentKeyRegistry,
     PgCommitmentEngine, PgEventStore, PgSequencer, PgVesCommitmentEngine,
-    PgVesComplianceProofStore, PgVesValidityProofStore, VesSequencer,
+    PgVesComplianceProofStore, PgVesValidityProofStore, SchemaValidationMode, VesSequencer,
 };
 use stateset_sequencer::metrics::MetricsRegistry;
 use stateset_sequencer::server::AppState;
@@ -80,6 +80,8 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
         agent_key_registry,
         schema_store,
         metrics,
+        // Use disabled mode for tests by default (to not break existing tests)
+        schema_validation_mode: SchemaValidationMode::Disabled,
     }
 }
 
@@ -1149,4 +1151,453 @@ async fn test_create_ves_commitment_success() {
     assert_eq!(status, StatusCode::OK, "body: {:?}", body);
     assert!(body["batch_id"].as_str().is_some());
     assert!(body["events_root"].as_str().is_some());
+}
+
+// ============================================================================
+// Cross-Tenant Access Denial Tests (Security Regression Tests)
+// ============================================================================
+
+/// Create a test router with tenant-scoped authentication.
+fn create_tenant_scoped_router(
+    state: AppState,
+    tenant_id: Uuid,
+    store_ids: Vec<Uuid>,
+    agent_id: Option<Uuid>,
+) -> (axum::Router<()>, String) {
+    let api_key_validator = Arc::new(ApiKeyValidator::new());
+
+    // Generate a unique test key for this tenant
+    let test_key = format!("sk_test_tenant_{}_{}", tenant_id, Uuid::new_v4());
+    let key_hash = ApiKeyValidator::hash_key(&test_key);
+    api_key_validator.register_key(ApiKeyRecord {
+        key_hash,
+        tenant_id,
+        store_ids,
+        permissions: Permissions::read_write(),
+        agent_id,
+        active: true,
+        rate_limit: None,
+    });
+
+    let authenticator = Arc::new(Authenticator::new(api_key_validator));
+    let auth_state = AuthMiddlewareState {
+        authenticator,
+        require_auth: true,
+        rate_limiter: None,
+    };
+
+    let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
+        auth_state,
+        stateset_sequencer::auth::auth_middleware,
+    ));
+
+    let router = axum::Router::new()
+        .nest("/api", api)
+        .with_state::<()>(state);
+
+    (router, test_key)
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_cross_tenant_schema_read_denied() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_a = Uuid::new_v4();
+    let tenant_b = Uuid::new_v4();
+
+    // Create a schema for tenant_a directly in the database
+    let schema_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO schemas (id, tenant_id, event_type, version, schema_json, status, compatibility, created_at, updated_at)
+        VALUES ($1, $2, 'order.created', 1, '{"type": "object"}', 'active', 'backward', NOW(), NOW())
+        "#,
+    )
+    .bind(schema_id)
+    .bind(tenant_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = create_test_state(pool).await;
+
+    // Create router scoped to tenant_b
+    let (app, api_key) = create_tenant_scoped_router(state, tenant_b, vec![], None);
+
+    // Tenant B tries to read tenant A's schema by ID
+    let uri = format!("/api/v1/schemas/{}", schema_id);
+    let (status, body) = send_request(&app, Method::GET, &uri, None, Some(&api_key)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Cross-tenant schema read should be denied: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_cross_tenant_schema_list_denied() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_a = Uuid::new_v4();
+    let tenant_b = Uuid::new_v4();
+
+    let state = create_test_state(pool).await;
+
+    // Create router scoped to tenant_b
+    let (app, api_key) = create_tenant_scoped_router(state, tenant_b, vec![], None);
+
+    // Tenant B tries to list tenant A's schemas
+    let uri = format!("/api/v1/schemas?tenant_id={}", tenant_a);
+    let (status, body) = send_request(&app, Method::GET, &uri, None, Some(&api_key)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Cross-tenant schema listing should be denied: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_cross_tenant_schema_delete_denied() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_a = Uuid::new_v4();
+    let tenant_b = Uuid::new_v4();
+
+    // Create a schema for tenant_a
+    let schema_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO schemas (id, tenant_id, event_type, version, schema_json, status, compatibility, created_at, updated_at)
+        VALUES ($1, $2, 'order.created', 1, '{"type": "object"}', 'active', 'backward', NOW(), NOW())
+        "#,
+    )
+    .bind(schema_id)
+    .bind(tenant_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = create_test_state(pool).await;
+
+    // Create router scoped to tenant_b with admin permissions
+    let api_key_validator = Arc::new(ApiKeyValidator::new());
+    let test_key = format!("sk_test_admin_{}", Uuid::new_v4());
+    let key_hash = ApiKeyValidator::hash_key(&test_key);
+    api_key_validator.register_key(ApiKeyRecord {
+        key_hash,
+        tenant_id: tenant_b,
+        store_ids: vec![],
+        permissions: Permissions::admin(), // Even admin of tenant B shouldn't delete tenant A's schema
+        agent_id: None,
+        active: true,
+        rate_limit: None,
+    });
+
+    let authenticator = Arc::new(Authenticator::new(api_key_validator));
+    let auth_state = AuthMiddlewareState {
+        authenticator,
+        require_auth: true,
+        rate_limiter: None,
+    };
+
+    let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
+        auth_state,
+        stateset_sequencer::auth::auth_middleware,
+    ));
+
+    let app = axum::Router::new()
+        .nest("/api", api)
+        .with_state::<()>(state);
+
+    // Tenant B tries to delete tenant A's schema
+    let uri = format!("/api/v1/schemas/{}", schema_id);
+    let (status, body) = send_request(&app, Method::DELETE, &uri, None, Some(&test_key)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Cross-tenant schema deletion should be denied: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_cross_tenant_schema_update_status_denied() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_a = Uuid::new_v4();
+    let tenant_b = Uuid::new_v4();
+
+    // Create a schema for tenant_a
+    let schema_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO schemas (id, tenant_id, event_type, version, schema_json, status, compatibility, created_at, updated_at)
+        VALUES ($1, $2, 'order.created', 1, '{"type": "object"}', 'active', 'backward', NOW(), NOW())
+        "#,
+    )
+    .bind(schema_id)
+    .bind(tenant_a)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = create_test_state(pool).await;
+
+    // Create router scoped to tenant_b
+    let (app, api_key) = create_tenant_scoped_router(state, tenant_b, vec![], None);
+
+    // Tenant B tries to update tenant A's schema status
+    let uri = format!("/api/v1/schemas/{}/status", schema_id);
+    let (status, body) = send_request(
+        &app,
+        Method::PUT,
+        &uri,
+        Some(json!({ "status": "deprecated" })),
+        Some(&api_key),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Cross-tenant schema update should be denied: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_agent_scoped_ingest_denies_mismatched_agent() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let agent_a = Uuid::new_v4();
+    let agent_b = Uuid::new_v4();
+
+    let state = create_test_state(pool).await;
+
+    // Create router scoped to agent_a
+    let (app, api_key) = create_tenant_scoped_router(state, tenant_id, vec![store_id], Some(agent_a));
+
+    // Try to ingest events claiming to be from agent_b
+    let event = TestEventBuilder::new()
+        .tenant_id(tenant_id)
+        .store_id(store_id)
+        .source_agent(agent_b) // Mismatched agent
+        .build_json();
+
+    let request_body = json!({
+        "agent_id": agent_b, // Claiming to be agent_b
+        "events": [event]
+    });
+
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/events/ingest",
+        Some(request_body),
+        Some(&api_key),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Agent-scoped ingest with mismatched agent should be denied: {:?}",
+        body
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .map(|s| s.contains("Agent mismatch"))
+            .unwrap_or(false),
+        "Expected 'Agent mismatch' error, got: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_agent_scoped_ingest_allows_matching_agent() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+
+    let state = create_test_state(pool).await;
+
+    // Create router scoped to the correct agent
+    let (app, api_key) = create_tenant_scoped_router(state, tenant_id, vec![store_id], Some(agent_id));
+
+    // Ingest events with matching agent
+    let event = TestEventBuilder::new()
+        .tenant_id(tenant_id)
+        .store_id(store_id)
+        .source_agent(agent_id)
+        .build_json();
+
+    let request_body = json!({
+        "agent_id": agent_id,
+        "events": [event]
+    });
+
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/events/ingest",
+        Some(request_body),
+        Some(&api_key),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "Agent-scoped ingest with matching agent should succeed: {:?}",
+        body
+    );
+    assert_eq!(body["events_accepted"], 1);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_cross_tenant_event_ingest_denied() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_a = Uuid::new_v4();
+    let tenant_b = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let agent_id = Uuid::new_v4();
+
+    let state = create_test_state(pool).await;
+
+    // Create router scoped to tenant_b
+    let (app, api_key) = create_tenant_scoped_router(state, tenant_b, vec![store_id], None);
+
+    // Try to ingest events for tenant_a
+    let event = TestEventBuilder::new()
+        .tenant_id(tenant_a) // Different tenant
+        .store_id(store_id)
+        .source_agent(agent_id)
+        .build_json();
+
+    let request_body = json!({
+        "agent_id": agent_id,
+        "events": [event]
+    });
+
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/events/ingest",
+        Some(request_body),
+        Some(&api_key),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Cross-tenant event ingest should be denied: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_cross_tenant_event_list_denied() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_a = Uuid::new_v4();
+    let tenant_b = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+
+    // Seed events for tenant_a
+    seed_test_events(&pool, tenant_a, store_id, 5).await;
+
+    let state = create_test_state(pool).await;
+
+    // Create router scoped to tenant_b
+    let (app, api_key) = create_tenant_scoped_router(state, tenant_b, vec![], None);
+
+    // Tenant B tries to list tenant A's events
+    let uri = format!(
+        "/api/v1/events?tenant_id={}&store_id={}&from=1&limit=10",
+        tenant_a, store_id
+    );
+    let (status, body) = send_request(&app, Method::GET, &uri, None, Some(&api_key)).await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "Cross-tenant event listing should be denied: {:?}",
+        body
+    );
 }

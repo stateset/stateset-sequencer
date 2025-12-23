@@ -128,6 +128,16 @@ data:
   PORT: "8080"
   RUST_LOG: "info"
   MAX_DB_CONNECTIONS: "20"
+  # Rate limiting
+  RATE_LIMIT_PER_MINUTE: "100"
+  RATE_LIMIT_MAX_ENTRIES: "10000"
+  RATE_LIMIT_WINDOW_SECONDS: "60"
+  # Request size limits
+  MAX_BODY_SIZE_BYTES: "10485760"       # 10MB
+  MAX_EVENTS_PER_BATCH: "1000"
+  MAX_EVENT_PAYLOAD_SIZE: "1048576"     # 1MB
+  # Schema validation
+  SCHEMA_VALIDATION_MODE: "enforce"      # disabled|warn|enforce|required
 ```
 
 ### Secrets

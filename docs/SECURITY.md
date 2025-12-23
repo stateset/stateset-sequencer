@@ -96,6 +96,14 @@ All hash operations use domain separators to prevent cross-protocol attacks:
 "VES_RECEIPT_V1" || receipt_data
 ```
 
+### RFC 8785 JSON Canonicalization
+
+All JSON payloads are canonicalized using [RFC 8785 JSON Canonicalization Scheme (JCS)](https://www.rfc-editor.org/rfc/rfc8785.html) before hashing. This ensures:
+- Deterministic key ordering (lexicographic UTF-8)
+- ES6-compatible number serialization (handles -0, exponents, floats)
+- Consistent hashes across implementations in different languages
+- Cross-platform signature verification
+
 ### Key Derivation
 
 Never use raw keys directly. Always derive purpose-specific keys:
@@ -195,6 +203,14 @@ After revocation:
 
 ## Authentication & Authorization
 
+### Multi-Tenant Isolation
+
+All API endpoints enforce strict tenant isolation:
+- Schema endpoints verify tenant ownership before read/write/delete operations
+- Event ingestion validates tenant_id matches authenticated tenant
+- Agent-scoped tokens can only ingest events with matching agent_id
+- Cross-tenant access attempts return HTTP 403 Forbidden
+
 ### API Authentication
 
 Support multiple authentication methods:
@@ -231,21 +247,44 @@ Authorization: Bearer eyJhbGciOiJFZDI1NTE5...
 
 ### Rate Limiting
 
-Implement rate limits to prevent abuse:
+Implement rate limits to prevent abuse. The sequencer includes bounded in-memory rate limiting with metrics:
 
-```yaml
-# Rate limit configuration
-rate_limits:
-  events_ingest:
-    requests_per_second: 100
-    burst: 500
-  events_read:
-    requests_per_second: 1000
-    burst: 2000
-  commitments:
-    requests_per_second: 10
-    burst: 50
+```bash
+# Environment variables for rate limiting
+RATE_LIMIT_PER_MINUTE=100          # Requests per minute per key
+RATE_LIMIT_MAX_ENTRIES=10000       # Max tracked keys (bounded storage)
+RATE_LIMIT_WINDOW_SECONDS=60       # Window duration
 ```
+
+Features:
+- Per-key rate limiting with sliding window
+- Bounded storage to prevent memory exhaustion (LRU-like eviction)
+- Built-in metrics: `sequencer.ratelimit.allowed`, `sequencer.ratelimit.rejected`, `sequencer.ratelimit.evicted`
+
+### Request Size Limits
+
+Protect against payload abuse with configurable limits:
+
+```bash
+# Environment variables for request limits
+MAX_BODY_SIZE_BYTES=10485760       # 10MB max request body
+MAX_EVENTS_PER_BATCH=1000          # Max events per ingest batch
+MAX_EVENT_PAYLOAD_SIZE=1048576     # 1MB max per event payload
+```
+
+### Schema Validation
+
+Validate event payloads against registered JSON schemas:
+
+```bash
+# Schema validation modes
+SCHEMA_VALIDATION_MODE=disabled    # No validation (fastest)
+SCHEMA_VALIDATION_MODE=warn        # Validate and log, accept all events
+SCHEMA_VALIDATION_MODE=enforce     # Reject invalid payloads, allow missing schemas
+SCHEMA_VALIDATION_MODE=required    # Require schemas for all event types
+```
+
+Events failing schema validation are rejected with `RejectionReason::SchemaValidation`.
 
 ## Network Security
 

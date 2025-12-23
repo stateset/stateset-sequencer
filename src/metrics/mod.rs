@@ -317,6 +317,7 @@ pub mod metric_names {
     // Error counters
     pub const VALIDATION_ERRORS: &str = "sequencer.errors.validation";
     pub const DATABASE_ERRORS: &str = "sequencer.errors.database";
+    pub const SCHEMA_VALIDATION_ERRORS: &str = "sequencer.errors.schema_validation";
 
     // Connection gauges
     pub const ACTIVE_CONNECTIONS: &str = "sequencer.connections.active";
@@ -324,6 +325,16 @@ pub mod metric_names {
 
     // Head sequence
     pub const HEAD_SEQUENCE: &str = "sequencer.head_sequence";
+
+    // Rate limiting
+    pub const RATE_LIMIT_ALLOWED: &str = "sequencer.ratelimit.allowed";
+    pub const RATE_LIMIT_REJECTED: &str = "sequencer.ratelimit.rejected";
+    pub const RATE_LIMIT_ENTRIES: &str = "sequencer.ratelimit.entries";
+    pub const RATE_LIMIT_EVICTED: &str = "sequencer.ratelimit.evicted";
+
+    // Request sizes
+    pub const REQUEST_BODY_SIZE: &str = "sequencer.request.body_size_bytes";
+    pub const EVENTS_PER_BATCH: &str = "sequencer.request.events_per_batch";
 }
 
 /// Timer guard for measuring operation duration
