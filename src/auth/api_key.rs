@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::RwLock;
 use uuid::Uuid;
+use sqlx::postgres::PgPool;
 
 /// API key prefix
 pub const API_KEY_PREFIX: &str = "ss_";
@@ -35,6 +36,17 @@ pub struct ApiKeyRecord {
 
     /// Rate limit (requests per minute)
     pub rate_limit: Option<u32>,
+}
+
+impl ApiKeyRecord {
+    pub fn to_auth_context(&self) -> AuthContext {
+        AuthContext {
+            tenant_id: self.tenant_id,
+            store_ids: self.store_ids.clone(),
+            agent_id: self.agent_id,
+            permissions: self.permissions.clone(),
+        }
+    }
 }
 
 /// API key validator
@@ -107,12 +119,7 @@ impl ApiKeyValidator {
             return Err(AuthError::InvalidApiKey);
         }
 
-        Ok(AuthContext {
-            tenant_id: record.tenant_id,
-            store_ids: record.store_ids.clone(),
-            agent_id: record.agent_id,
-            permissions: record.permissions.clone(),
-        })
+        Ok(record.to_auth_context())
     }
 
     /// Revoke an API key
@@ -144,6 +151,159 @@ pub trait ApiKeyStore: Send + Sync {
 
     /// List API keys for a tenant
     async fn list_for_tenant(&self, tenant_id: &Uuid) -> Result<Vec<ApiKeyRecord>, AuthError>;
+
+    /// Whether any active API keys exist
+    async fn has_any_active(&self) -> Result<bool, AuthError>;
+}
+
+/// PostgreSQL-backed API key store
+pub struct PgApiKeyStore {
+    pool: PgPool,
+}
+
+impl PgApiKeyStore {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct ApiKeyRow {
+    key_hash: String,
+    tenant_id: Uuid,
+    store_ids: Vec<Uuid>,
+    can_read: bool,
+    can_write: bool,
+    can_admin: bool,
+    agent_id: Option<Uuid>,
+    active: bool,
+    rate_limit: Option<i32>,
+}
+
+impl ApiKeyRow {
+    fn to_record(self) -> ApiKeyRecord {
+        ApiKeyRecord {
+            key_hash: self.key_hash,
+            tenant_id: self.tenant_id,
+            store_ids: self.store_ids,
+            permissions: Permissions {
+                read: self.can_read,
+                write: self.can_write,
+                admin: self.can_admin,
+            },
+            agent_id: self.agent_id,
+            active: self.active,
+            rate_limit: self.rate_limit.map(|v| v as u32),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ApiKeyStore for PgApiKeyStore {
+    async fn get_by_hash(&self, key_hash: &str) -> Result<Option<ApiKeyRecord>, AuthError> {
+        let row = sqlx::query_as::<_, ApiKeyRow>(
+            r#"
+            SELECT key_hash, tenant_id, store_ids, can_read, can_write, can_admin,
+                   agent_id, active, rate_limit
+            FROM api_keys
+            WHERE key_hash = $1
+            "#,
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AuthError::InvalidApiKey)?;
+
+        Ok(row.map(ApiKeyRow::to_record))
+    }
+
+    async fn store(&self, record: &ApiKeyRecord) -> Result<(), AuthError> {
+        sqlx::query(
+            r#"
+            INSERT INTO api_keys (
+                key_hash, tenant_id, store_ids,
+                can_read, can_write, can_admin,
+                agent_id, active, rate_limit,
+                created_at, updated_at
+            ) VALUES (
+                $1, $2, $3,
+                $4, $5, $6,
+                $7, $8, $9,
+                NOW(), NOW()
+            )
+            ON CONFLICT (key_hash) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                store_ids = EXCLUDED.store_ids,
+                can_read = EXCLUDED.can_read,
+                can_write = EXCLUDED.can_write,
+                can_admin = EXCLUDED.can_admin,
+                agent_id = EXCLUDED.agent_id,
+                active = EXCLUDED.active,
+                rate_limit = EXCLUDED.rate_limit,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(&record.key_hash)
+        .bind(record.tenant_id)
+        .bind(&record.store_ids)
+        .bind(record.permissions.read)
+        .bind(record.permissions.write)
+        .bind(record.permissions.admin)
+        .bind(record.agent_id)
+        .bind(record.active)
+        .bind(record.rate_limit.map(|v| v as i32))
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AuthError::InvalidApiKey)?;
+
+        Ok(())
+    }
+
+    async fn revoke(&self, key_hash: &str) -> Result<(), AuthError> {
+        sqlx::query(
+            r#"
+            UPDATE api_keys
+            SET active = FALSE,
+                updated_at = NOW()
+            WHERE key_hash = $1
+            "#,
+        )
+        .bind(key_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(|_| AuthError::InvalidApiKey)?;
+
+        Ok(())
+    }
+
+    async fn list_for_tenant(&self, tenant_id: &Uuid) -> Result<Vec<ApiKeyRecord>, AuthError> {
+        let rows = sqlx::query_as::<_, ApiKeyRow>(
+            r#"
+            SELECT key_hash, tenant_id, store_ids, can_read, can_write, can_admin,
+                   agent_id, active, rate_limit
+            FROM api_keys
+            WHERE tenant_id = $1
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| AuthError::InvalidApiKey)?;
+
+        Ok(rows.into_iter().map(ApiKeyRow::to_record).collect())
+    }
+
+    async fn has_any_active(&self) -> Result<bool, AuthError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM api_keys WHERE active = TRUE LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| AuthError::InvalidApiKey)?;
+
+        Ok(row.is_some())
+    }
 }
 
 #[cfg(test)]

@@ -12,11 +12,12 @@ use axum::{
 use std::sync::Arc;
 use uuid::Uuid;
 
-use super::{ApiKeyValidator, AuthContext, AuthError, JwtValidator, Permissions};
+use super::{ApiKeyStore, ApiKeyValidator, AuthContext, AuthError, JwtValidator, Permissions, API_KEY_PREFIX};
 
 /// Combined authenticator supporting both API keys and JWT
 pub struct Authenticator {
     api_key_validator: Arc<ApiKeyValidator>,
+    api_key_store: Option<Arc<dyn ApiKeyStore>>,
     jwt_validator: Option<Arc<JwtValidator>>,
 }
 
@@ -24,8 +25,14 @@ impl Authenticator {
     pub fn new(api_key_validator: Arc<ApiKeyValidator>) -> Self {
         Self {
             api_key_validator,
+            api_key_store: None,
             jwt_validator: None,
         }
+    }
+
+    pub fn with_api_key_store(mut self, store: Arc<dyn ApiKeyStore>) -> Self {
+        self.api_key_store = Some(store);
+        self
     }
 
     pub fn with_jwt(mut self, jwt_validator: Arc<JwtValidator>) -> Self {
@@ -34,7 +41,7 @@ impl Authenticator {
     }
 
     /// Authenticate a request
-    pub fn authenticate(&self, auth_header: Option<&str>) -> Result<AuthContext, AuthError> {
+    pub async fn authenticate(&self, auth_header: Option<&str>) -> Result<AuthContext, AuthError> {
         let header = auth_header.ok_or(AuthError::MissingAuth)?;
 
         // Check for Bearer token (JWT)
@@ -47,15 +54,41 @@ impl Authenticator {
 
         // Check for API key
         if let Some(key) = header.strip_prefix("ApiKey ") {
-            return self.api_key_validator.validate(key);
+            return self.authenticate_api_key(key).await;
         }
 
         // Try as raw API key
-        if header.starts_with("ss_") {
-            return self.api_key_validator.validate(header);
+        if header.starts_with(API_KEY_PREFIX) {
+            return self.authenticate_api_key(header).await;
         }
 
         Err(AuthError::MissingAuth)
+    }
+
+    async fn authenticate_api_key(&self, key: &str) -> Result<AuthContext, AuthError> {
+        if !key.starts_with(API_KEY_PREFIX) {
+            return Err(AuthError::InvalidApiKey);
+        }
+
+        if let Ok(context) = self.api_key_validator.validate(key) {
+            return Ok(context);
+        }
+
+        let Some(store) = &self.api_key_store else {
+            return Err(AuthError::InvalidApiKey);
+        };
+
+        let key_hash = ApiKeyValidator::hash_key(key);
+        let record = store.get_by_hash(&key_hash).await?;
+        let Some(record) = record else {
+            return Err(AuthError::InvalidApiKey);
+        };
+
+        if !record.active {
+            return Err(AuthError::InvalidApiKey);
+        }
+
+        Ok(record.to_auth_context())
     }
 }
 
@@ -85,7 +118,7 @@ pub async fn auth_middleware(
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
 
-    let context = match state.authenticator.authenticate(auth_header) {
+    let context = match state.authenticator.authenticate(auth_header).await {
         Ok(context) => context,
         Err(e) if state.require_auth => return auth_error_response(e),
         Err(_) => AuthContext {
