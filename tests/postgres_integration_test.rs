@@ -336,6 +336,7 @@ async fn postgres_ves_validity_proofs_rest_flow() {
 
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+    let schema_store = Arc::new(stateset_sequencer::infra::PgSchemaStore::new(pool.clone()));
 
     let metrics = Arc::new(stateset_sequencer::metrics::MetricsRegistry::new());
 
@@ -349,6 +350,7 @@ async fn postgres_ves_validity_proofs_rest_flow() {
         anchor_service: None,
         ves_sequencer,
         agent_key_registry,
+        schema_store,
         metrics,
     };
 
@@ -623,6 +625,7 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
 
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+    let schema_store = Arc::new(stateset_sequencer::infra::PgSchemaStore::new(pool.clone()));
 
     let metrics = Arc::new(stateset_sequencer::metrics::MetricsRegistry::new());
 
@@ -636,6 +639,7 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
         anchor_service: None,
         ves_sequencer,
         agent_key_registry,
+        schema_store,
         metrics,
     };
 

@@ -123,6 +123,27 @@ pub fn router() -> Router<AppState> {
         )
         // Agent key management
         .route("/v1/agents/keys", post(handlers::register_agent_key))
+        // Schema registry
+        .route("/v1/schemas", get(handlers::list_schemas))
+        .route("/v1/schemas", post(handlers::register_schema))
+        .route("/v1/schemas/validate", post(handlers::validate_payload))
+        .route("/v1/schemas/:schema_id", get(handlers::get_schema))
+        .route(
+            "/v1/schemas/:schema_id/status",
+            axum::routing::put(handlers::update_schema_status),
+        )
+        .route(
+            "/v1/schemas/:schema_id",
+            axum::routing::delete(handlers::delete_schema),
+        )
+        .route(
+            "/v1/schemas/event-type/:event_type",
+            get(handlers::get_schemas_by_event_type),
+        )
+        .route(
+            "/v1/schemas/event-type/:event_type/latest",
+            get(handlers::get_latest_schema),
+        )
 }
 
 /// Minimal root-level compatibility router for Set Chain's separate anchor service.

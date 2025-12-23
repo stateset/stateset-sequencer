@@ -6,6 +6,7 @@
 
 mod commitment;
 mod event;
+mod schema;
 mod types;
 mod ves_commitment;
 mod ves_compliance;
@@ -14,6 +15,7 @@ mod ves_validity;
 
 pub use commitment::*;
 pub use event::*;
+pub use schema::*;
 pub use types::*;
 pub use ves_commitment::*;
 pub use ves_compliance::*;

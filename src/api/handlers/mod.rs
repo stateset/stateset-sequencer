@@ -6,6 +6,7 @@ pub mod commitments;
 pub mod events;
 pub mod ingest;
 pub mod proofs;
+pub mod schemas;
 pub mod ves;
 
 pub use agent_keys::*;
@@ -14,3 +15,4 @@ pub use commitments::*;
 pub use events::*;
 pub use ingest::*;
 pub use proofs::*;
+pub use schemas::*;

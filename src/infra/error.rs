@@ -90,6 +90,26 @@ pub enum SequencerError {
     /// Invalid entity type
     #[error("invalid entity type: {0}")]
     InvalidEntityType(String),
+
+    /// Schema not found
+    #[error("schema not found for event type: {0}")]
+    SchemaNotFound(String),
+
+    /// Schema version not found
+    #[error("schema version {version} not found for event type: {event_type}")]
+    SchemaVersionNotFound { event_type: String, version: u32 },
+
+    /// Schema validation failed
+    #[error("schema validation failed: {0}")]
+    SchemaValidationFailed(String),
+
+    /// Invalid JSON Schema definition
+    #[error("invalid JSON schema: {0}")]
+    InvalidJsonSchema(String),
+
+    /// Schema compatibility violation
+    #[error("schema compatibility violation: {0}")]
+    SchemaCompatibilityViolation(String),
 }
 
 /// Result type for sequencer operations
@@ -251,6 +271,46 @@ mod tests {
         let err = SequencerError::InvalidEntityType("unknown_type".to_string());
         assert!(err.to_string().contains("invalid entity type"));
         assert!(err.to_string().contains("unknown_type"));
+    }
+
+    #[test]
+    fn test_schema_not_found_error() {
+        let err = SequencerError::SchemaNotFound("order.created".to_string());
+        assert!(err.to_string().contains("schema not found"));
+        assert!(err.to_string().contains("order.created"));
+    }
+
+    #[test]
+    fn test_schema_version_not_found_error() {
+        let err = SequencerError::SchemaVersionNotFound {
+            event_type: "order.created".to_string(),
+            version: 3,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("schema version"));
+        assert!(msg.contains("3"));
+        assert!(msg.contains("order.created"));
+    }
+
+    #[test]
+    fn test_schema_validation_failed_error() {
+        let err = SequencerError::SchemaValidationFailed("missing required field: order_id".to_string());
+        assert!(err.to_string().contains("schema validation failed"));
+        assert!(err.to_string().contains("order_id"));
+    }
+
+    #[test]
+    fn test_invalid_json_schema_error() {
+        let err = SequencerError::InvalidJsonSchema("invalid type keyword".to_string());
+        assert!(err.to_string().contains("invalid JSON schema"));
+        assert!(err.to_string().contains("invalid type keyword"));
+    }
+
+    #[test]
+    fn test_schema_compatibility_violation_error() {
+        let err = SequencerError::SchemaCompatibilityViolation("removed required field".to_string());
+        assert!(err.to_string().contains("schema compatibility violation"));
+        assert!(err.to_string().contains("removed required field"));
     }
 
     #[test]

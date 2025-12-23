@@ -5,10 +5,12 @@
 
 mod agent_keys;
 mod event_store;
+mod schema_store;
 mod sequencer;
 mod ves_sequencer;
 
 pub use agent_keys::*;
 pub use event_store::*;
+pub use schema_store::*;
 pub use sequencer::*;
 pub use ves_sequencer::*;

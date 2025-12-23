@@ -6,8 +6,9 @@ use mockall::automock;
 use uuid::Uuid;
 
 use crate::domain::{
-    AgentId, BatchCommitment, EntityType, EventBatch, EventEnvelope, Hash256, IngestReceipt,
-    MerkleProof, ProjectionResult, SequencedEvent, StoreId, SyncState, TenantId,
+    AgentId, BatchCommitment, EntityType, EventBatch, EventEnvelope, EventType, Hash256,
+    IngestReceipt, MerkleProof, ProjectionResult, Schema, SchemaId, SchemaValidationResult,
+    SequencedEvent, StoreId, SyncState, TenantId,
 };
 
 use super::Result;
@@ -160,6 +161,67 @@ pub trait CommitmentEngine: Send + Sync {
 
     /// Verify an inclusion proof
     fn verify_inclusion(&self, leaf: Hash256, proof: &MerkleProof, root: Hash256) -> bool;
+}
+
+/// Schema registry for event payload validation.
+///
+/// Stores JSON Schema definitions per event type and tenant, supporting
+/// schema versioning and compatibility checks.
+#[cfg_attr(test, automock)]
+#[async_trait]
+pub trait SchemaStore: Send + Sync {
+    /// Register a new schema version for an event type
+    ///
+    /// Returns the assigned version number (auto-incremented per event type).
+    async fn register(&self, schema: Schema) -> Result<Schema>;
+
+    /// Get the latest active schema for an event type
+    async fn get_latest(
+        &self,
+        tenant_id: &TenantId,
+        event_type: &EventType,
+    ) -> Result<Option<Schema>>;
+
+    /// Get a specific schema version
+    async fn get_version(
+        &self,
+        tenant_id: &TenantId,
+        event_type: &EventType,
+        version: u32,
+    ) -> Result<Option<Schema>>;
+
+    /// Get schema by ID
+    async fn get_by_id(&self, schema_id: SchemaId) -> Result<Option<Schema>>;
+
+    /// List all schema versions for an event type
+    async fn list_versions(
+        &self,
+        tenant_id: &TenantId,
+        event_type: &EventType,
+    ) -> Result<Vec<Schema>>;
+
+    /// List all schemas for a tenant
+    async fn list_by_tenant(&self, tenant_id: &TenantId) -> Result<Vec<Schema>>;
+
+    /// Update schema status (active, deprecated, archived)
+    async fn update_status(
+        &self,
+        schema_id: SchemaId,
+        status: crate::domain::SchemaStatus,
+    ) -> Result<()>;
+
+    /// Validate a payload against the latest schema for an event type
+    ///
+    /// Returns a validation result indicating success or failure with details.
+    async fn validate(
+        &self,
+        tenant_id: &TenantId,
+        event_type: &EventType,
+        payload: &serde_json::Value,
+    ) -> Result<SchemaValidationResult>;
+
+    /// Delete a schema (only if not used by any events)
+    async fn delete(&self, schema_id: SchemaId) -> Result<()>;
 }
 
 /// Health check for components

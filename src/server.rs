@@ -27,9 +27,9 @@ use crate::auth::{
 };
 use crate::domain::{StoreId, TenantId};
 use crate::infra::{
-    PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore, PgSequencer,
-    PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore, Sequencer,
-    VesSequencer,
+    PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore, PgSchemaStore,
+    PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore,
+    Sequencer, VesSequencer,
 };
 use crate::metrics::MetricsRegistry;
 
@@ -86,6 +86,7 @@ pub struct AppState {
     pub anchor_service: Option<Arc<AnchorService>>,
     pub ves_sequencer: Arc<VesSequencer<PgAgentKeyRegistry>>,
     pub agent_key_registry: Arc<PgAgentKeyRegistry>,
+    pub schema_store: Arc<PgSchemaStore>,
     pub metrics: Arc<MetricsRegistry>,
 }
 
@@ -216,6 +217,11 @@ pub async fn run() -> anyhow::Result<()> {
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
 
+    // Initialize schema registry
+    let schema_store = Arc::new(PgSchemaStore::new(pool.clone()));
+    schema_store.initialize().await?;
+    info!("Schema registry initialized");
+
     // Initialize metrics registry
     let metrics = Arc::new(MetricsRegistry::new());
     info!("Metrics registry initialized");
@@ -248,6 +254,7 @@ pub async fn run() -> anyhow::Result<()> {
         anchor_service,
         ves_sequencer,
         agent_key_registry,
+        schema_store,
         metrics,
     };
 

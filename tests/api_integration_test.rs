@@ -65,6 +65,7 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
 
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+    let schema_store = Arc::new(stateset_sequencer::infra::PgSchemaStore::new(pool.clone()));
     let metrics = Arc::new(MetricsRegistry::new());
 
     AppState {
@@ -77,6 +78,7 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
         anchor_service: None,
         ves_sequencer,
         agent_key_registry,
+        schema_store,
         metrics,
     }
 }

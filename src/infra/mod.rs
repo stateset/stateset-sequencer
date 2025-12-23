@@ -19,7 +19,7 @@ mod ves_validity;
 pub use commitment::PgCommitmentEngine;
 pub use error::*;
 pub use payload_encryption::{PayloadEncryption, PayloadEncryptionMode};
-pub use postgres::{PgAgentKeyRegistry, PgEventStore, PgSequencer, VesSequencer};
+pub use postgres::{PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer, VesSequencer};
 pub use sqlite::SqliteOutbox;
 pub use traits::*;
 pub use ves_commitment::PgVesCommitmentEngine;

@@ -226,6 +226,112 @@ pub struct AnchorNotificationRequest {
 }
 
 // ============================================================================
+// Schema registry types
+// ============================================================================
+
+/// Query parameters for schema operations.
+#[derive(Debug, Deserialize)]
+pub struct SchemaQuery {
+    pub tenant_id: Uuid,
+}
+
+/// Query parameters for schema by event type.
+#[derive(Debug, Deserialize)]
+pub struct SchemaByEventTypeQuery {
+    pub tenant_id: Uuid,
+    pub event_type: String,
+}
+
+/// Query parameters for schema version.
+#[derive(Debug, Deserialize)]
+pub struct SchemaVersionQuery {
+    pub tenant_id: Uuid,
+    pub event_type: String,
+    pub version: Option<u32>,
+}
+
+/// Request body for registering a schema.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterSchemaRequest {
+    pub tenant_id: Uuid,
+    pub event_type: String,
+    pub schema_json: serde_json::Value,
+    pub description: Option<String>,
+    pub compatibility: Option<String>,
+}
+
+/// Request body for validating a payload against a schema.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidatePayloadRequest {
+    pub tenant_id: Uuid,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub schema_version: Option<u32>,
+}
+
+/// Request body for updating schema status.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSchemaStatusRequest {
+    pub status: String,
+}
+
+/// Response for schema registration.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterSchemaResponse {
+    pub id: Uuid,
+    pub event_type: String,
+    pub version: u32,
+    pub created_at: String,
+}
+
+/// Response for schema details.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaResponse {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub event_type: String,
+    pub version: u32,
+    pub schema_json: serde_json::Value,
+    pub status: String,
+    pub compatibility: String,
+    pub description: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub created_by: Option<String>,
+}
+
+/// Response for schema list.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaListResponse {
+    pub schemas: Vec<SchemaResponse>,
+    pub count: usize,
+}
+
+/// Response for payload validation.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationResponse {
+    pub valid: bool,
+    pub schema_id: Option<Uuid>,
+    pub schema_version: Option<u32>,
+    pub errors: Vec<ValidationErrorResponse>,
+}
+
+/// A single validation error.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValidationErrorResponse {
+    pub path: String,
+    pub message: String,
+}
+
+// ============================================================================
 // Default value functions
 // ============================================================================
 
