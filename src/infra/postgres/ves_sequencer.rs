@@ -47,6 +47,13 @@ struct VesEventRow {
     base_version: Option<i64>,
 }
 
+#[derive(sqlx::FromRow)]
+struct ExistingVesEvent {
+    tenant_id: Uuid,
+    store_id: Uuid,
+    sequence_number: i64,
+}
+
 /// Rejection reason for VES events
 #[derive(Debug, Clone)]
 pub enum VesRejectionReason {
@@ -163,7 +170,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     ) -> Result<u64> {
         sqlx::query(
             r#"
-            INSERT INTO sequence_counters (tenant_id, store_id, current_sequence, updated_at)
+            INSERT INTO ves_sequence_counters (tenant_id, store_id, current_sequence, updated_at)
             VALUES ($1, $2, 0, NOW())
             ON CONFLICT (tenant_id, store_id) DO NOTHING
             "#,
@@ -176,7 +183,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         let row: (i64,) = sqlx::query_as(
             r#"
             SELECT current_sequence
-            FROM sequence_counters
+            FROM ves_sequence_counters
             WHERE tenant_id = $1 AND store_id = $2
             FOR UPDATE
             "#,
@@ -198,7 +205,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     ) -> Result<()> {
         sqlx::query(
             r#"
-            UPDATE sequence_counters
+            UPDATE ves_sequence_counters
             SET current_sequence = $3,
                 updated_at = NOW()
             WHERE tenant_id = $1 AND store_id = $2
@@ -215,7 +222,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     /// Get current head sequence
     pub async fn head(&self, tenant_id: &TenantId, store_id: &StoreId) -> Result<u64> {
         let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT current_sequence FROM sequence_counters WHERE tenant_id = $1 AND store_id = $2",
+            "SELECT current_sequence FROM ves_sequence_counters WHERE tenant_id = $1 AND store_id = $2",
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
@@ -225,18 +232,19 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         Ok(row.map(|r| r.0 as u64).unwrap_or(0))
     }
 
-    async fn get_existing_sequence(
+    async fn get_existing_event(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         event_id: Uuid,
-    ) -> Result<Option<u64>> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT sequence_number FROM ves_events WHERE event_id = $1")
-                .bind(event_id)
-                .fetch_optional(&mut **tx)
-                .await?;
+    ) -> Result<Option<ExistingVesEvent>> {
+        let row: Option<ExistingVesEvent> = sqlx::query_as(
+            "SELECT tenant_id, store_id, sequence_number FROM ves_events WHERE event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_optional(&mut **tx)
+        .await?;
 
-        Ok(row.map(|(seq,)| seq as u64))
+        Ok(row)
     }
 
     async fn get_existing_receipt(
@@ -336,6 +344,14 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             });
         }
 
+        if chrono::DateTime::parse_from_rfc3339(event.created_at_rfc3339()).is_err() {
+            return Some(VesRejectedEvent {
+                event_id: event.event_id,
+                reason: VesRejectionReason::SchemaValidation("created_at".to_string()),
+                message: "created_at must be RFC3339".to_string(),
+            });
+        }
+
         // 2. Validate payload hash
         if !event.verify_payload_hash() {
             let reason = if event.is_plaintext() {
@@ -426,7 +442,9 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         // Parse created_at from string to DateTime (for database storage)
         let created_at_dt = chrono::DateTime::parse_from_rfc3339(&env.created_at)
             .map(|dt| dt.with_timezone(&Utc))
-            .unwrap_or_else(|_| Utc::now());
+            .map_err(|e| {
+                SequencerError::SchemaValidation(format!("created_at must be RFC3339: {}", e))
+            })?;
         let sequenced_at_dt = env.sequenced_at.unwrap_or_else(Utc::now);
 
         let event_signing_hash = event.compute_signing_hash();
@@ -653,7 +671,16 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 });
                 continue;
             }
-            if let Some(_seq) = self.get_existing_sequence(&mut tx, event.event_id).await? {
+            if let Some(existing) = self.get_existing_event(&mut tx, event.event_id).await? {
+                if existing.tenant_id != tenant_id.0 || existing.store_id != store_id.0 {
+                    rejected.push(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::DuplicateEventId,
+                        message: "Event ID already exists".to_string(),
+                    });
+                    continue;
+                }
+
                 if let Some(receipt) = self.get_existing_receipt(&mut tx, event.event_id).await? {
                     receipts.push(receipt);
                     continue;

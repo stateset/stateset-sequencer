@@ -661,7 +661,7 @@ GET /v1/ves/validity/proofs/{proof_id}
 
 ### Verify VES Validity Proof
 
-Verify that a stored proof is internally consistent with the sequencer’s canonical public inputs for the referenced batch.
+Verify that a stored proof is internally consistent with the sequencer’s canonical public inputs for the referenced batch, and that the stored proof bytes match the recorded proof hash.
 This does not perform cryptographic proof verification (SNARK verification is prover/system-specific); it validates `public_inputs` consistency and returns stable hashes for external verifiers.
 
 ```http
@@ -678,6 +678,7 @@ GET /v1/ves/validity/proofs/{proof_id}/verify
   "proof_type": "groth16",
   "proof_version": 1,
   "proof_hash": "hex-32-bytes",
+  "proof_hash_match": true,
   "public_inputs_hash": "hex-32-bytes",
   "canonical_public_inputs_hash": "hex-32-bytes",
   "public_inputs_match": true,
@@ -825,7 +826,7 @@ GET /v1/ves/compliance/proofs/{proof_id}
 
 ### Verify VES Compliance Proof
 
-Verify that a stored proof is internally consistent with the sequencer’s canonical public inputs for the referenced event + policy.
+Verify that a stored proof is internally consistent with the sequencer’s canonical public inputs for the referenced event + policy, and that the stored proof bytes match the recorded proof hash.
 This does not perform cryptographic proof verification.
 
 ```http
@@ -844,6 +845,7 @@ GET /v1/ves/compliance/proofs/{proof_id}/verify
   "policy_id": "aml.amount_lt",
   "policy_hash": "hex-32-bytes",
   "proof_hash": "hex-32-bytes",
+  "proof_hash_match": true,
   "public_inputs_hash": "hex-32-bytes",
   "canonical_public_inputs_hash": "hex-32-bytes",
   "public_inputs_match": true,

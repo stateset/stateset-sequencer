@@ -11,7 +11,9 @@ use crate::api::handlers::ves::ves_compliance_public_inputs;
 use crate::api::types::{SubmitVesComplianceProofRequest, VesComplianceInputsRequest};
 use crate::api::utils::decode_base64_any;
 use crate::auth::AuthContextExt;
-use crate::crypto::{canonical_json_hash, compute_ves_compliance_policy_hash};
+use crate::crypto::{
+    canonical_json_hash, compute_ves_compliance_policy_hash, compute_ves_compliance_proof_hash,
+};
 use crate::server::AppState;
 
 /// POST /api/v1/ves/compliance/:event_id/inputs - Get compliance public inputs.
@@ -306,22 +308,23 @@ pub async fn verify_ves_compliance_proof(
     );
     let canonical_public_inputs_hash = canonical_json_hash(&canonical_public_inputs);
 
-    let public_inputs_match = proof
-        .public_inputs
-        .as_ref()
-        .is_some_and(|v| *v == canonical_public_inputs);
+    let proof_hash_match =
+        compute_ves_compliance_proof_hash(&proof.proof) == proof.proof_hash;
 
     let stored_policy_hash_ok = proof.policy_hash == computed_policy_hash;
 
-    let public_inputs_hash = proof.public_inputs.as_ref().map(|v| {
-        let hash = canonical_json_hash(v);
-        hex::encode(hash)
-    });
+    let stored_public_inputs_hash = proof.public_inputs.as_ref().map(canonical_json_hash);
+    let public_inputs_match = stored_public_inputs_hash
+        .as_ref()
+        .is_some_and(|hash| *hash == canonical_public_inputs_hash);
+    let public_inputs_hash = stored_public_inputs_hash.map(hex::encode);
 
-    let (valid, reason) = if proof.public_inputs.is_none() {
-        (false, Some("missing_public_inputs"))
+    let (valid, reason) = if !proof_hash_match {
+        (false, Some("proof_hash_mismatch"))
     } else if !stored_policy_hash_ok {
         (false, Some("policy_hash_mismatch"))
+    } else if proof.public_inputs.is_none() {
+        (false, Some("missing_public_inputs"))
     } else if !public_inputs_match {
         (false, Some("public_inputs_mismatch"))
     } else {
@@ -338,6 +341,7 @@ pub async fn verify_ves_compliance_proof(
         "policy_id": proof.policy_id,
         "policy_hash": hex::encode(proof.policy_hash),
         "proof_hash": hex::encode(proof.proof_hash),
+        "proof_hash_match": proof_hash_match,
         "public_inputs_hash": public_inputs_hash,
         "canonical_public_inputs_hash": hex::encode(canonical_public_inputs_hash),
         "public_inputs_match": public_inputs_match,

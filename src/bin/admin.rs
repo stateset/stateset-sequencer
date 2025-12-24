@@ -101,7 +101,7 @@ async fn head_sequence(
     store_id: &Uuid,
 ) -> anyhow::Result<u64> {
     let row: Option<(i64,)> = sqlx::query_as(
-        "SELECT current_sequence FROM sequence_counters WHERE tenant_id = $1 AND store_id = $2",
+        "SELECT current_sequence FROM ves_sequence_counters WHERE tenant_id = $1 AND store_id = $2",
     )
     .bind(tenant_id)
     .bind(store_id)
