@@ -1,6 +1,34 @@
 //! PostgreSQL Sequencer implementation
 //!
 //! Provides canonical ordering of events with monotonic sequence numbers.
+//! This is the core component that ensures deterministic event ordering.
+//!
+//! # Ordering Guarantees
+//!
+//! - **Gap-Free**: Sequence numbers are contiguous with no gaps
+//! - **Monotonic**: Each number is strictly greater than the previous
+//! - **Per-Stream**: Sequences are scoped to (tenant_id, store_id) pairs
+//! - **Linearizable**: Total ordering via PostgreSQL transactions
+//!
+//! # Atomicity
+//!
+//! Sequence assignment uses `SELECT FOR UPDATE` on the `sequence_counters` table:
+//! ```sql
+//! BEGIN;
+//! SELECT current_sequence FROM sequence_counters
+//!     WHERE tenant_id = $1 AND store_id = $2 FOR UPDATE;
+//! -- increment and insert event atomically
+//! COMMIT;
+//! ```
+//!
+//! This ensures that even with multiple concurrent requests, each event
+//! receives a unique, sequential number within its stream.
+//!
+//! # Idempotency
+//!
+//! Events are deduplicated by:
+//! - `event_id`: Globally unique, rejects exact duplicates
+//! - `command_id`: Intent-level dedup, same command = same effect
 
 use async_trait::async_trait;
 use chrono::Utc;

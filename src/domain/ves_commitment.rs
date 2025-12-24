@@ -78,6 +78,11 @@ impl VesBatchCommitment {
         )
     }
 
+    /// Create a new batch commitment with explicit state roots.
+    ///
+    /// Note: This function takes many parameters by design - each represents
+    /// a distinct field in the VES commitment structure.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_state_roots(
         tenant_id: TenantId,
         store_id: StoreId,

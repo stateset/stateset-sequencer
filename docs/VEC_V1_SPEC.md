@@ -1,23 +1,3 @@
-Yes — here is the **complete updated VES specification** (production-ready) with:
-
-* **Encrypted payloads (VES-ENC-1)** using AES-256-GCM + HPKE (X25519)
-* **Agent signatures** (Ed25519) with a frozen signing preimage
-* **Unambiguous leaf encoding** with domain separation + fixed binary encodings
-* **Commitment chaining** on-chain via `prev_events_root` to prevent anchored forks
-* Clear **clock drift / ordering semantics** (`sequence_number` is canonical; `created_at` is informational)
-
-You can share this directly with engineering:
-
-[Download VES-SPEC-v1.0.md](sandbox:/mnt/data/VES-SPEC-v1.0.md)
-
----
-
-## VES Specification v1.0 (Updated)
-
-Below is the full text (same as the file):
-
----
-
 # Verifiable Event Sync (VES) Specification v1.0
 
 **Status:** Draft (production-oriented, audit-ready)

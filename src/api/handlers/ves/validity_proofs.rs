@@ -1,4 +1,34 @@
 //! VES validity proof handlers.
+//!
+//! Validity proofs provide cryptographic attestation that a batch commitment
+//! was correctly computed from its constituent events. This enables light
+//! clients to verify batch integrity without processing all events.
+//!
+//! # Proof Workflow
+//!
+//! 1. Sequencer creates a batch commitment with Merkle root
+//! 2. Client retrieves canonical public inputs via `/inputs`
+//! 3. Client generates STARK proof off-chain proving:
+//!    - All leaf hashes are correctly computed
+//!    - Merkle tree is correctly constructed
+//!    - State transition is valid
+//! 4. Client submits proof via `/submit`
+//! 5. Sequencer stores proof with batch commitment
+//!
+//! # Public Inputs
+//!
+//! The canonical public inputs include:
+//! - `batch_id`: Unique commitment identifier
+//! - `prev_state_root`: State root before this batch
+//! - `new_state_root`: State root after this batch
+//! - `merkle_root`: Root of the event Merkle tree
+//! - `leaf_count`: Number of events in batch
+//!
+//! # Security
+//!
+//! - Proofs are encrypted at rest with AES-GCM
+//! - AAD includes batch_id and proof_hash
+//! - Verification can be done on-chain or off-chain
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;

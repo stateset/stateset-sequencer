@@ -23,6 +23,10 @@ impl PgVesValidityProofStore {
         }
     }
 
+    /// Submit a validity proof for a batch commitment.
+    ///
+    /// Note: Parameters represent distinct proof components per VES specification.
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_proof(
         &self,
         tenant_id: &TenantId,

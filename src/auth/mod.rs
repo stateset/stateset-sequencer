@@ -1,10 +1,33 @@
 //! Authentication and authorization for StateSet Sequencer
 //!
-//! Supports:
-//! - API keys (per tenant/store)
-//! - JWT tokens with claims
-//! - Rate limiting per agent/tenant
-//! - Agent signing key registry (VES v1.0 Section 9)
+//! This module provides a flexible authentication system supporting multiple
+//! credential types for different use cases.
+//!
+//! # Authentication Methods
+//!
+//! - **API Keys**: SHA-256 hashed keys stored in database, scoped to tenant/store
+//! - **JWT Tokens**: HMAC-validated tokens with configurable issuer/audience
+//! - **Agent Keys**: Ed25519 public keys for VES v1.0 event signature verification
+//!
+//! # Authorization Model
+//!
+//! Permissions are granted at three levels:
+//! - `read`: Query events, commitments, and proofs
+//! - `write`: Ingest new events
+//! - `admin`: Manage agent keys, schemas, and anchoring
+//!
+//! # Rate Limiting
+//!
+//! Per-tenant rate limiting with configurable limits:
+//! - Sliding window algorithm
+//! - LRU eviction for bounded memory
+//! - Configurable via `RATE_LIMIT_*` environment variables
+//!
+//! # Configuration
+//!
+//! - `AUTH_MODE`: `required` (default) or `disabled` for development
+//! - `BOOTSTRAP_ADMIN_API_KEY`: Initial admin key for setup
+//! - `JWT_SECRET`: HMAC secret for JWT validation
 
 mod agent_keys;
 mod api_key;

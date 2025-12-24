@@ -1,6 +1,30 @@
 //! Domain-specific projection handlers
 //!
-//! Projectors for each domain entity type: Orders, Inventory, Products, Customers, Returns
+//! This module implements state projections for each domain entity type in the e-commerce
+//! system. Projectors apply events to maintain consistent read models with conflict detection.
+//!
+//! # Entity Types
+//!
+//! - **Orders**: Tracks order lifecycle (pending → confirmed → shipped → delivered)
+//! - **Inventory**: Maintains stock levels with adjustment tracking
+//! - **Products**: Catalog management with versioning
+//! - **Customers**: Customer profile and preference management
+//! - **Returns**: Return request processing and status tracking
+//!
+//! # State Machine Pattern
+//!
+//! Each projector implements a state machine that:
+//! 1. Validates the event against current entity state
+//! 2. Checks version conflicts (optimistic concurrency)
+//! 3. Applies state transitions if valid
+//! 4. Returns rejection reason if invalid (e.g., invalid status transition)
+//!
+//! # Conflict Handling
+//!
+//! Events are never silently dropped. If a conflict occurs:
+//! - `ApplyResult::Rejected` is returned with a specific `RejectionReason`
+//! - The caller can then emit an `event.rejected` event for auditability
+//! - Original event remains in the append-only log for debugging
 
 use super::{ApplyResult, DomainProjector, RejectionReason};
 use crate::domain::{SequencedEvent, StoreId, TenantId};

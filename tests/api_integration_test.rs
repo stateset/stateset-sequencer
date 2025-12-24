@@ -7,7 +7,6 @@ mod common;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use base64::Engine;
 use http_body_util::BodyExt;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -18,12 +17,11 @@ use uuid::Uuid;
 use stateset_sequencer::auth::{
     ApiKeyRecord, ApiKeyValidator, AuthMiddlewareState, Authenticator, Permissions, RequestLimits,
 };
-use stateset_sequencer::crypto::StaticKeyManager;
 use stateset_sequencer::domain::{
     AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
 };
 use stateset_sequencer::infra::{
-    IngestService, PayloadEncryption, PayloadEncryptionMode, PgAgentKeyRegistry,
+    IngestService, PayloadEncryption, PgAgentKeyRegistry,
     PgCommitmentEngine, PgEventStore, PgSequencer, PgVesCommitmentEngine,
     PgVesComplianceProofStore, PgVesValidityProofStore, SchemaValidationMode, VesSequencer,
 };

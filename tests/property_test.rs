@@ -20,7 +20,7 @@ use stateset_sequencer::domain::{
 
 /// Generate a random UUID
 fn arb_uuid() -> impl Strategy<Value = Uuid> {
-    any::<[u8; 16]>().prop_map(|bytes| Uuid::from_bytes(bytes))
+    any::<[u8; 16]>().prop_map(Uuid::from_bytes)
 }
 
 /// Generate a random 32-byte hash

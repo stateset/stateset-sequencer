@@ -108,7 +108,7 @@ impl MerkleProof {
         let mut directions = Vec::with_capacity(proof_path.len());
         let mut idx = leaf_index;
         for _ in 0..proof_path.len() {
-            directions.push(idx % 2 == 0); // true if we're on the left
+            directions.push(idx.is_multiple_of(2)); // true if we're on the left
             idx /= 2;
         }
 

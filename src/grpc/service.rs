@@ -113,6 +113,9 @@ impl SequencerService {
     }
 
     /// Convert proto event to domain event envelope
+    ///
+    /// Note: tonic::Status is an external type with fixed size.
+    #[allow(clippy::result_large_err)]
     fn from_proto_event(proto: &EventEnvelope) -> Result<crate::domain::EventEnvelope, Status> {
         let event_id = Uuid::parse_str(&proto.event_id)
             .map_err(|e| Status::invalid_argument(format!("invalid event_id: {}", e)))?;
@@ -287,7 +290,7 @@ impl SequencerTrait for SequencerService {
 
         let tenant_id = TenantId(tenant_id);
         let store_id = StoreId(store_id);
-        let batch_size = req.batch_size.max(1).min(1000) as usize;
+        let batch_size = req.batch_size.clamp(1, 1000) as usize;
         let mut from_sequence = req.from_sequence;
 
         // Clone for async move

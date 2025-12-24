@@ -8,7 +8,8 @@ use stateset_sequencer::crypto::{
     compute_stream_id, compute_ves_compliance_policy_hash,
     compute_ves_compliance_proof_at_rest_aad, compute_ves_compliance_proof_hash,
     compute_ves_state_root, compute_ves_validity_proof_at_rest_aad,
-    compute_ves_validity_proof_hash, is_payload_at_rest_encrypted, Hash256,
+    compute_ves_validity_proof_hash, is_payload_at_rest_encrypted, ComplianceProofAadParams,
+    Hash256,
 };
 use stateset_sequencer::infra::{PayloadEncryption, PayloadEncryptionMode};
 use stateset_sequencer::{StoreId, TenantId};
@@ -334,8 +335,8 @@ async fn main() -> anyhow::Result<()> {
 
                     let is_encrypted = is_payload_at_rest_encrypted(&row.payload_encrypted);
 
-                    if is_encrypted && !force {
-                        if payload_encryption
+                    if is_encrypted && !force
+                        && payload_encryption
                             .decrypt_payload_with_current_key(
                                 &row.tenant_id,
                                 &aad,
@@ -347,7 +348,6 @@ async fn main() -> anyhow::Result<()> {
                             skipped_current_key += 1;
                             continue;
                         }
-                    }
 
                     let plaintext = if is_encrypted {
                         payload_encryption
@@ -523,8 +523,8 @@ async fn main() -> anyhow::Result<()> {
 
                     let is_encrypted = is_payload_at_rest_encrypted(&row.proof);
 
-                    if is_encrypted && !force {
-                        if payload_encryption
+                    if is_encrypted && !force
+                        && payload_encryption
                             .decrypt_payload_with_current_key(&row.tenant_id, &aad, &row.proof)
                             .await
                             .is_ok()
@@ -532,7 +532,6 @@ async fn main() -> anyhow::Result<()> {
                             skipped_current_key += 1;
                             continue;
                         }
-                    }
 
                     let plaintext = if is_encrypted {
                         payload_encryption
@@ -722,21 +721,21 @@ async fn main() -> anyhow::Result<()> {
                     }
 
                     let proof_hash = bytes32("proof_hash", &row.proof_hash)?;
-                    let aad = compute_ves_compliance_proof_at_rest_aad(
-                        &row.tenant_id,
-                        &row.store_id,
-                        &row.event_id,
-                        &row.proof_id,
-                        &policy_hash,
-                        &row.proof_type,
-                        row.proof_version as u32,
-                        &proof_hash,
-                    );
+                    let aad = compute_ves_compliance_proof_at_rest_aad(&ComplianceProofAadParams {
+                        tenant_id: &row.tenant_id,
+                        store_id: &row.store_id,
+                        event_id: &row.event_id,
+                        proof_id: &row.proof_id,
+                        policy_hash: &policy_hash,
+                        proof_type: &row.proof_type,
+                        proof_version: row.proof_version as u32,
+                        proof_hash: &proof_hash,
+                    });
 
                     let is_encrypted = is_payload_at_rest_encrypted(&row.proof);
 
-                    if is_encrypted && !force {
-                        if payload_encryption
+                    if is_encrypted && !force
+                        && payload_encryption
                             .decrypt_payload_with_current_key(&row.tenant_id, &aad, &row.proof)
                             .await
                             .is_ok()
@@ -744,7 +743,6 @@ async fn main() -> anyhow::Result<()> {
                             skipped_current_key += 1;
                             continue;
                         }
-                    }
 
                     let plaintext = if is_encrypted {
                         payload_encryption
@@ -924,7 +922,7 @@ async fn main() -> anyhow::Result<()> {
                     .enumerate()
                     .filter(|(_, r)| r.chain_tx_hash.is_some())
                     .map(|(i, _)| i)
-                    .last();
+                    .next_back();
 
                 let (mut idx, mut prev_end, mut current_prev_root) = if force {
                     (0usize, None, [0u8; 32])
@@ -1148,9 +1146,7 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::bail!("no new events to commit (head_sequence={head})");
                 }
                 let max_events = max_events.max(1);
-                let end = start
-                    .checked_add(max_events.saturating_sub(1))
-                    .unwrap_or(u64::MAX)
+                let end = start.saturating_add(max_events.saturating_sub(1))
                     .min(head);
                 (start, end)
             };

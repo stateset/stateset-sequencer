@@ -128,6 +128,10 @@ impl VesEventEnvelope {
     /// Create a new plaintext event envelope
     ///
     /// Automatically computes payload_plain_hash and signs with the provided key
+    ///
+    /// Note: This function takes many parameters by design - each parameter represents
+    /// a distinct VES v1.0 specification field that must be provided explicitly.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_plaintext(
         tenant_id: TenantId,
         store_id: StoreId,
@@ -194,6 +198,10 @@ impl VesEventEnvelope {
     /// Create a new encrypted event envelope
     ///
     /// Takes pre-computed encrypted payload and hashes
+    ///
+    /// Note: This function takes many parameters by design - each parameter represents
+    /// a distinct VES v1.0 specification field that must be provided explicitly.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_encrypted(
         tenant_id: TenantId,
         store_id: StoreId,
@@ -313,7 +321,7 @@ impl VesEventEnvelope {
                         entity_type: self.entity_type.as_str(),
                         entity_id: &self.entity_id,
                         event_type: self.event_type.as_str(),
-                        created_at: &created_at_str,
+                        created_at: created_at_str,
                         payload_plain_hash: &self.payload_plain_hash,
                     };
                     let aad = compute_payload_aad(&aad_params);

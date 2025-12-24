@@ -733,27 +733,30 @@ pub fn compute_ves_validity_proof_at_rest_aad(
     hasher.finalize().into()
 }
 
+/// Parameters for computing compliance proof encryption-at-rest AAD.
+pub struct ComplianceProofAadParams<'a> {
+    pub tenant_id: &'a Uuid,
+    pub store_id: &'a Uuid,
+    pub event_id: &'a Uuid,
+    pub proof_id: &'a Uuid,
+    pub policy_hash: &'a Hash256,
+    pub proof_type: &'a str,
+    pub proof_version: u32,
+    pub proof_hash: &'a Hash256,
+}
+
 /// Compute encryption-at-rest AAD for a VES compliance proof row.
-pub fn compute_ves_compliance_proof_at_rest_aad(
-    tenant_id: &Uuid,
-    store_id: &Uuid,
-    event_id: &Uuid,
-    proof_id: &Uuid,
-    policy_hash: &Hash256,
-    proof_type: &str,
-    proof_version: u32,
-    proof_hash: &Hash256,
-) -> Hash256 {
+pub fn compute_ves_compliance_proof_at_rest_aad(params: &ComplianceProofAadParams<'_>) -> Hash256 {
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_STATESET_VES_COMPLIANCE_PROOF_ATREST_AAD_V1);
-    hasher.update(tenant_id.as_bytes());
-    hasher.update(store_id.as_bytes());
-    hasher.update(event_id.as_bytes());
-    hasher.update(proof_id.as_bytes());
-    hasher.update(policy_hash);
-    hasher.update(u32_be(proof_version));
-    hasher.update(encode_string(proof_type));
-    hasher.update(proof_hash);
+    hasher.update(params.tenant_id.as_bytes());
+    hasher.update(params.store_id.as_bytes());
+    hasher.update(params.event_id.as_bytes());
+    hasher.update(params.proof_id.as_bytes());
+    hasher.update(params.policy_hash);
+    hasher.update(u32_be(params.proof_version));
+    hasher.update(encode_string(params.proof_type));
+    hasher.update(params.proof_hash);
     hasher.finalize().into()
 }
 
@@ -937,7 +940,7 @@ impl KeyManager for InMemoryKeyManager {
     async fn rotate_tenant_key(&self, tenant_id: &Uuid) -> Result<EncryptionKey, EncryptionError> {
         let new_key = generate_key();
         let mut keys = self.keys.write().unwrap();
-        let entry = keys.entry(*tenant_id).or_insert_with(Vec::new);
+        let entry = keys.entry(*tenant_id).or_default();
         entry.insert(0, new_key);
         Ok(new_key)
     }

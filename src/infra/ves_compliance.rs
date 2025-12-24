@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::crypto::{
     compute_ves_compliance_policy_hash, compute_ves_compliance_proof_at_rest_aad,
-    compute_ves_compliance_proof_hash,
+    compute_ves_compliance_proof_hash, ComplianceProofAadParams,
 };
 use crate::domain::{Hash256, StoreId, TenantId, VesComplianceProof, VesComplianceProofSummary};
 use crate::infra::{PayloadEncryption, Result, SequencerError};
@@ -85,6 +85,10 @@ impl PgVesComplianceProofStore {
         }))
     }
 
+    /// Submit a compliance proof for an event.
+    ///
+    /// Note: Parameters represent distinct proof components per VES specification.
+    #[allow(clippy::too_many_arguments)]
     pub async fn submit_proof(
         &self,
         tenant_id: &TenantId,
@@ -122,16 +126,16 @@ impl PgVesComplianceProofStore {
         let proof_hash = compute_ves_compliance_proof_hash(&proof);
         let proof_id = Uuid::new_v4();
 
-        let aad = compute_ves_compliance_proof_at_rest_aad(
-            &tenant_id.0,
-            &store_id.0,
-            &event_id,
-            &proof_id,
-            &policy_hash,
+        let aad = compute_ves_compliance_proof_at_rest_aad(&ComplianceProofAadParams {
+            tenant_id: &tenant_id.0,
+            store_id: &store_id.0,
+            event_id: &event_id,
+            proof_id: &proof_id,
+            policy_hash: &policy_hash,
             proof_type,
             proof_version,
-            &proof_hash,
-        );
+            proof_hash: &proof_hash,
+        });
 
         let ciphertext = self
             .payload_encryption
@@ -330,16 +334,16 @@ impl PgVesComplianceProofStore {
             .try_into()
             .map_err(|_| SequencerError::Internal("invalid proof_hash length".to_string()))?;
 
-        let aad = compute_ves_compliance_proof_at_rest_aad(
-            &row.tenant_id,
-            &row.store_id,
-            &row.event_id,
-            &row.proof_id,
-            &policy_hash,
-            &row.proof_type,
-            row.proof_version as u32,
-            &proof_hash,
-        );
+        let aad = compute_ves_compliance_proof_at_rest_aad(&ComplianceProofAadParams {
+            tenant_id: &row.tenant_id,
+            store_id: &row.store_id,
+            event_id: &row.event_id,
+            proof_id: &row.proof_id,
+            policy_hash: &policy_hash,
+            proof_type: &row.proof_type,
+            proof_version: row.proof_version as u32,
+            proof_hash: &proof_hash,
+        });
 
         let plaintext = self
             .payload_encryption

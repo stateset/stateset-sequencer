@@ -683,7 +683,7 @@ fn test_signing_hash_cross_platform() {
         "Created at encoded: {:?}",
         encode_string("2025-12-20T17:51:10.243Z")
     );
-    println!("Computed hash: {}", hex::encode(&hash));
+    println!("Computed hash: {}", hex::encode(hash));
 
     // Expected hash from CLI
     let expected =
@@ -867,7 +867,7 @@ mod rfc8785_tests {
     fn test_rfc8785_spec_vectors() {
         // RFC 8785 Appendix B.2 test vector
         let value = json!({
-            "numbers": [333333333.33333329, 1e30, 4.5e-308, 1e-305],
+            "numbers": [333_333_333.333_333_3, 1e30, 4.5e-308, 1e-305],
             "string": "\u{0080}",
             "literals": [null, true, false]
         });

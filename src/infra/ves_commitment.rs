@@ -1129,8 +1129,8 @@ mod tests {
         }
 
         // Last 3 should be pad leaves
-        for i in 5..8 {
-            assert_eq!(padded[i], pad_leaf());
+        for leaf in padded.iter().skip(5).take(3) {
+            assert_eq!(*leaf, pad_leaf());
         }
     }
 

@@ -143,7 +143,7 @@ async fn test_grpc_push_events_success() {
 
     assert_eq!(response.events_accepted, 1);
     assert_eq!(response.events_rejected.len(), 0);
-    assert!(response.batch_id.len() > 0);
+    assert!(!response.batch_id.is_empty());
     assert_eq!(response.assigned_sequence_start, 1);
     assert_eq!(response.assigned_sequence_end, 1);
 }

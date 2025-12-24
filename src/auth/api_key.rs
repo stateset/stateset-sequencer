@@ -181,7 +181,7 @@ struct ApiKeyRow {
 }
 
 impl ApiKeyRow {
-    fn to_record(self) -> ApiKeyRecord {
+    fn into_record(self) -> ApiKeyRecord {
         ApiKeyRecord {
             key_hash: self.key_hash,
             tenant_id: self.tenant_id,
@@ -214,7 +214,7 @@ impl ApiKeyStore for PgApiKeyStore {
         .await
         .map_err(|_| AuthError::InvalidApiKey)?;
 
-        Ok(row.map(ApiKeyRow::to_record))
+        Ok(row.map(ApiKeyRow::into_record))
     }
 
     async fn store(&self, record: &ApiKeyRecord) -> Result<(), AuthError> {
@@ -291,7 +291,7 @@ impl ApiKeyStore for PgApiKeyStore {
         .await
         .map_err(|_| AuthError::InvalidApiKey)?;
 
-        Ok(rows.into_iter().map(ApiKeyRow::to_record).collect())
+        Ok(rows.into_iter().map(ApiKeyRow::into_record).collect())
     }
 
     async fn has_any_active(&self) -> Result<bool, AuthError> {

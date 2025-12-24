@@ -26,8 +26,10 @@ pub type EncryptionPublicKey = [u8; 32];
     Debug, Clone, Copy, PartialEq, Eq, serde_repr::Serialize_repr, serde_repr::Deserialize_repr,
 )]
 #[repr(u32)]
+#[derive(Default)]
 pub enum PayloadKind {
     /// Plaintext payload (payload field present, payload_encrypted absent)
+    #[default]
     Plaintext = 0,
     /// Encrypted payload (payload absent/null, payload_encrypted present)
     Encrypted = 1,
@@ -50,11 +52,6 @@ impl PayloadKind {
     }
 }
 
-impl Default for PayloadKind {
-    fn default() -> Self {
-        PayloadKind::Plaintext
-    }
-}
 
 /// Agent key identifier for key rotation
 /// Each agent can have multiple signing keys identified by this ID

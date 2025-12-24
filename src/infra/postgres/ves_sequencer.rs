@@ -51,7 +51,16 @@ struct VesEventRow {
 struct ExistingVesEvent {
     tenant_id: Uuid,
     store_id: Uuid,
+}
+
+/// Row data for an existing sequencer receipt
+#[derive(sqlx::FromRow)]
+struct ExistingReceiptRow {
+    sequencer_id: Uuid,
     sequence_number: i64,
+    sequenced_at: chrono::DateTime<Utc>,
+    receipt_hash: Vec<u8>,
+    sequencer_signature: Option<Vec<u8>>,
 }
 
 /// Rejection reason for VES events
@@ -238,7 +247,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         event_id: Uuid,
     ) -> Result<Option<ExistingVesEvent>> {
         let row: Option<ExistingVesEvent> = sqlx::query_as(
-            "SELECT tenant_id, store_id, sequence_number FROM ves_events WHERE event_id = $1",
+            "SELECT tenant_id, store_id FROM ves_events WHERE event_id = $1",
         )
         .bind(event_id)
         .fetch_optional(&mut **tx)
@@ -252,29 +261,27 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         tx: &mut Transaction<'_, Postgres>,
         event_id: Uuid,
     ) -> Result<Option<VesSequencerReceipt>> {
-        let row: Option<(Uuid, i64, chrono::DateTime<Utc>, Vec<u8>, Option<Vec<u8>>)> =
-            sqlx::query_as(
-                r#"
-                SELECT sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature
-                FROM ves_sequencer_receipts
-                WHERE event_id = $1
-                "#,
-            )
-            .bind(event_id)
-            .fetch_optional(&mut **tx)
-            .await?;
+        let row: Option<ExistingReceiptRow> = sqlx::query_as(
+            r#"
+            SELECT sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature
+            FROM ves_sequencer_receipts
+            WHERE event_id = $1
+            "#,
+        )
+        .bind(event_id)
+        .fetch_optional(&mut **tx)
+        .await?;
 
-        let Some((sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature)) =
-            row
-        else {
+        let Some(row) = row else {
             return Ok(None);
         };
 
-        let receipt_hash: Hash256 = receipt_hash
+        let receipt_hash: Hash256 = row
+            .receipt_hash
             .try_into()
             .map_err(|_| SequencerError::Internal("invalid receipt_hash".into()))?;
 
-        let sequencer_signature = match sequencer_signature {
+        let sequencer_signature = match row.sequencer_signature {
             Some(bytes) => {
                 let sig: Signature64 = bytes
                     .try_into()
@@ -294,10 +301,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         };
 
         Ok(Some(VesSequencerReceipt {
-            sequencer_id,
+            sequencer_id: row.sequencer_id,
             event_id,
-            sequence_number: sequence_number as u64,
-            sequenced_at,
+            sequence_number: row.sequence_number as u64,
+            sequenced_at: row.sequenced_at,
             receipt_hash,
             signature_alg,
             sequencer_signature,
@@ -409,10 +416,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             event_type = %event.event_type,
             created_at = %event.created_at,
             payload_kind = ?event.payload_kind,
-            payload_plain_hash = %hex::encode(&event.payload_plain_hash),
-            payload_cipher_hash = %hex::encode(&event.payload_cipher_hash),
-            computed_signing_hash = %hex::encode(&signing_hash),
-            agent_signature = %hex::encode(&event.agent_signature),
+            payload_plain_hash = %hex::encode(event.payload_plain_hash),
+            payload_cipher_hash = %hex::encode(event.payload_cipher_hash),
+            computed_signing_hash = %hex::encode(signing_hash),
+            agent_signature = %hex::encode(event.agent_signature),
             "VES signature verification"
         );
 

@@ -28,7 +28,7 @@ pub fn random_event_id() -> Uuid {
 
 /// Generate a random entity ID
 pub fn random_entity_id(prefix: &str) -> String {
-    format!("{}-{}", prefix, Uuid::new_v4().to_string()[..8].to_string())
+    format!("{}-{}", prefix, &Uuid::new_v4().to_string()[..8])
 }
 
 /// Compute SHA-256 hash of JSON payload

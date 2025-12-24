@@ -37,10 +37,12 @@ impl std::fmt::Display for SchemaId {
 /// Schema compatibility mode for version upgrades
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SchemaCompatibility {
     /// New schema can read data written by old schema (forward compatible)
     Forward,
     /// Old schema can read data written by new schema (backward compatible)
+    #[default]
     Backward,
     /// Both forward and backward compatible
     Full,
@@ -48,17 +50,14 @@ pub enum SchemaCompatibility {
     None,
 }
 
-impl Default for SchemaCompatibility {
-    fn default() -> Self {
-        SchemaCompatibility::Backward
-    }
-}
 
 /// Schema status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SchemaStatus {
     /// Schema is active and used for validation
+    #[default]
     Active,
     /// Schema is deprecated but still valid for existing events
     Deprecated,
@@ -66,11 +65,6 @@ pub enum SchemaStatus {
     Archived,
 }
 
-impl Default for SchemaStatus {
-    fn default() -> Self {
-        SchemaStatus::Active
-    }
-}
 
 /// A registered schema for an event type
 #[derive(Debug, Clone, Serialize, Deserialize)]

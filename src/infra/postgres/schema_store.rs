@@ -86,6 +86,9 @@ impl PgSchemaStore {
     }
 
     /// Convert database row to Schema
+    ///
+    /// Note: Parameters map directly to database columns - splitting would reduce clarity.
+    #[allow(clippy::too_many_arguments)]
     fn row_to_schema(
         id: Uuid,
         tenant_id: Uuid,

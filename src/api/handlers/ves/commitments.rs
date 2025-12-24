@@ -180,9 +180,7 @@ pub async fn commit_and_anchor_ves_commitment(
             }
 
             let max_events = request.max_events.unwrap_or(1024).max(1);
-            let end = start
-                .checked_add(max_events.saturating_sub(1))
-                .unwrap_or(u64::MAX)
+            let end = start.saturating_add(max_events.saturating_sub(1))
                 .min(head);
             (start, end)
         }

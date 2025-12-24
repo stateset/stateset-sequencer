@@ -236,7 +236,7 @@ pub trait AgentKeyRegistry: Send + Sync {
     ) -> Result<AgentVerifyingKey, AgentKeyError> {
         let entry = self.get_key(lookup).await?;
         AgentVerifyingKey::from_bytes(&entry.public_key)
-            .map_err(|e| AgentKeyError::SignatureVerificationFailed(e))
+            .map_err(AgentKeyError::SignatureVerificationFailed)
     }
 
     /// Get the verifying key valid at a specific time
@@ -247,7 +247,7 @@ pub trait AgentKeyRegistry: Send + Sync {
     ) -> Result<AgentVerifyingKey, AgentKeyError> {
         let entry = self.get_valid_key_at(lookup, at).await?;
         AgentVerifyingKey::from_bytes(&entry.public_key)
-            .map_err(|e| AgentKeyError::SignatureVerificationFailed(e))
+            .map_err(AgentKeyError::SignatureVerificationFailed)
     }
 }
 
@@ -291,7 +291,7 @@ impl AgentKeyRegistry for InMemoryAgentKeyRegistry {
         let keys = self.keys.read().unwrap();
         keys.get(lookup)
             .cloned()
-            .ok_or_else(|| AgentKeyError::KeyNotFound {
+            .ok_or(AgentKeyError::KeyNotFound {
                 tenant_id: lookup.tenant_id,
                 agent_id: lookup.agent_id,
                 key_id: lookup.key_id,
@@ -330,7 +330,7 @@ impl AgentKeyRegistry for InMemoryAgentKeyRegistry {
         let mut keys = self.keys.write().unwrap();
         let entry = keys
             .get_mut(lookup)
-            .ok_or_else(|| AgentKeyError::KeyNotFound {
+            .ok_or(AgentKeyError::KeyNotFound {
                 tenant_id: lookup.tenant_id,
                 agent_id: lookup.agent_id,
                 key_id: lookup.key_id,

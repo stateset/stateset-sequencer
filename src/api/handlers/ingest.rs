@@ -1,4 +1,30 @@
-//! Event ingestion handlers.
+//! Event ingestion handlers for the VES v1.0 sequencer.
+//!
+//! This module provides HTTP handlers for ingesting events into the sequencer.
+//! It supports both legacy event formats and VES v1.0 compliant event envelopes.
+//!
+//! # Ingestion Flow
+//!
+//! 1. **Authentication**: Verify API key or JWT, extract tenant context
+//! 2. **Rate Limiting**: Check per-tenant request limits
+//! 3. **Schema Validation**: Validate payloads against registered JSON schemas
+//! 4. **Deduplication**: Check event_id and command_id for duplicates
+//! 5. **Signature Verification**: Verify agent Ed25519 signatures (VES events)
+//! 6. **Sequencing**: Assign monotonic sequence numbers atomically
+//! 7. **Persistence**: Store events in append-only log
+//! 8. **Receipt Generation**: Return signed sequencer receipts
+//!
+//! # Validation Modes
+//!
+//! Schema validation can be configured via `SCHEMA_VALIDATION_MODE`:
+//! - `disabled`: No validation, all payloads accepted
+//! - `warn`: Log validation failures but accept events
+//! - `strict`: Reject events that fail schema validation
+//!
+//! # Error Handling
+//!
+//! Invalid events are not silently dropped. They are returned in the response
+//! with detailed rejection reasons for debugging.
 
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;

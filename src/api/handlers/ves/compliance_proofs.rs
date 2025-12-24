@@ -1,4 +1,29 @@
 //! VES compliance proof handlers.
+//!
+//! Compliance proofs provide cryptographic attestation that an event satisfies
+//! a compliance policy (e.g., GDPR data handling, AML checks, trade sanctions).
+//!
+//! # Proof Workflow
+//!
+//! 1. Client retrieves canonical public inputs for an event via `/inputs`
+//! 2. Client generates STARK proof off-chain using the inputs
+//! 3. Client submits proof via `/submit` with policy ID and parameters
+//! 4. Sequencer verifies the proof hash matches inputs
+//! 5. Proof is encrypted at rest and stored with the event
+//!
+//! # Policy Hashing
+//!
+//! The policy is identified by a deterministic hash of:
+//! - `policy_id`: Unique policy identifier string
+//! - `policy_params`: JSON object of policy parameters
+//!
+//! This allows the same policy logic to be applied with different parameters.
+//!
+//! # Security
+//!
+//! - Proofs are encrypted at rest with AES-GCM
+//! - AAD includes event_id, proof_id, and policy_hash to prevent substitution
+//! - Proof hash is stored separately for verification without decryption
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;

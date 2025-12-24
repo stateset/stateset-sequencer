@@ -503,8 +503,8 @@ async fn postgres_ves_validity_proofs_rest_flow() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let verify_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(verify_json["valid"].as_bool().unwrap(), true);
-    assert_eq!(verify_json["public_inputs_match"].as_bool().unwrap(), true);
+    assert!(verify_json["valid"].as_bool().unwrap());
+    assert!(verify_json["public_inputs_match"].as_bool().unwrap());
 
     let conflict_body = json!({
         "proofType": "groth16",
@@ -801,8 +801,8 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
         String::from_utf8_lossy(&body)
     );
     let verify_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(verify_json["valid"].as_bool().unwrap(), true);
-    assert_eq!(verify_json["public_inputs_match"].as_bool().unwrap(), true);
+    assert!(verify_json["valid"].as_bool().unwrap());
+    assert!(verify_json["public_inputs_match"].as_bool().unwrap());
 
     let conflict_body = json!({
         "proofType": "stark",
