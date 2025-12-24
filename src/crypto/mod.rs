@@ -10,6 +10,9 @@ mod encrypt;
 mod hash;
 mod signing;
 
+#[cfg(test)]
+mod tests;
+
 pub use encrypt::*;
 pub use hash::*;
 pub use signing::*;

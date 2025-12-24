@@ -1,0 +1,96 @@
+# Pre-commit hooks for StateSet Sequencer
+# Install: pip install pre-commit && pre-commit install
+
+default_stages: [commit]
+fail_fast: false
+
+repos:
+  # Standard pre-commit hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.5.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: [--unsafe]
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=1000']
+      - id: detect-private-key
+      - id: check-case-conflict
+
+  # Rust-specific hooks
+  - repo: local
+    hooks:
+      # Format check
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # Clippy linting
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [commit]
+
+      # Unit tests (fast)
+      - id: cargo-test
+        name: cargo test (fast)
+        entry: bash -c 'cargo test --lib -- --test-threads=4'
+        language: system
+        types: [rust]
+        pass_filenames: false
+        stages: [push]
+
+      # Check for TODO/FIXME comments (warning only)
+      - id: check-todos
+        name: check TODOs
+        entry: bash -c 'git diff --cached --name-only | xargs grep -l "TODO\|FIXME" || true'
+        language: system
+        verbose: true
+        stages: [commit]
+
+      # Check for debug/println statements
+      - id: no-debug-prints
+        name: no debug prints
+        entry: bash -c 'git diff --cached --name-only -- "*.rs" | xargs grep -l "println!\|dbg!\|eprintln!" && exit 1 || exit 0'
+        language: system
+        types: [rust]
+        stages: [commit]
+
+      # Security audit (on push only, slow)
+      - id: cargo-audit
+        name: cargo audit
+        entry: cargo audit
+        language: system
+        pass_filenames: false
+        stages: [push]
+
+  # Markdown linting
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.38.0
+    hooks:
+      - id: markdownlint
+        args: ['--fix', '--ignore', 'target/**']
+
+  # Shell script linting
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.9.0.6
+    hooks:
+      - id: shellcheck
+        args: ['--severity=warning']
+
+  # Commit message format
+  - repo: https://github.com/commitizen-tools/commitizen
+    rev: v3.13.0
+    hooks:
+      - id: commitizen
+        stages: [commit-msg]

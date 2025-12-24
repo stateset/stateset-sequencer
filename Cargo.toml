@@ -7,6 +7,28 @@ description = "Verifiable Event Sync (VES) sequencer for deterministic event ord
 license = "MIT"
 repository = "https://github.com/stateset/stateset-sequencer"
 
+[features]
+default = ["full"]
+full = ["grpc", "telemetry", "anchoring", "schema-validation"]
+
+# Enable gRPC service (adds tonic/prost dependencies)
+grpc = []
+
+# Enable OpenTelemetry distributed tracing and OTLP export
+telemetry = []
+
+# Enable L2 blockchain anchoring (adds alloy dependency)
+anchoring = []
+
+# Enable JSON Schema validation (adds jsonschema dependency)
+schema-validation = []
+
+# Enable SQLite backend for embedded/local agents
+sqlite = []
+
+# Enable payload encryption at rest
+encryption = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

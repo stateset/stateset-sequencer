@@ -4,9 +4,12 @@
 //! organized by domain for maintainability.
 
 pub mod auth_helpers;
+pub mod error;
 pub mod handlers;
 pub mod types;
 pub mod utils;
+
+pub use error::{ApiError, ErrorCode, ErrorDetails};
 
 use axum::routing::{get, post};
 use axum::Router;

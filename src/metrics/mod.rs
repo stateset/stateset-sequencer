@@ -1,6 +1,13 @@
 //! Metrics and observability for StateSet Sequencer
 //!
 //! Provides metrics collection, health checks, and debugging endpoints.
+//!
+//! # Metrics Categories
+//!
+//! - **Counters**: Monotonically increasing values (events ingested, errors)
+//! - **Gauges**: Point-in-time values (active connections, queue depth)
+//! - **Histograms**: Distribution of values (latencies, sizes)
+//! - **Labels**: Dimensional metrics for tenant/store breakdowns
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,16 +15,94 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
+/// Label set for dimensional metrics
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Labels(Vec<(String, String)>);
+
+impl Labels {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn with(mut self, key: &str, value: &str) -> Self {
+        self.0.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    pub fn tenant(self, tenant_id: &str) -> Self {
+        self.with("tenant_id", tenant_id)
+    }
+
+    pub fn store(self, store_id: &str) -> Self {
+        self.with("store_id", store_id)
+    }
+
+    pub fn method(self, method: &str) -> Self {
+        self.with("method", method)
+    }
+
+    pub fn status(self, status: &str) -> Self {
+        self.with("status", status)
+    }
+
+    pub fn error_type(self, error_type: &str) -> Self {
+        self.with("error_type", error_type)
+    }
+
+    pub fn cache_name(self, name: &str) -> Self {
+        self.with("cache", name)
+    }
+
+    pub fn circuit(self, name: &str) -> Self {
+        self.with("circuit", name)
+    }
+
+    fn to_suffix(&self) -> String {
+        if self.0.is_empty() {
+            return String::new();
+        }
+        let parts: Vec<String> = self.0.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        format!("{{{}}}", parts.join(","))
+    }
+
+    fn to_prometheus_labels(&self) -> String {
+        if self.0.is_empty() {
+            return String::new();
+        }
+        let parts: Vec<String> = self
+            .0
+            .iter()
+            .map(|(k, v)| format!("{}=\"{}\"", k, v))
+            .collect();
+        format!("{{{}}}", parts.join(","))
+    }
+}
+
+impl Default for Labels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Global metrics registry
 pub struct MetricsRegistry {
     /// Counter metrics
     counters: RwLock<HashMap<String, Arc<AtomicU64>>>,
 
+    /// Labeled counter metrics
+    labeled_counters: RwLock<HashMap<String, HashMap<Labels, Arc<AtomicU64>>>>,
+
     /// Gauge metrics (current values)
     gauges: RwLock<HashMap<String, Arc<AtomicU64>>>,
 
+    /// Labeled gauge metrics
+    labeled_gauges: RwLock<HashMap<String, HashMap<Labels, Arc<AtomicU64>>>>,
+
     /// Histogram metrics (bucketed)
     histograms: RwLock<HashMap<String, Arc<Histogram>>>,
+
+    /// Labeled histogram metrics
+    labeled_histograms: RwLock<HashMap<String, HashMap<Labels, Arc<Histogram>>>>,
 
     /// Service start time
     start_time: Instant,
@@ -27,8 +112,11 @@ impl MetricsRegistry {
     pub fn new() -> Self {
         Self {
             counters: RwLock::new(HashMap::new()),
+            labeled_counters: RwLock::new(HashMap::new()),
             gauges: RwLock::new(HashMap::new()),
+            labeled_gauges: RwLock::new(HashMap::new()),
             histograms: RwLock::new(HashMap::new()),
+            labeled_histograms: RwLock::new(HashMap::new()),
             start_time: Instant::now(),
         }
     }
@@ -104,6 +192,92 @@ impl MetricsRegistry {
         histogram.observe(value).await;
     }
 
+    // =========================================================================
+    // Labeled metrics methods
+    // =========================================================================
+
+    /// Increment a labeled counter
+    pub async fn inc_counter_labeled(&self, name: &str, labels: Labels) {
+        self.add_counter_labeled(name, labels, 1).await;
+    }
+
+    /// Add to a labeled counter
+    pub async fn add_counter_labeled(&self, name: &str, labels: Labels, value: u64) {
+        let counters = self.labeled_counters.read().await;
+        if let Some(label_map) = counters.get(name) {
+            if let Some(counter) = label_map.get(&labels) {
+                counter.fetch_add(value, Ordering::Relaxed);
+                return;
+            }
+        }
+        drop(counters);
+
+        // Create new counter
+        let mut counters = self.labeled_counters.write().await;
+        let label_map = counters.entry(name.to_string()).or_default();
+        let counter = label_map
+            .entry(labels)
+            .or_insert_with(|| Arc::new(AtomicU64::new(0)));
+        counter.fetch_add(value, Ordering::Relaxed);
+    }
+
+    /// Set a labeled gauge value
+    pub async fn set_gauge_labeled(&self, name: &str, labels: Labels, value: u64) {
+        let gauges = self.labeled_gauges.read().await;
+        if let Some(label_map) = gauges.get(name) {
+            if let Some(gauge) = label_map.get(&labels) {
+                gauge.store(value, Ordering::Relaxed);
+                return;
+            }
+        }
+        drop(gauges);
+
+        // Create new gauge
+        let mut gauges = self.labeled_gauges.write().await;
+        let label_map = gauges.entry(name.to_string()).or_default();
+        label_map.insert(labels, Arc::new(AtomicU64::new(value)));
+    }
+
+    /// Record a labeled histogram observation
+    pub async fn observe_histogram_labeled(&self, name: &str, labels: Labels, value: f64) {
+        let histograms = self.labeled_histograms.read().await;
+        if let Some(label_map) = histograms.get(name) {
+            if let Some(histogram) = label_map.get(&labels) {
+                histogram.observe(value).await;
+                return;
+            }
+        }
+        drop(histograms);
+
+        // Create new histogram with default buckets
+        let mut histograms = self.labeled_histograms.write().await;
+        let label_map = histograms.entry(name.to_string()).or_default();
+        let histogram = label_map
+            .entry(labels)
+            .or_insert_with(|| Arc::new(Histogram::default()));
+        histogram.observe(value).await;
+    }
+
+    /// Get a labeled counter value
+    pub async fn get_counter_labeled(&self, name: &str, labels: &Labels) -> u64 {
+        let counters = self.labeled_counters.read().await;
+        counters
+            .get(name)
+            .and_then(|m| m.get(labels))
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// Get a labeled gauge value
+    pub async fn get_gauge_labeled(&self, name: &str, labels: &Labels) -> u64 {
+        let gauges = self.labeled_gauges.read().await;
+        gauges
+            .get(name)
+            .and_then(|m| m.get(labels))
+            .map(|g| g.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
     /// Get uptime in seconds
     pub fn uptime_seconds(&self) -> u64 {
         self.start_time.elapsed().as_secs()
@@ -141,8 +315,11 @@ impl MetricsRegistry {
     /// Export metrics in Prometheus format
     pub async fn to_prometheus(&self) -> String {
         let counters = self.counters.read().await;
+        let labeled_counters = self.labeled_counters.read().await;
         let gauges = self.gauges.read().await;
+        let labeled_gauges = self.labeled_gauges.read().await;
         let histograms = self.histograms.read().await;
+        let labeled_histograms = self.labeled_histograms.read().await;
 
         let mut output = String::new();
 
@@ -165,6 +342,20 @@ impl MetricsRegistry {
             ));
         }
 
+        // Labeled counters
+        for (name, label_map) in labeled_counters.iter() {
+            let prometheus_name = name.replace(['.', '-'], "_");
+            output.push_str(&format!("# TYPE {} counter\n", prometheus_name));
+            for (labels, counter) in label_map.iter() {
+                output.push_str(&format!(
+                    "{}{} {}\n",
+                    prometheus_name,
+                    labels.to_prometheus_labels(),
+                    counter.load(Ordering::Relaxed)
+                ));
+            }
+        }
+
         // Gauges
         for (name, gauge) in gauges.iter() {
             let prometheus_name = name.replace(['.', '-'], "_");
@@ -176,9 +367,31 @@ impl MetricsRegistry {
             ));
         }
 
+        // Labeled gauges
+        for (name, label_map) in labeled_gauges.iter() {
+            let prometheus_name = name.replace(['.', '-'], "_");
+            output.push_str(&format!("# TYPE {} gauge\n", prometheus_name));
+            for (labels, gauge) in label_map.iter() {
+                output.push_str(&format!(
+                    "{}{} {}\n",
+                    prometheus_name,
+                    labels.to_prometheus_labels(),
+                    gauge.load(Ordering::Relaxed)
+                ));
+            }
+        }
+
         // Histograms
         for (name, histogram) in histograms.iter() {
             output.push_str(&histogram.to_prometheus(name).await);
+        }
+
+        // Labeled histograms
+        for (name, label_map) in labeled_histograms.iter() {
+            for (labels, histogram) in label_map.iter() {
+                let labeled_name = format!("{}{}", name, labels.to_suffix());
+                output.push_str(&histogram.to_prometheus(&labeled_name).await);
+            }
         }
 
         output
@@ -308,20 +521,30 @@ pub mod metric_names {
 
     // Commitments
     pub const COMMITMENTS_CREATED: &str = "sequencer.commitments.created";
+    pub const COMMITMENTS_ANCHORED: &str = "sequencer.commitments.anchored";
+    pub const COMMITMENTS_VERIFIED: &str = "sequencer.commitments.verified";
 
     // Latency histograms
     pub const INGEST_LATENCY: &str = "sequencer.ingest.latency_seconds";
     pub const SEQUENCE_LATENCY: &str = "sequencer.sequence.latency_seconds";
     pub const PROJECT_LATENCY: &str = "sequencer.project.latency_seconds";
+    pub const COMMIT_LATENCY: &str = "sequencer.commit.latency_seconds";
+    pub const ANCHOR_LATENCY: &str = "sequencer.anchor.latency_seconds";
+    pub const PROOF_LATENCY: &str = "sequencer.proof.latency_seconds";
+    pub const DB_QUERY_LATENCY: &str = "sequencer.db.query_latency_seconds";
 
     // Error counters
     pub const VALIDATION_ERRORS: &str = "sequencer.errors.validation";
     pub const DATABASE_ERRORS: &str = "sequencer.errors.database";
     pub const SCHEMA_VALIDATION_ERRORS: &str = "sequencer.errors.schema_validation";
+    pub const SIGNATURE_ERRORS: &str = "sequencer.errors.signature";
+    pub const AUTH_ERRORS: &str = "sequencer.errors.auth";
 
     // Connection gauges
     pub const ACTIVE_CONNECTIONS: &str = "sequencer.connections.active";
     pub const DB_POOL_SIZE: &str = "sequencer.db.pool_size";
+    pub const DB_POOL_IDLE: &str = "sequencer.db.pool_idle";
+    pub const DB_POOL_WAITING: &str = "sequencer.db.pool_waiting";
 
     // Head sequence
     pub const HEAD_SEQUENCE: &str = "sequencer.head_sequence";
@@ -335,6 +558,49 @@ pub mod metric_names {
     // Request sizes
     pub const REQUEST_BODY_SIZE: &str = "sequencer.request.body_size_bytes";
     pub const EVENTS_PER_BATCH: &str = "sequencer.request.events_per_batch";
+
+    // Cache metrics
+    pub const CACHE_HITS: &str = "sequencer.cache.hits";
+    pub const CACHE_MISSES: &str = "sequencer.cache.misses";
+    pub const CACHE_SIZE: &str = "sequencer.cache.size";
+    pub const CACHE_EVICTIONS: &str = "sequencer.cache.evictions";
+
+    // Circuit breaker metrics
+    pub const CIRCUIT_BREAKER_STATE: &str = "sequencer.circuit_breaker.state";
+    pub const CIRCUIT_BREAKER_FAILURES: &str = "sequencer.circuit_breaker.failures";
+    pub const CIRCUIT_BREAKER_SUCCESSES: &str = "sequencer.circuit_breaker.successes";
+    pub const CIRCUIT_BREAKER_REJECTIONS: &str = "sequencer.circuit_breaker.rejections";
+
+    // VES-specific metrics
+    pub const VES_EVENTS_RECEIVED: &str = "sequencer.ves.events_received";
+    pub const VES_EVENTS_VERIFIED: &str = "sequencer.ves.events_verified";
+    pub const VES_MERKLE_TREE_DEPTH: &str = "sequencer.ves.merkle_tree_depth";
+    pub const VES_PROOF_SIZE_BYTES: &str = "sequencer.ves.proof_size_bytes";
+
+    // Anchor service metrics
+    pub const ANCHOR_BATCHES_SUBMITTED: &str = "sequencer.anchor.batches_submitted";
+    pub const ANCHOR_BATCHES_CONFIRMED: &str = "sequencer.anchor.batches_confirmed";
+    pub const ANCHOR_GAS_USED: &str = "sequencer.anchor.gas_used";
+    pub const ANCHOR_RETRIES: &str = "sequencer.anchor.retries";
+
+    // Dead letter queue metrics
+    pub const DLQ_SIZE: &str = "sequencer.dlq.size";
+    pub const DLQ_ADDED: &str = "sequencer.dlq.added";
+    pub const DLQ_RETRIED: &str = "sequencer.dlq.retried";
+    pub const DLQ_DISCARDED: &str = "sequencer.dlq.discarded";
+
+    // Audit metrics
+    pub const AUDIT_EVENTS_LOGGED: &str = "sequencer.audit.events_logged";
+
+    // gRPC metrics
+    pub const GRPC_REQUESTS_TOTAL: &str = "sequencer.grpc.requests_total";
+    pub const GRPC_REQUEST_LATENCY: &str = "sequencer.grpc.request_latency_seconds";
+    pub const GRPC_STREAM_MESSAGES: &str = "sequencer.grpc.stream_messages";
+
+    // HTTP metrics
+    pub const HTTP_REQUESTS_TOTAL: &str = "sequencer.http.requests_total";
+    pub const HTTP_REQUEST_LATENCY: &str = "sequencer.http.request_latency_seconds";
+    pub const HTTP_RESPONSE_SIZE: &str = "sequencer.http.response_size_bytes";
 }
 
 /// Timer guard for measuring operation duration

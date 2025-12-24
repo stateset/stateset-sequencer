@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use chrono;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
@@ -23,15 +24,44 @@ USAGE:
   stateset-sequencer-admin <command> [options]
 
 COMMANDS:
-  migrate
-  reencrypt-events
-  reencrypt-ves-validity-proofs
-  reencrypt-ves-compliance-proofs
-  backfill-ves-state-roots
-  ves-commit-and-anchor
+  migrate                         Run database migrations
+  verify-proof                    Verify an inclusion proof
+  export-events                   Export events to JSON/NDJSON file
+  rotate-keys                     Rotate agent signing keys
+  list-agent-keys                 List agent keys for a tenant
+  reencrypt-events                Re-encrypt event payloads with new key
+  reencrypt-ves-validity-proofs   Re-encrypt validity proofs
+  reencrypt-ves-compliance-proofs Re-encrypt compliance proofs
+  backfill-ves-state-roots        Backfill VES state roots
+  ves-commit-and-anchor           Create and anchor a VES commitment
 
 COMMON OPTIONS:
   --database-url <postgres_url>    (defaults to env DATABASE_URL)
+
+verify-proof OPTIONS:
+  --leaf-hash <hex>               (required) Hex-encoded leaf hash
+  --merkle-root <hex>             (required) Hex-encoded Merkle root
+  --proof-path <hex,hex,...>      (required) Comma-separated hex proof hashes
+  --leaf-index <n>                (required) Leaf index in the tree
+
+export-events OPTIONS:
+  --tenant-id <uuid>              (required)
+  --store-id <uuid>               (required)
+  --from <n>                      (optional) Starting sequence number
+  --to <n>                        (optional) Ending sequence number
+  --output <path>                 (optional) Output file path (default: stdout)
+  --format <json|ndjson>          (default: ndjson)
+
+rotate-keys OPTIONS:
+  --tenant-id <uuid>              (required)
+  --agent-id <uuid>               (required)
+  --new-key-id <n>                (required) New key ID
+  --public-key <hex>              (required) New Ed25519 public key (hex)
+  --revoke-old                    (optional) Revoke all previous keys
+
+list-agent-keys OPTIONS:
+  --tenant-id <uuid>              (required)
+  --agent-id <uuid>               (optional) Filter by agent
 
 reencrypt-events OPTIONS:
   --tenant-id <uuid>              (optional)
@@ -1051,6 +1081,453 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
+            Ok(())
+        }
+        "verify-proof" => {
+            let mut leaf_hash: Option<String> = None;
+            let mut merkle_root: Option<String> = None;
+            let mut proof_path: Option<String> = None;
+            let mut leaf_index: Option<usize> = None;
+
+            while let Some(arg) = args.pop_front() {
+                match arg.as_str() {
+                    "--leaf-hash" => {
+                        leaf_hash = Some(
+                            args.pop_front()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --leaf-hash"))?,
+                        );
+                    }
+                    "--merkle-root" => {
+                        merkle_root = Some(
+                            args.pop_front()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --merkle-root"))?,
+                        );
+                    }
+                    "--proof-path" => {
+                        proof_path = Some(
+                            args.pop_front()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --proof-path"))?,
+                        );
+                    }
+                    "--leaf-index" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --leaf-index"))?;
+                        leaf_index = Some(raw.parse()?);
+                    }
+                    "-h" | "--help" => {
+                        print_help();
+                        return Ok(());
+                    }
+                    other => anyhow::bail!("unexpected argument: {other}"),
+                }
+            }
+
+            let leaf_hash = leaf_hash.ok_or_else(|| anyhow::anyhow!("--leaf-hash is required"))?;
+            let merkle_root =
+                merkle_root.ok_or_else(|| anyhow::anyhow!("--merkle-root is required"))?;
+            let proof_path =
+                proof_path.ok_or_else(|| anyhow::anyhow!("--proof-path is required"))?;
+            let leaf_index =
+                leaf_index.ok_or_else(|| anyhow::anyhow!("--leaf-index is required"))?;
+
+            let leaf_bytes = hex::decode(&leaf_hash)
+                .map_err(|_| anyhow::anyhow!("invalid hex for --leaf-hash"))?;
+            let leaf: Hash256 = leaf_bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("--leaf-hash must be 32 bytes"))?;
+
+            let root_bytes = hex::decode(&merkle_root)
+                .map_err(|_| anyhow::anyhow!("invalid hex for --merkle-root"))?;
+            let root: Hash256 = root_bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("--merkle-root must be 32 bytes"))?;
+
+            let proof_hashes: Vec<Hash256> = proof_path
+                .split(',')
+                .map(|h| {
+                    let bytes = hex::decode(h.trim())
+                        .map_err(|_| anyhow::anyhow!("invalid hex in proof path: {h}"))?;
+                    bytes
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("proof hash must be 32 bytes: {h}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+
+            // Verify the proof using rs_merkle
+            use rs_merkle::{algorithms::Sha256, MerkleProof};
+
+            let proof = MerkleProof::<Sha256>::new(proof_hashes.clone());
+            let indices = [leaf_index];
+            let leaves = [leaf];
+
+            // Calculate the total tree size from the proof path length
+            let tree_depth = proof_hashes.len();
+            let total_leaves = 1usize << tree_depth;
+
+            let is_valid = proof.verify(
+                root,
+                &indices,
+                &leaves,
+                total_leaves,
+            );
+
+            if is_valid {
+                println!("ok: proof is VALID");
+                println!("  leaf_hash:   {}", hex::encode(leaf));
+                println!("  leaf_index:  {}", leaf_index);
+                println!("  merkle_root: {}", hex::encode(root));
+                println!("  proof_depth: {}", tree_depth);
+            } else {
+                println!("FAIL: proof is INVALID");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        "export-events" => {
+            use std::io::Write;
+
+            let mut database_url: Option<String> = None;
+            let mut tenant_id: Option<Uuid> = None;
+            let mut store_id: Option<Uuid> = None;
+            let mut from_seq: Option<u64> = None;
+            let mut to_seq: Option<u64> = None;
+            let mut output_path: Option<String> = None;
+            let mut format = "ndjson".to_string();
+
+            while let Some(arg) = args.pop_front() {
+                match arg.as_str() {
+                    "--database-url" => {
+                        database_url = Some(
+                            args.pop_front()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --database-url"))?,
+                        );
+                    }
+                    "--tenant-id" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?;
+                        tenant_id = Some(Uuid::parse_str(&raw)?);
+                    }
+                    "--store-id" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --store-id"))?;
+                        store_id = Some(Uuid::parse_str(&raw)?);
+                    }
+                    "--from" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --from"))?;
+                        from_seq = Some(raw.parse()?);
+                    }
+                    "--to" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --to"))?;
+                        to_seq = Some(raw.parse()?);
+                    }
+                    "--output" => {
+                        output_path = Some(
+                            args.pop_front()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --output"))?,
+                        );
+                    }
+                    "--format" => {
+                        format = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --format"))?;
+                    }
+                    "-h" | "--help" => {
+                        print_help();
+                        return Ok(());
+                    }
+                    other => anyhow::bail!("unexpected argument: {other}"),
+                }
+            }
+
+            let tenant_id = tenant_id.ok_or_else(|| anyhow::anyhow!("--tenant-id is required"))?;
+            let store_id = store_id.ok_or_else(|| anyhow::anyhow!("--store-id is required"))?;
+
+            if !matches!(format.as_str(), "json" | "ndjson") {
+                anyhow::bail!("--format must be 'json' or 'ndjson'");
+            }
+
+            let database_url = require_database_url(database_url)?;
+            let pool = PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&database_url)
+                .await?;
+
+            #[derive(Debug, serde::Serialize, sqlx::FromRow)]
+            struct ExportRow {
+                event_id: Uuid,
+                sequence_number: i64,
+                event_type: String,
+                entity_type: String,
+                entity_id: String,
+                payload: serde_json::Value,
+                created_at: chrono::DateTime<chrono::Utc>,
+            }
+
+            let rows: Vec<ExportRow> = sqlx::query_as(
+                r#"
+                SELECT
+                    event_id,
+                    sequence_number,
+                    event_type,
+                    entity_type,
+                    entity_id,
+                    payload,
+                    created_at
+                FROM ves_events
+                WHERE tenant_id = $1
+                  AND store_id = $2
+                  AND ($3::bigint IS NULL OR sequence_number >= $3)
+                  AND ($4::bigint IS NULL OR sequence_number <= $4)
+                ORDER BY sequence_number ASC
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(store_id)
+            .bind(from_seq.map(|v| v as i64))
+            .bind(to_seq.map(|v| v as i64))
+            .fetch_all(&pool)
+            .await?;
+
+            let mut output: Box<dyn Write> = match output_path {
+                Some(path) => Box::new(std::fs::File::create(&path)?),
+                None => Box::new(std::io::stdout()),
+            };
+
+            match format.as_str() {
+                "json" => {
+                    serde_json::to_writer_pretty(&mut output, &rows)?;
+                    writeln!(output)?;
+                }
+                "ndjson" => {
+                    for row in &rows {
+                        serde_json::to_writer(&mut output, row)?;
+                        writeln!(output)?;
+                    }
+                }
+                _ => unreachable!(),
+            }
+
+            eprintln!("ok: exported {} events", rows.len());
+            Ok(())
+        }
+        "list-agent-keys" => {
+            let mut database_url: Option<String> = None;
+            let mut tenant_id: Option<Uuid> = None;
+            let mut agent_id: Option<Uuid> = None;
+
+            while let Some(arg) = args.pop_front() {
+                match arg.as_str() {
+                    "--database-url" => {
+                        database_url = Some(
+                            args.pop_front()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --database-url"))?,
+                        );
+                    }
+                    "--tenant-id" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?;
+                        tenant_id = Some(Uuid::parse_str(&raw)?);
+                    }
+                    "--agent-id" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --agent-id"))?;
+                        agent_id = Some(Uuid::parse_str(&raw)?);
+                    }
+                    "-h" | "--help" => {
+                        print_help();
+                        return Ok(());
+                    }
+                    other => anyhow::bail!("unexpected argument: {other}"),
+                }
+            }
+
+            let tenant_id = tenant_id.ok_or_else(|| anyhow::anyhow!("--tenant-id is required"))?;
+
+            let database_url = require_database_url(database_url)?;
+            let pool = PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&database_url)
+                .await?;
+
+            #[derive(Debug, sqlx::FromRow)]
+            struct KeyRow {
+                agent_id: Uuid,
+                key_id: i32,
+                public_key: Vec<u8>,
+                active: bool,
+                valid_from: Option<chrono::DateTime<chrono::Utc>>,
+                valid_to: Option<chrono::DateTime<chrono::Utc>>,
+                created_at: chrono::DateTime<chrono::Utc>,
+            }
+
+            let rows: Vec<KeyRow> = sqlx::query_as(
+                r#"
+                SELECT
+                    agent_id,
+                    key_id,
+                    public_key,
+                    active,
+                    valid_from,
+                    valid_to,
+                    created_at
+                FROM ves_agent_keys
+                WHERE tenant_id = $1
+                  AND ($2::uuid IS NULL OR agent_id = $2)
+                ORDER BY agent_id ASC, key_id ASC
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(agent_id)
+            .fetch_all(&pool)
+            .await?;
+
+            println!("Agent keys for tenant {}:", tenant_id);
+            println!("{:-<100}", "");
+            println!(
+                "{:<36} {:>6} {:<8} {:<20} {:<20}",
+                "agent_id", "key_id", "active", "valid_from", "valid_to"
+            );
+            println!("{:-<100}", "");
+
+            for row in &rows {
+                println!(
+                    "{:<36} {:>6} {:<8} {:<20} {:<20}",
+                    row.agent_id,
+                    row.key_id,
+                    if row.active { "yes" } else { "no" },
+                    row.valid_from
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    row.valid_to
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                );
+                println!("  public_key: {}", hex::encode(&row.public_key));
+            }
+
+            println!("{:-<100}", "");
+            println!("Total: {} keys", rows.len());
+            Ok(())
+        }
+        "rotate-keys" => {
+            let mut database_url: Option<String> = None;
+            let mut tenant_id: Option<Uuid> = None;
+            let mut agent_id: Option<Uuid> = None;
+            let mut new_key_id: Option<i32> = None;
+            let mut public_key: Option<String> = None;
+            let mut revoke_old = false;
+
+            while let Some(arg) = args.pop_front() {
+                match arg.as_str() {
+                    "--database-url" => {
+                        database_url = Some(
+                            args.pop_front()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --database-url"))?,
+                        );
+                    }
+                    "--tenant-id" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --tenant-id"))?;
+                        tenant_id = Some(Uuid::parse_str(&raw)?);
+                    }
+                    "--agent-id" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --agent-id"))?;
+                        agent_id = Some(Uuid::parse_str(&raw)?);
+                    }
+                    "--new-key-id" => {
+                        let raw = args
+                            .pop_front()
+                            .ok_or_else(|| anyhow::anyhow!("missing value for --new-key-id"))?;
+                        new_key_id = Some(raw.parse()?);
+                    }
+                    "--public-key" => {
+                        public_key = Some(
+                            args.pop_front()
+                                .ok_or_else(|| anyhow::anyhow!("missing value for --public-key"))?,
+                        );
+                    }
+                    "--revoke-old" => revoke_old = true,
+                    "-h" | "--help" => {
+                        print_help();
+                        return Ok(());
+                    }
+                    other => anyhow::bail!("unexpected argument: {other}"),
+                }
+            }
+
+            let tenant_id = tenant_id.ok_or_else(|| anyhow::anyhow!("--tenant-id is required"))?;
+            let agent_id = agent_id.ok_or_else(|| anyhow::anyhow!("--agent-id is required"))?;
+            let new_key_id = new_key_id.ok_or_else(|| anyhow::anyhow!("--new-key-id is required"))?;
+            let public_key = public_key.ok_or_else(|| anyhow::anyhow!("--public-key is required"))?;
+
+            let public_key_bytes = hex::decode(&public_key)
+                .map_err(|_| anyhow::anyhow!("invalid hex for --public-key"))?;
+
+            if public_key_bytes.len() != 32 {
+                anyhow::bail!("--public-key must be 32 bytes (Ed25519 public key)");
+            }
+
+            let database_url = require_database_url(database_url)?;
+            let pool = PgPoolOptions::new()
+                .max_connections(5)
+                .connect(&database_url)
+                .await?;
+
+            let mut tx = pool.begin().await?;
+
+            if revoke_old {
+                let result = sqlx::query(
+                    r#"
+                    UPDATE ves_agent_keys
+                    SET active = false
+                    WHERE tenant_id = $1 AND agent_id = $2 AND active = true
+                    "#,
+                )
+                .bind(tenant_id)
+                .bind(agent_id)
+                .execute(&mut *tx)
+                .await?;
+
+                eprintln!("Revoked {} existing keys", result.rows_affected());
+            }
+
+            sqlx::query(
+                r#"
+                INSERT INTO ves_agent_keys (tenant_id, agent_id, key_id, public_key, active, created_at)
+                VALUES ($1, $2, $3, $4, true, NOW())
+                ON CONFLICT (tenant_id, agent_id, key_id) DO UPDATE
+                SET public_key = EXCLUDED.public_key,
+                    active = true
+                "#,
+            )
+            .bind(tenant_id)
+            .bind(agent_id)
+            .bind(new_key_id)
+            .bind(&public_key_bytes)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+
+            println!(
+                "ok: registered new key for agent {} with key_id {}",
+                agent_id, new_key_id
+            );
+            if revoke_old {
+                println!("  (all previous keys have been revoked)");
+            }
             Ok(())
         }
         "ves-commit-and-anchor" => {

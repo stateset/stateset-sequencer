@@ -1,0 +1,1360 @@
+openapi: 3.1.0
+info:
+  title: StateSet Sequencer API
+  description: |
+    Verifiable Event Sync (VES) sequencer for deterministic event ordering,
+    state projection, and cryptographic commitments.
+
+    ## Authentication
+
+    All API endpoints require authentication via API key or JWT token:
+    - **API Key**: Pass in `X-API-Key` header
+    - **JWT**: Pass in `Authorization: Bearer <token>` header
+
+    ## VES Protocol
+
+    The VES (Verifiable Event Sync) protocol provides:
+    - Cryptographic signatures on events (Ed25519)
+    - Gap-free sequence numbering
+    - Merkle tree commitments
+    - L2 anchoring for finality
+    - Inclusion proofs for any event
+  version: 0.1.1
+  contact:
+    email: engineering@stateset.io
+    url: https://github.com/stateset/stateset-sequencer
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8080/api
+    description: Local development
+  - url: https://sequencer.stateset.io/api
+    description: Production
+
+tags:
+  - name: Events
+    description: Event ingestion and retrieval
+  - name: VES
+    description: Verifiable Event Sync operations
+  - name: Commitments
+    description: Batch commitments and Merkle roots
+  - name: Proofs
+    description: Inclusion proofs and verification
+  - name: Anchoring
+    description: L2 blockchain anchoring
+  - name: Schemas
+    description: Event schema registry
+  - name: Agents
+    description: Agent key management
+
+security:
+  - apiKey: []
+  - bearerAuth: []
+
+paths:
+  # ==========================================================================
+  # Event Ingestion
+  # ==========================================================================
+  /v1/events/ingest:
+    post:
+      summary: Ingest events (legacy)
+      description: Ingest a batch of events without signature verification
+      operationId: ingestEvents
+      tags: [Events]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestRequest'
+      responses:
+        '200':
+          description: Events ingested successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /v1/ves/events/ingest:
+    post:
+      summary: Ingest VES events
+      description: |
+        Ingest a batch of cryptographically signed events using the VES protocol.
+        Each event must include a valid Ed25519 signature from a registered agent.
+      operationId: ingestVesEvents
+      tags: [VES, Events]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VesIngestRequest'
+      responses:
+        '200':
+          description: Events ingested with receipts
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VesIngestResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: Signature verification failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  # ==========================================================================
+  # Event Retrieval
+  # ==========================================================================
+  /v1/events:
+    get:
+      summary: List events
+      description: Retrieve events for a tenant/store, optionally starting from a sequence number
+      operationId: listEvents
+      tags: [Events]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+        - name: from
+          in: query
+          description: Starting sequence number
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: limit
+          in: query
+          description: Maximum number of events to return
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: List of events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SequencedEvent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/head:
+    get:
+      summary: Get head sequence
+      description: Get the current head sequence number for a tenant/store
+      operationId: getHead
+      tags: [Events]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+      responses:
+        '200':
+          description: Head sequence number
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  head_sequence:
+                    type: integer
+                    format: int64
+                    example: 12345
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ==========================================================================
+  # VES Commitments
+  # ==========================================================================
+  /v1/ves/commitments:
+    get:
+      summary: List VES commitments
+      description: List all commitments for a tenant/store
+      operationId: listVesCommitments
+      tags: [VES, Commitments]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+      responses:
+        '200':
+          description: List of commitments
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BatchCommitment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      summary: Create VES commitment
+      description: Create a new batch commitment for a sequence range
+      operationId: createVesCommitment
+      tags: [VES, Commitments]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCommitmentRequest'
+      responses:
+        '201':
+          description: Commitment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchCommitment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Commitment already exists for this range
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /v1/ves/commitments/anchor:
+    post:
+      summary: Create and anchor commitment
+      description: Create a commitment and immediately submit it for L2 anchoring
+      operationId: commitAndAnchorVes
+      tags: [VES, Commitments, Anchoring]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommitAndAnchorRequest'
+      responses:
+        '200':
+          description: Commitment created and anchoring initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchCommitment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/ves/commitments/{batch_id}:
+    get:
+      summary: Get VES commitment
+      description: Retrieve a specific commitment by batch ID
+      operationId: getVesCommitment
+      tags: [VES, Commitments]
+      parameters:
+        - $ref: '#/components/parameters/batchId'
+      responses:
+        '200':
+          description: Commitment details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchCommitment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==========================================================================
+  # VES Proofs
+  # ==========================================================================
+  /v1/ves/proofs/{sequence_number}:
+    get:
+      summary: Get inclusion proof
+      description: Get a Merkle inclusion proof for an event at a specific sequence number
+      operationId: getVesInclusionProof
+      tags: [VES, Proofs]
+      parameters:
+        - name: sequence_number
+          in: path
+          required: true
+          description: The sequence number of the event
+          schema:
+            type: integer
+            format: int64
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+        - $ref: '#/components/parameters/batchIdQuery'
+      responses:
+        '200':
+          description: Inclusion proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerkleProof'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/ves/proofs/verify:
+    post:
+      summary: Verify inclusion proof
+      description: Verify a Merkle inclusion proof
+      operationId: verifyVesProof
+      tags: [VES, Proofs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyProofRequest'
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid:
+                    type: boolean
+                    description: Whether the proof is valid
+                  merkle_root:
+                    type: string
+                    description: The computed Merkle root
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  # ==========================================================================
+  # VES Validity Proofs
+  # ==========================================================================
+  /v1/ves/validity/{batch_id}/inputs:
+    get:
+      summary: Get validity proof public inputs
+      description: Get the public inputs needed to generate a validity proof for a batch
+      operationId: getVesValidityPublicInputs
+      tags: [VES, Proofs]
+      parameters:
+        - $ref: '#/components/parameters/batchId'
+      responses:
+        '200':
+          description: Public inputs for validity proof
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/ves/validity/{batch_id}/proofs:
+    get:
+      summary: List validity proofs
+      description: List all validity proofs for a batch
+      operationId: listVesValidityProofs
+      tags: [VES, Proofs]
+      parameters:
+        - $ref: '#/components/parameters/batchId'
+      responses:
+        '200':
+          description: List of validity proofs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ValidityProof'
+
+    post:
+      summary: Submit validity proof
+      description: Submit a validity proof for a batch
+      operationId: submitVesValidityProof
+      tags: [VES, Proofs]
+      parameters:
+        - $ref: '#/components/parameters/batchId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitValidityProofRequest'
+      responses:
+        '201':
+          description: Proof submitted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidityProof'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  # ==========================================================================
+  # VES Anchoring
+  # ==========================================================================
+  /v1/ves/anchor:
+    post:
+      summary: Anchor commitment to L2
+      description: Submit a commitment's Merkle root to the L2 blockchain
+      operationId: anchorVesCommitment
+      tags: [VES, Anchoring]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnchorRequest'
+      responses:
+        '200':
+          description: Anchoring initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnchorStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/ves/anchor/{batch_id}/verify:
+    get:
+      summary: Verify anchor on-chain
+      description: Verify that a commitment is anchored on the L2 blockchain
+      operationId: verifyVesAnchorOnchain
+      tags: [VES, Anchoring]
+      parameters:
+        - $ref: '#/components/parameters/batchId'
+      responses:
+        '200':
+          description: On-chain verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verified:
+                    type: boolean
+                  chain_id:
+                    type: integer
+                  tx_hash:
+                    type: string
+                  block_number:
+                    type: integer
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==========================================================================
+  # Legacy Commitments
+  # ==========================================================================
+  /v1/commitments:
+    get:
+      summary: List commitments (legacy)
+      operationId: listCommitments
+      tags: [Commitments]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+      responses:
+        '200':
+          description: List of commitments
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BatchCommitment'
+
+    post:
+      summary: Create commitment (legacy)
+      operationId: createCommitment
+      tags: [Commitments]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCommitmentRequest'
+      responses:
+        '201':
+          description: Commitment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchCommitment'
+
+  # ==========================================================================
+  # Schema Registry
+  # ==========================================================================
+  /v1/schemas:
+    get:
+      summary: List schemas
+      description: List all registered event schemas for a tenant
+      operationId: listSchemas
+      tags: [Schemas]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+      responses:
+        '200':
+          description: List of schemas
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaListResponse'
+
+    post:
+      summary: Register schema
+      description: Register a new JSON schema for an event type
+      operationId: registerSchema
+      tags: [Schemas]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterSchemaRequest'
+      responses:
+        '201':
+          description: Schema registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterSchemaResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Incompatible schema version
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /v1/schemas/{schema_id}:
+    get:
+      summary: Get schema
+      description: Get a specific schema by ID
+      operationId: getSchema
+      tags: [Schemas]
+      parameters:
+        - name: schema_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Schema details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      summary: Delete schema
+      description: Delete a schema (must be in draft status)
+      operationId: deleteSchema
+      tags: [Schemas]
+      parameters:
+        - name: schema_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Schema deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Cannot delete active schema
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /v1/schemas/validate:
+    post:
+      summary: Validate payload
+      description: Validate a payload against a registered schema
+      operationId: validatePayload
+      tags: [Schemas]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ValidatePayloadRequest'
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  # ==========================================================================
+  # Agent Keys
+  # ==========================================================================
+  /v1/agents/keys:
+    post:
+      summary: Register agent key
+      description: Register a new Ed25519 public key for an agent
+      operationId: registerAgentKey
+      tags: [Agents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterAgentKeyRequest'
+      responses:
+        '201':
+          description: Key registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  agent_id:
+                    type: string
+                    format: uuid
+                  key_id:
+                    type: integer
+                  active:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ==========================================================================
+  # Health & Metrics
+  # ==========================================================================
+  /health:
+    get:
+      summary: Health check
+      description: Check if the service is healthy
+      operationId: healthCheck
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  service:
+                    type: string
+                    example: stateset-sequencer
+                  version:
+                    type: string
+                    example: 0.1.1
+
+  /ready:
+    get:
+      summary: Readiness check
+      description: Check if the service is ready to accept requests
+      operationId: readinessCheck
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Service is ready
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+                  database:
+                    type: string
+                    example: connected
+        '503':
+          description: Service not ready
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      description: Get Prometheus-format metrics
+      operationId: getMetrics
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          description: Prometheus metrics
+          content:
+            text/plain:
+              schema:
+                type: string
+
+components:
+  securitySchemes:
+    apiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    tenantId:
+      name: tenant_id
+      in: query
+      required: true
+      description: Tenant identifier
+      schema:
+        type: string
+        format: uuid
+    storeId:
+      name: store_id
+      in: query
+      required: true
+      description: Store identifier
+      schema:
+        type: string
+        format: uuid
+    batchId:
+      name: batch_id
+      in: path
+      required: true
+      description: Batch/commitment identifier
+      schema:
+        type: string
+        format: uuid
+    batchIdQuery:
+      name: batch_id
+      in: query
+      required: true
+      description: Batch/commitment identifier
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+    RateLimited:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ApiError'
+      headers:
+        Retry-After:
+          description: Seconds until rate limit resets
+          schema:
+            type: integer
+
+  schemas:
+    ApiError:
+      type: object
+      required:
+        - error
+        - code
+        - message
+      properties:
+        error:
+          type: string
+          description: Error type
+        code:
+          type: integer
+          description: Numeric error code
+        message:
+          type: string
+          description: Human-readable error message
+        details:
+          type: object
+          additionalProperties: true
+          description: Additional error details
+        request_id:
+          type: string
+          description: Request correlation ID
+        docs_url:
+          type: string
+          format: uri
+          description: Link to error documentation
+
+    IngestRequest:
+      type: object
+      required:
+        - agent_id
+        - events
+      properties:
+        agent_id:
+          type: string
+          format: uuid
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/EventEnvelope'
+
+    EventEnvelope:
+      type: object
+      required:
+        - event_id
+        - tenant_id
+        - store_id
+        - event_type
+        - entity_type
+        - entity_id
+        - payload
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+        store_id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+        entity_type:
+          type: string
+        entity_id:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        timestamp:
+          type: string
+          format: date-time
+
+    VesIngestRequest:
+      type: object
+      required:
+        - agentId
+        - events
+      properties:
+        agentId:
+          type: string
+          format: uuid
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/VesEventEnvelope'
+
+    VesEventEnvelope:
+      type: object
+      required:
+        - eventId
+        - tenantId
+        - storeId
+        - eventType
+        - entityType
+        - entityId
+        - payload
+        - signingKeyId
+        - signature
+      properties:
+        eventId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        storeId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+        entityType:
+          type: string
+        entityId:
+          type: string
+        payload:
+          type: object
+          additionalProperties: true
+        encryptedPayload:
+          type: string
+          description: Base64-encoded encrypted payload (optional)
+        signingKeyId:
+          type: integer
+          format: int32
+        signature:
+          type: string
+          description: Hex-encoded Ed25519 signature
+        timestamp:
+          type: string
+          format: date-time
+
+    IngestResponse:
+      type: object
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+        events_accepted:
+          type: integer
+        events_rejected:
+          type: integer
+        assigned_sequence_start:
+          type: integer
+          format: int64
+        assigned_sequence_end:
+          type: integer
+          format: int64
+        head_sequence:
+          type: integer
+          format: int64
+        rejections:
+          type: array
+          items:
+            $ref: '#/components/schemas/RejectionInfo'
+
+    VesIngestResponse:
+      type: object
+      properties:
+        batchId:
+          type: string
+          format: uuid
+        eventsAccepted:
+          type: integer
+        eventsRejected:
+          type: integer
+        sequenceStart:
+          type: integer
+          format: int64
+        sequenceEnd:
+          type: integer
+          format: int64
+        headSequence:
+          type: integer
+          format: int64
+        rejections:
+          type: array
+          items:
+            $ref: '#/components/schemas/RejectionInfo'
+        receipts:
+          type: array
+          items:
+            $ref: '#/components/schemas/VesReceipt'
+
+    VesReceipt:
+      type: object
+      properties:
+        sequencerId:
+          type: string
+          format: uuid
+        eventId:
+          type: string
+          format: uuid
+        sequenceNumber:
+          type: integer
+          format: int64
+        sequencedAt:
+          type: string
+          format: date-time
+        receiptHash:
+          type: string
+          description: Hex-encoded SHA-256 hash
+        signatureAlg:
+          type: string
+          example: Ed25519
+        sequencerSignature:
+          type: string
+          description: Hex-encoded sequencer signature
+
+    RejectionInfo:
+      type: object
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+        message:
+          type: string
+
+    SequencedEvent:
+      type: object
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+        store_id:
+          type: string
+          format: uuid
+        sequence_number:
+          type: integer
+          format: int64
+        event_type:
+          type: string
+        entity_type:
+          type: string
+        entity_id:
+          type: string
+        payload:
+          type: object
+        event_hash:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    BatchCommitment:
+      type: object
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+        store_id:
+          type: string
+          format: uuid
+        sequence_start:
+          type: integer
+          format: int64
+        sequence_end:
+          type: integer
+          format: int64
+        events_root:
+          type: string
+          description: Hex-encoded Merkle root
+        event_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        anchor_status:
+          type: string
+          enum: [pending, submitted, confirmed, failed]
+        anchor_tx_hash:
+          type: string
+        anchor_chain_id:
+          type: integer
+
+    MerkleProof:
+      type: object
+      properties:
+        leaf_hash:
+          type: string
+          description: Hex-encoded leaf hash
+        leaf_index:
+          type: integer
+        proof_path:
+          type: array
+          items:
+            type: string
+          description: Array of hex-encoded proof hashes
+        merkle_root:
+          type: string
+          description: Hex-encoded Merkle root
+        batch_id:
+          type: string
+          format: uuid
+
+    CreateCommitmentRequest:
+      type: object
+      required:
+        - tenant_id
+        - store_id
+        - sequence_start
+        - sequence_end
+      properties:
+        tenant_id:
+          type: string
+          format: uuid
+        store_id:
+          type: string
+          format: uuid
+        sequence_start:
+          type: integer
+          format: int64
+        sequence_end:
+          type: integer
+          format: int64
+
+    CommitAndAnchorRequest:
+      type: object
+      required:
+        - tenant_id
+        - store_id
+      properties:
+        tenant_id:
+          type: string
+          format: uuid
+        store_id:
+          type: string
+          format: uuid
+        sequence_start:
+          type: integer
+          format: int64
+        sequence_end:
+          type: integer
+          format: int64
+        max_events:
+          type: integer
+          format: int64
+
+    VerifyProofRequest:
+      type: object
+      required:
+        - leaf_hash
+        - merkle_root
+        - proof_path
+        - leaf_index
+      properties:
+        leaf_hash:
+          type: string
+        merkle_root:
+          type: string
+        proof_path:
+          type: array
+          items:
+            type: string
+        leaf_index:
+          type: integer
+
+    AnchorRequest:
+      type: object
+      required:
+        - batch_id
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+
+    AnchorStatus:
+      type: object
+      properties:
+        batch_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, submitted, confirmed, failed]
+        tx_hash:
+          type: string
+        chain_id:
+          type: integer
+        block_number:
+          type: integer
+        gas_used:
+          type: integer
+
+    ValidityProof:
+      type: object
+      properties:
+        proof_id:
+          type: string
+          format: uuid
+        batch_id:
+          type: string
+          format: uuid
+        proof_type:
+          type: string
+        proof_version:
+          type: integer
+        proof_data:
+          type: string
+          format: byte
+        public_inputs:
+          type: object
+        verified:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    SubmitValidityProofRequest:
+      type: object
+      required:
+        - proofType
+        - proofB64
+      properties:
+        proofType:
+          type: string
+        proofVersion:
+          type: integer
+          default: 1
+        proofB64:
+          type: string
+          format: byte
+        publicInputs:
+          type: object
+
+    RegisterAgentKeyRequest:
+      type: object
+      required:
+        - tenantId
+        - agentId
+        - keyId
+        - publicKey
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        agentId:
+          type: string
+          format: uuid
+        keyId:
+          type: integer
+        publicKey:
+          type: string
+          description: Hex-encoded Ed25519 public key
+        validFrom:
+          type: string
+          format: date-time
+        validTo:
+          type: string
+          format: date-time
+
+    RegisterSchemaRequest:
+      type: object
+      required:
+        - tenantId
+        - eventType
+        - schemaJson
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+        schemaJson:
+          type: object
+          description: JSON Schema object
+        description:
+          type: string
+        compatibility:
+          type: string
+          enum: [none, backward, forward, full]
+          default: backward
+
+    RegisterSchemaResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+        version:
+          type: integer
+        createdAt:
+          type: string
+          format: date-time
+
+    SchemaResponse:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+        version:
+          type: integer
+        schemaJson:
+          type: object
+        status:
+          type: string
+          enum: [draft, active, deprecated, archived]
+        compatibility:
+          type: string
+        description:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    SchemaListResponse:
+      type: object
+      properties:
+        schemas:
+          type: array
+          items:
+            $ref: '#/components/schemas/SchemaResponse'
+        count:
+          type: integer
+
+    ValidatePayloadRequest:
+      type: object
+      required:
+        - tenantId
+        - eventType
+        - payload
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+        payload:
+          type: object
+        schemaVersion:
+          type: integer
+
+    ValidationResponse:
+      type: object
+      properties:
+        valid:
+          type: boolean
+        schemaId:
+          type: string
+          format: uuid
+        schemaVersion:
+          type: integer
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              path:
+                type: string
+              message:
+                type: string

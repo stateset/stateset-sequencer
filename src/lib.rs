@@ -11,6 +11,7 @@
 //! - [`crypto`] - Cryptographic utilities (hashing, encryption)
 //! - [`projection`] - Event projection and conflict handling
 //! - [`metrics`] - Observability and metrics
+//! - [`telemetry`] - Distributed tracing and OpenTelemetry integration
 //! - [`api`] - REST API routes
 //! - [`grpc`] - gRPC service implementations
 //! - [`proto`] - Protocol buffer definitions
@@ -27,6 +28,7 @@ pub mod migrations;
 pub mod projection;
 pub mod proto;
 pub mod server;
+pub mod telemetry;
 
 // Re-export commonly used types
 pub use domain::{
