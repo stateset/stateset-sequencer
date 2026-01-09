@@ -355,6 +355,8 @@ async fn postgres_ves_validity_proofs_rest_flow() {
         metrics,
         schema_validation_mode: SchemaValidationMode::Disabled,
         request_limits: RequestLimits::default(),
+        pool_monitor: None,
+        circuit_breaker_registry: None,
     };
 
     let api_key_validator = Arc::new(ApiKeyValidator::new());
@@ -646,6 +648,8 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
         metrics,
         schema_validation_mode: SchemaValidationMode::Disabled,
         request_limits: RequestLimits::default(),
+        pool_monitor: None,
+        circuit_breaker_registry: None,
     };
 
     let api_key_validator = Arc::new(ApiKeyValidator::new());

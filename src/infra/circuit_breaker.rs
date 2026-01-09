@@ -42,12 +42,22 @@ pub struct CircuitBreakerConfig {
     pub failure_threshold: u32,
     /// Number of successes in half-open state to close circuit
     pub success_threshold: u32,
-    /// Duration to wait before transitioning from open to half-open
+    /// Initial duration to wait before transitioning from open to half-open
     pub open_timeout: Duration,
     /// Duration window for counting failures
     pub failure_window: Duration,
     /// Maximum requests allowed in half-open state
     pub half_open_max_requests: u32,
+    /// Exponential backoff multiplier for consecutive failures (e.g., 2.0 = double timeout each time)
+    pub backoff_multiplier: f64,
+    /// Maximum backoff duration (caps exponential growth)
+    pub max_backoff: Duration,
+    /// Jitter factor (0.0-1.0) to add randomness to backoff timing
+    pub jitter_factor: f64,
+    /// Threshold for slow calls (calls slower than this are counted as degraded)
+    pub slow_call_threshold: Option<Duration>,
+    /// Number of slow calls to trigger circuit open
+    pub slow_call_rate_threshold: Option<f64>,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -58,6 +68,11 @@ impl Default for CircuitBreakerConfig {
             open_timeout: Duration::from_secs(30),
             failure_window: Duration::from_secs(60),
             half_open_max_requests: 3,
+            backoff_multiplier: 2.0,
+            max_backoff: Duration::from_secs(300), // 5 minutes max
+            jitter_factor: 0.1,
+            slow_call_threshold: None,
+            slow_call_rate_threshold: None,
         }
     }
 }
@@ -75,17 +90,38 @@ pub struct CircuitBreakerStats {
     pub times_opened: AtomicU64,
     /// Number of times circuit closed
     pub times_closed: AtomicU64,
+    /// Number of slow calls detected
+    pub slow_calls: AtomicU64,
+    /// Total call duration in milliseconds (for average calculation)
+    pub total_duration_ms: AtomicU64,
+    /// Number of calls with duration recorded
+    pub calls_with_duration: AtomicU64,
 }
 
 impl CircuitBreakerStats {
     pub fn to_json(&self) -> serde_json::Value {
+        let calls_with_duration = self.calls_with_duration.load(Ordering::Relaxed);
+        let avg_duration_ms = if calls_with_duration > 0 {
+            self.total_duration_ms.load(Ordering::Relaxed) / calls_with_duration
+        } else {
+            0
+        };
+
         serde_json::json!({
             "successes": self.successes.load(Ordering::Relaxed),
             "failures": self.failures.load(Ordering::Relaxed),
             "rejected": self.rejected.load(Ordering::Relaxed),
             "times_opened": self.times_opened.load(Ordering::Relaxed),
             "times_closed": self.times_closed.load(Ordering::Relaxed),
+            "slow_calls": self.slow_calls.load(Ordering::Relaxed),
+            "avg_duration_ms": avg_duration_ms,
         })
+    }
+
+    /// Record call duration
+    pub fn record_duration(&self, duration: Duration) {
+        self.total_duration_ms.fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+        self.calls_with_duration.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -97,6 +133,14 @@ struct InternalState {
     last_failure_time: Option<Instant>,
     opened_at: Option<Instant>,
     half_open_requests: u32,
+    /// Number of consecutive times circuit opened (for exponential backoff)
+    consecutive_opens: u32,
+    /// Current backoff duration (increases with consecutive opens)
+    current_backoff: Duration,
+    /// Slow call count in current window
+    slow_call_count: u32,
+    /// Total calls in current window (for slow call rate calculation)
+    window_call_count: u32,
 }
 
 impl Default for InternalState {
@@ -108,6 +152,10 @@ impl Default for InternalState {
             last_failure_time: None,
             opened_at: None,
             half_open_requests: 0,
+            consecutive_opens: 0,
+            current_backoff: Duration::from_secs(30),
+            slow_call_count: 0,
+            window_call_count: 0,
         }
     }
 }
@@ -239,7 +287,21 @@ impl CircuitBreaker {
             return Err(CircuitBreakerError::CircuitOpen);
         }
 
-        match f.await {
+        let start = Instant::now();
+        let result = f.await;
+        let duration = start.elapsed();
+
+        // Record duration for stats
+        self.stats.record_duration(duration);
+
+        // Check for slow call
+        if let Some(threshold) = self.config.slow_call_threshold {
+            if duration > threshold {
+                self.record_slow_call().await;
+            }
+        }
+
+        match result {
             Ok(result) => {
                 self.record_success().await;
                 Ok(result)
@@ -247,6 +309,77 @@ impl CircuitBreaker {
             Err(e) => {
                 self.record_failure().await;
                 Err(CircuitBreakerError::ServiceError(e))
+            }
+        }
+    }
+
+    /// Execute a function with circuit breaker protection and timeout
+    pub async fn call_with_timeout<F, T, E>(
+        &self,
+        f: F,
+        timeout: Duration,
+    ) -> Result<T, CircuitBreakerError<E>>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+        E: From<std::io::Error>,
+    {
+        if !self.is_allowed().await {
+            return Err(CircuitBreakerError::CircuitOpen);
+        }
+
+        let start = Instant::now();
+
+        match tokio::time::timeout(timeout, f).await {
+            Ok(result) => {
+                let duration = start.elapsed();
+                self.stats.record_duration(duration);
+
+                if let Some(threshold) = self.config.slow_call_threshold {
+                    if duration > threshold {
+                        self.record_slow_call().await;
+                    }
+                }
+
+                match result {
+                    Ok(value) => {
+                        self.record_success().await;
+                        Ok(value)
+                    }
+                    Err(e) => {
+                        self.record_failure().await;
+                        Err(CircuitBreakerError::ServiceError(e))
+                    }
+                }
+            }
+            Err(_) => {
+                self.record_failure().await;
+                Err(CircuitBreakerError::Timeout)
+            }
+        }
+    }
+
+    /// Record a slow call
+    async fn record_slow_call(&self) {
+        self.stats.slow_calls.fetch_add(1, Ordering::Relaxed);
+
+        let mut state = self.state.write().await;
+        state.slow_call_count += 1;
+        state.window_call_count += 1;
+
+        // Check if slow call rate exceeds threshold
+        if let Some(rate_threshold) = self.config.slow_call_rate_threshold {
+            if state.window_call_count >= 10 {
+                // Minimum sample size
+                let rate = state.slow_call_count as f64 / state.window_call_count as f64;
+                if rate >= rate_threshold {
+                    tracing::warn!(
+                        circuit = %self.name,
+                        slow_call_rate = %rate,
+                        threshold = %rate_threshold,
+                        "Slow call rate exceeded threshold, opening circuit"
+                    );
+                    self.transition_to_open(&mut state);
+                }
             }
         }
     }
@@ -279,7 +412,8 @@ impl CircuitBreaker {
     fn maybe_transition(&self, state: &mut InternalState) {
         if state.state == CircuitState::Open {
             if let Some(opened_at) = state.opened_at {
-                if opened_at.elapsed() >= self.config.open_timeout {
+                // Use dynamic backoff duration instead of fixed open_timeout
+                if opened_at.elapsed() >= state.current_backoff {
                     self.transition_to_half_open(state);
                 }
             }
@@ -287,22 +421,54 @@ impl CircuitBreaker {
     }
 
     fn transition_to_open(&self, state: &mut InternalState) {
+        state.consecutive_opens += 1;
+
+        // Calculate exponential backoff with jitter
+        let base_backoff = self.config.open_timeout.as_secs_f64();
+        let multiplier = self.config.backoff_multiplier.powi(state.consecutive_opens.saturating_sub(1) as i32);
+        let backoff_secs = base_backoff * multiplier;
+
+        // Cap at max backoff
+        let capped_backoff = backoff_secs.min(self.config.max_backoff.as_secs_f64());
+
+        // Add jitter to prevent thundering herd
+        let jitter = if self.config.jitter_factor > 0.0 {
+            let jitter_range = capped_backoff * self.config.jitter_factor;
+            // Use a simple pseudo-random based on current time
+            let now_nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos() as f64
+                / 1_000_000_000.0;
+            jitter_range * now_nanos
+        } else {
+            0.0
+        };
+
+        let final_backoff = Duration::from_secs_f64(capped_backoff + jitter);
+        state.current_backoff = final_backoff;
+
         tracing::warn!(
             circuit = %self.name,
             failures = state.failure_count,
-            "Circuit breaker opened"
+            consecutive_opens = state.consecutive_opens,
+            backoff_secs = ?final_backoff,
+            "Circuit breaker opened with exponential backoff"
         );
 
         state.state = CircuitState::Open;
         state.opened_at = Some(Instant::now());
         state.success_count = 0;
         state.half_open_requests = 0;
+        state.slow_call_count = 0;
+        state.window_call_count = 0;
         self.stats.times_opened.fetch_add(1, Ordering::Relaxed);
     }
 
     fn transition_to_half_open(&self, state: &mut InternalState) {
         tracing::info!(
             circuit = %self.name,
+            consecutive_opens = state.consecutive_opens,
             "Circuit breaker transitioning to half-open"
         );
 
@@ -314,7 +480,8 @@ impl CircuitBreaker {
     fn transition_to_closed(&self, state: &mut InternalState) {
         tracing::info!(
             circuit = %self.name,
-            "Circuit breaker closed"
+            consecutive_opens = state.consecutive_opens,
+            "Circuit breaker closed, resetting backoff"
         );
 
         state.state = CircuitState::Closed;
@@ -322,7 +489,23 @@ impl CircuitBreaker {
         state.success_count = 0;
         state.opened_at = None;
         state.half_open_requests = 0;
+        state.consecutive_opens = 0; // Reset on successful close
+        state.current_backoff = self.config.open_timeout;
+        state.slow_call_count = 0;
+        state.window_call_count = 0;
         self.stats.times_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Get the current backoff duration
+    pub async fn current_backoff(&self) -> Duration {
+        let state = self.state.read().await;
+        state.current_backoff
+    }
+
+    /// Get the number of consecutive times the circuit has opened
+    pub async fn consecutive_opens(&self) -> u32 {
+        let state = self.state.read().await;
+        state.consecutive_opens
     }
 }
 
@@ -333,6 +516,8 @@ pub enum CircuitBreakerError<E> {
     CircuitOpen,
     /// Underlying service error
     ServiceError(E),
+    /// Operation timed out
+    Timeout,
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for CircuitBreakerError<E> {
@@ -340,6 +525,7 @@ impl<E: std::fmt::Display> std::fmt::Display for CircuitBreakerError<E> {
         match self {
             CircuitBreakerError::CircuitOpen => write!(f, "circuit breaker is open"),
             CircuitBreakerError::ServiceError(e) => write!(f, "service error: {}", e),
+            CircuitBreakerError::Timeout => write!(f, "operation timed out"),
         }
     }
 }
@@ -349,6 +535,7 @@ impl<E: std::error::Error + 'static> std::error::Error for CircuitBreakerError<E
         match self {
             CircuitBreakerError::CircuitOpen => None,
             CircuitBreakerError::ServiceError(e) => Some(e),
+            CircuitBreakerError::Timeout => None,
         }
     }
 }

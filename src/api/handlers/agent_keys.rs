@@ -3,6 +3,7 @@
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::Json;
+use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::api::auth_helpers::ensure_admin;
@@ -11,11 +12,17 @@ use crate::auth::{AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, AuthContextEx
 use crate::server::AppState;
 
 /// POST /api/v1/agents/keys - Register an agent public key.
+#[instrument(skip(state, auth, request), fields(
+    tenant_id = %request.tenant_id,
+    agent_id = %request.agent_id,
+    key_id = %request.key_id
+))]
 pub async fn register_agent_key(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<RegisterAgentKeyRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    info!("Registering agent key");
     // Admin-only operation (manages signing keys).
     ensure_admin(&auth, request.tenant_id, Uuid::nil())?;
 

@@ -4,8 +4,14 @@
 //! - Recent Merkle roots and commitments
 //! - Computed proof paths
 //! - Agent public keys
+//!
+//! Features:
+//! - Background refresh for frequently accessed entries (stale-while-revalidate)
+//! - TTL-based expiration with configurable refresh thresholds
+//! - LRU eviction when capacity is reached
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -21,7 +27,29 @@ use crate::domain::{StoreId, TenantId};
 // LRU Cache Implementation
 // ============================================================================
 
-/// A simple LRU cache with TTL support
+/// Configuration for cache refresh behavior
+#[derive(Debug, Clone)]
+pub struct CacheRefreshConfig {
+    /// Percentage of TTL after which to trigger background refresh (0.0-1.0)
+    /// e.g., 0.75 means refresh starts when 75% of TTL has elapsed
+    pub refresh_threshold: f64,
+    /// Whether to enable stale-while-revalidate pattern
+    pub stale_while_revalidate: bool,
+    /// Maximum age for stale entries (after TTL, entry can still be served for this duration while refreshing)
+    pub max_stale_age: Duration,
+}
+
+impl Default for CacheRefreshConfig {
+    fn default() -> Self {
+        Self {
+            refresh_threshold: 0.75,
+            stale_while_revalidate: true,
+            max_stale_age: Duration::from_secs(60),
+        }
+    }
+}
+
+/// A simple LRU cache with TTL support and background refresh
 pub struct LruCache<K, V> {
     /// Maximum number of entries
     max_entries: usize,
@@ -31,12 +59,18 @@ pub struct LruCache<K, V> {
     entries: RwLock<HashMap<K, CacheEntry<V>>>,
     /// Cache statistics
     stats: CacheStats,
+    /// Refresh configuration
+    refresh_config: CacheRefreshConfig,
+    /// Keys currently being refreshed (to prevent duplicate refresh)
+    refreshing: RwLock<std::collections::HashSet<K>>,
 }
 
 struct CacheEntry<V> {
     value: V,
     created_at: Instant,
     last_accessed: Instant,
+    /// Whether this entry is stale but being kept for stale-while-revalidate
+    is_stale: bool,
 }
 
 /// Cache statistics
@@ -46,6 +80,9 @@ pub struct CacheStats {
     misses: AtomicU64,
     evictions: AtomicU64,
     expirations: AtomicU64,
+    stale_hits: AtomicU64,
+    background_refreshes: AtomicU64,
+    refresh_failures: AtomicU64,
 }
 
 impl CacheStats {
@@ -63,6 +100,18 @@ impl CacheStats {
 
     pub fn expirations(&self) -> u64 {
         self.expirations.load(Ordering::Relaxed)
+    }
+
+    pub fn stale_hits(&self) -> u64 {
+        self.stale_hits.load(Ordering::Relaxed)
+    }
+
+    pub fn background_refreshes(&self) -> u64 {
+        self.background_refreshes.load(Ordering::Relaxed)
+    }
+
+    pub fn refresh_failures(&self) -> u64 {
+        self.refresh_failures.load(Ordering::Relaxed)
     }
 
     pub fn hit_rate(&self) -> f64 {
@@ -88,6 +137,24 @@ where
             ttl,
             entries: RwLock::new(HashMap::new()),
             stats: CacheStats::default(),
+            refresh_config: CacheRefreshConfig::default(),
+            refreshing: RwLock::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Create with custom refresh configuration
+    pub fn with_refresh_config(
+        max_entries: usize,
+        ttl: Duration,
+        refresh_config: CacheRefreshConfig,
+    ) -> Self {
+        Self {
+            max_entries,
+            ttl,
+            entries: RwLock::new(HashMap::new()),
+            stats: CacheStats::default(),
+            refresh_config,
+            refreshing: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -96,12 +163,29 @@ where
         let mut entries = self.entries.write().await;
 
         if let Some(entry) = entries.get_mut(key) {
-            // Check if expired
-            if entry.created_at.elapsed() > self.ttl {
+            let age = entry.created_at.elapsed();
+
+            // Check if completely expired (beyond stale grace period)
+            if age > self.ttl + self.refresh_config.max_stale_age {
                 entries.remove(key);
                 self.stats.expirations.fetch_add(1, Ordering::Relaxed);
                 self.stats.misses.fetch_add(1, Ordering::Relaxed);
                 return None;
+            }
+
+            // Check if stale but within grace period (stale-while-revalidate)
+            if age > self.ttl {
+                if self.refresh_config.stale_while_revalidate {
+                    entry.is_stale = true;
+                    entry.last_accessed = Instant::now();
+                    self.stats.stale_hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(entry.value.clone());
+                } else {
+                    entries.remove(key);
+                    self.stats.expirations.fetch_add(1, Ordering::Relaxed);
+                    self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
             }
 
             // Update last accessed time
@@ -112,6 +196,44 @@ where
 
         self.stats.misses.fetch_add(1, Ordering::Relaxed);
         None
+    }
+
+    /// Check if an entry needs background refresh
+    pub async fn needs_refresh(&self, key: &K) -> bool {
+        let entries = self.entries.read().await;
+
+        if let Some(entry) = entries.get(key) {
+            let age = entry.created_at.elapsed();
+            let refresh_threshold = Duration::from_secs_f64(
+                self.ttl.as_secs_f64() * self.refresh_config.refresh_threshold,
+            );
+            return age >= refresh_threshold && age < self.ttl;
+        }
+
+        false
+    }
+
+    /// Try to acquire refresh lock for a key
+    async fn try_acquire_refresh(&self, key: &K) -> bool
+    where
+        K: Eq + Hash,
+    {
+        let mut refreshing = self.refreshing.write().await;
+        if refreshing.contains(key) {
+            false
+        } else {
+            refreshing.insert(key.clone());
+            true
+        }
+    }
+
+    /// Release refresh lock for a key
+    async fn release_refresh(&self, key: &K)
+    where
+        K: Eq + Hash,
+    {
+        let mut refreshing = self.refreshing.write().await;
+        refreshing.remove(key);
     }
 
     /// Insert a value into the cache
@@ -130,6 +252,7 @@ where
                 value,
                 created_at: now,
                 last_accessed: now,
+                is_stale: false,
             },
         );
     }
@@ -177,11 +300,11 @@ where
     /// Remove expired entries
     pub async fn cleanup_expired(&self) {
         let mut entries = self.entries.write().await;
-        let now = Instant::now();
+        let max_age = self.ttl + self.refresh_config.max_stale_age;
 
         let expired_keys: Vec<K> = entries
             .iter()
-            .filter(|(_, e)| now.duration_since(e.created_at) > self.ttl)
+            .filter(|(_, e)| e.created_at.elapsed() > max_age)
             .map(|(k, _)| k.clone())
             .collect();
 
@@ -190,7 +313,52 @@ where
             self.stats.expirations.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    /// Get value with optional background refresh indication
+    ///
+    /// Returns the cached value (possibly stale) and indicates if a refresh is needed.
+    /// The caller can then spawn a background task to refresh if needed.
+    pub async fn get_with_refresh_check(&self, key: &K) -> (Option<V>, bool) {
+        // First, try to get from cache
+        let cached = self.get(key).await;
+
+        // Check if we need to trigger background refresh
+        let needs_refresh =
+            self.needs_refresh(key).await && self.try_acquire_refresh(key).await;
+
+        if needs_refresh {
+            self.stats.background_refreshes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        (cached, needs_refresh)
+    }
+
+    /// Refresh an entry in the background
+    ///
+    /// This is typically called when get_or_refresh detects the entry needs refresh.
+    /// The caller should spawn this as a background task.
+    pub async fn refresh<F, Fut, E>(&self, key: K, refresh_fn: F) -> Result<(), E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<V, E>>,
+    {
+        let result = refresh_fn().await;
+
+        match result {
+            Ok(value) => {
+                self.insert(key.clone(), value).await;
+                self.release_refresh(&key).await;
+                Ok(())
+            }
+            Err(e) => {
+                self.stats.refresh_failures.fetch_add(1, Ordering::Relaxed);
+                self.release_refresh(&key).await;
+                Err(e)
+            }
+        }
+    }
 }
+
 
 // ============================================================================
 // Commitment Cache
@@ -573,7 +741,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_lru_cache_ttl() {
-        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_millis(50));
+        // Use config that disables stale-while-revalidate for predictable TTL testing
+        let config = CacheRefreshConfig {
+            stale_while_revalidate: false,
+            max_stale_age: Duration::ZERO,
+            ..Default::default()
+        };
+        let cache: LruCache<String, i32> =
+            LruCache::with_refresh_config(10, Duration::from_millis(50), config);
 
         cache.insert("key".to_string(), 100).await;
         assert_eq!(cache.get(&"key".to_string()).await, Some(100));
@@ -581,6 +756,33 @@ mod tests {
         // Wait for TTL to expire
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        assert_eq!(cache.get(&"key".to_string()).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_stale_while_revalidate() {
+        let config = CacheRefreshConfig {
+            stale_while_revalidate: true,
+            max_stale_age: Duration::from_millis(100),
+            refresh_threshold: 0.5,
+        };
+        let cache: LruCache<String, i32> =
+            LruCache::with_refresh_config(10, Duration::from_millis(50), config);
+
+        cache.insert("key".to_string(), 100).await;
+        assert_eq!(cache.get(&"key".to_string()).await, Some(100));
+
+        // Wait for TTL to expire but within stale grace period
+        tokio::time::sleep(Duration::from_millis(75)).await;
+
+        // Should still return the stale value
+        assert_eq!(cache.get(&"key".to_string()).await, Some(100));
+        assert_eq!(cache.stats().stale_hits(), 1);
+
+        // Wait beyond the max_stale_age
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Now it should be gone
         assert_eq!(cache.get(&"key".to_string()).await, None);
     }
 

@@ -383,15 +383,11 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
+        let code_str = self.error.code.to_string();
         let mut response = (status, Json(self)).into_response();
 
         // Add error code header for easier debugging
-        if let Ok(code_value) = axum::http::HeaderValue::from_str(
-            &response.extensions().get::<ApiError>().map_or_else(
-                || "UNKNOWN".to_string(),
-                |e| e.error.code.to_string()
-            )
-        ) {
+        if let Ok(code_value) = axum::http::HeaderValue::from_str(&code_str) {
             response.headers_mut().insert(
                 axum::http::header::HeaderName::from_static("x-error-code"),
                 code_value,

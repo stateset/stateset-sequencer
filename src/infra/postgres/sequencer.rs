@@ -36,6 +36,7 @@ use sqlx::postgres::PgPool;
 use sqlx::{Postgres, Transaction};
 use std::collections::HashSet;
 use std::sync::Arc;
+use tracing::instrument;
 use uuid::Uuid;
 
 use crate::domain::{
@@ -325,6 +326,7 @@ impl PgSequencer {
 
 #[async_trait]
 impl Sequencer for PgSequencer {
+    #[instrument(skip(self, events), fields(event_count = events.len()))]
     async fn sequence(&self, events: Vec<EventEnvelope>) -> Result<Vec<SequencedEvent>> {
         if events.is_empty() {
             return Ok(Vec::new());
@@ -349,6 +351,7 @@ impl Sequencer for PgSequencer {
         Ok(sequenced)
     }
 
+    #[instrument(skip(self), fields(tenant_id = %tenant_id.0, store_id = %store_id.0))]
     async fn head(&self, tenant_id: &TenantId, store_id: &StoreId) -> Result<u64> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT current_sequence FROM sequence_counters WHERE tenant_id = $1 AND store_id = $2",
@@ -364,6 +367,11 @@ impl Sequencer for PgSequencer {
 
 #[async_trait]
 impl IngestService for PgSequencer {
+    #[instrument(skip(self, batch), fields(
+        batch_size = batch.len(),
+        tenant_id = batch.events.first().map(|e| e.tenant_id.0.to_string()).unwrap_or_default(),
+        store_id = batch.events.first().map(|e| e.store_id.0.to_string()).unwrap_or_default()
+    ))]
     async fn ingest(&self, batch: EventBatch) -> Result<IngestReceipt> {
         if batch.is_empty() {
             // Return empty receipt for empty batch

@@ -3,6 +3,7 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
 use crate::api::auth_helpers::{ensure_read, ensure_write};
@@ -13,11 +14,13 @@ use crate::infra::CommitmentEngine;
 use crate::server::AppState;
 
 /// GET /api/v1/commitments/:batch_id - Get a commitment by ID.
+#[instrument(skip(state, auth), fields(batch_id = %batch_id))]
 pub async fn get_commitment(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(batch_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Getting commitment by ID");
     match state.commitment_engine.get_commitment(batch_id).await {
         Ok(Some(commitment)) => {
             ensure_read(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
@@ -29,11 +32,18 @@ pub async fn get_commitment(
 }
 
 /// POST /api/v1/commitments - Create a commitment.
+#[instrument(skip(state, auth, request), fields(
+    tenant_id = %request.tenant_id,
+    store_id = %request.store_id,
+    sequence_start = request.sequence_start,
+    sequence_end = request.sequence_end
+))]
 pub async fn create_commitment(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<CreateCommitmentRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    info!("Creating commitment for sequence range {}..{}", request.sequence_start, request.sequence_end);
     ensure_write(&auth, request.tenant_id, request.store_id)?;
 
     let tenant_id = TenantId::from_uuid(request.tenant_id);
@@ -65,11 +75,16 @@ pub async fn create_commitment(
 }
 
 /// GET /api/v1/commitments - List commitments.
+#[instrument(skip(state, auth), fields(
+    tenant_id = %query.tenant_id,
+    store_id = %query.store_id
+))]
 pub async fn list_commitments(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Query(query): Query<HeadQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Listing commitments");
     ensure_read(&auth, query.tenant_id, query.store_id)?;
 
     // List all unanchored commitments for now, then filter by tenant/store.

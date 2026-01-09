@@ -3,6 +3,7 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::api::auth_helpers::{ensure_admin, ensure_read, ensure_write};
@@ -45,11 +46,16 @@ fn schema_to_response(schema: &Schema) -> SchemaResponse {
 }
 
 /// POST /api/v1/schemas - Register a new schema.
+#[instrument(skip(state, auth, request), fields(
+    tenant_id = %request.tenant_id,
+    event_type = %request.event_type
+))]
 pub async fn register_schema(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<RegisterSchemaRequest>,
 ) -> Result<Json<RegisterSchemaResponse>, (StatusCode, String)> {
+    info!("Registering schema for event type: {}", request.event_type);
     // Require write access to the tenant
     ensure_write(&auth, request.tenant_id, Uuid::nil())?;
 
@@ -93,11 +99,13 @@ pub async fn register_schema(
 }
 
 /// GET /api/v1/schemas - List all schemas for a tenant.
+#[instrument(skip(state, auth), fields(tenant_id = %query.tenant_id))]
 pub async fn list_schemas(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Query(query): Query<SchemaQuery>,
 ) -> Result<Json<SchemaListResponse>, (StatusCode, String)> {
+    debug!("Listing schemas for tenant");
     // Verify caller has read access to the requested tenant (store_id not applicable for schemas)
     ensure_read(&auth, query.tenant_id, Uuid::nil())?;
 
@@ -117,11 +125,13 @@ pub async fn list_schemas(
 }
 
 /// GET /api/v1/schemas/:schema_id - Get a schema by ID.
+#[instrument(skip(state, auth), fields(schema_id = %schema_id))]
 pub async fn get_schema(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(schema_id): Path<Uuid>,
 ) -> Result<Json<SchemaResponse>, (StatusCode, String)> {
+    debug!("Getting schema by ID");
     let schema_id = SchemaId::from_uuid(schema_id);
 
     // Fetch schema first, then verify tenant ownership
@@ -137,12 +147,18 @@ pub async fn get_schema(
 }
 
 /// GET /api/v1/schemas/event-type/:event_type - Get schemas for an event type.
+#[instrument(skip(state, auth), fields(
+    tenant_id = %query.tenant_id,
+    event_type = %event_type,
+    version = query.version
+))]
 pub async fn get_schemas_by_event_type(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(event_type): Path<String>,
     Query(query): Query<SchemaVersionQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Getting schemas by event type");
     // Verify caller has read access to the requested tenant
     ensure_read(&auth, query.tenant_id, Uuid::nil())?;
 
@@ -187,12 +203,17 @@ pub async fn get_schemas_by_event_type(
 }
 
 /// GET /api/v1/schemas/event-type/:event_type/latest - Get latest schema for an event type.
+#[instrument(skip(state, auth), fields(
+    tenant_id = %query.tenant_id,
+    event_type = %event_type
+))]
 pub async fn get_latest_schema(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(event_type): Path<String>,
     Query(query): Query<SchemaByEventTypeQuery>,
 ) -> Result<Json<SchemaResponse>, (StatusCode, String)> {
+    debug!("Getting latest schema for event type");
     // Verify caller has read access to the requested tenant
     ensure_read(&auth, query.tenant_id, Uuid::nil())?;
 
@@ -210,12 +231,17 @@ pub async fn get_latest_schema(
 }
 
 /// PUT /api/v1/schemas/:schema_id/status - Update schema status.
+#[instrument(skip(state, auth, request), fields(
+    schema_id = %schema_id,
+    new_status = %request.status
+))]
 pub async fn update_schema_status(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(schema_id): Path<Uuid>,
     Json(request): Json<UpdateSchemaStatusRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    info!("Updating schema status to: {}", request.status);
     let schema_id = SchemaId::from_uuid(schema_id);
 
     // Fetch schema first to verify tenant ownership
@@ -251,11 +277,13 @@ pub async fn update_schema_status(
 }
 
 /// DELETE /api/v1/schemas/:schema_id - Delete a schema.
+#[instrument(skip(state, auth), fields(schema_id = %schema_id))]
 pub async fn delete_schema(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(schema_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    warn!("Deleting schema: {}", schema_id);
     let schema_id = SchemaId::from_uuid(schema_id);
 
     // Fetch schema first to verify tenant ownership
@@ -278,11 +306,17 @@ pub async fn delete_schema(
 }
 
 /// POST /api/v1/schemas/validate - Validate a payload against a schema.
+#[instrument(skip(state, auth, request), fields(
+    tenant_id = %request.tenant_id,
+    event_type = %request.event_type,
+    schema_version = request.schema_version
+))]
 pub async fn validate_payload(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<ValidatePayloadRequest>,
 ) -> Result<Json<ValidationResponse>, (StatusCode, String)> {
+    debug!("Validating payload against schema");
     // Verify caller has read access to the requested tenant
     ensure_read(&auth, request.tenant_id, Uuid::nil())?;
 

@@ -81,6 +81,8 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
         // Use disabled mode for tests by default (to not break existing tests)
         schema_validation_mode: SchemaValidationMode::Disabled,
         request_limits: RequestLimits::default(),
+        pool_monitor: None,
+        circuit_breaker_registry: None,
     }
 }
 

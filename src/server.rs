@@ -27,13 +27,12 @@ use crate::auth::{
     RateLimiter, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
-use crate::domain::{StoreId, TenantId};
 use crate::infra::{
-    PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore, PgSchemaStore,
-    PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore,
-    SchemaValidationMode, Sequencer, VesSequencer,
+    CircuitBreakerRegistry, PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine,
+    PgEventStore, PgSchemaStore, PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore,
+    PgVesValidityProofStore, PoolMonitor, SchemaValidationMode, VesSequencer,
 };
-use crate::metrics::MetricsRegistry;
+use crate::metrics::{ComponentMetrics, MetricsRegistry};
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -94,6 +93,10 @@ pub struct AppState {
     pub schema_validation_mode: SchemaValidationMode,
     /// Request limits for ingestion and payload sizing
     pub request_limits: RequestLimits,
+    /// Connection pool health monitor
+    pub pool_monitor: Option<Arc<PoolMonitor>>,
+    /// Circuit breaker registry for external service calls
+    pub circuit_breaker_registry: Option<Arc<CircuitBreakerRegistry>>,
 }
 
 /// Start the HTTP server.
@@ -257,6 +260,15 @@ pub async fn run() -> anyhow::Result<()> {
     let metrics = Arc::new(MetricsRegistry::new());
     info!("Metrics registry initialized");
 
+    // Initialize pool monitor for health checks
+    let pool_monitor = Arc::new(PoolMonitor::new(config.max_connections));
+    pool_monitor.update_from_pool(&pool).await;
+    info!("Pool monitor initialized");
+
+    // Initialize circuit breaker registry for external services
+    let circuit_breaker_registry = Arc::new(CircuitBreakerRegistry::new());
+    info!("Circuit breaker registry initialized");
+
     // Initialize anchor service (optional - only if env vars are set)
     let anchor_service = match AnchorConfig::from_env() {
         Some(anchor_config) => {
@@ -289,7 +301,18 @@ pub async fn run() -> anyhow::Result<()> {
         metrics,
         schema_validation_mode,
         request_limits: request_limits.clone(),
+        pool_monitor: Some(pool_monitor),
+        circuit_breaker_registry: Some(circuit_breaker_registry),
     };
+
+    // Start component metrics collection in background
+    let component_metrics = Arc::new(ComponentMetrics::new(
+        state.metrics.clone(),
+        state.pool_monitor.clone(),
+        state.circuit_breaker_registry.clone(),
+    ));
+    let _metrics_task = component_metrics.start_collection_task(std::time::Duration::from_secs(15));
+    info!("Component metrics collection started (15s interval)");
 
     // Build router
     let app = build_router(auth_state)?
@@ -420,8 +443,9 @@ fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppSta
     let mut router = Router::new()
         .merge(anchor_compat)
         .nest("/api", api)
-        .route("/health", get(health_check))
-        .route("/ready", get(readiness_check))
+        .route("/health", get(crate::api::handlers::health::health_check))
+        .route("/health/detailed", get(crate::api::handlers::health::detailed_health_check))
+        .route("/ready", get(crate::api::handlers::health::readiness_check))
         .route("/metrics", get(metrics_handler))
         .layer(TraceLayer::new_for_http());
 
@@ -467,39 +491,6 @@ fn cors_layer_from_env() -> anyhow::Result<Option<CorsLayer>> {
                 axum::http::header::CONTENT_TYPE,
             ]),
     ))
-}
-
-/// Health check endpoint.
-async fn health_check() -> axum::Json<serde_json::Value> {
-    axum::Json(serde_json::json!({
-        "status": "healthy",
-        "service": "stateset-sequencer",
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
-}
-
-/// Readiness check endpoint.
-async fn readiness_check(
-    axum::extract::State(state): axum::extract::State<AppState>,
-) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
-    // Check database connectivity by reading head from a known stream.
-    match state
-        .sequencer
-        .head(
-            &TenantId::from_uuid(uuid::Uuid::nil()),
-            &StoreId::from_uuid(uuid::Uuid::nil()),
-        )
-        .await
-    {
-        Ok(_) => Ok(axum::Json(serde_json::json!({
-            "status": "ready",
-            "database": "connected",
-        }))),
-        Err(e) => Err((
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            format!("Database unavailable: {}", e),
-        )),
-    }
 }
 
 /// Prometheus metrics endpoint.

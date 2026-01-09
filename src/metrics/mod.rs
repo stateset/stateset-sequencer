@@ -588,6 +588,26 @@ pub mod metric_names {
     pub const DLQ_ADDED: &str = "sequencer.dlq.added";
     pub const DLQ_RETRIED: &str = "sequencer.dlq.retried";
     pub const DLQ_DISCARDED: &str = "sequencer.dlq.discarded";
+    pub const DLQ_PENDING: &str = "sequencer.dlq.pending";
+    pub const DLQ_FAILED: &str = "sequencer.dlq.failed";
+    pub const DLQ_DUE_FOR_RETRY: &str = "sequencer.dlq.due_for_retry";
+
+    // Retry metrics
+    pub const RETRY_ATTEMPTS: &str = "sequencer.retry.attempts";
+    pub const RETRY_SUCCESSES: &str = "sequencer.retry.successes";
+    pub const RETRY_FAILURES: &str = "sequencer.retry.failures";
+    pub const RETRY_EXHAUSTED: &str = "sequencer.retry.exhausted";
+    pub const RETRY_LATENCY: &str = "sequencer.retry.latency_seconds";
+
+    // Pool monitoring metrics
+    pub const POOL_ACTIVE_CONNECTIONS: &str = "sequencer.pool.active_connections";
+    pub const POOL_IDLE_CONNECTIONS: &str = "sequencer.pool.idle_connections";
+    pub const POOL_TOTAL_CONNECTIONS: &str = "sequencer.pool.total_connections";
+    pub const POOL_MAX_CONNECTIONS: &str = "sequencer.pool.max_connections";
+    pub const POOL_ACQUISITION_LATENCY: &str = "sequencer.pool.acquisition_latency_ms";
+    pub const POOL_SLOW_ACQUISITIONS: &str = "sequencer.pool.slow_acquisitions";
+    pub const POOL_TIMED_OUT_ACQUISITIONS: &str = "sequencer.pool.timed_out_acquisitions";
+    pub const POOL_UTILIZATION: &str = "sequencer.pool.utilization";
 
     // Audit metrics
     pub const AUDIT_EVENTS_LOGGED: &str = "sequencer.audit.events_logged";
@@ -643,6 +663,181 @@ where
     let duration = start.elapsed().as_secs_f64();
     metrics.observe_histogram(metric_name, duration).await;
     result
+}
+
+// ============================================================================
+// Component Metrics Collection
+// ============================================================================
+
+use crate::infra::{CircuitBreakerRegistry, PoolMonitor, PoolStats};
+
+/// Collector for infrastructure component metrics
+pub struct ComponentMetrics {
+    metrics: Arc<MetricsRegistry>,
+    pool_monitor: Option<Arc<PoolMonitor>>,
+    circuit_breaker_registry: Option<Arc<CircuitBreakerRegistry>>,
+}
+
+impl ComponentMetrics {
+    /// Create a new component metrics collector
+    pub fn new(
+        metrics: Arc<MetricsRegistry>,
+        pool_monitor: Option<Arc<PoolMonitor>>,
+        circuit_breaker_registry: Option<Arc<CircuitBreakerRegistry>>,
+    ) -> Self {
+        Self {
+            metrics,
+            pool_monitor,
+            circuit_breaker_registry,
+        }
+    }
+
+    /// Update all component metrics
+    pub async fn update(&self) {
+        self.update_pool_metrics().await;
+        self.update_circuit_breaker_metrics().await;
+    }
+
+    /// Update pool monitoring metrics
+    pub async fn update_pool_metrics(&self) {
+        if let Some(ref monitor) = self.pool_monitor {
+            let stats = monitor.stats().await;
+
+            self.metrics
+                .set_gauge(metric_names::POOL_ACTIVE_CONNECTIONS, stats.active_connections as u64)
+                .await;
+            self.metrics
+                .set_gauge(metric_names::POOL_IDLE_CONNECTIONS, stats.idle_connections as u64)
+                .await;
+            self.metrics
+                .set_gauge(metric_names::POOL_TOTAL_CONNECTIONS, stats.total_connections as u64)
+                .await;
+            self.metrics
+                .set_gauge(metric_names::POOL_MAX_CONNECTIONS, stats.max_connections as u64)
+                .await;
+            self.metrics
+                .set_gauge(
+                    metric_names::POOL_UTILIZATION,
+                    (stats.utilization() * 100.0) as u64,
+                )
+                .await;
+
+            // Counters for acquisition stats
+            self.metrics
+                .add_counter(
+                    metric_names::POOL_SLOW_ACQUISITIONS,
+                    stats.slow_acquisitions,
+                )
+                .await;
+            self.metrics
+                .add_counter(
+                    metric_names::POOL_TIMED_OUT_ACQUISITIONS,
+                    stats.timed_out_acquisitions,
+                )
+                .await;
+
+            // Record acquisition latency histogram if we have data
+            if stats.avg_acquisition_latency_ms > 0.0 {
+                self.metrics
+                    .observe_histogram(
+                        metric_names::POOL_ACQUISITION_LATENCY,
+                        stats.avg_acquisition_latency_ms / 1000.0, // Convert to seconds
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Update circuit breaker metrics
+    pub async fn update_circuit_breaker_metrics(&self) {
+        if let Some(ref registry) = self.circuit_breaker_registry {
+            let status = registry.status().await;
+
+            if let Some(obj) = status.as_object() {
+                for (name, value) in obj {
+                    let labels = Labels::new().circuit(name);
+
+                    // State gauge (0=closed, 1=half-open, 2=open)
+                    let state_value = match value.get("state").and_then(|v| v.as_str()) {
+                        Some("closed") => 0u64,
+                        Some("half_open") => 1u64,
+                        Some("open") => 2u64,
+                        _ => 0u64,
+                    };
+                    self.metrics
+                        .set_gauge_labeled(metric_names::CIRCUIT_BREAKER_STATE, labels.clone(), state_value)
+                        .await;
+
+                    // Stats from the circuit breaker
+                    if let Some(stats) = value.get("stats") {
+                        if let Some(successes) = stats.get("successes").and_then(|v| v.as_u64()) {
+                            self.metrics
+                                .add_counter_labeled(
+                                    metric_names::CIRCUIT_BREAKER_SUCCESSES,
+                                    labels.clone(),
+                                    successes,
+                                )
+                                .await;
+                        }
+                        if let Some(failures) = stats.get("failures").and_then(|v| v.as_u64()) {
+                            self.metrics
+                                .add_counter_labeled(
+                                    metric_names::CIRCUIT_BREAKER_FAILURES,
+                                    labels.clone(),
+                                    failures,
+                                )
+                                .await;
+                        }
+                        if let Some(rejected) = stats.get("rejected").and_then(|v| v.as_u64()) {
+                            self.metrics
+                                .add_counter_labeled(
+                                    metric_names::CIRCUIT_BREAKER_REJECTIONS,
+                                    labels,
+                                    rejected,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start a background task that periodically updates metrics
+    pub fn start_collection_task(
+        self: Arc<Self>,
+        interval: std::time::Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                self.update().await;
+            }
+        })
+    }
+}
+
+/// Record pool stats directly to metrics registry
+pub async fn record_pool_stats(metrics: &MetricsRegistry, stats: &PoolStats) {
+    metrics
+        .set_gauge(metric_names::POOL_ACTIVE_CONNECTIONS, stats.active_connections as u64)
+        .await;
+    metrics
+        .set_gauge(metric_names::POOL_IDLE_CONNECTIONS, stats.idle_connections as u64)
+        .await;
+    metrics
+        .set_gauge(metric_names::POOL_TOTAL_CONNECTIONS, stats.total_connections as u64)
+        .await;
+    metrics
+        .set_gauge(metric_names::POOL_MAX_CONNECTIONS, stats.max_connections as u64)
+        .await;
+    metrics
+        .set_gauge(
+            metric_names::POOL_UTILIZATION,
+            (stats.utilization() * 100.0) as u64,
+        )
+        .await;
 }
 
 #[cfg(test)]

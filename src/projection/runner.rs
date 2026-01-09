@@ -2,18 +2,27 @@
 //!
 //! Reads sequenced events and applies them to domain projections.
 //! Handles checkpointing, conflict detection, and rejection event emission.
+//!
+//! # Dead Letter Queue Integration
+//!
+//! Failed projections are automatically sent to a dead letter queue for:
+//! - Later investigation and debugging
+//! - Automatic retry with exponential backoff
+//! - Alerting and monitoring
 
 use super::{
     ApplyResult, CheckpointStore, DomainProjector, EntityVersionStore, ProjectionCheckpoint,
     RejectionEvent, RejectionReason,
 };
 use crate::domain::{SequencedEvent, StoreId, TenantId};
-use crate::infra::SequencerError;
+use crate::infra::{
+    DeadLetterReason, EnqueueParams, PgDeadLetterQueue, SequencerError,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 /// Event source for the projection runner
 #[async_trait]
@@ -102,6 +111,9 @@ pub struct ProjectionRunner {
 
     /// Whether the runner is running
     running: RwLock<bool>,
+
+    /// Optional dead letter queue for failed projections
+    dead_letter_queue: Option<Arc<PgDeadLetterQueue>>,
 }
 
 impl ProjectionRunner {
@@ -121,7 +133,14 @@ impl ProjectionRunner {
             projectors: HashMap::new(),
             stats: RwLock::new(ProjectionStats::default()),
             running: RwLock::new(false),
+            dead_letter_queue: None,
         }
+    }
+
+    /// Set the dead letter queue for failed projection handling
+    pub fn with_dead_letter_queue(mut self, dlq: Arc<PgDeadLetterQueue>) -> Self {
+        self.dead_letter_queue = Some(dlq);
+        self
     }
 
     /// Register a domain projector
@@ -135,7 +154,63 @@ impl ProjectionRunner {
         self.stats.read().await.clone()
     }
 
+    /// Send a failed event to the dead letter queue
+    #[instrument(skip(self, event, payload), fields(event_id = %event.event_id()))]
+    async fn send_to_dead_letter_queue(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        event: &SequencedEvent,
+        reason: DeadLetterReason,
+        error_message: &str,
+        payload: serde_json::Value,
+    ) {
+        if let Some(ref dlq) = self.dead_letter_queue {
+            let reason_str = reason.to_string();
+            let params = EnqueueParams {
+                event_id: event.event_id(),
+                tenant_id,
+                store_id,
+                event_type: event.event_type().as_str(),
+                reason,
+                error_message,
+                payload,
+                metadata: Some(serde_json::json!({
+                    "sequence_number": event.sequence_number(),
+                    "entity_type": event.entity_type().as_str(),
+                    "entity_id": event.entity_id(),
+                })),
+            };
+
+            if let Err(e) = dlq.enqueue(params).await {
+                error!(
+                    event_id = %event.event_id(),
+                    error = %e,
+                    "Failed to enqueue event to dead letter queue"
+                );
+            } else {
+                info!(
+                    event_id = %event.event_id(),
+                    reason = %reason_str,
+                    "Event sent to dead letter queue"
+                );
+            }
+        }
+    }
+
+    /// Convert projection rejection reason to dead letter reason
+    fn rejection_to_dlq_reason(reason: &RejectionReason) -> DeadLetterReason {
+        match reason {
+            RejectionReason::VersionConflict { .. } => DeadLetterReason::VersionConflict,
+            RejectionReason::InvariantViolation { .. } => DeadLetterReason::InvariantViolation,
+            RejectionReason::InvalidStateTransition { .. } => DeadLetterReason::InvalidStateTransition,
+            RejectionReason::PayloadInvalid { .. } => DeadLetterReason::SchemaValidation,
+            RejectionReason::EntityNotFound => DeadLetterReason::HandlerError,
+        }
+    }
+
     /// Run the projection loop for a tenant/store
+    #[instrument(skip(self), fields(tenant_id = %tenant_id.0, store_id = %store_id.0))]
     pub async fn run(
         &self,
         tenant_id: &TenantId,
@@ -219,6 +294,16 @@ impl ProjectionRunner {
                             "Error processing event"
                         );
 
+                        // Send to dead letter queue
+                        self.send_to_dead_letter_queue(
+                            tenant_id,
+                            store_id,
+                            &event,
+                            DeadLetterReason::HandlerError,
+                            &e.to_string(),
+                            event.payload().clone(),
+                        ).await;
+
                         {
                             let mut stats = self.stats.write().await;
                             stats.errors += 1;
@@ -253,6 +338,11 @@ impl ProjectionRunner {
     }
 
     /// Process a single event
+    #[instrument(skip(self, event), fields(
+        event_id = %event.event_id(),
+        sequence = event.sequence_number(),
+        entity_type = %event.entity_type().as_str()
+    ))]
     async fn process_event(
         &self,
         tenant_id: &TenantId,
@@ -300,6 +390,16 @@ impl ProjectionRunner {
                 };
 
                 self.rejection_sink.emit_rejection(rejection).await?;
+
+                // Send to dead letter queue for potential retry
+                self.send_to_dead_letter_queue(
+                    tenant_id,
+                    store_id,
+                    event,
+                    DeadLetterReason::VersionConflict,
+                    &format!("Version conflict: expected {}, got {}", expected_version, actual_version),
+                    event.payload().clone(),
+                ).await;
 
                 warn!(
                     event_id = %event.event_id(),
@@ -353,13 +453,24 @@ impl ProjectionRunner {
                     original_sequence: event.sequence_number(),
                     entity_type: entity_type.clone(),
                     entity_id: event.entity_id().to_string(),
-                    reason: message,
+                    reason: message.clone(),
                     reason_code: format!("{:?}", reason),
                     expected_version,
                     actual_version,
                 };
 
                 self.rejection_sink.emit_rejection(rejection).await?;
+
+                // Send to dead letter queue
+                let dlq_reason = Self::rejection_to_dlq_reason(&reason);
+                self.send_to_dead_letter_queue(
+                    tenant_id,
+                    store_id,
+                    event,
+                    dlq_reason,
+                    &message,
+                    event.payload().clone(),
+                ).await;
 
                 warn!(
                     event_id = %event.event_id(),
@@ -386,6 +497,13 @@ impl ProjectionRunner {
     }
 
     /// Rebuild a single entity from its event history
+    #[instrument(skip(self, events), fields(
+        tenant_id = %tenant_id.0,
+        store_id = %store_id.0,
+        entity_type = entity_type,
+        entity_id = entity_id,
+        event_count = events.len()
+    ))]
     pub async fn rebuild_entity(
         &self,
         tenant_id: &TenantId,

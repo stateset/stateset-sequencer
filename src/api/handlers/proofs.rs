@@ -3,6 +3,7 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use tracing::{debug, instrument};
 
 use crate::api::auth_helpers::ensure_read;
 use crate::api::types::{ProofQuery, VerifyProofRequest};
@@ -13,12 +14,19 @@ use crate::infra::CommitmentEngine;
 use crate::server::AppState;
 
 /// GET /api/v1/proofs/:sequence_number - Get inclusion proof for an event.
+#[instrument(skip(state, auth), fields(
+    sequence_number = sequence_number,
+    tenant_id = %query.tenant_id,
+    store_id = %query.store_id,
+    batch_id = %query.batch_id
+))]
 pub async fn get_inclusion_proof(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(sequence_number): Path<u64>,
     Query(query): Query<ProofQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Getting inclusion proof for sequence {}", sequence_number);
     let tenant_id = TenantId::from_uuid(query.tenant_id);
     let store_id = StoreId::from_uuid(query.store_id);
 
@@ -148,11 +156,13 @@ pub async fn get_inclusion_proof(
 }
 
 /// POST /api/v1/proofs/verify - Verify a Merkle proof.
+#[instrument(skip(state, auth, request), fields(leaf_index = request.leaf_index))]
 pub async fn verify_proof(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<VerifyProofRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Verifying Merkle proof");
     if !auth.can_read() && !auth.is_admin() {
         return Err((
             StatusCode::FORBIDDEN,

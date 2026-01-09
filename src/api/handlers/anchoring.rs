@@ -3,6 +3,7 @@
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
 use crate::api::auth_helpers::{ensure_admin, ensure_read};
@@ -12,11 +13,13 @@ use crate::infra::CommitmentEngine;
 use crate::server::AppState;
 
 /// POST /api/v1/anchor - Anchor a commitment on-chain.
+#[instrument(skip(state, auth, request), fields(batch_id = %request.batch_id))]
 pub async fn anchor_commitment(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<AnchorRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    info!("Anchoring commitment {} on-chain", request.batch_id);
     // Check if anchor service is configured
     let anchor_service = state.anchor_service.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -66,10 +69,12 @@ pub async fn anchor_commitment(
 }
 
 /// GET /api/v1/anchor/status - Get anchor service status.
+#[instrument(skip(state, auth))]
 pub async fn get_anchor_status(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Getting anchor service status");
     if !auth.can_read() && !auth.is_admin() {
         return Err((
             StatusCode::FORBIDDEN,
@@ -90,11 +95,13 @@ pub async fn get_anchor_status(
 }
 
 /// GET /api/v1/anchor/:batch_id/verify - Verify commitment is anchored on-chain.
+#[instrument(skip(state, auth), fields(batch_id = %batch_id))]
 pub async fn verify_anchor_onchain(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(batch_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Verifying commitment is anchored on-chain");
     // Check if anchor service is configured
     let anchor_service = state.anchor_service.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,

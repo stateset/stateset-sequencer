@@ -3,6 +3,7 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use tracing::{debug, instrument};
 
 use crate::api::auth_helpers::ensure_read;
 use crate::api::types::{HeadQuery, ListEventsQuery};
@@ -12,11 +13,18 @@ use crate::infra::{EventStore, Sequencer};
 use crate::server::AppState;
 
 /// GET /api/v1/events - List events for a tenant/store.
+#[instrument(skip(state, auth), fields(
+    tenant_id = %query.tenant_id,
+    store_id = %query.store_id,
+    from = query.from,
+    limit = query.limit
+))]
 pub async fn list_events(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Query(query): Query<ListEventsQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Listing events for tenant/store");
     let tenant_id = TenantId::from_uuid(query.tenant_id);
     let store_id = StoreId::from_uuid(query.store_id);
     let from = query.from.unwrap_or(0);
@@ -47,11 +55,16 @@ pub async fn list_events(
 }
 
 /// GET /api/v1/head - Get head sequence for a tenant/store.
+#[instrument(skip(state, auth), fields(
+    tenant_id = %query.tenant_id,
+    store_id = %query.store_id
+))]
 pub async fn get_head(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Query(query): Query<HeadQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Getting head sequence");
     let tenant_id = TenantId::from_uuid(query.tenant_id);
     let store_id = StoreId::from_uuid(query.store_id);
 
@@ -64,12 +77,19 @@ pub async fn get_head(
 }
 
 /// GET /api/v1/entities/:entity_type/:entity_id - Get event history for an entity.
+#[instrument(skip(state, auth), fields(
+    tenant_id = %query.tenant_id,
+    store_id = %query.store_id,
+    entity_type = %entity_type,
+    entity_id = %entity_id
+))]
 pub async fn get_entity_history(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path((entity_type, entity_id)): Path<(String, String)>,
     Query(query): Query<HeadQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    debug!("Getting entity history");
     let tenant_id = TenantId::from_uuid(query.tenant_id);
     let store_id = StoreId::from_uuid(query.store_id);
     let entity_type = EntityType::from(entity_type.as_str());

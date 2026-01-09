@@ -1,6 +1,5 @@
 use std::collections::VecDeque;
 
-use chrono;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
@@ -1366,6 +1365,7 @@ async fn main() -> anyhow::Result<()> {
                 active: bool,
                 valid_from: Option<chrono::DateTime<chrono::Utc>>,
                 valid_to: Option<chrono::DateTime<chrono::Utc>>,
+                #[allow(dead_code)]
                 created_at: chrono::DateTime<chrono::Utc>,
             }
 

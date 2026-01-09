@@ -29,6 +29,7 @@
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::Json;
+use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
 use crate::api::auth_helpers::ensure_write;
@@ -46,10 +47,12 @@ use crate::server::AppState;
 /// Validate events against registered schemas.
 ///
 /// Returns (valid_events, rejected_events) based on schema validation results.
+#[instrument(skip(state, events), fields(event_count = events.len()))]
 async fn validate_events_against_schemas(
     state: &AppState,
     events: Vec<EventEnvelope>,
 ) -> (Vec<EventEnvelope>, Vec<RejectedEvent>) {
+    debug!("Validating {} events against schemas", events.len());
     let validation_mode = state.schema_validation_mode;
 
     // If validation is disabled, return all events as valid
@@ -265,11 +268,16 @@ fn enforce_ves_limits(
 }
 
 /// POST /api/v1/events/ingest - Ingest events (legacy API).
+#[instrument(skip(state, auth, request), fields(
+    event_count = request.events.len(),
+    agent_id = %request.agent_id
+))]
 pub async fn ingest_events(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<IngestRequest>,
 ) -> Result<Json<IngestResponse>, (StatusCode, String)> {
+    info!("Ingesting {} events via legacy API", request.events.len());
     // Require tenant/store consistency and authorization.
     let (tenant_id, store_id) = request
         .events
@@ -369,11 +377,16 @@ pub async fn ingest_events(
 }
 
 /// POST /api/v1/ves/events/ingest - Ingest VES events with signature verification.
+#[instrument(skip(state, auth, request), fields(
+    event_count = request.events.len(),
+    agent_id = %request.agent_id
+))]
 pub async fn ingest_ves_events(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<VesIngestRequest>,
 ) -> Result<Json<VesIngestResponse>, (StatusCode, String)> {
+    info!("Ingesting {} VES events", request.events.len());
     if !request.events.is_empty() {
         let first = &request.events[0];
         let tenant_id = first.tenant_id.0;
