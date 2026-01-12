@@ -1,10 +1,11 @@
-//! HTTP server bootstrap for StateSet Sequencer.
+//! HTTP and gRPC server bootstrap for StateSet Sequencer.
 //!
 //! This module wires together:
 //! - configuration
 //! - database connection pool
 //! - core services (sequencer, event store, commitment engine, VES sequencer)
-//! - the Axum router
+//! - the Axum HTTP router
+//! - the Tonic gRPC server (v1 and v2 APIs)
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -14,12 +15,18 @@ use axum::http::{HeaderValue, Method};
 use axum::routing::get;
 use axum::Router;
 use sqlx::postgres::PgPoolOptions;
+use tonic::transport::Server as TonicServer;
 use tower_http::cors::AllowOrigin;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use uuid::Uuid;
+
+use crate::grpc::{GrpcAuthInterceptor, KeyManagementServiceV2, SequencerService, SequencerServiceV2};
+use crate::proto::v2::key_management_server::KeyManagementServer;
+use crate::proto::sequencer_server::SequencerServer as SequencerServerV1;
+use crate::proto::v2::sequencer_server::SequencerServer as SequencerServerV2;
 
 use crate::anchor::{AnchorConfig, AnchorService};
 use crate::auth::{
@@ -39,8 +46,10 @@ use crate::metrics::{ComponentMetrics, MetricsRegistry};
 pub struct Config {
     /// PostgreSQL connection URL.
     pub database_url: String,
-    /// Server listen address.
+    /// HTTP server listen address.
     pub listen_addr: SocketAddr,
+    /// gRPC server listen address (optional).
+    pub grpc_addr: Option<SocketAddr>,
     /// Maximum database connections.
     pub max_connections: u32,
 }
@@ -62,6 +71,17 @@ impl Config {
             .parse()
             .expect("Invalid listen address");
 
+        // gRPC port configuration (defaults to HTTP port + 1, e.g., 8081 if HTTP is 8080)
+        let grpc_addr: Option<SocketAddr> = if std::env::var("GRPC_DISABLED").is_ok() {
+            None
+        } else {
+            let grpc_port: u16 = std::env::var("GRPC_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(port + 1);
+            Some(format!("{host}:{grpc_port}").parse().expect("Invalid gRPC address"))
+        };
+
         let max_connections: u32 = std::env::var("MAX_DB_CONNECTIONS")
             .ok()
             .and_then(|p| p.parse().ok())
@@ -70,6 +90,7 @@ impl Config {
         Self {
             database_url,
             listen_addr,
+            grpc_addr,
             max_connections,
         }
     }
@@ -180,7 +201,12 @@ pub async fn run() -> anyhow::Result<()> {
     // Load configuration
     let config = Config::from_env();
     info!("Configuration loaded");
-    info!("  Listen address: {}", config.listen_addr);
+    info!("  HTTP listen address: {}", config.listen_addr);
+    if let Some(grpc_addr) = config.grpc_addr {
+        info!("  gRPC listen address: {}", grpc_addr);
+    } else {
+        info!("  gRPC server: disabled");
+    }
     info!("  Max connections: {}", config.max_connections);
 
     // Connect to PostgreSQL
@@ -314,17 +340,78 @@ pub async fn run() -> anyhow::Result<()> {
     let _metrics_task = component_metrics.start_collection_task(std::time::Duration::from_secs(15));
     info!("Component metrics collection started (15s interval)");
 
-    // Build router
+    // Start gRPC server (if enabled) - must happen before build_router consumes auth_state
+    let grpc_handle = if let Some(grpc_addr) = config.grpc_addr {
+        // Create gRPC services
+        let sequencer_v1_service = SequencerService::new(
+            state.sequencer.clone(),
+            state.event_store.clone(),
+            state.commitment_engine.clone(),
+        );
+        let sequencer_v2_service = SequencerServiceV2::new(
+            state.sequencer.clone(),
+            state.event_store.clone(),
+            state.commitment_engine.clone(),
+        );
+        let key_management_service = KeyManagementServiceV2::new();
+
+        // Create auth interceptor for gRPC
+        let grpc_auth_interceptor = GrpcAuthInterceptor::new(
+            auth_state.authenticator.clone(),
+            auth_state.require_auth,
+        );
+
+        let grpc_server = TonicServer::builder()
+            .add_service(SequencerServerV1::with_interceptor(
+                sequencer_v1_service,
+                grpc_auth_interceptor.clone(),
+            ))
+            .add_service(SequencerServerV2::with_interceptor(
+                sequencer_v2_service,
+                grpc_auth_interceptor.clone(),
+            ))
+            .add_service(KeyManagementServer::with_interceptor(
+                key_management_service,
+                grpc_auth_interceptor,
+            ));
+
+        info!("Starting gRPC server on {}", grpc_addr);
+        Some(tokio::spawn(async move {
+            if let Err(e) = grpc_server.serve(grpc_addr).await {
+                tracing::error!("gRPC server error: {}", e);
+            }
+        }))
+    } else {
+        None
+    };
+
+    // Build HTTP router
     let app = build_router(auth_state)?
-        .with_state(state)
+        .with_state(state.clone())
         .layer(DefaultBodyLimit::max(request_limits.max_body_size));
 
-    // Start server
+    // Start HTTP server
     info!("Starting HTTP server on {}", config.listen_addr);
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
 
     info!("StateSet Sequencer is ready to accept connections");
-    axum::serve(listener, app).await?;
+
+    // Run both servers
+    tokio::select! {
+        result = axum::serve(listener, app) => {
+            if let Err(e) = result {
+                tracing::error!("HTTP server error: {}", e);
+            }
+        }
+        _ = async {
+            if let Some(handle) = grpc_handle {
+                let _ = handle.await;
+            } else {
+                // If no gRPC server, just wait forever (HTTP server will control)
+                std::future::pending::<()>().await;
+            }
+        } => {}
+    }
 
     Ok(())
 }

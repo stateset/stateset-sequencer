@@ -62,6 +62,35 @@ impl PgCommitmentEngine {
         row.map(BatchCommitment::try_from).transpose()
     }
 
+    /// Get the commitment containing a specific sequence number.
+    pub async fn get_commitment_by_sequence(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        sequence: u64,
+    ) -> Result<Option<BatchCommitment>> {
+        let row: Option<CommitmentRow> = sqlx::query_as(
+            r#"
+            SELECT batch_id, tenant_id, store_id,
+                   prev_state_root, new_state_root, events_root,
+                   sequence_start, sequence_end, event_count,
+                   committed_at, chain_tx_hash
+            FROM commitments
+            WHERE tenant_id = $1 AND store_id = $2
+              AND sequence_start <= $3 AND sequence_end >= $3
+            ORDER BY sequence_end DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(sequence as i64)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(BatchCommitment::try_from).transpose()
+    }
+
     /// Initialize the commitments table
     pub async fn initialize(&self) -> Result<()> {
         sqlx::query(

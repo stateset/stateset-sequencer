@@ -40,6 +40,22 @@ impl Authenticator {
         self
     }
 
+    /// Get the JWT validator (if configured)
+    pub fn jwt_validator(&self) -> Option<&Arc<JwtValidator>> {
+        self.jwt_validator.as_ref()
+    }
+
+    /// Validate an API key synchronously (in-memory only)
+    ///
+    /// This is used by the gRPC interceptor which needs sync validation.
+    /// Only checks the in-memory key store, not the database.
+    pub fn validate_api_key(&self, key: &str) -> Result<AuthContext, AuthError> {
+        if !key.starts_with(API_KEY_PREFIX) {
+            return Err(AuthError::InvalidApiKey);
+        }
+        self.api_key_validator.validate(key)
+    }
+
     /// Authenticate a request
     pub async fn authenticate(&self, auth_header: Option<&str>) -> Result<AuthContext, AuthError> {
         let header = auth_header.ok_or(AuthError::MissingAuth)?;

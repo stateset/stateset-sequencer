@@ -40,7 +40,7 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use crate::domain::{
-    AgentId, EventBatch, EventEnvelope, IngestReceipt, RejectedEvent, RejectionReason,
+    AgentId, EntityType, EventBatch, EventEnvelope, IngestReceipt, RejectedEvent, RejectionReason,
     SequencedEvent, StoreId, SyncState, TenantId,
 };
 use crate::infra::{IngestService, PayloadEncryption, Result, Sequencer, SequencerError};
@@ -291,6 +291,31 @@ impl PgSequencer {
         Ok(())
     }
 
+    /// Get the current entity version within a transaction (for OCC at ingest time)
+    async fn get_entity_version_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<Option<u64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT version
+            FROM entity_versions
+            WHERE tenant_id = $1 AND store_id = $2 AND entity_type = $3 AND entity_id = $4
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(entity_type.as_str())
+        .bind(entity_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        Ok(row.map(|(v,)| v as u64))
+    }
+
     async fn fetch_existing_command_id_tx(
         tx: &mut Transaction<'_, Postgres>,
         event_id: Uuid,
@@ -512,6 +537,39 @@ impl IngestService for PgSequencer {
         let mut events_accepted: u32 = 0;
 
         for event in valid_events {
+            // Check base_version for optimistic concurrency control at ingest time
+            if let Some(expected_version) = event.base_version {
+                let current_version = Self::get_entity_version_tx(
+                    &mut tx,
+                    &event.tenant_id,
+                    &event.store_id,
+                    &event.entity_type,
+                    &event.entity_id,
+                )
+                .await?;
+                let actual_version = current_version.unwrap_or(0);
+
+                if expected_version != actual_version {
+                    // Release command_id reservation if we had one
+                    if let Some(cmd_id) = event.command_id {
+                        if reserved_command_ids.contains(&cmd_id) {
+                            Self::release_command_id_tx(&mut tx, &tenant_id, &store_id, cmd_id)
+                                .await?;
+                        }
+                    }
+
+                    rejected.push(RejectedEvent {
+                        event_id: event.event_id,
+                        reason: RejectionReason::VersionConflict,
+                        message: format!(
+                            "Version conflict: expected {}, actual {}",
+                            expected_version, actual_version
+                        ),
+                    });
+                    continue;
+                }
+            }
+
             let next_seq = head.saturating_add(1);
             let sequenced = SequencedEvent::new(event, next_seq);
 

@@ -82,6 +82,8 @@ pub enum VesRejectionReason {
     UnsupportedVersion,
     /// Schema validation failed
     SchemaValidation(String),
+    /// Version conflict (optimistic concurrency at sequencer)
+    VersionConflict { expected: u64, actual: u64 },
 }
 
 impl std::fmt::Display for VesRejectionReason {
@@ -95,6 +97,9 @@ impl std::fmt::Display for VesRejectionReason {
             Self::AgentKeyInvalid(msg) => write!(f, "agent_key_invalid: {}", msg),
             Self::UnsupportedVersion => write!(f, "unsupported_version"),
             Self::SchemaValidation(msg) => write!(f, "schema_validation: {}", msg),
+            Self::VersionConflict { expected, actual } => {
+                write!(f, "version_conflict: expected {}, actual {}", expected, actual)
+            }
         }
     }
 }
@@ -594,6 +599,58 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         Ok(())
     }
 
+    /// Get the current entity version within a transaction (for OCC at ingest time)
+    async fn get_entity_version_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<Option<u64>> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT version
+            FROM entity_versions
+            WHERE tenant_id = $1 AND store_id = $2 AND entity_type = $3 AND entity_id = $4
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(entity_type.as_str())
+        .bind(entity_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        Ok(row.map(|(v,)| v as u64))
+    }
+
+    /// Bump entity version within a transaction
+    async fn bump_entity_version_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        event: &SequencedVesEvent,
+    ) -> Result<()> {
+        let env = &event.envelope;
+        sqlx::query(
+            r#"
+            INSERT INTO entity_versions (
+                tenant_id, store_id, entity_type, entity_id, version, updated_at
+            ) VALUES ($1, $2, $3, $4, 1, NOW())
+            ON CONFLICT (tenant_id, store_id, entity_type, entity_id)
+            DO UPDATE SET
+                version = entity_versions.version + 1,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(env.tenant_id.0)
+        .bind(env.store_id.0)
+        .bind(env.entity_type.as_str())
+        .bind(&env.entity_id)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
     /// Generate a sequencer receipt for an event
     fn generate_receipt(&self, event: &SequencedVesEvent) -> VesSequencerReceipt {
         let event_signing_hash = event.compute_signing_hash();
@@ -771,6 +828,42 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         }
 
         for event in valid_events {
+            // Check base_version for optimistic concurrency control at ingest time
+            if let Some(expected_version) = event.base_version {
+                let current_version = Self::get_entity_version_tx(
+                    &mut tx,
+                    &event.tenant_id,
+                    &event.store_id,
+                    &event.entity_type,
+                    &event.entity_id,
+                )
+                .await?;
+                let actual_version = current_version.unwrap_or(0);
+
+                if expected_version != actual_version {
+                    // Release command_id reservation if we had one
+                    if let Some(cmd_id) = event.command_id {
+                        if reserved_command_ids.contains(&cmd_id) {
+                            self.release_command_id_tx(&mut tx, &tenant_id, &store_id, cmd_id)
+                                .await?;
+                        }
+                    }
+
+                    rejected.push(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::VersionConflict {
+                            expected: expected_version,
+                            actual: actual_version,
+                        },
+                        message: format!(
+                            "Version conflict: expected {}, actual {}",
+                            expected_version, actual_version
+                        ),
+                    });
+                    continue;
+                }
+            }
+
             let next_seq = head.saturating_add(1);
             let sequenced = SequencedVesEvent::new(event, next_seq);
 
@@ -797,6 +890,9 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
             let receipt = self.generate_receipt(&sequenced);
             self.store_receipt_tx(&mut tx, &receipt).await?;
+
+            // Bump entity version for state root consistency
+            Self::bump_entity_version_tx(&mut tx, &sequenced).await?;
 
             head = next_seq;
             new_events_accepted += 1;

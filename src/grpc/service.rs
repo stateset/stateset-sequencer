@@ -12,6 +12,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
+use crate::auth::{AuthContext, Permissions};
 /// Convert domain event to proto event (free function for use in async blocks)
 fn to_proto_event(event: &crate::domain::SequencedEvent) -> crate::proto::SequencedEvent {
     crate::proto::SequencedEvent {
@@ -79,6 +80,49 @@ impl SequencerService {
         }
     }
 
+    fn auth_context<T>(request: &Request<T>) -> AuthContext {
+        request
+            .extensions()
+            .get::<AuthContext>()
+            .cloned()
+            .unwrap_or(AuthContext {
+                tenant_id: Uuid::nil(),
+                store_ids: Vec::new(),
+                agent_id: None,
+                permissions: Permissions::admin(),
+            })
+    }
+
+    fn require_read(ctx: &AuthContext) -> Result<(), Status> {
+        if ctx.can_read() {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("read permission required"))
+        }
+    }
+
+    fn require_write(ctx: &AuthContext) -> Result<(), Status> {
+        if ctx.can_write() {
+            Ok(())
+        } else {
+            Err(Status::permission_denied("write permission required"))
+        }
+    }
+
+    fn authorize_tenant_store(
+        ctx: &AuthContext,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+    ) -> Result<(), Status> {
+        if !ctx.tenant_id.is_nil() && ctx.tenant_id != tenant_id.0 {
+            return Err(Status::permission_denied("tenant access denied"));
+        }
+        if !ctx.can_access_store(&store_id.0) {
+            return Err(Status::permission_denied("store access denied"));
+        }
+        Ok(())
+    }
+
     /// Convert domain event to proto event
     fn to_proto_event(event: &crate::domain::SequencedEvent) -> SequencedEvent {
         SequencedEvent {
@@ -129,14 +173,11 @@ impl SequencerService {
         let payload: serde_json::Value = serde_json::from_slice(&proto.payload)
             .map_err(|e| Status::invalid_argument(format!("invalid payload JSON: {}", e)))?;
 
-        let created_at = proto
-            .created_at
-            .as_ref()
-            .map(|ts| {
-                chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
-                    .unwrap_or_else(chrono::Utc::now)
-            })
-            .unwrap_or_else(chrono::Utc::now);
+        let created_at = match proto.created_at.as_ref() {
+            Some(ts) => chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
+                .ok_or_else(|| Status::invalid_argument("invalid created_at timestamp"))?,
+            None => chrono::Utc::now(),
+        };
 
         let source_agent = Uuid::parse_str(&proto.source_agent)
             .map_err(|e| Status::invalid_argument(format!("invalid source_agent: {}", e)))?;
@@ -150,11 +191,15 @@ impl SequencerService {
             )
         };
 
-        let payload_hash: [u8; 32] = proto
-            .payload_hash
-            .as_slice()
-            .try_into()
-            .map_err(|_| Status::invalid_argument("payload_hash must be 32 bytes"))?;
+        let payload_hash: [u8; 32] = match proto.payload_hash.len() {
+            0 => crate::domain::EventEnvelope::compute_payload_hash(&payload),
+            32 => proto
+                .payload_hash
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("payload_hash must be 32 bytes"))?,
+            _ => return Err(Status::invalid_argument("payload_hash must be 32 bytes")),
+        };
 
         Ok(crate::domain::EventEnvelope {
             event_id,
@@ -202,6 +247,7 @@ impl SequencerService {
 impl SequencerTrait for SequencerService {
     /// Push a batch of events for sequencing
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushResponse>, Status> {
+        let auth_ctx = Self::auth_context(&request);
         let req = request.into_inner();
 
         info!(
@@ -210,6 +256,8 @@ impl SequencerTrait for SequencerService {
             "Processing Push request"
         );
 
+        Self::require_write(&auth_ctx)?;
+
         // Parse agent ID
         let agent_id = Uuid::parse_str(&req.agent_id)
             .map_err(|e| Status::invalid_argument(format!("invalid agent_id: {}", e)))?;
@@ -217,7 +265,9 @@ impl SequencerTrait for SequencerService {
         // Convert proto events to domain events
         let mut events = Vec::with_capacity(req.events.len());
         for proto_event in &req.events {
-            events.push(Self::from_proto_event(proto_event)?);
+            let event = Self::from_proto_event(proto_event)?;
+            Self::authorize_tenant_store(&auth_ctx, &event.tenant_id, &event.store_id)?;
+            events.push(event);
         }
 
         // Create batch
@@ -272,6 +322,7 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<PullRequest>,
     ) -> Result<Response<Self::PullStream>, Status> {
+        let auth_ctx = Self::auth_context(&request);
         let req = request.into_inner();
 
         debug!(
@@ -293,6 +344,9 @@ impl SequencerTrait for SequencerService {
         let batch_size = req.batch_size.clamp(1, 1000) as usize;
         let mut from_sequence = req.from_sequence;
 
+        Self::require_read(&auth_ctx)?;
+        Self::authorize_tenant_store(&auth_ctx, &tenant_id, &store_id)?;
+
         // Clone for async move
         let event_store = self.event_store.clone();
         let sequencer = self.sequencer.clone();
@@ -313,13 +367,11 @@ impl SequencerTrait for SequencerService {
                 };
 
                 // Read events
+                let end_sequence = from_sequence
+                    .saturating_add(batch_size as u64)
+                    .saturating_sub(1);
                 let events = match event_store
-                    .read_range(
-                        &tenant_id,
-                        &store_id,
-                        from_sequence,
-                        from_sequence + batch_size as u64,
-                    )
+                    .read_range(&tenant_id, &store_id, from_sequence, end_sequence)
                     .await
                 {
                     Ok(e) => e,
@@ -329,21 +381,16 @@ impl SequencerTrait for SequencerService {
                     }
                 };
 
-                let event_count = events.len();
-                let has_more =
-                    event_count == batch_size && (from_sequence + event_count as u64) < head;
+                let has_more = head > end_sequence;
 
                 // Convert to proto events
                 let proto_events: Vec<SequencedEvent> = events.iter().map(to_proto_event).collect();
 
                 // Calculate next sequence
-                let next_sequence = if events.is_empty() {
-                    from_sequence
+                let next_sequence = if has_more {
+                    end_sequence.saturating_add(1)
                 } else {
-                    events
-                        .last()
-                        .map(|e| e.sequence_number() + 1)
-                        .unwrap_or(from_sequence)
+                    head.saturating_add(1)
                 };
 
                 // Send response
@@ -375,6 +422,7 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<GetHeadRequest>,
     ) -> Result<Response<GetHeadResponse>, Status> {
+        let auth_ctx = Self::auth_context(&request);
         let req = request.into_inner();
 
         let tenant_id = Uuid::parse_str(&req.tenant_id)
@@ -384,6 +432,9 @@ impl SequencerTrait for SequencerService {
 
         let tenant_id = TenantId(tenant_id);
         let store_id = StoreId(store_id);
+
+        Self::require_read(&auth_ctx)?;
+        Self::authorize_tenant_store(&auth_ctx, &tenant_id, &store_id)?;
 
         let head = self
             .sequencer
@@ -409,7 +460,10 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<GetInclusionProofRequest>,
     ) -> Result<Response<GetInclusionProofResponse>, Status> {
+        let auth_ctx = Self::auth_context(&request);
         let req = request.into_inner();
+
+        Self::require_read(&auth_ctx)?;
 
         let batch_id = Uuid::parse_str(&req.batch_id)
             .map_err(|e| Status::invalid_argument(format!("invalid batch_id: {}", e)))?;
@@ -425,6 +479,8 @@ impl SequencerTrait for SequencerService {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("commitment not found"))?;
 
+        Self::authorize_tenant_store(&auth_ctx, &commitment.tenant_id, &commitment.store_id)?;
+
         // Get the event by ID
         let event = self
             .event_store
@@ -432,6 +488,12 @@ impl SequencerTrait for SequencerService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("event not found"))?;
+
+        if event.envelope.tenant_id.0 != commitment.tenant_id.0
+            || event.envelope.store_id.0 != commitment.store_id.0
+        {
+            return Err(Status::not_found("event not found"));
+        }
 
         // Verify event is within the batch's sequence range
         let seq = event.sequence_number();
@@ -541,7 +603,10 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<GetCommitmentRequest>,
     ) -> Result<Response<GetCommitmentResponse>, Status> {
+        let auth_ctx = Self::auth_context(&request);
         let req = request.into_inner();
+
+        Self::require_read(&auth_ctx)?;
 
         let batch_id = Uuid::parse_str(&req.batch_id)
             .map_err(|e| Status::invalid_argument(format!("invalid batch_id: {}", e)))?;
@@ -553,6 +618,8 @@ impl SequencerTrait for SequencerService {
             .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found("commitment not found"))?;
 
+        Self::authorize_tenant_store(&auth_ctx, &commitment.tenant_id, &commitment.store_id)?;
+
         Ok(Response::new(GetCommitmentResponse {
             commitment: Some(Self::to_proto_commitment(&commitment)),
         }))
@@ -563,6 +630,7 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<GetEntityHistoryRequest>,
     ) -> Result<Response<GetEntityHistoryResponse>, Status> {
+        let auth_ctx = Self::auth_context(&request);
         let req = request.into_inner();
 
         let tenant_id = Uuid::parse_str(&req.tenant_id)
@@ -573,6 +641,9 @@ impl SequencerTrait for SequencerService {
         let tenant_id = TenantId(tenant_id);
         let store_id = StoreId(store_id);
         let entity_type = EntityType::from(req.entity_type.as_str());
+
+        Self::require_read(&auth_ctx)?;
+        Self::authorize_tenant_store(&auth_ctx, &tenant_id, &store_id)?;
 
         let events = self
             .event_store

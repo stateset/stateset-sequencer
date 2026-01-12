@@ -134,15 +134,20 @@ impl JwtValidator {
         let tenant_id = Uuid::parse_str(&claims.sub)
             .map_err(|_| AuthError::InvalidJwt("invalid tenant ID".to_string()))?;
 
-        // Parse store IDs
+        // Parse store IDs - fail if any store ID is invalid to prevent
+        // privilege escalation (empty store_ids = access to all stores)
         let store_ids: Vec<Uuid> = if claims.stores.is_empty() {
             vec![]
         } else {
             claims
                 .stores
                 .split(',')
-                .filter_map(|s| Uuid::parse_str(s.trim()).ok())
-                .collect()
+                .map(|s| {
+                    Uuid::parse_str(s.trim()).map_err(|_| {
+                        AuthError::InvalidJwt(format!("invalid store ID: {}", s.trim()))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
         };
 
         // Parse agent ID
@@ -263,5 +268,46 @@ mod tests {
 
         let result = validator.validate(&token);
         assert!(matches!(result, Err(AuthError::TokenExpired)));
+    }
+
+    #[test]
+    fn test_invalid_store_id_fails_validation() {
+        // This test verifies that invalid store IDs in the JWT cause
+        // a hard auth failure rather than silently granting all-stores access.
+        // Previously, invalid UUIDs were dropped via filter_map, so a claim
+        // like "invalid-uuid" would become an empty Vec, granting access to all stores.
+        let validator = create_validator();
+        let tenant_id = Uuid::new_v4();
+
+        // Create a token with valid structure, then manually craft one with invalid stores
+        let now = Utc::now();
+        let exp = now + Duration::hours(1);
+
+        let claims = Claims {
+            sub: tenant_id.to_string(),
+            iss: "stateset-sequencer".to_string(),
+            aud: "stateset-api".to_string(),
+            exp: exp.timestamp(),
+            iat: now.timestamp(),
+            nbf: now.timestamp(),
+            jti: Uuid::new_v4().to_string(),
+            stores: "not-a-valid-uuid,also-invalid".to_string(), // Invalid store IDs
+            agent: None,
+            perms: "read".to_string(),
+        };
+
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"test-secret-key-for-testing-only"),
+        )
+        .unwrap();
+
+        let result = validator.validate(&token);
+        assert!(
+            matches!(&result, Err(AuthError::InvalidJwt(msg)) if msg.contains("invalid store ID")),
+            "Expected InvalidJwt error for invalid store IDs, got: {:?}",
+            result
+        );
     }
 }

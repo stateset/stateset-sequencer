@@ -279,6 +279,9 @@ pub enum RejectionReason {
     /// Invalid payload hash
     InvalidPayloadHash,
 
+    /// Version conflict (optimistic concurrency at sequencer)
+    VersionConflict,
+
     /// Other error
     Other,
 }
