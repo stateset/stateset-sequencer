@@ -159,6 +159,56 @@ pub struct VesSequencer<R: AgentKeyRegistry> {
 }
 
 impl<R: AgentKeyRegistry> VesSequencer<R> {
+    fn decode_event_row(row: VesEventRow) -> Result<SequencedVesEvent> {
+        let plain_hash: Hash256 = row
+            .payload_plain_hash
+            .try_into()
+            .map_err(|_| SequencerError::Internal("invalid plain hash".into()))?;
+        let cipher_hash: Hash256 = row
+            .payload_cipher_hash
+            .try_into()
+            .map_err(|_| SequencerError::Internal("invalid cipher hash".into()))?;
+        let signature: Signature64 = row
+            .agent_signature
+            .try_into()
+            .map_err(|_| SequencerError::Internal("invalid signature".into()))?;
+
+        let payload_kind =
+            PayloadKind::from_u32(row.payload_kind as u32).unwrap_or(PayloadKind::Plaintext);
+
+        let payload_encrypted = if let Some(enc_json) = row.payload_encrypted {
+            serde_json::from_value(enc_json).ok()
+        } else {
+            None
+        };
+
+        let envelope = VesEventEnvelope {
+            ves_version: row.ves_version as u32,
+            event_id: row.event_id,
+            tenant_id: TenantId::from_uuid(row.tenant_id),
+            store_id: StoreId::from_uuid(row.store_id),
+            source_agent_id: AgentId::from_uuid(row.source_agent_id),
+            agent_key_id: AgentKeyId::new(row.agent_key_id as u32),
+            entity_type: EntityType::new(row.entity_type),
+            entity_id: row.entity_id,
+            event_type: EventType::new(row.event_type),
+            created_at: row
+                .created_at_str
+                .unwrap_or_else(|| row.created_at.to_rfc3339()),
+            payload_kind,
+            payload: row.payload,
+            payload_encrypted,
+            payload_plain_hash: plain_hash,
+            payload_cipher_hash: cipher_hash,
+            agent_signature: signature,
+            sequence_number: Some(row.sequence_number as u64),
+            sequenced_at: Some(row.sequenced_at),
+            command_id: row.command_id,
+            base_version: row.base_version.map(|v| v as u64),
+        };
+
+        Ok(SequencedVesEvent { envelope })
+    }
     fn strict_format_from_env() -> bool {
         std::env::var("VES_STRICT_FORMAT_VALIDATION")
             .ok()
@@ -1318,59 +1368,122 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .await?;
 
         let mut events = Vec::with_capacity(rows.len());
-
         for row in rows {
-            let plain_hash: Hash256 = row
-                .payload_plain_hash
-                .try_into()
-                .map_err(|_| SequencerError::Internal("invalid plain hash".into()))?;
-            let cipher_hash: Hash256 = row
-                .payload_cipher_hash
-                .try_into()
-                .map_err(|_| SequencerError::Internal("invalid cipher hash".into()))?;
-            let signature: Signature64 = row
-                .agent_signature
-                .try_into()
-                .map_err(|_| SequencerError::Internal("invalid signature".into()))?;
-
-            let payload_kind =
-                PayloadKind::from_u32(row.payload_kind as u32).unwrap_or(PayloadKind::Plaintext);
-
-            let payload_encrypted = if let Some(enc_json) = row.payload_encrypted {
-                serde_json::from_value(enc_json).ok()
-            } else {
-                None
-            };
-
-            let envelope = VesEventEnvelope {
-                ves_version: row.ves_version as u32,
-                event_id: row.event_id,
-                tenant_id: TenantId::from_uuid(row.tenant_id),
-                store_id: StoreId::from_uuid(row.store_id),
-                source_agent_id: AgentId::from_uuid(row.source_agent_id),
-                agent_key_id: AgentKeyId::new(row.agent_key_id as u32),
-                entity_type: EntityType::new(row.entity_type),
-                entity_id: row.entity_id,
-                event_type: EventType::new(row.event_type),
-                created_at: row
-                    .created_at_str
-                    .unwrap_or_else(|| row.created_at.to_rfc3339()),
-                payload_kind,
-                payload: row.payload,
-                payload_encrypted,
-                payload_plain_hash: plain_hash,
-                payload_cipher_hash: cipher_hash,
-                agent_signature: signature,
-                sequence_number: Some(row.sequence_number as u64),
-                sequenced_at: Some(row.sequenced_at),
-                command_id: row.command_id,
-                base_version: row.base_version.map(|v| v as u64),
-            };
-
-            events.push(SequencedVesEvent { envelope });
+            events.push(Self::decode_event_row(row)?);
         }
 
         Ok(events)
+    }
+
+    /// Read events by sequence range (inclusive).
+    pub async fn read_range(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        start: u64,
+        end: u64,
+    ) -> Result<Vec<SequencedVesEvent>> {
+        if end < start {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<VesEventRow> = sqlx::query_as(
+            r#"
+            SELECT
+                event_id, command_id, ves_version,
+                tenant_id, store_id,
+                source_agent_id, agent_key_id,
+                entity_type, entity_id, event_type,
+                created_at, created_at_str, sequenced_at,
+                payload_kind, payload, payload_encrypted,
+                payload_plain_hash, payload_cipher_hash,
+                agent_signature,
+                sequence_number, base_version
+            FROM ves_events
+            WHERE tenant_id = $1 AND store_id = $2
+              AND sequence_number >= $3 AND sequence_number <= $4
+            ORDER BY sequence_number ASC
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(start as i64)
+        .bind(end as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            events.push(Self::decode_event_row(row)?);
+        }
+
+        Ok(events)
+    }
+
+    /// Read events for a specific entity (ordered by sequence).
+    pub async fn read_entity(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        entity_type: &EntityType,
+        entity_id: &str,
+    ) -> Result<Vec<SequencedVesEvent>> {
+        let rows: Vec<VesEventRow> = sqlx::query_as(
+            r#"
+            SELECT
+                event_id, command_id, ves_version,
+                tenant_id, store_id,
+                source_agent_id, agent_key_id,
+                entity_type, entity_id, event_type,
+                created_at, created_at_str, sequenced_at,
+                payload_kind, payload, payload_encrypted,
+                payload_plain_hash, payload_cipher_hash,
+                agent_signature,
+                sequence_number, base_version
+            FROM ves_events
+            WHERE tenant_id = $1 AND store_id = $2
+              AND entity_type = $3 AND entity_id = $4
+            ORDER BY sequence_number ASC
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(entity_type.as_str())
+        .bind(entity_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut events = Vec::with_capacity(rows.len());
+        for row in rows {
+            events.push(Self::decode_event_row(row)?);
+        }
+
+        Ok(events)
+    }
+
+    /// Read a single event by ID.
+    pub async fn read_by_id(&self, event_id: Uuid) -> Result<Option<SequencedVesEvent>> {
+        let row: Option<VesEventRow> = sqlx::query_as(
+            r#"
+            SELECT
+                event_id, command_id, ves_version,
+                tenant_id, store_id,
+                source_agent_id, agent_key_id,
+                entity_type, entity_id, event_type,
+                created_at, created_at_str, sequenced_at,
+                payload_kind, payload, payload_encrypted,
+                payload_plain_hash, payload_cipher_hash,
+                agent_signature,
+                sequence_number, base_version
+            FROM ves_events
+            WHERE event_id = $1
+            "#,
+        )
+        .bind(event_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(Self::decode_event_row).transpose()
     }
 }
 

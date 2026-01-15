@@ -19,7 +19,7 @@ use tonic::transport::Server as TonicServer;
 use tower_http::cors::AllowOrigin;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use uuid::Uuid;
 
@@ -30,8 +30,8 @@ use crate::proto::v2::sequencer_server::SequencerServer as SequencerServerV2;
 
 use crate::anchor::{AnchorConfig, AnchorService};
 use crate::auth::{
-    ApiKeyRecord, ApiKeyValidator, AuthMiddlewareState, Authenticator, JwtValidator, Permissions,
-    RateLimiter, RequestLimits,
+    ApiKeyRecord, ApiKeyStore, ApiKeyValidator, AuthMiddlewareState, Authenticator, JwtValidator,
+    Permissions, PgApiKeyStore, RateLimiter, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::{
@@ -164,31 +164,11 @@ pub async fn run() -> anyhow::Result<()> {
         Err(_) => None,
     };
 
-    if require_auth && !any_auth_configured {
-        anyhow::bail!(
-            "AUTH_MODE=required but no auth is configured; set JWT_SECRET or BOOTSTRAP_ADMIN_API_KEY (or set AUTH_MODE=disabled for local dev)"
-        );
-    }
-
-    let authenticator = {
-        let authenticator = Authenticator::new(api_key_validator);
-        match jwt_validator {
-            Some(jwt) => Arc::new(authenticator.with_jwt(jwt)),
-            None => Arc::new(authenticator),
-        }
-    };
-
     let rate_limiter = std::env::var("RATE_LIMIT_PER_MINUTE")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|v| *v > 0)
         .map(|rpm| Arc::new(RateLimiter::new(rpm)));
-
-    let auth_state = AuthMiddlewareState {
-        authenticator,
-        require_auth,
-        rate_limiter,
-    };
 
     let request_limits = RequestLimits::from_env();
     info!(
@@ -233,6 +213,38 @@ pub async fn run() -> anyhow::Result<()> {
     } else {
         info!("DB migrations skipped (DB_MIGRATE_ON_STARTUP=0)");
     }
+
+    let api_key_store = Arc::new(PgApiKeyStore::new(pool.clone()));
+    match api_key_store.has_any_active().await {
+        Ok(true) => {
+            any_auth_configured = true;
+            info!("Active API keys detected in database");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            warn!("Failed to check API key store: {}", e);
+        }
+    }
+
+    if require_auth && !any_auth_configured {
+        anyhow::bail!(
+            "AUTH_MODE=required but no auth is configured; set JWT_SECRET or BOOTSTRAP_ADMIN_API_KEY (or set AUTH_MODE=disabled for local dev)"
+        );
+    }
+
+    let authenticator = {
+        let authenticator = Authenticator::new(api_key_validator).with_api_key_store(api_key_store);
+        match jwt_validator {
+            Some(jwt) => Arc::new(authenticator.with_jwt(jwt)),
+            None => Arc::new(authenticator),
+        }
+    };
+
+    let auth_state = AuthMiddlewareState {
+        authenticator,
+        require_auth,
+        rate_limiter,
+    };
 
     // Payload encryption-at-rest (legacy `events` table)
     let payload_encryption =
@@ -349,11 +361,11 @@ pub async fn run() -> anyhow::Result<()> {
             state.commitment_engine.clone(),
         );
         let sequencer_v2_service = SequencerServiceV2::new(
-            state.sequencer.clone(),
-            state.event_store.clone(),
-            state.commitment_engine.clone(),
+            state.ves_sequencer.clone(),
+            state.ves_commitment_engine.clone(),
         );
-        let key_management_service = KeyManagementServiceV2::new();
+        let key_management_service =
+            KeyManagementServiceV2::new(state.agent_key_registry.clone());
 
         // Create auth interceptor for gRPC
         let grpc_auth_interceptor = GrpcAuthInterceptor::new(

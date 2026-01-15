@@ -5,11 +5,12 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgPool, Postgres, Transaction};
+use std::borrow::Cow;
 use uuid::Uuid;
 
 use crate::crypto::{
-    compute_leaf_hash, compute_node_hash, compute_stream_id, compute_ves_state_root,
-    next_power_of_two, pad_leaf, LeafHashParams,
+    compute_event_signing_hash, compute_leaf_hash, compute_node_hash, compute_stream_id,
+    compute_ves_state_root, next_power_of_two, pad_leaf, EventSigningParams, LeafHashParams,
 };
 use crate::domain::{Hash256, MerkleProof, StoreId, TenantId, VesBatchCommitment};
 use crate::infra::{Result, SequencerError};
@@ -19,9 +20,79 @@ pub struct PgVesCommitmentEngine {
     pool: PgPool,
 }
 
+#[derive(sqlx::FromRow)]
+struct VesLeafRow {
+    sequence_number: i64,
+    event_signing_hash: Option<Vec<u8>>,
+    agent_signature: Vec<u8>,
+    ves_version: i32,
+    event_id: Uuid,
+    source_agent_id: Uuid,
+    agent_key_id: i32,
+    entity_type: String,
+    entity_id: String,
+    event_type: String,
+    created_at: DateTime<Utc>,
+    created_at_str: Option<String>,
+    payload_kind: i32,
+    payload_plain_hash: Vec<u8>,
+    payload_cipher_hash: Vec<u8>,
+}
+
 impl PgVesCommitmentEngine {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+
+    fn event_signing_hash_from_row(
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        row: &VesLeafRow,
+    ) -> Result<Hash256> {
+        if let Some(ref hash_bytes) = row.event_signing_hash {
+            if !hash_bytes.is_empty() {
+                return hash_bytes.as_slice().try_into().map_err(|_| {
+                    SequencerError::Internal("invalid event_signing_hash length".to_string())
+                });
+            }
+        }
+
+        if !(0..=1).contains(&row.payload_kind) {
+            return Err(SequencerError::Internal(format!(
+                "invalid payload_kind {}",
+                row.payload_kind
+            )));
+        }
+
+        let payload_plain_hash: Hash256 = row.payload_plain_hash.as_slice().try_into().map_err(
+            |_| SequencerError::Internal("invalid payload_plain_hash length".to_string()),
+        )?;
+        let payload_cipher_hash: Hash256 = row.payload_cipher_hash.as_slice().try_into().map_err(
+            |_| SequencerError::Internal("invalid payload_cipher_hash length".to_string()),
+        )?;
+
+        let created_at = match row.created_at_str.as_deref() {
+            Some(value) => Cow::Borrowed(value),
+            None => Cow::Owned(row.created_at.to_rfc3339()),
+        };
+
+        let params = EventSigningParams {
+            ves_version: row.ves_version as u32,
+            tenant_id: &tenant_id.0,
+            store_id: &store_id.0,
+            event_id: &row.event_id,
+            source_agent_id: &row.source_agent_id,
+            agent_key_id: row.agent_key_id as u32,
+            entity_type: row.entity_type.as_str(),
+            entity_id: &row.entity_id,
+            event_type: row.event_type.as_str(),
+            created_at: created_at.as_ref(),
+            payload_kind: row.payload_kind as u32,
+            payload_plain_hash: &payload_plain_hash,
+            payload_cipher_hash: &payload_cipher_hash,
+        };
+
+        Ok(compute_event_signing_hash(&params))
     }
 
     pub async fn initialize(&self) -> Result<()> {
@@ -75,9 +146,24 @@ impl PgVesCommitmentEngine {
         start: u64,
         end: u64,
     ) -> Result<Vec<Hash256>> {
-        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        let rows: Vec<VesLeafRow> = sqlx::query_as(
             r#"
-            SELECT sequence_number, event_signing_hash, agent_signature
+            SELECT
+                sequence_number,
+                event_signing_hash,
+                agent_signature,
+                ves_version,
+                event_id,
+                source_agent_id,
+                agent_key_id,
+                entity_type,
+                entity_id,
+                event_type,
+                created_at,
+                created_at_str,
+                payload_kind,
+                payload_plain_hash,
+                payload_cipher_hash
             FROM ves_events
             WHERE tenant_id = $1 AND store_id = $2
               AND sequence_number >= $3 AND sequence_number <= $4
@@ -111,29 +197,25 @@ impl PgVesCommitmentEngine {
         }
 
         let mut leaves = Vec::with_capacity(rows.len());
-        for (idx, (sequence_number, event_signing_hash, agent_signature)) in
-            rows.into_iter().enumerate()
-        {
+        for (idx, row) in rows.into_iter().enumerate() {
             let expected_seq = start + idx as u64;
-            if sequence_number as u64 != expected_seq {
+            if row.sequence_number as u64 != expected_seq {
                 return Err(SequencerError::Internal(format!(
                     "non-contiguous sequence in VES commitment range: expected {}, found {}",
-                    expected_seq, sequence_number
+                    expected_seq, row.sequence_number
                 )));
             }
 
-            let event_signing_hash: Hash256 = event_signing_hash.try_into().map_err(|_| {
-                SequencerError::Internal("invalid event_signing_hash length".to_string())
-            })?;
-
-            let agent_signature: [u8; 64] = agent_signature.try_into().map_err(|_| {
+            let event_signing_hash =
+                Self::event_signing_hash_from_row(tenant_id, store_id, &row)?;
+            let agent_signature: [u8; 64] = row.agent_signature.try_into().map_err(|_| {
                 SequencerError::Internal("invalid agent_signature length".to_string())
             })?;
 
             let params = LeafHashParams {
                 tenant_id: &tenant_id.0,
                 store_id: &store_id.0,
-                sequence_number: sequence_number as u64,
+                sequence_number: row.sequence_number as u64,
                 event_signing_hash: &event_signing_hash,
                 agent_signature: &agent_signature,
             };
@@ -152,9 +234,24 @@ impl PgVesCommitmentEngine {
         start: u64,
         end: u64,
     ) -> Result<Vec<Hash256>> {
-        let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+        let rows: Vec<VesLeafRow> = sqlx::query_as(
             r#"
-            SELECT sequence_number, event_signing_hash, agent_signature
+            SELECT
+                sequence_number,
+                event_signing_hash,
+                agent_signature,
+                ves_version,
+                event_id,
+                source_agent_id,
+                agent_key_id,
+                entity_type,
+                entity_id,
+                event_type,
+                created_at,
+                created_at_str,
+                payload_kind,
+                payload_plain_hash,
+                payload_cipher_hash
             FROM ves_events
             WHERE tenant_id = $1 AND store_id = $2
               AND sequence_number >= $3 AND sequence_number <= $4
@@ -188,29 +285,25 @@ impl PgVesCommitmentEngine {
         }
 
         let mut leaves = Vec::with_capacity(rows.len());
-        for (idx, (sequence_number, event_signing_hash, agent_signature)) in
-            rows.into_iter().enumerate()
-        {
+        for (idx, row) in rows.into_iter().enumerate() {
             let expected_seq = start + idx as u64;
-            if sequence_number as u64 != expected_seq {
+            if row.sequence_number as u64 != expected_seq {
                 return Err(SequencerError::Internal(format!(
                     "non-contiguous sequence in VES commitment range: expected {}, found {}",
-                    expected_seq, sequence_number
+                    expected_seq, row.sequence_number
                 )));
             }
 
-            let event_signing_hash: Hash256 = event_signing_hash.try_into().map_err(|_| {
-                SequencerError::Internal("invalid event_signing_hash length".to_string())
-            })?;
-
-            let agent_signature: [u8; 64] = agent_signature.try_into().map_err(|_| {
+            let event_signing_hash =
+                Self::event_signing_hash_from_row(tenant_id, store_id, &row)?;
+            let agent_signature: [u8; 64] = row.agent_signature.try_into().map_err(|_| {
                 SequencerError::Internal("invalid agent_signature length".to_string())
             })?;
 
             let params = LeafHashParams {
                 tenant_id: &tenant_id.0,
                 store_id: &store_id.0,
-                sequence_number: sequence_number as u64,
+                sequence_number: row.sequence_number as u64,
                 event_signing_hash: &event_signing_hash,
                 agent_signature: &agent_signature,
             };
@@ -684,6 +777,87 @@ impl PgVesCommitmentEngine {
             "#,
         )
         .bind(batch_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(VesBatchCommitment::try_from).transpose()
+    }
+
+    pub async fn get_last_commitment(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+    ) -> Result<Option<VesBatchCommitment>> {
+        let row: Option<VesCommitmentRow> = sqlx::query_as(
+            r#"
+            SELECT
+                batch_id,
+                tenant_id,
+                store_id,
+                ves_version,
+                tree_depth,
+                leaf_count,
+                padded_leaf_count,
+                merkle_root,
+                prev_state_root,
+                new_state_root,
+                sequence_start,
+                sequence_end,
+                committed_at,
+                chain_id,
+                chain_tx_hash,
+                chain_block_number,
+                anchored_at
+            FROM ves_commitments
+            WHERE tenant_id = $1 AND store_id = $2
+            ORDER BY sequence_end DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.map(VesBatchCommitment::try_from).transpose()
+    }
+
+    pub async fn get_commitment_by_sequence(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        sequence_number: u64,
+    ) -> Result<Option<VesBatchCommitment>> {
+        let row: Option<VesCommitmentRow> = sqlx::query_as(
+            r#"
+            SELECT
+                batch_id,
+                tenant_id,
+                store_id,
+                ves_version,
+                tree_depth,
+                leaf_count,
+                padded_leaf_count,
+                merkle_root,
+                prev_state_root,
+                new_state_root,
+                sequence_start,
+                sequence_end,
+                committed_at,
+                chain_id,
+                chain_tx_hash,
+                chain_block_number,
+                anchored_at
+            FROM ves_commitments
+            WHERE tenant_id = $1 AND store_id = $2
+              AND sequence_start <= $3 AND sequence_end >= $3
+            ORDER BY sequence_start DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(sequence_number as i64)
         .fetch_optional(&self.pool)
         .await?;
 

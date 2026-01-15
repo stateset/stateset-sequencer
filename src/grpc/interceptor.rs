@@ -42,13 +42,7 @@ impl GrpcAuthInterceptor {
                 .to_str()
                 .map_err(|_| Status::unauthenticated("invalid authorization header encoding"))?;
 
-            // Check for Bearer prefix
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                return self.validate_bearer_token(token);
-            }
-
-            // Treat as raw API key
-            return self.validate_api_key(auth_str);
+            return self.authenticate_header(auth_str);
         }
 
         // Try x-api-key header
@@ -56,7 +50,7 @@ impl GrpcAuthInterceptor {
             let key_str = api_key
                 .to_str()
                 .map_err(|_| Status::unauthenticated("invalid api key header encoding"))?;
-            return self.validate_api_key(key_str);
+            return self.authenticate_header(key_str);
         }
 
         // No credentials found
@@ -73,43 +67,40 @@ impl GrpcAuthInterceptor {
         }
     }
 
-    fn validate_bearer_token(&self, token: &str) -> Result<Option<AuthContext>, Status> {
-        // Try JWT first
-        if let Some(jwt_validator) = self.authenticator.jwt_validator() {
-            match jwt_validator.validate(token) {
-                Ok(ctx) => {
-                    debug!(tenant_id = %ctx.tenant_id, "JWT authenticated");
-                    return Ok(Some(ctx));
-                }
-                Err(e) => {
-                    debug!("JWT validation failed: {}, trying as API key", e);
-                }
-            }
-        }
-
-        // Fall back to API key
-        self.validate_api_key(token)
-    }
-
-    fn validate_api_key(&self, key: &str) -> Result<Option<AuthContext>, Status> {
-        match self.authenticator.validate_api_key(key) {
+    fn authenticate_header(&self, header: &str) -> Result<Option<AuthContext>, Status> {
+        match self.authenticate_blocking(Some(header)) {
             Ok(ctx) => {
-                debug!(tenant_id = %ctx.tenant_id, "API key authenticated");
+                debug!(tenant_id = %ctx.tenant_id, "gRPC authenticated");
                 Ok(Some(ctx))
             }
             Err(AuthError::InvalidApiKey) => {
                 warn!("Invalid API key provided");
                 Err(Status::unauthenticated("invalid api key"))
             }
+            Err(AuthError::InvalidJwt(_)) => {
+                warn!("Invalid JWT provided");
+                Err(Status::unauthenticated("invalid jwt"))
+            }
+            Err(AuthError::TokenExpired) => {
+                warn!("JWT token expired");
+                Err(Status::unauthenticated("token expired"))
+            }
             Err(AuthError::RateLimited) => {
                 warn!("Rate limit exceeded");
                 Err(Status::resource_exhausted("rate limit exceeded"))
             }
+            Err(AuthError::MissingAuth) => Err(Status::unauthenticated("authentication required")),
             Err(e) => {
                 warn!("Auth error: {}", e);
                 Err(Status::unauthenticated(e.to_string()))
             }
         }
+    }
+
+    fn authenticate_blocking(&self, auth_header: Option<&str>) -> Result<AuthContext, AuthError> {
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.authenticator.authenticate(auth_header))
+        })
     }
 }
 
