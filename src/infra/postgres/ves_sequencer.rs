@@ -14,10 +14,13 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::auth::{AgentKeyError, AgentKeyLookup, AgentKeyRegistry};
-use crate::crypto::{compute_receipt_hash, AgentSigningKey, Hash256, Signature64};
+use crate::crypto::{
+    base64_url_decode, base64_url_encode, compute_receipt_hash, AgentSigningKey, Hash256,
+    PayloadEncrypted, Signature64, NONCE_SIZE, TAG_SIZE,
+};
 use crate::domain::{
     AgentId, AgentKeyId, EntityType, EventType, PayloadKind, SequencedVesEvent, StoreId, TenantId,
-    VesEventEnvelope, VES_VERSION,
+    VesEventEnvelope, VES_VERSION, ZERO_HASH,
 };
 use crate::infra::{Result, SequencerError};
 
@@ -151,9 +154,23 @@ pub struct VesSequencer<R: AgentKeyRegistry> {
     sequencer_id: Uuid,
     /// Optional sequencer signing key for receipts
     sequencer_signing_key: Option<AgentSigningKey>,
+    /// Enforce strict formatting for VES hex/base64url fields
+    strict_format_validation: bool,
 }
 
 impl<R: AgentKeyRegistry> VesSequencer<R> {
+    fn strict_format_from_env() -> bool {
+        std::env::var("VES_STRICT_FORMAT_VALIDATION")
+            .ok()
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "off"
+                )
+            })
+            .unwrap_or(false)
+    }
+
     /// Create a new VES sequencer
     pub fn new(pool: PgPool, key_registry: Arc<R>) -> Self {
         Self {
@@ -161,6 +178,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             key_registry,
             sequencer_id: Uuid::new_v4(),
             sequencer_signing_key: None,
+            strict_format_validation: Self::strict_format_from_env(),
         }
     }
 
@@ -173,6 +191,12 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     /// Set the sequencer signing key for receipts
     pub fn with_signing_key(mut self, key: AgentSigningKey) -> Self {
         self.sequencer_signing_key = Some(key);
+        self
+    }
+
+    /// Enable or disable strict format validation for VES payload fields
+    pub fn with_strict_format_validation(mut self, enabled: bool) -> Self {
+        self.strict_format_validation = enabled;
         self
     }
 
@@ -316,6 +340,165 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         }))
     }
 
+    fn validate_payload_encrypted(
+        &self,
+        event_id: Uuid,
+        encrypted: &PayloadEncrypted,
+    ) -> Option<VesRejectedEvent> {
+        const EXPECTED_AEAD: &str = "AES-256-GCM";
+        const EXPECTED_HPKE_MODE: &str = "base";
+        const EXPECTED_HPKE_KEM: &str = "X25519-HKDF-SHA256";
+        const EXPECTED_HPKE_KDF: &str = "HKDF-SHA256";
+        const RECIPIENT_ENC_SIZE: usize = 32;
+        const RECIPIENT_CT_SIZE: usize = 48;
+
+        let reject = |field: &str, message: String| VesRejectedEvent {
+            event_id,
+            reason: VesRejectionReason::SchemaValidation(field.to_string()),
+            message,
+        };
+
+        let strict_format = self.strict_format_validation;
+        let decode_base64 =
+            |field: &str, value: &str| -> std::result::Result<Vec<u8>, VesRejectedEvent> {
+                let bytes = base64_url_decode(value)
+                    .map_err(|_| reject(field, "must be base64url".to_string()))?;
+            if strict_format && base64_url_encode(&bytes) != value {
+                return Err(reject(
+                    field,
+                    "must be canonical base64url without padding".to_string(),
+                ));
+            }
+            Ok(bytes)
+        };
+
+        if encrypted.enc_version != 1 {
+            return Some(reject(
+                "payload_encrypted.enc_version",
+                "enc_version must be 1".to_string(),
+            ));
+        }
+
+        if encrypted.aead != EXPECTED_AEAD {
+            return Some(reject(
+                "payload_encrypted.aead",
+                format!("aead must be {}", EXPECTED_AEAD),
+            ));
+        }
+
+        if encrypted.hpke.mode != EXPECTED_HPKE_MODE {
+            return Some(reject(
+                "payload_encrypted.hpke.mode",
+                format!("hpke.mode must be {}", EXPECTED_HPKE_MODE),
+            ));
+        }
+
+        if encrypted.hpke.kem != EXPECTED_HPKE_KEM {
+            return Some(reject(
+                "payload_encrypted.hpke.kem",
+                format!("hpke.kem must be {}", EXPECTED_HPKE_KEM),
+            ));
+        }
+
+        if encrypted.hpke.kdf != EXPECTED_HPKE_KDF {
+            return Some(reject(
+                "payload_encrypted.hpke.kdf",
+                format!("hpke.kdf must be {}", EXPECTED_HPKE_KDF),
+            ));
+        }
+
+        if encrypted.hpke.aead != EXPECTED_AEAD {
+            return Some(reject(
+                "payload_encrypted.hpke.aead",
+                format!("hpke.aead must be {}", EXPECTED_AEAD),
+            ));
+        }
+
+        let nonce = match decode_base64("payload_encrypted.nonce_b64u", &encrypted.nonce_b64u) {
+            Ok(bytes) => bytes,
+            Err(rejection) => return Some(rejection),
+        };
+        if nonce.len() != NONCE_SIZE {
+            return Some(reject(
+                "payload_encrypted.nonce_b64u",
+                format!("nonce_b64u must decode to {NONCE_SIZE} bytes"),
+            ));
+        }
+
+        let ciphertext =
+            match decode_base64("payload_encrypted.ciphertext_b64u", &encrypted.ciphertext_b64u) {
+                Ok(bytes) => bytes,
+                Err(rejection) => return Some(rejection),
+            };
+        if ciphertext.is_empty() {
+            return Some(reject(
+                "payload_encrypted.ciphertext_b64u",
+                "ciphertext_b64u must not be empty".to_string(),
+            ));
+        }
+
+        let tag = match decode_base64("payload_encrypted.tag_b64u", &encrypted.tag_b64u) {
+            Ok(bytes) => bytes,
+            Err(rejection) => return Some(rejection),
+        };
+        if tag.len() != TAG_SIZE {
+            return Some(reject(
+                "payload_encrypted.tag_b64u",
+                format!("tag_b64u must decode to {TAG_SIZE} bytes"),
+            ));
+        }
+
+        if encrypted.recipients.is_empty() {
+            return Some(reject(
+                "payload_encrypted.recipients",
+                "recipients must not be empty".to_string(),
+            ));
+        }
+
+        let mut last_kid: Option<u32> = None;
+        for recipient in &encrypted.recipients {
+            if let Some(prev) = last_kid {
+                if recipient.recipient_kid <= prev {
+                    return Some(reject(
+                        "payload_encrypted.recipients",
+                        "recipients must be sorted by recipient_kid and unique".to_string(),
+                    ));
+                }
+            }
+            last_kid = Some(recipient.recipient_kid);
+
+            let enc = match decode_base64(
+                "payload_encrypted.recipients.enc_b64u",
+                &recipient.enc_b64u,
+            ) {
+                Ok(bytes) => bytes,
+                Err(rejection) => return Some(rejection),
+            };
+            if enc.len() != RECIPIENT_ENC_SIZE {
+                return Some(reject(
+                    "payload_encrypted.recipients.enc_b64u",
+                    format!("enc_b64u must decode to {RECIPIENT_ENC_SIZE} bytes"),
+                ));
+            }
+
+            let ct = match decode_base64(
+                "payload_encrypted.recipients.ct_b64u",
+                &recipient.ct_b64u,
+            ) {
+                Ok(bytes) => bytes,
+                Err(rejection) => return Some(rejection),
+            };
+            if ct.len() != RECIPIENT_CT_SIZE {
+                return Some(reject(
+                    "payload_encrypted.recipients.ct_b64u",
+                    format!("ct_b64u must decode to {RECIPIENT_CT_SIZE} bytes"),
+                ));
+            }
+        }
+
+        None
+    }
+
     /// Validate an event per VES v1.0 Section 9
     async fn validate_event(&self, event: &VesEventEnvelope) -> Option<VesRejectedEvent> {
         // 1. Validate VES version
@@ -354,6 +537,68 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 reason: VesRejectionReason::SchemaValidation("event_type".to_string()),
                 message: "event_type must be 1-64 characters".to_string(),
             });
+        }
+
+        match event.payload_kind {
+            PayloadKind::Plaintext => {
+                if event.payload.is_none() {
+                    return Some(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::SchemaValidation("payload".to_string()),
+                        message: "payload is required for plaintext events".to_string(),
+                    });
+                }
+
+                if event.payload_encrypted.is_some() {
+                    return Some(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::SchemaValidation(
+                            "payload_encrypted".to_string(),
+                        ),
+                        message: "payload_encrypted must be omitted for plaintext events"
+                            .to_string(),
+                    });
+                }
+
+                if event.payload_cipher_hash != ZERO_HASH {
+                    return Some(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::SchemaValidation(
+                            "payload_cipher_hash".to_string(),
+                        ),
+                        message: "payload_cipher_hash must be zero for plaintext events"
+                            .to_string(),
+                    });
+                }
+            }
+            PayloadKind::Encrypted => {
+                if event.payload.is_some() {
+                    return Some(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::SchemaValidation("payload".to_string()),
+                        message: "payload must be omitted for encrypted events".to_string(),
+                    });
+                }
+
+                if event.payload_encrypted.is_none() {
+                    return Some(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::SchemaValidation(
+                            "payload_encrypted".to_string(),
+                        ),
+                        message: "payload_encrypted is required for encrypted events".to_string(),
+                    });
+                }
+            }
+        }
+
+        if event.payload_kind == PayloadKind::Encrypted {
+            if let Some(ref encrypted) = event.payload_encrypted {
+                if let Some(rejection) = self.validate_payload_encrypted(event.event_id, encrypted)
+                {
+                    return Some(rejection);
+                }
+            }
         }
 
         if chrono::DateTime::parse_from_rfc3339(event.created_at_rfc3339()).is_err() {
@@ -1131,6 +1376,391 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
 #[cfg(test)]
 mod tests {
-    // Integration tests would require a PostgreSQL instance
-    // See tests/ves_sequencer_integration_test.rs
+    use super::*;
+    use crate::auth::{AgentKeyEntry, AgentKeyLookup, InMemoryAgentKeyRegistry};
+    use crate::crypto::{
+        base64_url_encode, compute_cipher_hash_from_encrypted, compute_payload_aad,
+        AgentSigningKey, EventSigningParams, Hash256, HpkeParams, PayloadAadParams,
+        PayloadEncrypted, Recipient, NONCE_SIZE, TAG_SIZE,
+    };
+    use crate::domain::{EntityType, EventType, PayloadKind, VES_VERSION};
+    use chrono::Utc;
+    use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
+
+    fn sequencer(
+        registry: Arc<InMemoryAgentKeyRegistry>,
+        strict_format: bool,
+    ) -> VesSequencer<InMemoryAgentKeyRegistry> {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost/stateset_sequencer")
+            .expect("connect_lazy should not fail");
+
+        VesSequencer {
+            pool,
+            key_registry: registry,
+            sequencer_id: Uuid::new_v4(),
+            sequencer_signing_key: None,
+            strict_format_validation: strict_format,
+        }
+    }
+
+    fn dummy_payload_encrypted() -> PayloadEncrypted {
+        PayloadEncrypted {
+            enc_version: 1,
+            aead: "AES-256-GCM".to_string(),
+            nonce_b64u: "AA".to_string(),
+            ciphertext_b64u: "AA".to_string(),
+            tag_b64u: "AA".to_string(),
+            hpke: HpkeParams::default(),
+            recipients: vec![Recipient {
+                recipient_kid: 1,
+                enc_b64u: "AA".to_string(),
+                ct_b64u: "AA".to_string(),
+            }],
+        }
+    }
+
+    async fn register_key(
+        registry: &InMemoryAgentKeyRegistry,
+        event: &VesEventEnvelope,
+        signing_key: &AgentSigningKey,
+    ) {
+        let lookup =
+            AgentKeyLookup::new(&event.tenant_id, &event.source_agent_id, event.agent_key_id);
+        let entry = AgentKeyEntry::new(signing_key.public_key_bytes());
+        registry.register_key(&lookup, entry).await.unwrap();
+    }
+
+    fn recipient(kid: u32, fill: u8) -> Recipient {
+        let enc = vec![fill; 32];
+        let ct = vec![fill; 48];
+        Recipient {
+            recipient_kid: kid,
+            enc_b64u: base64_url_encode(&enc),
+            ct_b64u: base64_url_encode(&ct),
+        }
+    }
+
+    fn valid_payload_encrypted() -> PayloadEncrypted {
+        let nonce = vec![1u8; NONCE_SIZE];
+        let ciphertext = vec![2u8; 24];
+        let tag = vec![3u8; TAG_SIZE];
+
+        PayloadEncrypted {
+            enc_version: 1,
+            aead: "AES-256-GCM".to_string(),
+            nonce_b64u: base64_url_encode(&nonce),
+            ciphertext_b64u: base64_url_encode(&ciphertext),
+            tag_b64u: base64_url_encode(&tag),
+            hpke: HpkeParams::default(),
+            recipients: vec![recipient(1, 4)],
+        }
+    }
+
+    fn build_encrypted_event(
+        signing_key: &AgentSigningKey,
+        payload_encrypted: PayloadEncrypted,
+    ) -> VesEventEnvelope {
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+        let event_id = Uuid::new_v4();
+        let source_agent_id = AgentId::new();
+        let agent_key_id = AgentKeyId::default();
+        let entity_type = EntityType::order();
+        let entity_id = "order-123".to_string();
+        let event_type = EventType::from(EventType::ORDER_CREATED);
+        let created_at = Utc::now().to_rfc3339();
+        let payload_plain_hash: Hash256 = [9u8; 32];
+
+        let aad_params = PayloadAadParams {
+            tenant_id: &tenant_id.0,
+            store_id: &store_id.0,
+            event_id: &event_id,
+            source_agent_id: &source_agent_id.0,
+            agent_key_id: agent_key_id.as_u32(),
+            entity_type: entity_type.as_str(),
+            entity_id: &entity_id,
+            event_type: event_type.as_str(),
+            created_at: &created_at,
+            payload_plain_hash: &payload_plain_hash,
+        };
+        let payload_aad = compute_payload_aad(&aad_params);
+        let payload_cipher_hash = compute_cipher_hash_from_encrypted(&payload_encrypted, &payload_aad)
+            .expect("payload_encrypted should be decodable");
+
+        let signing_params = EventSigningParams {
+            ves_version: VES_VERSION,
+            tenant_id: &tenant_id.0,
+            store_id: &store_id.0,
+            event_id: &event_id,
+            source_agent_id: &source_agent_id.0,
+            agent_key_id: agent_key_id.as_u32(),
+            entity_type: entity_type.as_str(),
+            entity_id: &entity_id,
+            event_type: event_type.as_str(),
+            created_at: &created_at,
+            payload_kind: PayloadKind::Encrypted.as_u32(),
+            payload_plain_hash: &payload_plain_hash,
+            payload_cipher_hash: &payload_cipher_hash,
+        };
+        let agent_signature = signing_key.sign_event(&signing_params);
+
+        VesEventEnvelope {
+            ves_version: VES_VERSION,
+            event_id,
+            tenant_id,
+            store_id,
+            source_agent_id,
+            agent_key_id,
+            entity_type,
+            entity_id,
+            event_type,
+            created_at,
+            payload_kind: PayloadKind::Encrypted,
+            payload: None,
+            payload_encrypted: Some(payload_encrypted),
+            payload_plain_hash,
+            payload_cipher_hash,
+            agent_signature,
+            sequence_number: None,
+            sequenced_at: None,
+            command_id: None,
+            base_version: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_plaintext_with_encrypted_payload() {
+        let signing_key = AgentSigningKey::generate();
+        let mut event = VesEventEnvelope::new_plaintext(
+            TenantId::new(),
+            StoreId::new(),
+            AgentId::new(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({"amount": 100}),
+            &signing_key,
+        );
+        event.payload_encrypted = Some(dummy_payload_encrypted());
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, false);
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+
+        match rejection.reason {
+            VesRejectionReason::SchemaValidation(field) => {
+                assert_eq!(field, "payload_encrypted");
+            }
+            other => panic!("unexpected rejection: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_plaintext_with_cipher_hash() {
+        let signing_key = AgentSigningKey::generate();
+        let mut event = VesEventEnvelope::new_plaintext(
+            TenantId::new(),
+            StoreId::new(),
+            AgentId::new(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({"amount": 100}),
+            &signing_key,
+        );
+        event.payload_cipher_hash = [42u8; 32];
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, false);
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+
+        match rejection.reason {
+            VesRejectionReason::SchemaValidation(field) => {
+                assert_eq!(field, "payload_cipher_hash");
+            }
+            other => panic!("unexpected rejection: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_encrypted_with_payload() {
+        let signing_key = AgentSigningKey::generate();
+        let mut event = VesEventEnvelope::new_plaintext(
+            TenantId::new(),
+            StoreId::new(),
+            AgentId::new(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({"amount": 100}),
+            &signing_key,
+        );
+        event.payload_kind = PayloadKind::Encrypted;
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, false);
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+
+        match rejection.reason {
+            VesRejectionReason::SchemaValidation(field) => {
+                assert_eq!(field, "payload");
+            }
+            other => panic!("unexpected rejection: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_encrypted_without_payload_encrypted() {
+        let signing_key = AgentSigningKey::generate();
+        let mut event = VesEventEnvelope::new_plaintext(
+            TenantId::new(),
+            StoreId::new(),
+            AgentId::new(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({"amount": 100}),
+            &signing_key,
+        );
+        event.payload_kind = PayloadKind::Encrypted;
+        event.payload = None;
+        event.payload_encrypted = None;
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, false);
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+
+        match rejection.reason {
+            VesRejectionReason::SchemaValidation(field) => {
+                assert_eq!(field, "payload_encrypted");
+            }
+            other => panic!("unexpected rejection: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_encrypted_invalid_hpke_mode() {
+        let signing_key = AgentSigningKey::generate();
+        let mut payload_encrypted = valid_payload_encrypted();
+        payload_encrypted.hpke.mode = "unsupported".to_string();
+        let event = build_encrypted_event(&signing_key, payload_encrypted);
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, false);
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+
+        match rejection.reason {
+            VesRejectionReason::SchemaValidation(field) => {
+                assert_eq!(field, "payload_encrypted.hpke.mode");
+            }
+            other => panic!("unexpected rejection: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_encrypted_unsorted_recipients() {
+        let signing_key = AgentSigningKey::generate();
+        let mut payload_encrypted = valid_payload_encrypted();
+        payload_encrypted.recipients = vec![recipient(2, 5), recipient(1, 7)];
+        let event = build_encrypted_event(&signing_key, payload_encrypted);
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, false);
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+
+        match rejection.reason {
+            VesRejectionReason::SchemaValidation(field) => {
+                assert_eq!(field, "payload_encrypted.recipients");
+            }
+            other => panic!("unexpected rejection: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_encrypted_invalid_nonce() {
+        let signing_key = AgentSigningKey::generate();
+        let mut event = build_encrypted_event(&signing_key, valid_payload_encrypted());
+        event
+            .payload_encrypted
+            .as_mut()
+            .unwrap()
+            .nonce_b64u = "!!!".to_string();
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, false);
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+
+        match rejection.reason {
+            VesRejectionReason::SchemaValidation(field) => {
+                assert_eq!(field, "payload_encrypted.nonce_b64u");
+            }
+            other => panic!("unexpected rejection: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_padded_tag_in_strict_mode() {
+        let signing_key = AgentSigningKey::generate();
+        let mut payload_encrypted = valid_payload_encrypted();
+        payload_encrypted.tag_b64u = format!("{}==", payload_encrypted.tag_b64u);
+        let event = build_encrypted_event(&signing_key, payload_encrypted);
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, true);
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+
+        match rejection.reason {
+            VesRejectionReason::SchemaValidation(field) => {
+                assert_eq!(field, "payload_encrypted.tag_b64u");
+            }
+            other => panic!("unexpected rejection: {:?}", other),
+        }
+    }
 }

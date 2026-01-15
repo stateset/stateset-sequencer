@@ -39,21 +39,22 @@ use crate::api::types::{
 };
 use crate::auth::{AuthContextExt, RequestLimits};
 use crate::domain::{
-    AgentId, EventBatch, EventEnvelope, RejectedEvent, RejectionReason, TenantId, VesEventEnvelope,
+    AgentId, EventBatch, EventEnvelope, RejectedEvent, RejectionReason, StoreId, TenantId,
+    VesEventEnvelope,
 };
-use crate::infra::{IngestService, SchemaStore, Sequencer};
+use crate::infra::{IngestService, SchemaStore, SchemaValidationMode, Sequencer};
 use crate::server::AppState;
 
 /// Validate events against registered schemas.
 ///
 /// Returns (valid_events, rejected_events) based on schema validation results.
-#[instrument(skip(state, events), fields(event_count = events.len()))]
+#[instrument(skip(schema_store, events), fields(event_count = events.len()))]
 async fn validate_events_against_schemas(
-    state: &AppState,
+    schema_store: &dyn SchemaStore,
+    validation_mode: SchemaValidationMode,
     events: Vec<EventEnvelope>,
 ) -> (Vec<EventEnvelope>, Vec<RejectedEvent>) {
     debug!("Validating {} events against schemas", events.len());
-    let validation_mode = state.schema_validation_mode;
 
     // If validation is disabled, return all events as valid
     if !validation_mode.should_validate() {
@@ -67,8 +68,7 @@ async fn validate_events_against_schemas(
         let tenant_id = TenantId::from_uuid(event.tenant_id.0);
 
         // Validate payload against schema
-        let validation_result = match state
-            .schema_store
+        let validation_result = match schema_store
             .validate(&tenant_id, &event.event_type, &event.payload)
             .await
         {
@@ -149,6 +149,189 @@ async fn validate_events_against_schemas(
                 });
             } else {
                 // Warn mode - log and accept
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    errors = ?error_messages,
+                    "Schema validation failed (warn mode)"
+                );
+                valid_events.push(event);
+            }
+        }
+    }
+
+    (valid_events, rejected_events)
+}
+
+/// Validate VES events against registered schemas.
+///
+/// Returns (valid_events, rejected_events) based on schema validation results.
+#[instrument(skip(schema_store, events), fields(event_count = events.len()))]
+async fn validate_ves_events_against_schemas(
+    schema_store: &dyn SchemaStore,
+    validation_mode: SchemaValidationMode,
+    events: Vec<VesEventEnvelope>,
+) -> (Vec<VesEventEnvelope>, Vec<RejectionInfo>) {
+    debug!("Validating {} VES events against schemas", events.len());
+
+    // If validation is disabled, return all events as valid
+    if !validation_mode.should_validate() {
+        return (events, Vec::new());
+    }
+
+    let mut valid_events = Vec::new();
+    let mut rejected_events = Vec::new();
+
+    for event in events {
+        if event.is_encrypted() {
+            if matches!(
+                validation_mode,
+                SchemaValidationMode::WarnOnly | SchemaValidationMode::Required
+            ) {
+                match schema_store
+                    .get_latest(&event.tenant_id, &event.event_type)
+                    .await
+                {
+                    Ok(Some(_)) => {
+                        valid_events.push(event);
+                        continue;
+                    }
+                    Ok(None) => {
+                        if validation_mode.should_reject_missing_schema() {
+                            rejected_events.push(RejectionInfo {
+                                event_id: event.event_id,
+                                reason: "schema_validation".to_string(),
+                                message: format!(
+                                    "No schema registered for event type '{}'",
+                                    event.event_type.as_str()
+                                ),
+                            });
+                            continue;
+                        }
+
+                        tracing::warn!(
+                            event_id = %event.event_id,
+                            event_type = %event.event_type,
+                            "No schema registered for event type"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            event_id = %event.event_id,
+                            event_type = %event.event_type,
+                            error = %e,
+                            "Schema lookup error"
+                        );
+
+                        if validation_mode.should_reject_missing_schema() {
+                            rejected_events.push(RejectionInfo {
+                                event_id: event.event_id,
+                                reason: "schema_validation".to_string(),
+                                message: format!("Schema validation error: {}", e),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            debug!(
+                event_id = %event.event_id,
+                event_type = %event.event_type,
+                "Schema validation skipped for encrypted VES payload"
+            );
+            valid_events.push(event);
+            continue;
+        }
+
+        let payload = match event.payload.as_ref() {
+            Some(payload) => payload,
+            None => {
+                rejected_events.push(RejectionInfo {
+                    event_id: event.event_id,
+                    reason: "schema_validation".to_string(),
+                    message: "Missing payload for plaintext VES event".to_string(),
+                });
+                continue;
+            }
+        };
+
+        let validation_result = match schema_store
+            .validate(&event.tenant_id, &event.event_type, payload)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    error = %e,
+                    "Schema validation error"
+                );
+
+                if validation_mode.should_reject_missing_schema() {
+                    rejected_events.push(RejectionInfo {
+                        event_id: event.event_id,
+                        reason: "schema_validation".to_string(),
+                        message: format!("Schema validation error: {}", e),
+                    });
+                    continue;
+                }
+
+                valid_events.push(event);
+                continue;
+            }
+        };
+
+        // Check if schema exists
+        if validation_result.schema_id.is_none() {
+            if validation_mode.should_reject_missing_schema() {
+                rejected_events.push(RejectionInfo {
+                    event_id: event.event_id,
+                    reason: "schema_validation".to_string(),
+                    message: format!(
+                        "No schema registered for event type '{}'",
+                        event.event_type.as_str()
+                    ),
+                });
+                continue;
+            }
+
+            if matches!(validation_mode, SchemaValidationMode::WarnOnly) {
+                tracing::warn!(
+                    event_id = %event.event_id,
+                    event_type = %event.event_type,
+                    "No schema registered for event type"
+                );
+            }
+
+            valid_events.push(event);
+            continue;
+        }
+
+        // Schema exists, check validation result
+        if validation_result.valid {
+            valid_events.push(event);
+        } else {
+            let error_messages: Vec<String> = validation_result
+                .errors
+                .iter()
+                .map(|e| format!("{}: {}", e.path, e.message))
+                .collect();
+
+            let message = format!(
+                "Schema validation failed for event type '{}': {}",
+                event.event_type.as_str(),
+                error_messages.join("; ")
+            );
+
+            if validation_mode.should_reject_on_failure() {
+                rejected_events.push(RejectionInfo {
+                    event_id: event.event_id,
+                    reason: "schema_validation".to_string(),
+                    message,
+                });
+            } else {
                 tracing::warn!(
                     event_id = %event.event_id,
                     event_type = %event.event_type,
@@ -308,8 +491,12 @@ pub async fn ingest_events(
     enforce_legacy_limits(&state.request_limits, &request.events)?;
 
     // Perform schema validation before sequencing
-    let (valid_events, schema_rejections) =
-        validate_events_against_schemas(&state, request.events).await;
+    let (valid_events, schema_rejections) = validate_events_against_schemas(
+        state.schema_store.as_ref(),
+        state.schema_validation_mode,
+        request.events,
+    )
+    .await;
 
     // If all events were rejected by schema validation, return early
     if valid_events.is_empty() && !schema_rejections.is_empty() {
@@ -387,10 +574,13 @@ pub async fn ingest_ves_events(
     Json(request): Json<VesIngestRequest>,
 ) -> Result<Json<VesIngestResponse>, (StatusCode, String)> {
     info!("Ingesting {} VES events", request.events.len());
+    let mut tenant_id = Uuid::nil();
+    let mut store_id = Uuid::nil();
+
     if !request.events.is_empty() {
         let first = &request.events[0];
-        let tenant_id = first.tenant_id.0;
-        let store_id = first.store_id.0;
+        tenant_id = first.tenant_id.0;
+        store_id = first.store_id.0;
 
         for e in &request.events {
             if e.tenant_id.0 != tenant_id || e.store_id.0 != store_id {
@@ -413,17 +603,43 @@ pub async fn ingest_ves_events(
 
     enforce_ves_limits(&state.request_limits, &request.events)?;
 
-    match state.ves_sequencer.ingest(request.events).await {
+    let (valid_events, schema_rejections) = validate_ves_events_against_schemas(
+        state.schema_store.as_ref(),
+        state.schema_validation_mode,
+        request.events,
+    )
+    .await;
+
+    if valid_events.is_empty() && !schema_rejections.is_empty() {
+        let head = state
+            .ves_sequencer
+            .head(
+                &TenantId::from_uuid(tenant_id),
+                &StoreId::from_uuid(store_id),
+            )
+            .await
+            .unwrap_or(0);
+
+        return Ok(Json(VesIngestResponse {
+            batch_id: Uuid::new_v4(),
+            events_accepted: 0,
+            events_rejected: schema_rejections.len() as u32,
+            sequence_start: None,
+            sequence_end: None,
+            head_sequence: head,
+            rejections: schema_rejections,
+            receipts: Vec::new(),
+        }));
+    }
+
+    match state.ves_sequencer.ingest(valid_events).await {
         Ok(receipt) => {
-            let rejections: Vec<RejectionInfo> = receipt
-                .events_rejected
-                .iter()
-                .map(|r| RejectionInfo {
-                    event_id: r.event_id,
-                    reason: r.reason.to_string(),
-                    message: r.message.clone(),
-                })
-                .collect();
+            let mut rejections: Vec<RejectionInfo> = schema_rejections;
+            rejections.extend(receipt.events_rejected.iter().map(|r| RejectionInfo {
+                event_id: r.event_id,
+                reason: r.reason.to_string(),
+                message: r.message.clone(),
+            }));
 
             let receipts: Vec<VesReceiptResponse> = receipt
                 .receipts
@@ -446,7 +662,7 @@ pub async fn ingest_ves_events(
             Ok(Json(VesIngestResponse {
                 batch_id: receipt.batch_id,
                 events_accepted: receipt.events_accepted,
-                events_rejected: receipt.events_rejected.len() as u32,
+                events_rejected: rejections.len() as u32,
                 sequence_start: receipt.assigned_sequence_start,
                 sequence_end: receipt.assigned_sequence_end,
                 head_sequence: receipt.head_sequence,
@@ -455,5 +671,190 @@ pub async fn ingest_ves_events(
             }))
         }
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::{
+        base64_url_encode, AgentSigningKey, HpkeParams, PayloadEncrypted, Recipient, NONCE_SIZE,
+        TAG_SIZE,
+    };
+    use crate::domain::{
+        AgentId, AgentKeyId, EntityType, EventType, PayloadKind, SchemaId, SchemaValidationError,
+        SchemaValidationResult, StoreId, TenantId, VesEventEnvelope,
+    };
+    use crate::infra::{MockSchemaStore, SchemaValidationMode};
+    use serde_json::json;
+
+    fn build_plaintext_event(signing_key: &AgentSigningKey) -> VesEventEnvelope {
+        VesEventEnvelope::new_plaintext(
+            TenantId::new(),
+            StoreId::new(),
+            AgentId::new(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({ "amount": 100 }),
+            signing_key,
+        )
+    }
+
+    fn build_payload_encrypted() -> PayloadEncrypted {
+        PayloadEncrypted {
+            enc_version: 1,
+            aead: "AES-256-GCM".to_string(),
+            nonce_b64u: base64_url_encode(&vec![0u8; NONCE_SIZE]),
+            ciphertext_b64u: base64_url_encode(&[1u8]),
+            tag_b64u: base64_url_encode(&vec![2u8; TAG_SIZE]),
+            hpke: HpkeParams::default(),
+            recipients: vec![Recipient {
+                recipient_kid: 1,
+                enc_b64u: base64_url_encode(&vec![3u8; 32]),
+                ct_b64u: base64_url_encode(&vec![4u8; 48]),
+            }],
+        }
+    }
+
+    fn build_encrypted_event(signing_key: &AgentSigningKey) -> VesEventEnvelope {
+        let mut event = build_plaintext_event(signing_key);
+        event.payload_kind = PayloadKind::Encrypted;
+        event.payload = None;
+        event.payload_encrypted = Some(build_payload_encrypted());
+        event.payload_plain_hash = [1u8; 32];
+        event.payload_cipher_hash = [2u8; 32];
+        event
+    }
+
+    #[tokio::test]
+    async fn validate_ves_schema_enforce_rejects_invalid_payload() {
+        let mut schema_store = MockSchemaStore::new();
+        schema_store
+            .expect_validate()
+            .times(1)
+            .returning(|_, _, _| {
+                Ok(SchemaValidationResult::invalid(
+                    SchemaId::new(),
+                    1,
+                    vec![SchemaValidationError::new("$.amount", "must be >= 0")],
+                ))
+            });
+
+        let signing_key = AgentSigningKey::generate();
+        let event = build_plaintext_event(&signing_key);
+
+        let (valid, rejected) = validate_ves_events_against_schemas(
+            &schema_store,
+            SchemaValidationMode::Enforce,
+            vec![event],
+        )
+        .await;
+
+        assert!(valid.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].reason, "schema_validation");
+        assert!(rejected[0].message.contains("$.amount"));
+    }
+
+    #[tokio::test]
+    async fn validate_ves_schema_warn_accepts_invalid_payload() {
+        let mut schema_store = MockSchemaStore::new();
+        schema_store
+            .expect_validate()
+            .times(1)
+            .returning(|_, _, _| {
+                Ok(SchemaValidationResult::invalid(
+                    SchemaId::new(),
+                    1,
+                    vec![SchemaValidationError::new("$.amount", "must be >= 0")],
+                ))
+            });
+
+        let signing_key = AgentSigningKey::generate();
+        let event = build_plaintext_event(&signing_key);
+
+        let (valid, rejected) = validate_ves_events_against_schemas(
+            &schema_store,
+            SchemaValidationMode::WarnOnly,
+            vec![event],
+        )
+        .await;
+
+        assert_eq!(valid.len(), 1);
+        assert!(rejected.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_ves_schema_required_rejects_missing_schema() {
+        let mut schema_store = MockSchemaStore::new();
+        schema_store
+            .expect_validate()
+            .times(1)
+            .returning(|_, _, _| Ok(SchemaValidationResult::no_schema()));
+
+        let signing_key = AgentSigningKey::generate();
+        let event = build_plaintext_event(&signing_key);
+
+        let (valid, rejected) = validate_ves_events_against_schemas(
+            &schema_store,
+            SchemaValidationMode::Required,
+            vec![event],
+        )
+        .await;
+
+        assert!(valid.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0]
+            .message
+            .contains("No schema registered for event type"));
+    }
+
+    #[tokio::test]
+    async fn validate_ves_schema_required_rejects_missing_schema_for_encrypted() {
+        let mut schema_store = MockSchemaStore::new();
+        schema_store
+            .expect_get_latest()
+            .times(1)
+            .returning(|_, _| Ok(None));
+
+        let signing_key = AgentSigningKey::generate();
+        let event = build_encrypted_event(&signing_key);
+
+        let (valid, rejected) = validate_ves_events_against_schemas(
+            &schema_store,
+            SchemaValidationMode::Required,
+            vec![event],
+        )
+        .await;
+
+        assert!(valid.is_empty());
+        assert_eq!(rejected.len(), 1);
+        assert!(rejected[0]
+            .message
+            .contains("No schema registered for event type"));
+    }
+
+    #[tokio::test]
+    async fn validate_ves_schema_warn_accepts_missing_schema_for_encrypted() {
+        let mut schema_store = MockSchemaStore::new();
+        schema_store
+            .expect_get_latest()
+            .times(1)
+            .returning(|_, _| Ok(None));
+
+        let signing_key = AgentSigningKey::generate();
+        let event = build_encrypted_event(&signing_key);
+
+        let (valid, rejected) = validate_ves_events_against_schemas(
+            &schema_store,
+            SchemaValidationMode::WarnOnly,
+            vec![event],
+        )
+        .await;
+
+        assert_eq!(valid.len(), 1);
+        assert!(rejected.is_empty());
     }
 }

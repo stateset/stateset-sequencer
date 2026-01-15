@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::OnceLock;
 
 /// VES specification version
 pub const VES_VERSION: u32 = 1;
@@ -19,6 +20,47 @@ pub type PublicKey32 = [u8; 32];
 
 /// 32-byte X25519 public key (for encryption)
 pub type EncryptionPublicKey = [u8; 32];
+
+const VES_STRICT_FORMAT_ENV: &str = "VES_STRICT_FORMAT_VALIDATION";
+
+fn strict_ves_format_enabled() -> bool {
+    static STRICT: OnceLock<bool> = OnceLock::new();
+    *STRICT.get_or_init(|| {
+        std::env::var(VES_STRICT_FORMAT_ENV)
+            .ok()
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "" | "0" | "false" | "off"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn validate_hex_0x_strict(value: &str, bytes_len: usize, field: &str) -> Result<(), String> {
+    if !value.starts_with("0x") {
+        return Err(format!("{} must start with 0x", field));
+    }
+
+    let expected_len = 2 + bytes_len * 2;
+    if value.len() != expected_len {
+        return Err(format!(
+            "{} must be 0x plus {} lowercase hex characters",
+            field,
+            bytes_len * 2
+        ));
+    }
+
+    if !value[2..]
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(format!("{} must be lowercase hex", field));
+    }
+
+    Ok(())
+}
 
 /// Payload kind indicator per VES v1.0
 /// 0 = plaintext payload, 1 = encrypted payload
@@ -171,6 +213,10 @@ pub mod hash256_hex_0x {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
+        if super::strict_ves_format_enabled() {
+            super::validate_hex_0x_strict(&s, 32, "hash") // 32-byte hash
+                .map_err(serde::de::Error::custom)?;
+        }
         let hex_str = s.strip_prefix("0x").unwrap_or(&s);
         let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
         bytes
@@ -195,6 +241,10 @@ pub mod signature64_hex_0x {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
+        if super::strict_ves_format_enabled() {
+            super::validate_hex_0x_strict(&s, 64, "signature")
+                .map_err(serde::de::Error::custom)?;
+        }
         let hex_str = s.strip_prefix("0x").unwrap_or(&s);
         let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
         bytes
@@ -224,6 +274,10 @@ pub mod option_signature64_hex_0x {
         let opt: Option<String> = Option::deserialize(deserializer)?;
         match opt {
             Some(s) => {
+                if super::strict_ves_format_enabled() {
+                    super::validate_hex_0x_strict(&s, 64, "signature")
+                        .map_err(serde::de::Error::custom)?;
+                }
                 let hex_str = s.strip_prefix("0x").unwrap_or(&s);
                 let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
                 let arr: [u8; 64] = bytes
@@ -252,6 +306,10 @@ pub mod pubkey32_hex_0x {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
+        if super::strict_ves_format_enabled() {
+            super::validate_hex_0x_strict(&s, 32, "public_key")
+                .map_err(serde::de::Error::custom)?;
+        }
         let hex_str = s.strip_prefix("0x").unwrap_or(&s);
         let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
         bytes

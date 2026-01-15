@@ -286,6 +286,27 @@ SCHEMA_VALIDATION_MODE=required    # Require schemas for all event types
 
 Events failing schema validation are rejected with `RejectionReason::SchemaValidation`.
 
+Schema validation applies to plaintext payloads. Encrypted VES payloads skip payload validation
+because the payload content is opaque to the sequencer; use plaintext events when strict schema
+enforcement is required.
+
+Encrypted VES payload envelopes are still validated for structural correctness (enc_version,
+HPKE parameters, base64url fields, and recipient ordering) before signature verification.
+In `required` mode, encrypted events must still have a registered schema for their event type.
+
+### VES Strict Format Validation
+
+Enable stricter format checks for VES envelope fields:
+
+```bash
+# Require canonical 0x-prefixed lowercase hex and unpadded base64url
+VES_STRICT_FORMAT_VALIDATION=1
+```
+
+When enabled, VES hash/signature/public key fields must be `0x`-prefixed lowercase hex with
+the exact expected byte length. Encrypted payload fields must use canonical base64url without
+padding; padded or non-canonical encodings are rejected with clear schema validation errors.
+
 ## Network Security
 
 ### TLS Configuration

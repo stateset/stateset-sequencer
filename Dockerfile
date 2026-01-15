@@ -15,18 +15,21 @@ RUN apt-get update && apt-get install -y \
 # Copy manifests first for better caching
 COPY Cargo.toml Cargo.lock* ./
 
-# Create dummy source files to build dependencies (lib + bin targets)
-RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
+# Create dummy source files to build dependencies (lib + bin + bench targets)
+RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs && \
+    echo "fn main() {}" > src/bin/admin.rs && \
+    mkdir benches && echo "fn main() {}" > benches/sequencer_bench.rs
 
 # Build dependencies (this layer will be cached)
-RUN cargo build --release && rm -rf src
+RUN cargo build --release && rm -rf src benches
 
 # Copy actual source code
 COPY src ./src
 COPY migrations ./migrations
+COPY benches ./benches
 
-# Touch main.rs to rebuild with actual source
-RUN touch src/main.rs
+# Touch source files to rebuild with actual source
+RUN touch src/main.rs src/lib.rs src/bin/admin.rs
 
 # Build the actual application
 RUN cargo build --release
