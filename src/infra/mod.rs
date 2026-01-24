@@ -30,6 +30,7 @@ mod traits;
 mod ves_commitment;
 mod ves_compliance;
 mod ves_validity;
+mod x402_batch_worker;
 
 pub use audit::{AuditAction, AuditLogBuilder, AuditLogEntry, AuditQueryFilters, PgAuditLogger};
 pub use batch::{
@@ -57,7 +58,7 @@ pub use graceful_shutdown::{
 };
 pub use payload_encryption::{PayloadEncryption, PayloadEncryptionMode};
 pub use pool_monitor::{PoolHealthStatus, PoolMonitor, PoolMonitorConfig, PoolStats};
-pub use postgres::{PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer, VesSequencer};
+pub use postgres::{PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer, PgX402Repository, VesSequencer};
 pub use retry::{is_retryable_db_error, retry, retry_with_config, Retry, RetryConfig, RetryResult};
 pub use schema_validation::SchemaValidationMode;
 pub use sqlite::SqliteOutbox;
@@ -65,3 +66,6 @@ pub use traits::*;
 pub use ves_commitment::PgVesCommitmentEngine;
 pub use ves_compliance::{PgVesComplianceProofStore, VesComplianceEventInputs};
 pub use ves_validity::PgVesValidityProofStore;
+pub use x402_batch_worker::{
+    spawn_batch_worker, BatchWorkerMessage, X402BatchWorker, X402BatchWorkerConfig,
+};

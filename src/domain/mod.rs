@@ -12,6 +12,7 @@ mod ves_commitment;
 mod ves_compliance;
 mod ves_event;
 mod ves_validity;
+mod x402_payment;
 
 pub use commitment::*;
 pub use event::*;
@@ -21,3 +22,4 @@ pub use ves_commitment::*;
 pub use ves_compliance::*;
 pub use ves_event::*;
 pub use ves_validity::*;
+pub use x402_payment::*;

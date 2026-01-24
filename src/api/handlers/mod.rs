@@ -9,6 +9,7 @@ pub mod ingest;
 pub mod proofs;
 pub mod schemas;
 pub mod ves;
+pub mod x402;
 
 pub use agent_keys::*;
 pub use anchoring::*;
@@ -18,3 +19,4 @@ pub use health::*;
 pub use ingest::*;
 pub use proofs::*;
 pub use schemas::*;
+pub use x402::x402_router;

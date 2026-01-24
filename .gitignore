@@ -42,3 +42,6 @@ logs/
 *.key
 secrets/
 target_alt/
+
+# Kubernetes manifests
+k8s/

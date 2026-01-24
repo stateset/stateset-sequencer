@@ -147,6 +147,8 @@ pub fn router() -> Router<AppState> {
             "/v1/schemas/event-type/:event_type/latest",
             get(handlers::get_latest_schema),
         )
+        // x402 payment protocol
+        .nest("/v1/x402", handlers::x402_router())
 }
 
 /// Minimal root-level compatibility router for Set Chain's separate anchor service.

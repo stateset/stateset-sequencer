@@ -37,7 +37,7 @@ use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::{
     CircuitBreakerRegistry, PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine,
     PgEventStore, PgSchemaStore, PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore,
-    PgVesValidityProofStore, PoolMonitor, SchemaValidationMode, VesSequencer,
+    PgVesValidityProofStore, PgX402Repository, PoolMonitor, SchemaValidationMode, VesSequencer,
 };
 use crate::metrics::{ComponentMetrics, MetricsRegistry};
 
@@ -110,6 +110,8 @@ pub struct AppState {
     pub agent_key_registry: Arc<PgAgentKeyRegistry>,
     pub schema_store: Arc<PgSchemaStore>,
     pub metrics: Arc<MetricsRegistry>,
+    /// x402 payment repository
+    pub x402_repository: Arc<PgX402Repository>,
     /// Schema validation mode for event ingestion
     pub schema_validation_mode: SchemaValidationMode,
     /// Request limits for ingestion and payload sizing
@@ -290,6 +292,10 @@ pub async fn run() -> anyhow::Result<()> {
     schema_store.initialize().await?;
     info!("Schema registry initialized");
 
+    // Initialize x402 payment repository
+    let x402_repository = Arc::new(PgX402Repository::new(pool.clone()));
+    info!("x402 payment repository initialized");
+
     // Schema validation mode for event ingestion
     let schema_validation_mode = SchemaValidationMode::from_env();
     info!("Schema validation mode: {}", schema_validation_mode);
@@ -337,6 +343,7 @@ pub async fn run() -> anyhow::Result<()> {
         agent_key_registry,
         schema_store,
         metrics,
+        x402_repository,
         schema_validation_mode,
         request_limits: request_limits.clone(),
         pool_monitor: Some(pool_monitor),

@@ -1,0 +1,34 @@
+{
+  "name": "@stateset/x402-cli",
+  "version": "1.0.0",
+  "description": "x402 Payment Protocol CLI for StateSet Sequencer",
+  "type": "module",
+  "bin": {
+    "stateset-x402": "./bin/stateset-x402.js"
+  },
+  "main": "./src/x402/client.js",
+  "exports": {
+    ".": "./src/x402/client.js",
+    "./x402": "./src/x402/client.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [
+    "x402",
+    "payments",
+    "stateset",
+    "sequencer",
+    "agent-to-agent",
+    "ed25519"
+  ],
+  "author": "StateSet",
+  "license": "MIT",
+  "dependencies": {
+    "@noble/ed25519": "^2.0.0",
+    "@noble/hashes": "^1.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

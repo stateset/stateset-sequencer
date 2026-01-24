@@ -64,6 +64,7 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
     let schema_store = Arc::new(stateset_sequencer::infra::PgSchemaStore::new(pool.clone()));
+    let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(pool.clone()));
     let metrics = Arc::new(MetricsRegistry::new());
 
     AppState {
@@ -78,6 +79,7 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
         agent_key_registry,
         schema_store,
         metrics,
+        x402_repository,
         // Use disabled mode for tests by default (to not break existing tests)
         schema_validation_mode: SchemaValidationMode::Disabled,
         request_limits: RequestLimits::default(),

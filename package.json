@@ -2,20 +2,31 @@
   "name": "stateset-sequencer",
   "version": "1.0.0",
   "description": "Verifiable Event Sync (VES) service for deterministic event ordering, state projection, and cryptographic commitments.",
+  "type": "module",
   "main": "index.js",
+  "bin": {
+    "stateset-x402": "./cli/bin/stateset-x402.js"
+  },
   "directories": {
     "doc": "docs",
     "example": "examples",
     "test": "tests"
   },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "x402": "node cli/bin/stateset-x402.js"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "stateset",
+    "sequencer",
+    "ves",
+    "x402",
+    "payments"
+  ],
+  "author": "StateSet",
   "license": "ISC",
   "dependencies": {
-    "@noble/ed25519": "^3.0.0",
-    "@noble/hashes": "^2.0.1"
+    "@noble/ed25519": "^2.0.0",
+    "@noble/hashes": "^1.3.0"
   }
 }
