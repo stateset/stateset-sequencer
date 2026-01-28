@@ -58,6 +58,12 @@ pub async fn anchor_commitment(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    state
+        .cache_manager
+        .commitments
+        .invalidate(&commitment.batch_id)
+        .await;
+
     Ok(Json(serde_json::json!({
         "batch_id": commitment.batch_id,
         "status": "anchored",
@@ -114,7 +120,7 @@ pub async fn verify_anchor_onchain(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     // If we can find a local commitment, enforce tenant/store access.
-    if let Ok(Some(commitment)) = state.commitment_engine.get_commitment(batch_id).await {
+    if let Ok(Some(commitment)) = state.commitment_reader.get_commitment(batch_id).await {
         ensure_read(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
     } else if !auth.is_admin() {
         return Err((

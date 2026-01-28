@@ -13,8 +13,13 @@ pub use compliance_proofs::*;
 pub use inclusion_proofs::*;
 pub use validity_proofs::*;
 
+use axum::http::StatusCode;
+use std::time::Duration;
+use uuid::Uuid;
+
 use crate::domain::{Hash256, VesBatchCommitment};
 use crate::infra::VesComplianceEventInputs;
+use crate::server::AppState;
 
 /// Generate canonical public inputs for VES validity proofs.
 pub fn ves_validity_public_inputs(commitment: &VesBatchCommitment) -> serde_json::Value {
@@ -54,4 +59,63 @@ pub fn ves_compliance_public_inputs(
         "policyParams": policy_params,
         "policyHash": hex::encode(policy_hash),
     })
+}
+
+/// Fetch a VES commitment with cache and replica fallback.
+pub async fn get_ves_commitment_cached(
+    state: &AppState,
+    batch_id: Uuid,
+) -> Result<VesBatchCommitment, (StatusCode, String)> {
+    let cache = &state.cache_manager.ves_commitments;
+    if let Some(commitment) = cache.get_by_batch_id(&batch_id).await {
+        return Ok(commitment);
+    }
+
+    let (cached, lock_acquired) = cache.get_by_batch_id_with_lock(&batch_id).await;
+    if let Some(commitment) = cached {
+        return Ok(commitment);
+    }
+
+    if !lock_acquired {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if let Some(commitment) = cache.get_by_batch_id(&batch_id).await {
+            return Ok(commitment);
+        }
+    }
+
+    let commitment = match state.ves_commitment_reader.get_commitment(batch_id).await {
+        Ok(Some(commitment)) => Some(commitment),
+        Ok(None) => match state.ves_commitment_engine.get_commitment(batch_id).await {
+            Ok(commitment) => commitment,
+            Err(e) => {
+                if lock_acquired {
+                    cache.release_batch_id_lock(&batch_id).await;
+                }
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
+        },
+        Err(_) => match state.ves_commitment_engine.get_commitment(batch_id).await {
+            Ok(commitment) => commitment,
+            Err(e) => {
+                if lock_acquired {
+                    cache.release_batch_id_lock(&batch_id).await;
+                }
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
+        },
+    };
+
+    let Some(commitment) = commitment else {
+        if lock_acquired {
+            cache.release_batch_id_lock(&batch_id).await;
+        }
+        return Err((StatusCode::NOT_FOUND, "Commitment not found".to_string()));
+    };
+
+    cache.insert(commitment.clone()).await;
+    if lock_acquired {
+        cache.release_batch_id_lock(&batch_id).await;
+    }
+
+    Ok(commitment)
 }

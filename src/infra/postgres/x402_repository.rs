@@ -226,6 +226,77 @@ impl PgX402Repository {
         Ok(())
     }
 
+    /// Insert a new payment intent within a transaction
+    pub async fn insert_intent_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        intent: &X402PaymentIntent,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO x402_payment_intents (
+                intent_id, x402_version, status,
+                tenant_id, store_id, source_agent_id, agent_key_id,
+                payer_address, payee_address, amount, asset, network, chain_id, token_address,
+                created_at_unix, valid_until, nonce, idempotency_key,
+                resource_uri, description, order_id, merchant_id,
+                signing_hash, payer_signature, payer_public_key,
+                sequence_number, sequenced_at, batch_id,
+                tx_hash, block_number, settled_at,
+                metadata, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3,
+                $4, $5, $6, $7,
+                $8, $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18,
+                $19, $20, $21, $22,
+                $23, $24, $25,
+                $26, $27, $28,
+                $29, $30, $31,
+                $32, $33, $34
+            )
+            "#,
+        )
+        .bind(intent.intent_id)
+        .bind(intent.x402_version as i32)
+        .bind(intent.status.to_string())
+        .bind(intent.tenant_id.0)
+        .bind(intent.store_id.0)
+        .bind(intent.source_agent_id.0)
+        .bind(intent.agent_key_id.as_u32() as i32)
+        .bind(&intent.payer_address)
+        .bind(&intent.payee_address)
+        .bind(intent.amount as i64)
+        .bind(format!("{:?}", intent.asset).to_lowercase())
+        .bind(intent.network.to_string())
+        .bind(intent.chain_id as i64)
+        .bind(&intent.token_address)
+        .bind(intent.created_at_unix as i64)
+        .bind(intent.valid_until as i64)
+        .bind(intent.nonce as i64)
+        .bind(&intent.idempotency_key)
+        .bind(&intent.resource_uri)
+        .bind(&intent.description)
+        .bind(intent.order_id)
+        .bind(&intent.merchant_id)
+        .bind(intent.signing_hash.as_slice())
+        .bind(intent.payer_signature.as_slice())
+        .bind(intent.payer_public_key.as_ref().map(|pk| pk.as_slice()))
+        .bind(intent.sequence_number.map(|n| n as i64))
+        .bind(intent.sequenced_at)
+        .bind(intent.batch_id)
+        .bind(&intent.tx_hash)
+        .bind(intent.block_number.map(|n| n as i64))
+        .bind(intent.settled_at)
+        .bind(&intent.metadata)
+        .bind(intent.created_at)
+        .bind(intent.updated_at)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(())
+    }
+
     /// Get an intent by ID
     pub async fn get_intent(&self, intent_id: Uuid) -> Result<Option<X402PaymentIntent>> {
         let row: Option<X402IntentRow> = sqlx::query_as(
@@ -900,6 +971,8 @@ impl PgX402Repository {
             .get_intents_by_batch(batch_id)
             .await?;
 
+        let total_leaves = batch_intents.len() as u32;
+
         // Find leaf index for this intent
         let leaf_index = batch_intents
             .iter()
@@ -921,11 +994,17 @@ impl PgX402Repository {
             merkle_root,
             inclusion_proof,
             leaf_index: leaf_index as u32,
+            total_leaves,
             payer_address: intent.payer_address,
             payee_address: intent.payee_address,
             amount: intent.amount,
             asset: intent.asset,
             network: intent.network,
+            chain_id: intent.chain_id,
+            nonce: intent.nonce,
+            valid_until: intent.valid_until,
+            signing_hash: intent.signing_hash,
+            payer_signature: intent.payer_signature,
             tx_hash: intent.tx_hash,
             block_number: intent.block_number,
             created_at: Utc::now(),
@@ -969,16 +1048,23 @@ impl PgX402Repository {
             "usdc" => X402Asset::Usdc,
             "usdt" => X402Asset::Usdt,
             "ssusd" => X402Asset::SsUsd,
+            "wssusd" => X402Asset::WssUsd,
             "dai" => X402Asset::Dai,
+            "eth" => X402Asset::Eth,
             _ => X402Asset::Usdc,
         };
 
         let network = match row.network.as_str() {
             "set_chain" => X402Network::SetChain,
             "set_chain_testnet" => X402Network::SetChainTestnet,
+            "arc" => X402Network::Arc,
+            "arc_testnet" => X402Network::ArcTestnet,
             "base" => X402Network::Base,
             "base_sepolia" => X402Network::BaseSepolia,
             "ethereum" => X402Network::Ethereum,
+            "ethereum_sepolia" => X402Network::EthereumSepolia,
+            "arbitrum" => X402Network::Arbitrum,
+            "optimism" => X402Network::Optimism,
             _ => X402Network::SetChain,
         };
 
@@ -1057,9 +1143,14 @@ impl PgX402Repository {
         let network = match row.network.as_str() {
             "set_chain" => X402Network::SetChain,
             "set_chain_testnet" => X402Network::SetChainTestnet,
+            "arc" => X402Network::Arc,
+            "arc_testnet" => X402Network::ArcTestnet,
             "base" => X402Network::Base,
             "base_sepolia" => X402Network::BaseSepolia,
             "ethereum" => X402Network::Ethereum,
+            "ethereum_sepolia" => X402Network::EthereumSepolia,
+            "arbitrum" => X402Network::Arbitrum,
+            "optimism" => X402Network::Optimism,
             _ => X402Network::SetChain,
         };
 

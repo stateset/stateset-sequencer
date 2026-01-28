@@ -386,6 +386,64 @@ autovacuum_vacuum_scale_factor = 0.05
 autovacuum_analyze_scale_factor = 0.025
 ```
 
+### Read Replicas (Optional)
+
+Set a read replica URL to offload read-heavy endpoints (events, proofs, commitments):
+
+```bash
+# Route reads to a replica
+export READ_DATABASE_URL="postgres://sequencer:password@replica:5432/stateset_sequencer"
+
+# Optional read pool sizing
+export READ_MAX_DB_CONNECTIONS=50
+export READ_MIN_DB_CONNECTIONS=5
+```
+
+### Pool + Session Timeouts (Optional)
+
+Configure connection pool timeouts and per-session safeguards:
+
+```bash
+# Pool tuning (write pool)
+export DB_ACQUIRE_TIMEOUT_MS=30000
+export DB_IDLE_TIMEOUT_SECS=600
+export DB_MAX_LIFETIME_SECS=3600
+
+# Pool tuning (read pool)
+export READ_DB_ACQUIRE_TIMEOUT_MS=30000
+export READ_DB_IDLE_TIMEOUT_SECS=600
+export READ_DB_MAX_LIFETIME_SECS=3600
+
+# Session safeguards
+export DB_STATEMENT_TIMEOUT_MS=30000
+export DB_IDLE_IN_TX_TIMEOUT_MS=60000
+export DB_LOCK_TIMEOUT_MS=5000
+```
+
+### Cache Tuning (Optional)
+
+Tune in-memory caches for commitments and proofs:
+
+```bash
+# Legacy commitments/proofs
+export CACHE_COMMITMENT_MAX=1000
+export CACHE_COMMITMENT_TTL_SECS=300
+export CACHE_PROOF_MAX=5000
+export CACHE_PROOF_TTL_SECS=600
+
+# VES commitments/proofs (defaults to legacy values if unset)
+export CACHE_VES_COMMITMENT_MAX=1000
+export CACHE_VES_COMMITMENT_TTL_SECS=300
+export CACHE_VES_PROOF_MAX=5000
+export CACHE_VES_PROOF_TTL_SECS=600
+
+# Agent keys + schemas
+export CACHE_AGENT_KEY_MAX=1000
+export CACHE_AGENT_KEY_TTL_SECS=3600
+export CACHE_SCHEMA_MAX=1000
+export CACHE_SCHEMA_TTL_SECS=600
+```
+
 ### Backup Strategy
 
 ```bash

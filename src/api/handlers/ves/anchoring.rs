@@ -21,12 +21,7 @@ pub async fn anchor_ves_commitment(
         "Anchor service not configured".to_string(),
     ))?;
 
-    let commitment = state
-        .ves_commitment_engine
-        .get_commitment(request.batch_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?;
+    let commitment = super::get_ves_commitment_cached(&state, request.batch_id).await?;
 
     ensure_admin(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
 
@@ -53,6 +48,12 @@ pub async fn anchor_ves_commitment(
         )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state
+        .cache_manager
+        .ves_commitments
+        .invalidate(&request.batch_id)
+        .await;
 
     Ok(Json(serde_json::json!({
         "batch_id": commitment.batch_id,
@@ -81,7 +82,7 @@ pub async fn verify_ves_anchor_onchain(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    if let Ok(Some(commitment)) = state.ves_commitment_engine.get_commitment(batch_id).await {
+    if let Ok(commitment) = super::get_ves_commitment_cached(&state, batch_id).await {
         ensure_read(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
     } else if !auth.is_admin() {
         return Err((

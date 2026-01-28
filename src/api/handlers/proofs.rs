@@ -3,13 +3,14 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use std::time::Duration;
 use tracing::{debug, instrument};
 
 use crate::api::auth_helpers::ensure_read;
 use crate::api::types::{ProofQuery, VerifyProofRequest};
 use crate::auth::AuthContextExt;
 use crate::crypto::legacy_commitment_leaf_hash;
-use crate::domain::{MerkleProof, StoreId, TenantId};
+use crate::domain::{BatchCommitment, MerkleProof, StoreId, TenantId};
 use crate::infra::CommitmentEngine;
 use crate::server::AppState;
 
@@ -32,13 +33,130 @@ pub async fn get_inclusion_proof(
 
     ensure_read(&auth, tenant_id.0, store_id.0)?;
 
-    // Get the commitment
-    let commitment = state
-        .commitment_engine
-        .get_commitment(query.batch_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?;
+    // Get the commitment (cache -> replica -> primary fallback)
+    let commitment_cache = &state.cache_manager.commitments;
+    let mut commitment_lock_acquired = false;
+    let commitment = if let Some(cached) = commitment_cache.get_by_batch_id(&query.batch_id).await {
+        cached.commitment
+    } else {
+        let (cached, lock_acquired) =
+            commitment_cache.get_by_batch_id_with_lock(&query.batch_id).await;
+        commitment_lock_acquired = lock_acquired;
+        if let Some(cached) = cached {
+            cached.commitment
+        } else {
+            if !lock_acquired {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                if let Some(cached) = commitment_cache.get_by_batch_id(&query.batch_id).await {
+                    cached.commitment
+                } else {
+                    match state.commitment_reader.get_commitment(query.batch_id).await {
+                        Ok(Some(commitment)) => {
+                            commitment_cache
+                                .insert(commitment.clone(), commitment.events_root)
+                                .await;
+                            commitment
+                        }
+                        Ok(None) => {
+                            let fallback = match state
+                                .commitment_engine
+                                .get_commitment(query.batch_id)
+                                .await
+                            {
+                                Ok(Some(commitment)) => commitment,
+                                Ok(None) => {
+                                    if lock_acquired {
+                                        commitment_cache
+                                            .release_batch_id_lock(&query.batch_id)
+                                            .await;
+                                    }
+                                    return Err((
+                                        StatusCode::NOT_FOUND,
+                                        "Commitment not found".to_string(),
+                                    ));
+                                }
+                                Err(e) => {
+                                    if lock_acquired {
+                                        commitment_cache
+                                            .release_batch_id_lock(&query.batch_id)
+                                            .await;
+                                    }
+                                    return Err((
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        e.to_string(),
+                                    ));
+                                }
+                            };
+                            commitment_cache
+                                .insert(fallback.clone(), fallback.events_root)
+                                .await;
+                            fallback
+                        }
+                        Err(e) => {
+                            if lock_acquired {
+                                commitment_cache.release_batch_id_lock(&query.batch_id).await;
+                            }
+                            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                        }
+                    }
+                }
+            } else {
+                match state.commitment_reader.get_commitment(query.batch_id).await {
+                    Ok(Some(commitment)) => {
+                        commitment_cache
+                            .insert(commitment.clone(), commitment.events_root)
+                            .await;
+                        commitment
+                    }
+                    Ok(None) => {
+                        let fallback = match state
+                            .commitment_engine
+                            .get_commitment(query.batch_id)
+                            .await
+                        {
+                            Ok(Some(commitment)) => commitment,
+                            Ok(None) => {
+                                if lock_acquired {
+                                    commitment_cache
+                                        .release_batch_id_lock(&query.batch_id)
+                                        .await;
+                                }
+                                return Err((
+                                    StatusCode::NOT_FOUND,
+                                    "Commitment not found".to_string(),
+                                ));
+                            }
+                            Err(e) => {
+                                if lock_acquired {
+                                    commitment_cache
+                                        .release_batch_id_lock(&query.batch_id)
+                                        .await;
+                                }
+                                return Err((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    e.to_string(),
+                                ));
+                            }
+                        };
+                        commitment_cache
+                            .insert(fallback.clone(), fallback.events_root)
+                            .await;
+                        fallback
+                    }
+                    Err(e) => {
+                        if lock_acquired {
+                            commitment_cache.release_batch_id_lock(&query.batch_id).await;
+                        }
+                        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                    }
+                }
+            }
+        }
+    };
+
+    if commitment_lock_acquired {
+        commitment_cache.release_batch_id_lock(&query.batch_id).await;
+    }
 
     if commitment.tenant_id.0 != tenant_id.0 || commitment.store_id.0 != store_id.0 {
         return Err((
@@ -61,7 +179,7 @@ pub async fn get_inclusion_proof(
     let end = commitment.sequence_range.1;
 
     // Get leaf inputs for the commitment range.
-    let leaf_inputs = state
+    let mut leaf_inputs = state
         .event_store
         .get_leaf_inputs(&tenant_id, &store_id, start, end)
         .await
@@ -81,6 +199,16 @@ pub async fn get_inclusion_proof(
             StatusCode::BAD_REQUEST,
             "Invalid sequence range".to_string(),
         ))?;
+
+    if leaf_inputs.len() as u64 != expected_len {
+        // Fallback to primary if replica is lagging.
+        leaf_inputs = state
+            .sequencer
+            .event_store()
+            .get_leaf_inputs(&tenant_id, &store_id, start, end)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    }
 
     if leaf_inputs.len() as u64 != expected_len {
         return Err((
@@ -127,22 +255,167 @@ pub async fn get_inclusion_proof(
         })
         .collect();
 
-    let root_v0 = state.commitment_engine.compute_events_root(&leaves_v0);
-    let root_v1 = state.commitment_engine.compute_events_root(&leaves_v1);
+    let root_v0 = state.commitment_reader.compute_events_root(&leaves_v0);
+    let root_v1 = state.commitment_reader.compute_events_root(&leaves_v1);
 
     let leaves = if root_v1 == commitment.events_root {
         &leaves_v1
     } else if root_v0 == commitment.events_root {
         &leaves_v0
     } else {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Commitment events_root does not match events table".to_string(),
-        ));
+        // Retry with primary in case of replica lag.
+        let leaf_inputs_primary = state
+            .sequencer
+            .event_store()
+            .get_leaf_inputs(&tenant_id, &store_id, start, end)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+        let leaves_v0_primary: Vec<[u8; 32]> =
+            leaf_inputs_primary.iter().map(|i| i.payload_hash).collect();
+        let leaves_v1_primary: Vec<[u8; 32]> = leaf_inputs_primary
+            .iter()
+            .map(|i| {
+                legacy_commitment_leaf_hash(
+                    &tenant_id.0,
+                    &store_id.0,
+                    i.sequence_number,
+                    &i.payload_hash,
+                    &i.entity_type,
+                    &i.entity_id,
+                )
+            })
+            .collect();
+
+        let root_v0_primary = state.commitment_reader.compute_events_root(&leaves_v0_primary);
+        let root_v1_primary = state.commitment_reader.compute_events_root(&leaves_v1_primary);
+
+        if root_v1_primary == commitment.events_root {
+            return generate_cached_proof(
+                &state,
+                &tenant_id,
+                &store_id,
+                sequence_number,
+                &commitment,
+                leaf_index,
+                &leaves_v1_primary,
+            )
+            .await;
+        } else if root_v0_primary == commitment.events_root {
+            return generate_cached_proof(
+                &state,
+                &tenant_id,
+                &store_id,
+                sequence_number,
+                &commitment,
+                leaf_index,
+                &leaves_v0_primary,
+            )
+            .await;
+        } else {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Commitment events_root does not match events table".to_string(),
+            ));
+        }
     };
 
-    // Generate proof
-    let proof = state.commitment_engine.prove_inclusion(leaf_index, leaves);
+    // Generate proof (with cache)
+    return generate_cached_proof(
+        &state,
+        &tenant_id,
+        &store_id,
+        sequence_number,
+        &commitment,
+        leaf_index,
+        leaves,
+    )
+    .await;
+}
+
+async fn generate_cached_proof(
+    state: &AppState,
+    tenant_id: &TenantId,
+    store_id: &StoreId,
+    sequence_number: u64,
+    commitment: &BatchCommitment,
+    leaf_index: usize,
+    leaves: &[[u8; 32]],
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let proof_cache = &state.cache_manager.proofs;
+
+    if let Some(proof) = proof_cache
+        .get(&tenant_id.0, &store_id.0, sequence_number)
+        .await
+    {
+        if state
+            .commitment_reader
+            .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
+        {
+            return Ok(Json(serde_json::json!({
+                "sequence_number": sequence_number,
+                "batch_id": commitment.batch_id,
+                "events_root": hex::encode(commitment.events_root),
+                "leaf_hash": hex::encode(proof.leaf_hash),
+                "leaf_index": proof.leaf_index,
+                "proof_path": proof.proof_path.iter().map(hex::encode).collect::<Vec<_>>(),
+                "directions": proof.directions,
+            })));
+        }
+    }
+
+    let (cached, lock_acquired) = proof_cache
+        .get_with_lock(&tenant_id.0, &store_id.0, sequence_number)
+        .await;
+    if let Some(proof) = cached {
+        if state
+            .commitment_reader
+            .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
+        {
+            return Ok(Json(serde_json::json!({
+                "sequence_number": sequence_number,
+                "batch_id": commitment.batch_id,
+                "events_root": hex::encode(commitment.events_root),
+                "leaf_hash": hex::encode(proof.leaf_hash),
+                "leaf_index": proof.leaf_index,
+                "proof_path": proof.proof_path.iter().map(hex::encode).collect::<Vec<_>>(),
+                "directions": proof.directions,
+            })));
+        }
+    }
+
+    if !lock_acquired {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if let Some(proof) = proof_cache
+            .get(&tenant_id.0, &store_id.0, sequence_number)
+            .await
+        {
+            if state
+                .commitment_reader
+                .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
+            {
+                return Ok(Json(serde_json::json!({
+                    "sequence_number": sequence_number,
+                    "batch_id": commitment.batch_id,
+                    "events_root": hex::encode(commitment.events_root),
+                    "leaf_hash": hex::encode(proof.leaf_hash),
+                    "leaf_index": proof.leaf_index,
+                    "proof_path": proof.proof_path.iter().map(hex::encode).collect::<Vec<_>>(),
+                    "directions": proof.directions,
+                })));
+            }
+        }
+    }
+
+    let proof = state.commitment_reader.prove_inclusion(leaf_index, leaves);
+    proof_cache
+        .insert(tenant_id.0, store_id.0, sequence_number, proof.clone())
+        .await;
+    if lock_acquired {
+        proof_cache
+            .release_lock(&tenant_id.0, &store_id.0, sequence_number)
+            .await;
+    }
 
     Ok(Json(serde_json::json!({
         "sequence_number": sequence_number,
@@ -221,7 +494,7 @@ pub async fn verify_proof(
     let proof = MerkleProof::new(leaf_hash, proof_path, request.leaf_index);
 
     let valid = state
-        .commitment_engine
+        .commitment_reader
         .verify_inclusion(leaf_hash, &proof, events_root);
 
     Ok(Json(serde_json::json!({

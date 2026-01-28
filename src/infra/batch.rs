@@ -40,7 +40,6 @@ impl Default for BatchConfig {
 ///
 /// Uses PostgreSQL's UNNEST for efficient batch insertion.
 /// Returns a tuple of (successfully_reserved, duplicates).
-#[allow(dead_code)] // Utility function for future optimization
 pub async fn batch_reserve_command_ids<'e, E>(
     executor: E,
     tenant_id: &TenantId,
@@ -54,34 +53,32 @@ where
         return Ok((HashSet::new(), HashSet::new()));
     }
 
-    // PostgreSQL's UNNEST allows us to insert multiple rows in a single query
-    // We use INSERT...ON CONFLICT DO NOTHING and then check which rows were inserted
-    // by comparing with a RETURNING clause or by doing a SELECT afterwards
-
+    // PostgreSQL's UNNEST allows us to insert multiple rows in a single query.
+    // Use RETURNING to identify which command_ids were newly reserved.
     let cmd_ids: Vec<Uuid> = command_ids.to_vec();
 
-    // First, attempt to insert all command IDs
-    sqlx::query(
+    let inserted_rows: Vec<(Uuid,)> = sqlx::query_as(
         r#"
         INSERT INTO event_command_dedupe (tenant_id, store_id, command_id)
         SELECT $1, $2, unnest($3::uuid[])
         ON CONFLICT DO NOTHING
+        RETURNING command_id
         "#,
     )
     .bind(tenant_id.0)
     .bind(store_id.0)
     .bind(&cmd_ids)
-    .execute(executor)
+    .fetch_all(executor)
     .await?;
 
-    // Since ON CONFLICT DO NOTHING doesn't tell us which rows were inserted,
-    // we need to query back to determine which ones existed before
-    // This is still more efficient than N individual queries
+    let reserved: HashSet<Uuid> = inserted_rows.into_iter().map(|(id,)| id).collect();
+    let duplicates: HashSet<Uuid> = cmd_ids
+        .iter()
+        .copied()
+        .filter(|id| !reserved.contains(id))
+        .collect();
 
-    // For this optimization to work correctly, we need to track which existed
-    // before vs after. Since we're in a transaction, we can check which ones
-    // exist now (they were either pre-existing or just inserted)
-    Ok((cmd_ids.iter().copied().collect(), HashSet::new()))
+    Ok((reserved, duplicates))
 }
 
 /// Batch check for existing command IDs

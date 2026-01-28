@@ -49,8 +49,15 @@ async fn create_grpc_service(pool: sqlx::PgPool) -> SequencerService {
     let sequencer = Arc::new(PgSequencer::new(pool.clone(), payload_encryption.clone()));
     let event_store = Arc::new(PgEventStore::new(pool.clone(), payload_encryption));
     let commitment_engine = Arc::new(PgCommitmentEngine::new(pool.clone()));
+    let cache_manager = Arc::new(stateset_sequencer::infra::CacheManager::new());
 
-    SequencerService::new(sequencer, event_store, commitment_engine)
+    SequencerService::new(
+        sequencer,
+        event_store,
+        commitment_engine.clone(),
+        commitment_engine,
+        cache_manager,
+    )
 }
 
 fn create_test_event(

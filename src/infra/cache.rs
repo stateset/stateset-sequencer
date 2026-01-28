@@ -14,12 +14,14 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::hash::Hash;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::crypto::Hash256;
-use crate::domain::{BatchCommitment, MerkleProof};
+use crate::domain::{BatchCommitment, MerkleProof, Schema, VesBatchCommitment};
+use crate::auth::AgentKeyEntry;
 #[cfg(test)]
 use crate::domain::{StoreId, TenantId};
 
@@ -236,6 +238,22 @@ where
         refreshing.remove(key);
     }
 
+    /// Try to acquire a refresh lock for a key (used for cache miss stampede protection).
+    pub async fn try_acquire_refresh_lock(&self, key: &K) -> bool
+    where
+        K: Eq + Hash,
+    {
+        self.try_acquire_refresh(key).await
+    }
+
+    /// Release a previously acquired refresh lock.
+    pub async fn release_refresh_lock(&self, key: &K)
+    where
+        K: Eq + Hash,
+    {
+        self.release_refresh(key).await;
+    }
+
     /// Insert a value into the cache
     pub async fn insert(&self, key: K, value: V) {
         let mut entries = self.entries.write().await;
@@ -402,6 +420,24 @@ impl CommitmentCache {
         self.by_batch_id.get(batch_id).await
     }
 
+    /// Get commitment by batch ID with a miss lock for stampede protection.
+    pub async fn get_by_batch_id_with_lock(
+        &self,
+        batch_id: &Uuid,
+    ) -> (Option<CachedCommitment>, bool) {
+        if let Some(cached) = self.get_by_batch_id(batch_id).await {
+            return (Some(cached), false);
+        }
+
+        let lock_acquired = self.by_batch_id.try_acquire_refresh_lock(batch_id).await;
+        (None, lock_acquired)
+    }
+
+    /// Release a batch ID lock.
+    pub async fn release_batch_id_lock(&self, batch_id: &Uuid) {
+        self.by_batch_id.release_refresh_lock(batch_id).await;
+    }
+
     /// Get latest commitment for a stream
     pub async fn get_latest(&self, tenant_id: &Uuid, store_id: &Uuid) -> Option<CachedCommitment> {
         self.latest_by_stream.get(&(*tenant_id, *store_id)).await
@@ -417,9 +453,14 @@ impl CommitmentCache {
         self.by_batch_id
             .insert(commitment.batch_id, cached.clone())
             .await;
-        self.latest_by_stream
-            .insert((commitment.tenant_id.0, commitment.store_id.0), cached)
-            .await;
+        let stream_key = (commitment.tenant_id.0, commitment.store_id.0);
+        let should_update = match self.latest_by_stream.get(&stream_key).await {
+            Some(existing) => commitment.sequence_range.1 >= existing.commitment.sequence_range.1,
+            None => true,
+        };
+        if should_update {
+            self.latest_by_stream.insert(stream_key, cached).await;
+        }
     }
 
     /// Invalidate commitment
@@ -439,6 +480,117 @@ impl CommitmentCache {
 }
 
 impl Default for CommitmentCache {
+    fn default() -> Self {
+        Self::new(1000, Duration::from_secs(300)) // 5 minutes TTL
+    }
+}
+
+// ============================================================================
+// VES Commitment Cache
+// ============================================================================
+
+/// Cache for VES batch commitments
+pub struct VesCommitmentCache {
+    /// Commitment by batch ID
+    by_batch_id: LruCache<Uuid, VesBatchCommitment>,
+    /// Latest commitment by tenant/store
+    latest_by_stream: LruCache<(Uuid, Uuid), VesBatchCommitment>,
+}
+
+impl VesCommitmentCache {
+    /// Create a new VES commitment cache
+    pub fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            by_batch_id: LruCache::new(max_entries, ttl),
+            latest_by_stream: LruCache::new(max_entries / 10, ttl),
+        }
+    }
+
+    /// Get commitment by batch ID
+    pub async fn get_by_batch_id(&self, batch_id: &Uuid) -> Option<VesBatchCommitment> {
+        self.by_batch_id.get(batch_id).await
+    }
+
+    /// Get commitment by batch ID with a miss lock for stampede protection.
+    pub async fn get_by_batch_id_with_lock(
+        &self,
+        batch_id: &Uuid,
+    ) -> (Option<VesBatchCommitment>, bool) {
+        if let Some(cached) = self.get_by_batch_id(batch_id).await {
+            return (Some(cached), false);
+        }
+
+        let lock_acquired = self.by_batch_id.try_acquire_refresh_lock(batch_id).await;
+        (None, lock_acquired)
+    }
+
+    /// Release a batch ID lock.
+    pub async fn release_batch_id_lock(&self, batch_id: &Uuid) {
+        self.by_batch_id.release_refresh_lock(batch_id).await;
+    }
+
+    /// Get latest commitment for a stream
+    pub async fn get_latest(
+        &self,
+        tenant_id: &Uuid,
+        store_id: &Uuid,
+    ) -> Option<VesBatchCommitment> {
+        self.latest_by_stream.get(&(*tenant_id, *store_id)).await
+    }
+
+    /// Get latest commitment with a miss lock for stampede protection.
+    pub async fn get_latest_with_lock(
+        &self,
+        tenant_id: &Uuid,
+        store_id: &Uuid,
+    ) -> (Option<VesBatchCommitment>, bool) {
+        if let Some(cached) = self.get_latest(tenant_id, store_id).await {
+            return (Some(cached), false);
+        }
+
+        let key = (*tenant_id, *store_id);
+        let lock_acquired = self.latest_by_stream.try_acquire_refresh_lock(&key).await;
+        (None, lock_acquired)
+    }
+
+    /// Release a latest-by-stream lock.
+    pub async fn release_latest_lock(&self, tenant_id: &Uuid, store_id: &Uuid) {
+        let key = (*tenant_id, *store_id);
+        self.latest_by_stream.release_refresh_lock(&key).await;
+    }
+
+    /// Insert a VES commitment
+    pub async fn insert(&self, commitment: VesBatchCommitment) {
+        let batch_id = commitment.batch_id;
+        self.by_batch_id.insert(batch_id, commitment.clone()).await;
+
+        let stream_key = (commitment.tenant_id.0, commitment.store_id.0);
+        let should_update = match self.latest_by_stream.get(&stream_key).await {
+            Some(existing) => commitment.sequence_range.1 >= existing.sequence_range.1,
+            None => true,
+        };
+        if should_update {
+            self.latest_by_stream.insert(stream_key, commitment).await;
+        }
+    }
+
+    /// Invalidate commitment
+    pub async fn invalidate(&self, batch_id: &Uuid) {
+        self.by_batch_id.remove(batch_id).await;
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> CacheStatsSummary {
+        CacheStatsSummary {
+            by_batch_id_hits: self.by_batch_id.stats().hits(),
+            by_batch_id_misses: self.by_batch_id.stats().misses(),
+            latest_by_stream_hits: self.latest_by_stream.stats().hits(),
+            latest_by_stream_misses: self.latest_by_stream.stats().misses(),
+        }
+    }
+}
+
+impl Default for VesCommitmentCache {
     fn default() -> Self {
         Self::new(1000, Duration::from_secs(300)) // 5 minutes TTL
     }
@@ -484,6 +636,42 @@ impl ProofCache {
         self.proofs.get(&key).await
     }
 
+    /// Get a proof with a miss lock for stampede protection.
+    pub async fn get_with_lock(
+        &self,
+        tenant_id: &Uuid,
+        store_id: &Uuid,
+        sequence_number: u64,
+    ) -> (Option<MerkleProof>, bool) {
+        let key = ProofCacheKey {
+            tenant_id: *tenant_id,
+            store_id: *store_id,
+            sequence_number,
+        };
+
+        if let Some(proof) = self.proofs.get(&key).await {
+            return (Some(proof), false);
+        }
+
+        let lock_acquired = self.proofs.try_acquire_refresh_lock(&key).await;
+        (None, lock_acquired)
+    }
+
+    /// Release a previously acquired proof lock.
+    pub async fn release_lock(
+        &self,
+        tenant_id: &Uuid,
+        store_id: &Uuid,
+        sequence_number: u64,
+    ) {
+        let key = ProofCacheKey {
+            tenant_id: *tenant_id,
+            store_id: *store_id,
+            sequence_number,
+        };
+        self.proofs.release_refresh_lock(&key).await;
+    }
+
     /// Insert a proof into cache
     pub async fn insert(
         &self,
@@ -524,17 +712,9 @@ pub struct AgentKeyCacheKey {
     pub key_id: u32,
 }
 
-/// Cached agent key
-#[derive(Debug, Clone)]
-pub struct CachedAgentKey {
-    pub public_key: [u8; 32],
-    pub algorithm: String,
-    pub active: bool,
-}
-
 /// Cache for agent public keys
 pub struct AgentKeyCache {
-    keys: LruCache<AgentKeyCacheKey, CachedAgentKey>,
+    keys: LruCache<AgentKeyCacheKey, AgentKeyEntry>,
 }
 
 impl AgentKeyCache {
@@ -551,7 +731,7 @@ impl AgentKeyCache {
         tenant_id: &Uuid,
         agent_id: &Uuid,
         key_id: u32,
-    ) -> Option<CachedAgentKey> {
+    ) -> Option<AgentKeyEntry> {
         let key = AgentKeyCacheKey {
             tenant_id: *tenant_id,
             agent_id: *agent_id,
@@ -560,13 +740,34 @@ impl AgentKeyCache {
         self.keys.get(&key).await
     }
 
+    /// Get a key with a miss lock for stampede protection.
+    pub async fn get_with_lock(
+        &self,
+        tenant_id: &Uuid,
+        agent_id: &Uuid,
+        key_id: u32,
+    ) -> (Option<AgentKeyEntry>, bool) {
+        let key = AgentKeyCacheKey {
+            tenant_id: *tenant_id,
+            agent_id: *agent_id,
+            key_id,
+        };
+
+        if let Some(entry) = self.keys.get(&key).await {
+            return (Some(entry), false);
+        }
+
+        let lock_acquired = self.keys.try_acquire_refresh_lock(&key).await;
+        (None, lock_acquired)
+    }
+
     /// Insert an agent key into cache
     pub async fn insert(
         &self,
         tenant_id: Uuid,
         agent_id: Uuid,
         key_id: u32,
-        cached_key: CachedAgentKey,
+        cached_key: AgentKeyEntry,
     ) {
         let key = AgentKeyCacheKey {
             tenant_id,
@@ -574,6 +775,16 @@ impl AgentKeyCache {
             key_id,
         };
         self.keys.insert(key, cached_key).await;
+    }
+
+    /// Release a previously acquired lock.
+    pub async fn release_lock(&self, tenant_id: &Uuid, agent_id: &Uuid, key_id: u32) {
+        let key = AgentKeyCacheKey {
+            tenant_id: *tenant_id,
+            agent_id: *agent_id,
+            key_id,
+        };
+        self.keys.release_refresh_lock(&key).await;
     }
 
     /// Invalidate a specific key
@@ -599,6 +810,97 @@ impl Default for AgentKeyCache {
 }
 
 // ============================================================================
+// Schema Cache
+// ============================================================================
+
+/// Cache key for schemas
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct SchemaCacheKey {
+    pub tenant_id: Uuid,
+    pub event_type: String,
+}
+
+/// Cache for latest schemas
+pub struct SchemaCache {
+    latest: LruCache<SchemaCacheKey, Schema>,
+}
+
+impl SchemaCache {
+    /// Create a new schema cache
+    pub fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            latest: LruCache::new(max_entries, ttl),
+        }
+    }
+
+    /// Get latest schema from cache
+    pub async fn get_latest(&self, tenant_id: &Uuid, event_type: &str) -> Option<Schema> {
+        let key = SchemaCacheKey {
+            tenant_id: *tenant_id,
+            event_type: event_type.to_string(),
+        };
+        self.latest.get(&key).await
+    }
+
+    /// Get latest schema with miss lock for stampede protection
+    pub async fn get_latest_with_lock(
+        &self,
+        tenant_id: &Uuid,
+        event_type: &str,
+    ) -> (Option<Schema>, bool) {
+        let key = SchemaCacheKey {
+            tenant_id: *tenant_id,
+            event_type: event_type.to_string(),
+        };
+
+        if let Some(schema) = self.latest.get(&key).await {
+            return (Some(schema), false);
+        }
+
+        let lock_acquired = self.latest.try_acquire_refresh_lock(&key).await;
+        (None, lock_acquired)
+    }
+
+    /// Insert latest schema into cache
+    pub async fn insert_latest(&self, schema: Schema) {
+        let key = SchemaCacheKey {
+            tenant_id: schema.tenant_id.0,
+            event_type: schema.event_type.as_str().to_string(),
+        };
+        self.latest.insert(key, schema).await;
+    }
+
+    /// Invalidate latest schema
+    pub async fn invalidate_latest(&self, tenant_id: &Uuid, event_type: &str) {
+        let key = SchemaCacheKey {
+            tenant_id: *tenant_id,
+            event_type: event_type.to_string(),
+        };
+        self.latest.remove(&key).await;
+    }
+
+    /// Release a previously acquired lock
+    pub async fn release_latest_lock(&self, tenant_id: &Uuid, event_type: &str) {
+        let key = SchemaCacheKey {
+            tenant_id: *tenant_id,
+            event_type: event_type.to_string(),
+        };
+        self.latest.release_refresh_lock(&key).await;
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> &CacheStats {
+        self.latest.stats()
+    }
+}
+
+impl Default for SchemaCache {
+    fn default() -> Self {
+        Self::new(1000, Duration::from_secs(600)) // 10 minutes TTL
+    }
+}
+
+// ============================================================================
 // Combined Cache Manager
 // ============================================================================
 
@@ -613,18 +915,80 @@ pub struct CacheStatsSummary {
 
 /// Combined cache manager for all caches
 pub struct CacheManager {
-    pub commitments: CommitmentCache,
-    pub proofs: ProofCache,
-    pub agent_keys: AgentKeyCache,
+    pub commitments: Arc<CommitmentCache>,
+    pub ves_commitments: Arc<VesCommitmentCache>,
+    pub proofs: Arc<ProofCache>,
+    pub ves_proofs: Arc<ProofCache>,
+    pub agent_keys: Arc<AgentKeyCache>,
+    pub schemas: Arc<SchemaCache>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheManagerConfig {
+    pub commitment_max: usize,
+    pub commitment_ttl: Duration,
+    pub proof_max: usize,
+    pub proof_ttl: Duration,
+    pub ves_commitment_max: usize,
+    pub ves_commitment_ttl: Duration,
+    pub ves_proof_max: usize,
+    pub ves_proof_ttl: Duration,
+    pub agent_key_max: usize,
+    pub agent_key_ttl: Duration,
+    pub schema_max: usize,
+    pub schema_ttl: Duration,
+}
+
+impl Default for CacheManagerConfig {
+    fn default() -> Self {
+        Self {
+            commitment_max: 1000,
+            commitment_ttl: Duration::from_secs(300),
+            proof_max: 5000,
+            proof_ttl: Duration::from_secs(600),
+            ves_commitment_max: 1000,
+            ves_commitment_ttl: Duration::from_secs(300),
+            ves_proof_max: 5000,
+            ves_proof_ttl: Duration::from_secs(600),
+            agent_key_max: 1000,
+            agent_key_ttl: Duration::from_secs(3600),
+            schema_max: 1000,
+            schema_ttl: Duration::from_secs(600),
+        }
+    }
 }
 
 impl CacheManager {
     /// Create a new cache manager with default settings
     pub fn new() -> Self {
         Self {
-            commitments: CommitmentCache::default(),
-            proofs: ProofCache::default(),
-            agent_keys: AgentKeyCache::default(),
+            commitments: Arc::new(CommitmentCache::default()),
+            ves_commitments: Arc::new(VesCommitmentCache::default()),
+            proofs: Arc::new(ProofCache::default()),
+            ves_proofs: Arc::new(ProofCache::default()),
+            agent_keys: Arc::new(AgentKeyCache::default()),
+            schemas: Arc::new(SchemaCache::default()),
+        }
+    }
+
+    /// Create with a configuration struct.
+    pub fn with_manager_config(config: CacheManagerConfig) -> Self {
+        Self {
+            commitments: Arc::new(CommitmentCache::new(
+                config.commitment_max,
+                config.commitment_ttl,
+            )),
+            ves_commitments: Arc::new(VesCommitmentCache::new(
+                config.ves_commitment_max,
+                config.ves_commitment_ttl,
+            )),
+            proofs: Arc::new(ProofCache::new(config.proof_max, config.proof_ttl)),
+            ves_proofs: Arc::new(ProofCache::new(config.ves_proof_max, config.ves_proof_ttl)),
+            agent_keys: Arc::new(AgentKeyCache::new(
+                config.agent_key_max,
+                config.agent_key_ttl,
+            )),
+            schemas: Arc::new(SchemaCache::new(config.schema_max, config.schema_ttl)),
         }
     }
 
@@ -636,28 +1000,47 @@ impl CacheManager {
         proof_ttl: Duration,
         agent_key_max: usize,
         agent_key_ttl: Duration,
+        schema_max: usize,
+        schema_ttl: Duration,
     ) -> Self {
-        Self {
-            commitments: CommitmentCache::new(commitment_max, commitment_ttl),
-            proofs: ProofCache::new(proof_max, proof_ttl),
-            agent_keys: AgentKeyCache::new(agent_key_max, agent_key_ttl),
-        }
+        Self::with_manager_config(CacheManagerConfig {
+            commitment_max,
+            commitment_ttl,
+            proof_max,
+            proof_ttl,
+            ves_commitment_max: commitment_max,
+            ves_commitment_ttl: commitment_ttl,
+            ves_proof_max: proof_max,
+            ves_proof_ttl: proof_ttl,
+            agent_key_max,
+            agent_key_ttl,
+            schema_max,
+            schema_ttl,
+        })
     }
 
     /// Clear all caches
     pub async fn clear_all(&self) {
         self.commitments.by_batch_id.clear().await;
         self.commitments.latest_by_stream.clear().await;
+        self.ves_commitments.by_batch_id.clear().await;
+        self.ves_commitments.latest_by_stream.clear().await;
         self.proofs.proofs.clear().await;
+        self.ves_proofs.proofs.clear().await;
         self.agent_keys.keys.clear().await;
+        self.schemas.latest.clear().await;
     }
 
     /// Run cleanup on all caches
     pub async fn cleanup_expired(&self) {
         self.commitments.by_batch_id.cleanup_expired().await;
         self.commitments.latest_by_stream.cleanup_expired().await;
+        self.ves_commitments.by_batch_id.cleanup_expired().await;
+        self.ves_commitments.latest_by_stream.cleanup_expired().await;
         self.proofs.proofs.cleanup_expired().await;
+        self.ves_proofs.proofs.cleanup_expired().await;
         self.agent_keys.keys.cleanup_expired().await;
+        self.schemas.latest.cleanup_expired().await;
     }
 
     /// Get combined statistics as JSON
@@ -677,17 +1060,43 @@ impl CacheManager {
                     "evictions": self.commitments.latest_by_stream.stats().evictions(),
                 }
             },
+            "ves_commitments": {
+                "by_batch_id": {
+                    "hits": self.ves_commitments.by_batch_id.stats().hits(),
+                    "misses": self.ves_commitments.by_batch_id.stats().misses(),
+                    "hit_rate": self.ves_commitments.by_batch_id.stats().hit_rate(),
+                    "evictions": self.ves_commitments.by_batch_id.stats().evictions(),
+                },
+                "latest_by_stream": {
+                    "hits": self.ves_commitments.latest_by_stream.stats().hits(),
+                    "misses": self.ves_commitments.latest_by_stream.stats().misses(),
+                    "hit_rate": self.ves_commitments.latest_by_stream.stats().hit_rate(),
+                    "evictions": self.ves_commitments.latest_by_stream.stats().evictions(),
+                }
+            },
             "proofs": {
                 "hits": self.proofs.stats().hits(),
                 "misses": self.proofs.stats().misses(),
                 "hit_rate": self.proofs.stats().hit_rate(),
                 "evictions": self.proofs.stats().evictions(),
             },
+            "ves_proofs": {
+                "hits": self.ves_proofs.stats().hits(),
+                "misses": self.ves_proofs.stats().misses(),
+                "hit_rate": self.ves_proofs.stats().hit_rate(),
+                "evictions": self.ves_proofs.stats().evictions(),
+            },
             "agent_keys": {
                 "hits": self.agent_keys.stats().hits(),
                 "misses": self.agent_keys.stats().misses(),
                 "hit_rate": self.agent_keys.stats().hit_rate(),
                 "evictions": self.agent_keys.stats().evictions(),
+            },
+            "schemas": {
+                "hits": self.schemas.stats().hits(),
+                "misses": self.schemas.stats().misses(),
+                "hit_rate": self.schemas.stats().hit_rate(),
+                "evictions": self.schemas.stats().evictions(),
             }
         })
     }
@@ -851,13 +1260,17 @@ mod tests {
 
         // Verify all caches are initialized
         assert!(manager.proofs.proofs.is_empty().await);
+        assert!(manager.ves_proofs.proofs.is_empty().await);
         assert!(manager.commitments.by_batch_id.is_empty().await);
+        assert!(manager.ves_commitments.by_batch_id.is_empty().await);
         assert!(manager.agent_keys.keys.is_empty().await);
 
         // Verify stats work
         let stats = manager.stats_json();
         assert!(stats.get("commitments").is_some());
+        assert!(stats.get("ves_commitments").is_some());
         assert!(stats.get("proofs").is_some());
+        assert!(stats.get("ves_proofs").is_some());
         assert!(stats.get("agent_keys").is_some());
     }
 }

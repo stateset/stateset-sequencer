@@ -32,6 +32,7 @@ use crate::domain::{
     AgentId, AgentKeyId, GetX402BatchResponse, GetX402ReceiptResponse, Hash256, Signature64,
     StoreId, SubmitX402PaymentRequest, SubmitX402PaymentResponse, TenantId, X402BatchStatus,
     X402IntentStatus, X402Network, X402PaymentBatch, X402PaymentIntent, X402PaymentIntentFilter,
+    X402_MAX_VALIDITY_SECS,
 };
 use crate::infra::PgX402Repository;
 use crate::server::AppState;
@@ -94,6 +95,12 @@ pub async fn submit_payment_intent(
         return Err(ApiError::new(
             ErrorCode::InvalidFieldValue,
             "Payment intent has expired",
+        ));
+    }
+    if payload.valid_until > now_unix.saturating_add(X402_MAX_VALIDITY_SECS) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "Payment intent validity exceeds maximum window",
         ));
     }
 
@@ -204,8 +211,10 @@ pub async fn submit_payment_intent(
             }
             Err(e) => {
                 warn!(error = ?e, "Failed to look up agent key for signature verification");
-                // Allow submission without verification if agent key not found
-                // The payer_public_key should be provided in this case
+                return Err(ApiError::new(
+                    ErrorCode::AgentKeyNotFound,
+                    "Agent key not found; provide payer_public_key for verification",
+                ));
             }
         }
     }
@@ -251,10 +260,22 @@ pub async fn submit_payment_intent(
         updated_at: now,
     };
 
-    // Persist intent to database
+    // Persist intent and reserve nonce atomically
+    let mut tx = state
+        .x402_repository
+        .pool()
+        .begin()
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::InternalError,
+                format!("Failed to start transaction: {}", e),
+            )
+        })?;
+
     state
         .x402_repository
-        .insert_intent(&intent)
+        .insert_intent_tx(&mut tx, &intent)
         .await
         .map_err(|e| {
             ApiError::new(
@@ -262,6 +283,38 @@ pub async fn submit_payment_intent(
                 format!("Failed to persist payment intent: {}", e),
             )
         })?;
+
+    let reserved = state
+        .x402_repository
+        .reserve_nonce(
+            &mut tx,
+            &tenant_id,
+            &store_id,
+            &intent.payer_address,
+            intent.nonce,
+            intent_id,
+        )
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::InternalError,
+                format!("Failed to reserve nonce: {}", e),
+            )
+        })?;
+
+    if !reserved {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "Nonce already used for this payer",
+        ));
+    }
+
+    tx.commit().await.map_err(|e| {
+        ApiError::new(
+            ErrorCode::InternalError,
+            format!("Failed to commit payment intent: {}", e),
+        )
+    })?;
 
     // Assign sequence number atomically
     let sequence_number = state
@@ -526,17 +579,69 @@ pub async fn create_batch(
     let store_id = StoreId::from_uuid(payload.store_id);
     let max_size = payload.max_size.unwrap_or(100);
 
-    // Fetch pending intents for this tenant/store/network
-    let intents = state
-        .x402_repository
-        .get_pending_intents_for_batch(&tenant_id, &store_id, payload.network, max_size as u32)
-        .await
-        .map_err(|e| {
-            ApiError::new(
-                ErrorCode::InternalError,
-                format!("Failed to fetch pending intents: {}", e),
-            )
-        })?;
+    let intents = if let Some(intent_ids) = payload.intent_ids.as_ref().filter(|ids| !ids.is_empty())
+    {
+        if intent_ids.len() > max_size {
+            return Err(ApiError::new(
+                ErrorCode::BatchTooLarge,
+                "Requested intent_ids exceed batch size limit",
+            ));
+        }
+        let mut intents = Vec::with_capacity(intent_ids.len());
+        for intent_id in intent_ids {
+            let intent = state
+                .x402_repository
+                .get_intent(*intent_id)
+                .await
+                .map_err(|e| {
+                    ApiError::new(
+                        ErrorCode::InternalError,
+                        format!("Failed to fetch intent: {}", e),
+                    )
+                })?
+                .ok_or_else(|| {
+                    ApiError::new(
+                        ErrorCode::ResourceNotFound,
+                        format!("Intent {} not found", intent_id),
+                    )
+                })?;
+
+            if intent.tenant_id != tenant_id || intent.store_id != store_id {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidFieldValue,
+                    "Intent tenant/store mismatch",
+                ));
+            }
+            if intent.network != payload.network {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidFieldValue,
+                    "Intent network mismatch",
+                ));
+            }
+            if intent.status != X402IntentStatus::Sequenced {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidFieldValue,
+                    "Only sequenced intents can be batched",
+                ));
+            }
+            intents.push(intent);
+        }
+
+        intents.sort_by_key(|i| i.sequence_number.unwrap_or(0));
+        intents
+    } else {
+        // Fetch pending intents for this tenant/store/network
+        state
+            .x402_repository
+            .get_pending_intents_for_batch(&tenant_id, &store_id, payload.network, max_size as u32)
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InternalError,
+                    format!("Failed to fetch pending intents: {}", e),
+                )
+            })?
+    };
 
     if intents.is_empty() {
         return Err(ApiError::new(
@@ -565,14 +670,38 @@ pub async fn create_batch(
             )
         })?;
 
-    // TODO: Compute Merkle root and commit batch
-    // For now, return pending batch
+    // Update intents to batched status and attach batch id
+    let intent_ids: Vec<Uuid> = intents.iter().map(|i| i.intent_id).collect();
+    for intent_id in &intent_ids {
+        state
+            .x402_repository
+            .update_intent_batch(*intent_id, batch.batch_id)
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InternalError,
+                    format!("Failed to update intent batch: {}", e),
+                )
+            })?;
+    }
+
+    // Compute Merkle root + commit batch
+    let (merkle_root, _state_root) = state
+        .x402_repository
+        .commit_batch_with_merkle(batch.batch_id, &tenant_id, &store_id)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::InternalError,
+                format!("Failed to commit batch: {}", e),
+            )
+        })?;
 
     Ok(Json(CreateBatchResponse {
         batch_id: batch.batch_id,
-        status: batch.status,
+        status: X402BatchStatus::Committed,
         payment_count: batch.payment_count,
-        merkle_root: None,
+        merkle_root: Some(format!("0x{}", hex::encode(merkle_root))),
         sequence_range: (batch.sequence_start, batch.sequence_end),
     }))
 }

@@ -50,12 +50,7 @@ pub async fn get_ves_validity_public_inputs(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(batch_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let commitment = state
-        .ves_commitment_engine
-        .get_commitment(batch_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?;
+    let commitment = super::get_ves_commitment_cached(&state, batch_id).await?;
 
     ensure_read(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
 
@@ -76,12 +71,7 @@ pub async fn submit_ves_validity_proof(
     Path(batch_id): Path<Uuid>,
     Json(request): Json<SubmitVesValidityProofRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let commitment = state
-        .ves_commitment_engine
-        .get_commitment(batch_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?;
+    let commitment = super::get_ves_commitment_cached(&state, batch_id).await?;
 
     ensure_admin(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
 
@@ -174,12 +164,7 @@ pub async fn list_ves_validity_proofs(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(batch_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let commitment = state
-        .ves_commitment_engine
-        .get_commitment(batch_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?;
+    let commitment = super::get_ves_commitment_cached(&state, batch_id).await?;
 
     ensure_read(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
 
@@ -263,12 +248,16 @@ pub async fn verify_ves_validity_proof(
 
     ensure_read(&auth, proof.tenant_id.0, proof.store_id.0)?;
 
-    let commitment = state
-        .ves_commitment_engine
-        .get_commitment(proof.batch_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?;
+    let commitment = match state.ves_commitment_reader.get_commitment(proof.batch_id).await {
+        Ok(Some(commitment)) => commitment,
+        Ok(None) => state
+            .ves_commitment_engine
+            .get_commitment(proof.batch_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?,
+        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    };
 
     if commitment.tenant_id.0 != proof.tenant_id.0 || commitment.store_id.0 != proof.store_id.0 {
         return Err((

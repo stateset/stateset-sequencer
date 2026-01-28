@@ -237,9 +237,14 @@ impl X402BatchWorker {
                 let network = match network.as_str() {
                     "set_chain" => X402Network::SetChain,
                     "set_chain_testnet" => X402Network::SetChainTestnet,
+                    "arc" => X402Network::Arc,
+                    "arc_testnet" => X402Network::ArcTestnet,
                     "base" => X402Network::Base,
                     "base_sepolia" => X402Network::BaseSepolia,
                     "ethereum" => X402Network::Ethereum,
+                    "ethereum_sepolia" => X402Network::EthereumSepolia,
+                    "arbitrum" => X402Network::Arbitrum,
+                    "optimism" => X402Network::Optimism,
                     _ => return None,
                 };
                 Some((

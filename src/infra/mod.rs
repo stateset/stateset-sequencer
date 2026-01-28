@@ -34,12 +34,13 @@ mod x402_batch_worker;
 
 pub use audit::{AuditAction, AuditLogBuilder, AuditLogEntry, AuditQueryFilters, PgAuditLogger};
 pub use batch::{
-    batch_check_existing_command_ids, batch_check_existing_event_ids, chunked,
-    dedupe_preserve_order, partition_for_parallel, BatchConfig, BatchStats, DEFAULT_BATCH_SIZE,
+    batch_check_existing_command_ids, batch_check_existing_event_ids, batch_reserve_command_ids,
+    chunked, dedupe_preserve_order, partition_for_parallel, BatchConfig, BatchStats,
+    DEFAULT_BATCH_SIZE,
 };
 pub use cache::{
-    AgentKeyCache, CacheManager, CacheRefreshConfig, CacheStats, CachedAgentKey, CachedCommitment,
-    CommitmentCache, LruCache, ProofCache,
+    AgentKeyCache, CacheManager, CacheManagerConfig, CacheRefreshConfig, CacheStats,
+    CachedCommitment, CommitmentCache, LruCache, ProofCache, SchemaCache, VesCommitmentCache,
 };
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitBreakerRegistry, CircuitState,

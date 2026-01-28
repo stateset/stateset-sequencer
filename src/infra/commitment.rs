@@ -62,6 +62,52 @@ impl PgCommitmentEngine {
         row.map(BatchCommitment::try_from).transpose()
     }
 
+    /// List unanchored commitments for a specific tenant/store.
+    pub async fn list_unanchored_by_stream(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        limit: Option<u32>,
+    ) -> Result<Vec<BatchCommitment>> {
+        let rows: Vec<CommitmentRow> = if let Some(limit) = limit {
+            sqlx::query_as(
+                r#"
+                SELECT batch_id, tenant_id, store_id,
+                       prev_state_root, new_state_root, events_root,
+                       sequence_start, sequence_end, event_count,
+                       committed_at, chain_tx_hash
+                FROM commitments
+                WHERE tenant_id = $1 AND store_id = $2 AND chain_tx_hash IS NULL
+                ORDER BY committed_at ASC
+                LIMIT $3
+                "#,
+            )
+            .bind(tenant_id.0)
+            .bind(store_id.0)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                r#"
+                SELECT batch_id, tenant_id, store_id,
+                       prev_state_root, new_state_root, events_root,
+                       sequence_start, sequence_end, event_count,
+                       committed_at, chain_tx_hash
+                FROM commitments
+                WHERE tenant_id = $1 AND store_id = $2 AND chain_tx_hash IS NULL
+                ORDER BY committed_at ASC
+                "#,
+            )
+            .bind(tenant_id.0)
+            .bind(store_id.0)
+            .fetch_all(&self.pool)
+            .await?
+        };
+
+        rows.into_iter().map(BatchCommitment::try_from).collect()
+    }
+
     /// Get the commitment containing a specific sequence number.
     pub async fn get_commitment_by_sequence(
         &self,

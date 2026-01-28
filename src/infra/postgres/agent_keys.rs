@@ -6,20 +6,33 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPool;
+use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::auth::{AgentKeyEntry, AgentKeyError, AgentKeyLookup, AgentKeyRegistry, KeyStatus};
 use crate::crypto::PublicKey32;
+use crate::infra::AgentKeyCache;
 
 /// PostgreSQL-backed agent key registry
 pub struct PgAgentKeyRegistry {
     pool: PgPool,
+    cache: Option<Arc<AgentKeyCache>>,
 }
 
 impl PgAgentKeyRegistry {
     /// Create a new PostgreSQL agent key registry
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            cache: None,
+        }
+    }
+
+    /// Enable caching for agent key lookups.
+    pub fn with_cache(mut self, cache: Arc<AgentKeyCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Initialize the database schema for agent keys
@@ -105,6 +118,26 @@ impl PgAgentKeyRegistry {
 #[async_trait]
 impl AgentKeyRegistry for PgAgentKeyRegistry {
     async fn get_key(&self, lookup: &AgentKeyLookup) -> Result<AgentKeyEntry, AgentKeyError> {
+        let mut lock_acquired = false;
+        if let Some(cache) = &self.cache {
+            let (cached, lock) = cache
+                .get_with_lock(&lookup.tenant_id, &lookup.agent_id, lookup.key_id)
+                .await;
+            if let Some(entry) = cached {
+                return Ok(entry);
+            }
+            lock_acquired = lock;
+            if !lock_acquired {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                if let Some(entry) = cache
+                    .get(&lookup.tenant_id, &lookup.agent_id, lookup.key_id)
+                    .await
+                {
+                    return Ok(entry);
+                }
+            }
+        }
+
         let row: Option<(
             Vec<u8>,
             String,
@@ -113,7 +146,7 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
             Option<DateTime<Utc>>,
             Option<String>,
             DateTime<Utc>,
-        )> = sqlx::query_as(
+        )> = match sqlx::query_as(
             r#"
             SELECT public_key, status, valid_from, valid_to, revoked_at, metadata, created_at
             FROM agent_signing_keys
@@ -125,19 +158,72 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
         .bind(lookup.key_id as i32)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| AgentKeyError::Internal(e.to_string()))?;
+        {
+            Ok(row) => row,
+            Err(e) => {
+                if let Some(cache) = &self.cache {
+                    if lock_acquired {
+                        cache
+                            .release_lock(&lookup.tenant_id, &lookup.agent_id, lookup.key_id)
+                            .await;
+                    }
+                }
+                return Err(AgentKeyError::Internal(e.to_string()));
+            }
+        };
 
         match row {
             Some((pk, status, valid_from, valid_to, revoked_at, metadata, created_at)) => {
-                Self::row_to_entry(
+                let entry = match Self::row_to_entry(
                     pk, status, valid_from, valid_to, revoked_at, metadata, created_at,
-                )
+                ) {
+                    Ok(entry) => entry,
+                    Err(err) => {
+                        if let Some(cache) = &self.cache {
+                            if lock_acquired {
+                                cache
+                                    .release_lock(
+                                        &lookup.tenant_id,
+                                        &lookup.agent_id,
+                                        lookup.key_id,
+                                    )
+                                    .await;
+                            }
+                        }
+                        return Err(err);
+                    }
+                };
+                if let Some(cache) = &self.cache {
+                    cache
+                        .insert(
+                            lookup.tenant_id,
+                            lookup.agent_id,
+                            lookup.key_id,
+                            entry.clone(),
+                        )
+                        .await;
+                    if lock_acquired {
+                        cache
+                            .release_lock(&lookup.tenant_id, &lookup.agent_id, lookup.key_id)
+                            .await;
+                    }
+                }
+                Ok(entry)
             }
-            None => Err(AgentKeyError::KeyNotFound {
-                tenant_id: lookup.tenant_id,
-                agent_id: lookup.agent_id,
-                key_id: lookup.key_id,
-            }),
+            None => {
+                if let Some(cache) = &self.cache {
+                    if lock_acquired {
+                        cache
+                            .release_lock(&lookup.tenant_id, &lookup.agent_id, lookup.key_id)
+                            .await;
+                    }
+                }
+                Err(AgentKeyError::KeyNotFound {
+                    tenant_id: lookup.tenant_id,
+                    agent_id: lookup.agent_id,
+                    key_id: lookup.key_id,
+                })
+            }
         }
     }
 
@@ -188,7 +274,19 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
         .await;
 
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some(cache) = &self.cache {
+                    cache
+                        .insert(
+                            lookup.tenant_id,
+                            lookup.agent_id,
+                            lookup.key_id,
+                            entry.clone(),
+                        )
+                        .await;
+                }
+                Ok(())
+            }
             Err(e) if e.to_string().contains("duplicate key") => {
                 Err(AgentKeyError::KeyAlreadyExists)
             }
@@ -217,6 +315,12 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
                 agent_id: lookup.agent_id,
                 key_id: lookup.key_id,
             });
+        }
+
+        if let Some(cache) = &self.cache {
+            cache
+                .invalidate(&lookup.tenant_id, &lookup.agent_id, lookup.key_id)
+                .await;
         }
 
         Ok(())

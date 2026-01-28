@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
@@ -27,7 +28,10 @@ use crate::domain::{
     AgentId, AgentKeyId, EntityType, EventType, PayloadKind, SequencedVesEvent, StoreId, TenantId,
     VesBatchCommitment, VesEventEnvelope, VES_VERSION, ZERO_HASH,
 };
-use crate::infra::{postgres::VesRejectionReason, PgAgentKeyRegistry, PgVesCommitmentEngine, VesSequencer};
+use crate::infra::{
+    postgres::VesRejectionReason, CacheManager, PgAgentKeyRegistry, PgVesCommitmentEngine,
+    VesSequencer,
+};
 use crate::proto::v2::{
     self,
     sequencer_server::Sequencer as SequencerTrait,
@@ -45,7 +49,10 @@ use crate::proto::v2::{
 /// gRPC Sequencer v2 service implementation
 pub struct SequencerServiceV2 {
     ves_sequencer: Arc<VesSequencer<PgAgentKeyRegistry>>,
+    ves_sequencer_reader: Arc<VesSequencer<PgAgentKeyRegistry>>,
     ves_commitment_engine: Arc<PgVesCommitmentEngine>,
+    ves_commitment_reader: Arc<PgVesCommitmentEngine>,
+    cache_manager: Arc<CacheManager>,
     /// Broadcast channel for real-time event notifications
     event_tx: broadcast::Sender<SequencedEvent>,
 }
@@ -54,12 +61,18 @@ impl SequencerServiceV2 {
     pub fn new(
         ves_sequencer: Arc<VesSequencer<PgAgentKeyRegistry>>,
         ves_commitment_engine: Arc<PgVesCommitmentEngine>,
+        ves_sequencer_reader: Arc<VesSequencer<PgAgentKeyRegistry>>,
+        ves_commitment_reader: Arc<PgVesCommitmentEngine>,
+        cache_manager: Arc<CacheManager>,
     ) -> Self {
         // Create broadcast channel for event streaming (1024 event buffer)
         let (event_tx, _) = broadcast::channel(1024);
         Self {
             ves_sequencer,
+            ves_sequencer_reader,
             ves_commitment_engine,
+            ves_commitment_reader,
+            cache_manager,
             event_tx,
         }
     }
@@ -670,9 +683,9 @@ impl SequencerTrait for SequencerServiceV2 {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        // Read events
-        let events = self
-            .ves_sequencer
+        // Read events (replica -> primary fallback)
+        let mut events = self
+            .ves_sequencer_reader
             .read_range(
                 &tenant_id,
                 &store_id,
@@ -683,6 +696,24 @@ impl SequencerTrait for SequencerServiceV2 {
             )
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
+
+        if events.is_empty() {
+            let expected_start = if req.from_sequence == 0 { 1 } else { req.from_sequence };
+            if head >= expected_start {
+                events = self
+                    .ves_sequencer
+                    .read_range(
+                        &tenant_id,
+                        &store_id,
+                        req.from_sequence,
+                        req.from_sequence
+                            .saturating_add(limit)
+                            .saturating_sub(1),
+                    )
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+            }
+        }
 
         // Apply filters if specified
         let filtered_events: Vec<_> = events
@@ -767,11 +798,72 @@ impl SequencerTrait for SequencerServiceV2 {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let latest_commitment = self
-            .ves_commitment_engine
-            .get_last_commitment(&tenant_id, &store_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let cache = &self.cache_manager.ves_commitments;
+        let mut lock_acquired = false;
+        let mut latest_commitment = cache.get_latest(&tenant_id.0, &store_id.0).await;
+        if latest_commitment.is_none() {
+            let (cached, lock) = cache
+                .get_latest_with_lock(&tenant_id.0, &store_id.0)
+                .await;
+            lock_acquired = lock;
+            latest_commitment = cached;
+
+            if latest_commitment.is_none() && !lock_acquired {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                latest_commitment = cache.get_latest(&tenant_id.0, &store_id.0).await;
+            }
+
+            if latest_commitment.is_none() {
+                let fetched = match self
+                    .ves_commitment_reader
+                    .get_last_commitment(&tenant_id, &store_id)
+                    .await
+                {
+                    Ok(Some(c)) => Some(c),
+                    Ok(None) => match self
+                        .ves_commitment_engine
+                        .get_last_commitment(&tenant_id, &store_id)
+                        .await
+                    {
+                        Ok(commitment) => commitment,
+                        Err(e) => {
+                            if lock_acquired {
+                                cache
+                                    .release_latest_lock(&tenant_id.0, &store_id.0)
+                                    .await;
+                            }
+                            return Err(Status::internal(e.to_string()));
+                        }
+                    },
+                    Err(_) => match self
+                        .ves_commitment_engine
+                        .get_last_commitment(&tenant_id, &store_id)
+                        .await
+                    {
+                        Ok(commitment) => commitment,
+                        Err(e) => {
+                            if lock_acquired {
+                                cache
+                                    .release_latest_lock(&tenant_id.0, &store_id.0)
+                                    .await;
+                            }
+                            return Err(Status::internal(e.to_string()));
+                        }
+                    },
+                };
+
+                if let Some(commitment) = fetched {
+                    cache.insert(commitment.clone()).await;
+                    latest_commitment = Some(commitment);
+                }
+            }
+        }
+
+        if lock_acquired {
+            cache
+                .release_latest_lock(&tenant_id.0, &store_id.0)
+                .await;
+        }
 
         let state_root = latest_commitment
             .as_ref()
@@ -810,23 +902,40 @@ impl SequencerTrait for SequencerServiceV2 {
         Self::require_read(&auth_ctx)?;
         Self::authorize_tenant_store(&auth_ctx, &tenant_id, &store_id)?;
 
-        // Get event by selector
+        // Get event by selector (replica -> primary fallback)
         let event = match req.selector {
             Some(v2::get_inclusion_proof_request::Selector::EventId(ref id)) => {
                 let event_id = Uuid::parse_str(id)
                     .map_err(|e| Status::invalid_argument(format!("invalid event_id: {}", e)))?;
-                self.ves_sequencer
-                    .read_by_id(event_id)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found("event not found"))?
+                match self.ves_sequencer_reader.read_by_id(event_id).await {
+                    Ok(Some(event)) => event,
+                    Ok(None) => self
+                        .ves_sequencer
+                        .read_by_id(event_id)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .ok_or_else(|| Status::not_found("event not found"))?,
+                    Err(_) => self
+                        .ves_sequencer
+                        .read_by_id(event_id)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .ok_or_else(|| Status::not_found("event not found"))?,
+                }
             }
             Some(v2::get_inclusion_proof_request::Selector::SequenceNumber(seq)) => {
-                let events = self
-                    .ves_sequencer
+                let mut events = self
+                    .ves_sequencer_reader
                     .read_range(&tenant_id, &store_id, seq, seq)
                     .await
                     .map_err(|e| Status::internal(e.to_string()))?;
+                if events.is_empty() {
+                    events = self
+                        .ves_sequencer
+                        .read_range(&tenant_id, &store_id, seq, seq)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?;
+                }
                 events
                     .into_iter()
                     .next()
@@ -844,12 +953,30 @@ impl SequencerTrait for SequencerServiceV2 {
         let seq = event.sequence_number();
 
         // Find the commitment containing this event.
-        let commitment = self
-            .ves_commitment_engine
+        let commitment = match self
+            .ves_commitment_reader
             .get_commitment_by_sequence(&tenant_id, &store_id, seq)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("no commitment found"))?;
+        {
+            Ok(Some(commitment)) => commitment,
+            Ok(None) => self
+                .ves_commitment_engine
+                .get_commitment_by_sequence(&tenant_id, &store_id, seq)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("no commitment found"))?,
+            Err(_) => self
+                .ves_commitment_engine
+                .get_commitment_by_sequence(&tenant_id, &store_id, seq)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("no commitment found"))?,
+        };
+
+        self.cache_manager
+            .ves_commitments
+            .insert(commitment.clone())
+            .await;
 
         // Verify event is within the commitment's sequence range
         if seq < commitment.sequence_range.0 || seq > commitment.sequence_range.1 {
@@ -863,24 +990,152 @@ impl SequencerTrait for SequencerServiceV2 {
         // Calculate leaf index within batch
         let leaf_index = (seq - commitment.sequence_range.0) as usize;
 
+        let proof_cache = &self.cache_manager.ves_proofs;
+        if let Some(proof) = proof_cache.get(&tenant_id.0, &store_id.0, seq).await {
+            if self
+                .ves_commitment_reader
+                .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
+            {
+                return Ok(Response::new(GetInclusionProofResponse {
+                    included: true,
+                    proof: Some(InclusionProof {
+                        merkle_root: commitment.merkle_root.to_vec(),
+                        leaf_index: proof.leaf_index as u64,
+                        proof_hashes: proof.proof_path.iter().map(|h| h.to_vec()).collect(),
+                        leaf_count: commitment.leaf_count as u64,
+                        leaf_hash: proof.leaf_hash.to_vec(),
+                    }),
+                    event: Some(Self::to_proto_event(&event)?),
+                }));
+            }
+        }
+
+        let (cached, lock_acquired) = proof_cache
+            .get_with_lock(&tenant_id.0, &store_id.0, seq)
+            .await;
+        if let Some(proof) = cached {
+            if self
+                .ves_commitment_reader
+                .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
+            {
+                return Ok(Response::new(GetInclusionProofResponse {
+                    included: true,
+                    proof: Some(InclusionProof {
+                        merkle_root: commitment.merkle_root.to_vec(),
+                        leaf_index: proof.leaf_index as u64,
+                        proof_hashes: proof.proof_path.iter().map(|h| h.to_vec()).collect(),
+                        leaf_count: commitment.leaf_count as u64,
+                        leaf_hash: proof.leaf_hash.to_vec(),
+                    }),
+                    event: Some(Self::to_proto_event(&event)?),
+                }));
+            }
+        }
+
+        if !lock_acquired {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Some(proof) = proof_cache.get(&tenant_id.0, &store_id.0, seq).await {
+                if self
+                    .ves_commitment_reader
+                    .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
+                {
+                    return Ok(Response::new(GetInclusionProofResponse {
+                        included: true,
+                        proof: Some(InclusionProof {
+                            merkle_root: commitment.merkle_root.to_vec(),
+                            leaf_index: proof.leaf_index as u64,
+                            proof_hashes: proof.proof_path.iter().map(|h| h.to_vec()).collect(),
+                            leaf_count: commitment.leaf_count as u64,
+                            leaf_hash: proof.leaf_hash.to_vec(),
+                        }),
+                        event: Some(Self::to_proto_event(&event)?),
+                    }));
+                }
+            }
+        }
+
         // Build leaves
         let start = commitment.sequence_range.0;
         let end = commitment.sequence_range.1;
 
-        let leaves = self
-            .ves_commitment_engine
+        let mut leaves = match self
+            .ves_commitment_reader
             .leaf_hashes_for_range(&tenant_id, &store_id, start, end)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        {
+            Ok(leaves) => leaves,
+            Err(e) => {
+                if lock_acquired {
+                    proof_cache
+                        .release_lock(&tenant_id.0, &store_id.0, seq)
+                        .await;
+                }
+                return Err(Status::internal(e.to_string()));
+            }
+        };
 
         if leaves.is_empty() {
+            if lock_acquired {
+                proof_cache
+                    .release_lock(&tenant_id.0, &store_id.0, seq)
+                    .await;
+            }
             return Err(Status::internal("commitment range contains no events"));
         }
 
-        let proof = self
-            .ves_commitment_engine
+        let computed_root = self.ves_commitment_reader.compute_merkle_root(&leaves);
+        if computed_root != commitment.merkle_root {
+            leaves = match self
+                .ves_commitment_engine
+                .leaf_hashes_for_range(&tenant_id, &store_id, start, end)
+                .await
+            {
+                Ok(leaves) => leaves,
+                Err(e) => {
+                    if lock_acquired {
+                        proof_cache
+                            .release_lock(&tenant_id.0, &store_id.0, seq)
+                            .await;
+                    }
+                    return Err(Status::internal(e.to_string()));
+                }
+            };
+            let computed_root_primary = self.ves_commitment_engine.compute_merkle_root(&leaves);
+            if computed_root_primary != commitment.merkle_root {
+                if lock_acquired {
+                    proof_cache
+                        .release_lock(&tenant_id.0, &store_id.0, seq)
+                        .await;
+                }
+                return Err(Status::internal(
+                    "commitment merkle_root does not match ves_events",
+                ));
+            }
+        }
+
+        let proof = match self
+            .ves_commitment_reader
             .prove_inclusion(leaf_index, &leaves)
-            .map_err(|e| Status::internal(e.to_string()))?;
+        {
+            Ok(proof) => proof,
+            Err(e) => {
+                if lock_acquired {
+                    proof_cache
+                        .release_lock(&tenant_id.0, &store_id.0, seq)
+                        .await;
+                }
+                return Err(Status::internal(e.to_string()));
+            }
+        };
+
+        proof_cache
+            .insert(tenant_id.0, store_id.0, seq, proof.clone())
+            .await;
+        if lock_acquired {
+            proof_cache
+                .release_lock(&tenant_id.0, &store_id.0, seq)
+                .await;
+        }
 
         Ok(Response::new(GetInclusionProofResponse {
             included: true,
@@ -889,7 +1144,7 @@ impl SequencerTrait for SequencerServiceV2 {
                 leaf_index: leaf_index as u64,
                 proof_hashes: proof.proof_path.iter().map(|h| h.to_vec()).collect(),
                 leaf_count: leaves.len() as u64,
-                leaf_hash: leaves[leaf_index].to_vec(),
+                leaf_hash: proof.leaf_hash.to_vec(),
             }),
             event: Some(Self::to_proto_event(&event)?),
         }))
@@ -909,11 +1164,72 @@ impl SequencerTrait for SequencerServiceV2 {
             Some(v2::get_commitment_request::Selector::BatchId(ref id)) => {
                 let batch_id = Uuid::parse_str(id)
                     .map_err(|e| Status::invalid_argument(format!("invalid batch_id: {}", e)))?;
-                self.ves_commitment_engine
-                    .get_commitment(batch_id)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found("commitment not found"))?
+                let cache = &self.cache_manager.ves_commitments;
+                let mut lock_acquired = false;
+                let mut fetched_from_db = false;
+                let mut commitment = cache.get_by_batch_id(&batch_id).await;
+
+                if commitment.is_none() {
+                    let (cached, lock) = cache.get_by_batch_id_with_lock(&batch_id).await;
+                    lock_acquired = lock;
+                    commitment = cached;
+
+                    if commitment.is_none() && !lock_acquired {
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        commitment = cache.get_by_batch_id(&batch_id).await;
+                    }
+
+                    if commitment.is_none() {
+                        let fetched = match self.ves_commitment_reader.get_commitment(batch_id).await
+                        {
+                            Ok(Some(commitment)) => Some(commitment),
+                            Ok(None) => match self
+                                .ves_commitment_engine
+                                .get_commitment(batch_id)
+                                .await
+                            {
+                                Ok(commitment) => commitment,
+                                Err(e) => {
+                                    if lock_acquired {
+                                        cache.release_batch_id_lock(&batch_id).await;
+                                    }
+                                    return Err(Status::internal(e.to_string()));
+                                }
+                            },
+                            Err(_) => match self
+                                .ves_commitment_engine
+                                .get_commitment(batch_id)
+                                .await
+                            {
+                                Ok(commitment) => commitment,
+                                Err(e) => {
+                                    if lock_acquired {
+                                        cache.release_batch_id_lock(&batch_id).await;
+                                    }
+                                    return Err(Status::internal(e.to_string()));
+                                }
+                            },
+                        };
+
+                        commitment = fetched;
+                        fetched_from_db = true;
+                    }
+                }
+
+                let Some(commitment) = commitment else {
+                    if lock_acquired {
+                        cache.release_batch_id_lock(&batch_id).await;
+                    }
+                    return Err(Status::not_found("commitment not found"));
+                };
+
+                if fetched_from_db {
+                    cache.insert(commitment.clone()).await;
+                }
+                if lock_acquired {
+                    cache.release_batch_id_lock(&batch_id).await;
+                }
+                commitment
             }
             Some(v2::get_commitment_request::Selector::SequenceNumber(seq)) => {
                 if auth_ctx.tenant_id.is_nil() {
@@ -930,11 +1246,25 @@ impl SequencerTrait for SequencerServiceV2 {
                     }
                 };
                 let tenant_id = TenantId(auth_ctx.tenant_id);
-                self.ves_commitment_engine
+                match self
+                    .ves_commitment_reader
                     .get_commitment_by_sequence(&tenant_id, &store_id, seq)
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?
-                    .ok_or_else(|| Status::not_found("commitment not found"))?
+                {
+                    Ok(Some(commitment)) => commitment,
+                    Ok(None) => self
+                        .ves_commitment_engine
+                        .get_commitment_by_sequence(&tenant_id, &store_id, seq)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .ok_or_else(|| Status::not_found("commitment not found"))?,
+                    Err(_) => self
+                        .ves_commitment_engine
+                        .get_commitment_by_sequence(&tenant_id, &store_id, seq)
+                        .await
+                        .map_err(|e| Status::internal(e.to_string()))?
+                        .ok_or_else(|| Status::not_found("commitment not found"))?,
+                }
             }
             None => {
                 return Err(Status::invalid_argument("selector required"));
@@ -942,6 +1272,11 @@ impl SequencerTrait for SequencerServiceV2 {
         };
 
         Self::authorize_tenant_store(&auth_ctx, &commitment.tenant_id, &commitment.store_id)?;
+
+        self.cache_manager
+            .ves_commitments
+            .insert(commitment.clone())
+            .await;
 
         Ok(Response::new(Self::to_proto_commitment(&commitment)))
     }
@@ -967,7 +1302,7 @@ impl SequencerTrait for SequencerServiceV2 {
         Self::authorize_tenant_store(&auth_ctx, &tenant_id, &store_id)?;
 
         let events = self
-            .ves_sequencer
+            .ves_sequencer_reader
             .read_entity(&tenant_id, &store_id, &entity_type, &req.entity_id)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;

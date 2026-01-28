@@ -26,7 +26,7 @@ pub async fn list_ves_commitments(
     let store_id = StoreId::from_uuid(query.store_id);
 
     let commitments = state
-        .ves_commitment_engine
+        .ves_commitment_reader
         .list_unanchored(&tenant_id, &store_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -65,33 +65,28 @@ pub async fn get_ves_commitment(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(batch_id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match state.ves_commitment_engine.get_commitment(batch_id).await {
-        Ok(Some(commitment)) => {
-            ensure_read(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
-            Ok(Json(serde_json::json!({
-                "batch_id": commitment.batch_id,
-                "tenant_id": commitment.tenant_id.0,
-                "store_id": commitment.store_id.0,
-                "ves_version": commitment.ves_version,
-                "tree_depth": commitment.tree_depth,
-                "leaf_count": commitment.leaf_count,
-                "padded_leaf_count": commitment.padded_leaf_count,
-                "merkle_root": hex::encode(commitment.merkle_root),
-                "prev_state_root": hex::encode(commitment.prev_state_root),
-                "new_state_root": hex::encode(commitment.new_state_root),
-                "sequence_start": commitment.sequence_range.0,
-                "sequence_end": commitment.sequence_range.1,
-                "committed_at": commitment.committed_at,
-                "chain_id": commitment.chain_id,
-                "chain_tx_hash": commitment.chain_tx_hash.map(hex::encode),
-                "chain_block_number": commitment.chain_block_number,
-                "anchored_at": commitment.anchored_at,
-                "is_anchored": commitment.is_anchored(),
-            })))
-        }
-        Ok(None) => Err((StatusCode::NOT_FOUND, "Commitment not found".to_string())),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
-    }
+    let commitment = super::get_ves_commitment_cached(&state, batch_id).await?;
+    ensure_read(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
+    Ok(Json(serde_json::json!({
+        "batch_id": commitment.batch_id,
+        "tenant_id": commitment.tenant_id.0,
+        "store_id": commitment.store_id.0,
+        "ves_version": commitment.ves_version,
+        "tree_depth": commitment.tree_depth,
+        "leaf_count": commitment.leaf_count,
+        "padded_leaf_count": commitment.padded_leaf_count,
+        "merkle_root": hex::encode(commitment.merkle_root),
+        "prev_state_root": hex::encode(commitment.prev_state_root),
+        "new_state_root": hex::encode(commitment.new_state_root),
+        "sequence_start": commitment.sequence_range.0,
+        "sequence_end": commitment.sequence_range.1,
+        "committed_at": commitment.committed_at,
+        "chain_id": commitment.chain_id,
+        "chain_tx_hash": commitment.chain_tx_hash.map(hex::encode),
+        "chain_block_number": commitment.chain_block_number,
+        "anchored_at": commitment.anchored_at,
+        "is_anchored": commitment.is_anchored(),
+    })))
 }
 
 /// POST /api/v1/ves/commitments - Create a VES commitment.
@@ -119,6 +114,12 @@ pub async fn create_ves_commitment(
             }
             _ => (StatusCode::BAD_REQUEST, e.to_string()),
         })?;
+
+    state
+        .cache_manager
+        .ves_commitments
+        .insert(commitment.clone())
+        .await;
 
     Ok(Json(serde_json::json!({
         "batch_id": commitment.batch_id,
@@ -203,6 +204,12 @@ pub async fn commit_and_anchor_ves_commitment(
             _ => (StatusCode::BAD_REQUEST, e.to_string()),
         })?;
 
+    state
+        .cache_manager
+        .ves_commitments
+        .insert(commitment.clone())
+        .await;
+
     if commitment.is_anchored() {
         return Ok(Json(serde_json::json!({
             "batch_id": commitment.batch_id,
@@ -234,6 +241,12 @@ pub async fn commit_and_anchor_ves_commitment(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    state
+        .cache_manager
+        .ves_commitments
+        .invalidate(&commitment.batch_id)
+        .await;
+
     Ok(Json(serde_json::json!({
         "batch_id": commitment.batch_id,
         "status": "anchored",
@@ -263,7 +276,7 @@ pub async fn list_pending_ves_commitments(
 
     let limit = query.limit.unwrap_or(1000).min(5000) as usize;
     let commitments = state
-        .ves_commitment_engine
+        .ves_commitment_reader
         .list_unanchored_global(limit)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -307,12 +320,7 @@ pub async fn notify_ves_commitment_anchored(
         ));
     }
 
-    let commitment = state
-        .ves_commitment_engine
-        .get_commitment(batch_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?;
+    let commitment = super::get_ves_commitment_cached(&state, batch_id).await?;
 
     let chain_id: u32 = request.chain_id.try_into().map_err(|_| {
         (
@@ -364,6 +372,12 @@ pub async fn notify_ves_commitment_anchored(
         .update_chain_tx(batch_id, chain_id, tx_hash, request.block_number)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    state
+        .cache_manager
+        .ves_commitments
+        .invalidate(&batch_id)
+        .await;
 
     let _ = request.gas_used;
 

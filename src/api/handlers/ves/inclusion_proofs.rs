@@ -3,6 +3,7 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use std::time::Duration;
 
 use crate::api::auth_helpers::ensure_read;
 use crate::api::types::{ProofQuery, VerifyVesProofRequest};
@@ -22,12 +23,7 @@ pub async fn get_ves_inclusion_proof(
 
     ensure_read(&auth, tenant_id.0, store_id.0)?;
 
-    let commitment = state
-        .ves_commitment_engine
-        .get_commitment(query.batch_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?;
+    let commitment = super::get_ves_commitment_cached(&state, query.batch_id).await?;
 
     if commitment.tenant_id.0 != tenant_id.0 || commitment.store_id.0 != store_id.0 {
         return Err((
@@ -49,24 +45,153 @@ pub async fn get_ves_inclusion_proof(
     let end = commitment.sequence_range.1;
     let leaf_index = (sequence_number - start) as usize;
 
-    let leaves = state
-        .ves_commitment_engine
+    let proof_cache = &state.cache_manager.ves_proofs;
+    if let Some(proof) = proof_cache
+        .get(&tenant_id.0, &store_id.0, sequence_number)
+        .await
+    {
+        if state
+            .ves_commitment_reader
+            .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
+        {
+            return Ok(Json(serde_json::json!({
+                "sequence_number": sequence_number,
+                "batch_id": commitment.batch_id,
+                "merkle_root": hex::encode(commitment.merkle_root),
+                "leaf_hash": hex::encode(proof.leaf_hash),
+                "leaf_index": proof.leaf_index,
+                "proof_path": proof.proof_path.iter().map(hex::encode).collect::<Vec<_>>(),
+                "directions": proof.directions,
+            })));
+        }
+    }
+
+    let (cached, lock_acquired) = proof_cache
+        .get_with_lock(&tenant_id.0, &store_id.0, sequence_number)
+        .await;
+    if let Some(proof) = cached {
+        if state
+            .ves_commitment_reader
+            .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
+        {
+            return Ok(Json(serde_json::json!({
+                "sequence_number": sequence_number,
+                "batch_id": commitment.batch_id,
+                "merkle_root": hex::encode(commitment.merkle_root),
+                "leaf_hash": hex::encode(proof.leaf_hash),
+                "leaf_index": proof.leaf_index,
+                "proof_path": proof.proof_path.iter().map(hex::encode).collect::<Vec<_>>(),
+                "directions": proof.directions,
+            })));
+        }
+    }
+
+    if !lock_acquired {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if let Some(proof) = proof_cache
+            .get(&tenant_id.0, &store_id.0, sequence_number)
+            .await
+        {
+            if state
+                .ves_commitment_reader
+                .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
+            {
+                return Ok(Json(serde_json::json!({
+                    "sequence_number": sequence_number,
+                    "batch_id": commitment.batch_id,
+                    "merkle_root": hex::encode(commitment.merkle_root),
+                    "leaf_hash": hex::encode(proof.leaf_hash),
+                    "leaf_index": proof.leaf_index,
+                    "proof_path": proof.proof_path.iter().map(hex::encode).collect::<Vec<_>>(),
+                    "directions": proof.directions,
+                })));
+            }
+        }
+    }
+
+    let mut leaves = match state
+        .ves_commitment_reader
         .leaf_hashes_for_range(&tenant_id, &store_id, start, end)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    {
+        Ok(leaves) => leaves,
+        Err(e) => {
+            if lock_acquired {
+                proof_cache
+                    .release_lock(&tenant_id.0, &store_id.0, sequence_number)
+                    .await;
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
 
-    let computed_root = state.ves_commitment_engine.compute_merkle_root(&leaves);
+    let computed_root = state.ves_commitment_reader.compute_merkle_root(&leaves);
     if computed_root != commitment.merkle_root {
+        // Retry from primary in case of replica lag.
+        leaves = match state
+            .ves_commitment_engine
+            .leaf_hashes_for_range(&tenant_id, &store_id, start, end)
+            .await
+        {
+            Ok(leaves) => leaves,
+            Err(e) => {
+                if lock_acquired {
+                    proof_cache
+                        .release_lock(&tenant_id.0, &store_id.0, sequence_number)
+                        .await;
+                }
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            }
+        };
+        let computed_root_primary = state.ves_commitment_engine.compute_merkle_root(&leaves);
+        if computed_root_primary != commitment.merkle_root {
+            if lock_acquired {
+                proof_cache
+                    .release_lock(&tenant_id.0, &store_id.0, sequence_number)
+                    .await;
+            }
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Commitment merkle_root does not match ves_events".to_string(),
+            ));
+        }
+    }
+
+    if leaves.is_empty() {
+        if lock_acquired {
+            proof_cache
+                .release_lock(&tenant_id.0, &store_id.0, sequence_number)
+                .await;
+        }
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Commitment merkle_root does not match ves_events".to_string(),
+            "Commitment range contains no events".to_string(),
         ));
     }
 
-    let proof = state
-        .ves_commitment_engine
+    let proof = match state
+        .ves_commitment_reader
         .prove_inclusion(leaf_index, &leaves)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    {
+        Ok(proof) => proof,
+        Err(e) => {
+            if lock_acquired {
+                proof_cache
+                    .release_lock(&tenant_id.0, &store_id.0, sequence_number)
+                    .await;
+            }
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+
+    proof_cache
+        .insert(tenant_id.0, store_id.0, sequence_number, proof.clone())
+        .await;
+    if lock_acquired {
+        proof_cache
+            .release_lock(&tenant_id.0, &store_id.0, sequence_number)
+            .await;
+    }
 
     Ok(Json(serde_json::json!({
         "sequence_number": sequence_number,

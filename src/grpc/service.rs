@@ -4,6 +4,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -47,10 +48,13 @@ fn to_proto_event(event: &crate::domain::SequencedEvent) -> crate::proto::Sequen
 }
 
 use crate::crypto::legacy_commitment_leaf_hash;
-use crate::domain::{AgentId, EntityType, EventBatch, EventType, StoreId, TenantId};
+use crate::domain::{
+    AgentId, BatchCommitment as DomainBatchCommitment, EntityType, EventBatch, EventType, StoreId,
+    TenantId,
+};
 use crate::infra::{
-    CommitmentEngine, EventStore, IngestService, PgCommitmentEngine, PgEventStore, PgSequencer,
-    Sequencer,
+    CacheManager, CommitmentEngine, EventStore, IngestService, PgCommitmentEngine, PgEventStore,
+    PgSequencer, Sequencer,
 };
 use crate::proto::{
     sequencer_server::Sequencer as SequencerTrait, BatchCommitment, EventEnvelope,
@@ -65,6 +69,8 @@ pub struct SequencerService {
     sequencer: Arc<PgSequencer>,
     event_store: Arc<PgEventStore>,
     commitment_engine: Arc<PgCommitmentEngine>,
+    commitment_engine_writer: Arc<PgCommitmentEngine>,
+    cache_manager: Arc<CacheManager>,
 }
 
 impl SequencerService {
@@ -72,11 +78,15 @@ impl SequencerService {
         sequencer: Arc<PgSequencer>,
         event_store: Arc<PgEventStore>,
         commitment_engine: Arc<PgCommitmentEngine>,
+        commitment_engine_writer: Arc<PgCommitmentEngine>,
+        cache_manager: Arc<CacheManager>,
     ) -> Self {
         Self {
             sequencer,
             event_store,
             commitment_engine,
+            commitment_engine_writer,
+            cache_manager,
         }
     }
 
@@ -156,6 +166,114 @@ impl SequencerService {
         }
     }
 
+    async fn build_cached_proof_response(
+        &self,
+        commitment: &DomainBatchCommitment,
+        event: &crate::domain::SequencedEvent,
+        leaf_index: usize,
+        leaves: &[[u8; 32]],
+    ) -> Result<Response<GetInclusionProofResponse>, Status> {
+        let tenant_id = commitment.tenant_id.0;
+        let store_id = commitment.store_id.0;
+        let sequence_number = event.sequence_number();
+        let proof_cache = &self.cache_manager.proofs;
+
+        if let Some(proof) = proof_cache.get(&tenant_id, &store_id, sequence_number).await {
+            if self
+                .commitment_engine
+                .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
+            {
+                let proof_hashes: Vec<Vec<u8>> =
+                    proof.proof_path.iter().map(|h| h.to_vec()).collect();
+                let proof_response = GetInclusionProofResponse {
+                    event: Some(Self::to_proto_event(event)),
+                    proof: Some(InclusionProof {
+                        merkle_root: commitment.events_root.to_vec(),
+                        leaf_index: leaf_index as u64,
+                        proof_hashes,
+                        leaf_count: leaves.len() as u64,
+                    }),
+                    commitment: Some(Self::to_proto_commitment(commitment)),
+                };
+                return Ok(Response::new(proof_response));
+            }
+        }
+
+        let (cached, lock_acquired) = proof_cache
+            .get_with_lock(&tenant_id, &store_id, sequence_number)
+            .await;
+        if let Some(proof) = cached {
+            if self
+                .commitment_engine
+                .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
+            {
+                let proof_hashes: Vec<Vec<u8>> =
+                    proof.proof_path.iter().map(|h| h.to_vec()).collect();
+                let proof_response = GetInclusionProofResponse {
+                    event: Some(Self::to_proto_event(event)),
+                    proof: Some(InclusionProof {
+                        merkle_root: commitment.events_root.to_vec(),
+                        leaf_index: leaf_index as u64,
+                        proof_hashes,
+                        leaf_count: leaves.len() as u64,
+                    }),
+                    commitment: Some(Self::to_proto_commitment(commitment)),
+                };
+                return Ok(Response::new(proof_response));
+            }
+        }
+
+        if !lock_acquired {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Some(proof) = proof_cache.get(&tenant_id, &store_id, sequence_number).await {
+                if self
+                    .commitment_engine
+                    .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
+                {
+                    let proof_hashes: Vec<Vec<u8>> =
+                        proof.proof_path.iter().map(|h| h.to_vec()).collect();
+                    let proof_response = GetInclusionProofResponse {
+                        event: Some(Self::to_proto_event(event)),
+                        proof: Some(InclusionProof {
+                            merkle_root: commitment.events_root.to_vec(),
+                            leaf_index: leaf_index as u64,
+                            proof_hashes,
+                            leaf_count: leaves.len() as u64,
+                        }),
+                        commitment: Some(Self::to_proto_commitment(commitment)),
+                    };
+                    return Ok(Response::new(proof_response));
+                }
+            }
+        }
+
+        let proof = self
+            .commitment_engine
+            .prove_inclusion(leaf_index, leaves);
+        proof_cache
+            .insert(tenant_id, store_id, sequence_number, proof.clone())
+            .await;
+        if lock_acquired {
+            proof_cache
+                .release_lock(&tenant_id, &store_id, sequence_number)
+                .await;
+        }
+
+        let proof_hashes: Vec<Vec<u8>> = proof.proof_path.iter().map(|h| h.to_vec()).collect();
+        let proof_response = GetInclusionProofResponse {
+            event: Some(Self::to_proto_event(event)),
+            proof: Some(InclusionProof {
+                merkle_root: commitment.events_root.to_vec(),
+                leaf_index: leaf_index as u64,
+                proof_hashes,
+                leaf_count: leaves.len() as u64,
+            }),
+            commitment: Some(Self::to_proto_commitment(commitment)),
+        };
+
+        Ok(Response::new(proof_response))
+    }
+
     /// Convert proto event to domain event envelope
     ///
     /// Note: tonic::Status is an external type with fixed size.
@@ -228,7 +346,7 @@ impl SequencerService {
     }
 
     /// Convert domain commitment to proto commitment
-    fn to_proto_commitment(commitment: &crate::domain::BatchCommitment) -> BatchCommitment {
+    fn to_proto_commitment(commitment: &DomainBatchCommitment) -> BatchCommitment {
         BatchCommitment {
             batch_id: commitment.batch_id.to_string(),
             merkle_root: commitment.events_root.to_vec(),
@@ -287,14 +405,28 @@ impl SequencerTrait for SequencerService {
                     .collect();
 
                 // Get commitment if available
-                let commitment = if let Ok(Some(c)) = self
+                let commitment = match self
                     .commitment_engine
                     .get_commitment(receipt.batch_id)
                     .await
                 {
-                    Some(Self::to_proto_commitment(&c))
-                } else {
-                    None
+                    Ok(Some(c)) => Some(Self::to_proto_commitment(&c)),
+                    Ok(None) => match self
+                        .commitment_engine_writer
+                        .get_commitment(receipt.batch_id)
+                        .await
+                    {
+                        Ok(Some(c)) => Some(Self::to_proto_commitment(&c)),
+                        _ => None,
+                    },
+                    Err(_) => match self
+                        .commitment_engine_writer
+                        .get_commitment(receipt.batch_id)
+                        .await
+                    {
+                        Ok(Some(c)) => Some(Self::to_proto_commitment(&c)),
+                        _ => None,
+                    },
                 };
 
                 Ok(Response::new(PushResponse {
@@ -370,7 +502,7 @@ impl SequencerTrait for SequencerService {
                 let end_sequence = from_sequence
                     .saturating_add(batch_size as u64)
                     .saturating_sub(1);
-                let events = match event_store
+                let mut events = match event_store
                     .read_range(&tenant_id, &store_id, from_sequence, end_sequence)
                     .await
                 {
@@ -380,6 +512,24 @@ impl SequencerTrait for SequencerService {
                         break;
                     }
                 };
+
+                if events.is_empty() {
+                    let expected_start = if from_sequence == 0 { 1 } else { from_sequence };
+                    if head >= expected_start {
+                        // Replica might be lagging; fallback to primary.
+                        match sequencer
+                            .event_store()
+                            .read_range(&tenant_id, &store_id, from_sequence, end_sequence)
+                            .await
+                        {
+                            Ok(e) => events = e,
+                            Err(e) => {
+                                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                                break;
+                            }
+                        }
+                    }
+                }
 
                 let has_more = head > end_sequence;
 
@@ -471,23 +621,43 @@ impl SequencerTrait for SequencerService {
         let event_id = Uuid::parse_str(&req.event_id)
             .map_err(|e| Status::invalid_argument(format!("invalid event_id: {}", e)))?;
 
-        // Get commitment
-        let commitment = self
-            .commitment_engine
-            .get_commitment(batch_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("commitment not found"))?;
+        // Get commitment (replica -> primary fallback)
+        let commitment = match self.commitment_engine.get_commitment(batch_id).await {
+            Ok(Some(c)) => c,
+            Ok(None) => self
+                .commitment_engine_writer
+                .get_commitment(batch_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("commitment not found"))?,
+            Err(_) => self
+                .commitment_engine_writer
+                .get_commitment(batch_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("commitment not found"))?,
+        };
 
         Self::authorize_tenant_store(&auth_ctx, &commitment.tenant_id, &commitment.store_id)?;
 
-        // Get the event by ID
-        let event = self
-            .event_store
-            .read_by_id(event_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("event not found"))?;
+        // Get the event by ID (replica -> primary fallback)
+        let event = match self.event_store.read_by_id(event_id).await {
+            Ok(Some(event)) => event,
+            Ok(None) => self
+                .sequencer
+                .event_store()
+                .read_by_id(event_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("event not found"))?,
+            Err(_) => self
+                .sequencer
+                .event_store()
+                .read_by_id(event_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("event not found"))?,
+        };
 
         if event.envelope.tenant_id.0 != commitment.tenant_id.0
             || event.envelope.store_id.0 != commitment.store_id.0
@@ -510,7 +680,7 @@ impl SequencerTrait for SequencerService {
         let start = commitment.sequence_range.0;
         let end = commitment.sequence_range.1;
 
-        let leaf_inputs = self
+        let mut leaf_inputs = self
             .event_store
             .get_leaf_inputs(tenant_id, store_id, start, end)
             .await
@@ -524,6 +694,16 @@ impl SequencerTrait for SequencerService {
             .checked_sub(start)
             .and_then(|d| d.checked_add(1))
             .ok_or_else(|| Status::invalid_argument("invalid sequence range"))?;
+
+        if leaf_inputs.len() as u64 != expected_len {
+            // Replica may be lagging; fallback to primary.
+            leaf_inputs = self
+                .sequencer
+                .event_store()
+                .get_leaf_inputs(tenant_id, store_id, start, end)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+        }
 
         if leaf_inputs.len() as u64 != expected_len {
             return Err(Status::internal(format!(
@@ -568,34 +748,49 @@ impl SequencerTrait for SequencerService {
         } else if root_v0 == commitment.events_root {
             &leaves_v0
         } else {
-            return Err(Status::internal(
-                "commitment events_root does not match events table",
-            ));
+            // Retry with primary to avoid replica lag mismatches.
+            let leaf_inputs_primary = self
+                .sequencer
+                .event_store()
+                .get_leaf_inputs(tenant_id, store_id, start, end)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+            let leaves_v0_primary: Vec<[u8; 32]> =
+                leaf_inputs_primary.iter().map(|i| i.payload_hash).collect();
+            let leaves_v1_primary: Vec<[u8; 32]> = leaf_inputs_primary
+                .iter()
+                .map(|i| {
+                    legacy_commitment_leaf_hash(
+                        &tenant_id.0,
+                        &store_id.0,
+                        i.sequence_number,
+                        &i.payload_hash,
+                        &i.entity_type,
+                        &i.entity_id,
+                    )
+                })
+                .collect();
+
+            let root_v0_primary = self.commitment_engine.compute_events_root(&leaves_v0_primary);
+            let root_v1_primary = self.commitment_engine.compute_events_root(&leaves_v1_primary);
+
+            if root_v1_primary == commitment.events_root {
+                return self
+                    .build_cached_proof_response(&commitment, &event, leaf_index, &leaves_v1_primary)
+                    .await;
+            } else if root_v0_primary == commitment.events_root {
+                return self
+                    .build_cached_proof_response(&commitment, &event, leaf_index, &leaves_v0_primary)
+                    .await;
+            } else {
+                return Err(Status::internal(
+                    "commitment events_root does not match events table",
+                ));
+            }
         };
 
-        let proof = self
-            .commitment_engine
-            .prove_inclusion(leaf_index, leaves);
-
-        let proof_hashes: Vec<Vec<u8>> = proof
-            .proof_path
-            .iter()
-            .map(|h| h.to_vec())
-            .collect();
-
-        // Return the event, commitment info, and full proof path.
-        let proof_response = GetInclusionProofResponse {
-            event: Some(Self::to_proto_event(&event)),
-            proof: Some(InclusionProof {
-                merkle_root: commitment.events_root.to_vec(),
-                leaf_index: leaf_index as u64,
-                proof_hashes,
-                leaf_count: leaves.len() as u64,
-            }),
-            commitment: Some(Self::to_proto_commitment(&commitment)),
-        };
-
-        Ok(Response::new(proof_response))
+        self.build_cached_proof_response(&commitment, &event, leaf_index, leaves)
+            .await
     }
 
     /// Get a batch commitment by ID
@@ -611,12 +806,21 @@ impl SequencerTrait for SequencerService {
         let batch_id = Uuid::parse_str(&req.batch_id)
             .map_err(|e| Status::invalid_argument(format!("invalid batch_id: {}", e)))?;
 
-        let commitment = self
-            .commitment_engine
-            .get_commitment(batch_id)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .ok_or_else(|| Status::not_found("commitment not found"))?;
+        let commitment = match self.commitment_engine.get_commitment(batch_id).await {
+            Ok(Some(c)) => c,
+            Ok(None) => self
+                .commitment_engine_writer
+                .get_commitment(batch_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("commitment not found"))?,
+            Err(_) => self
+                .commitment_engine_writer
+                .get_commitment(batch_id)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+                .ok_or_else(|| Status::not_found("commitment not found"))?,
+        };
 
         Self::authorize_tenant_store(&auth_ctx, &commitment.tenant_id, &commitment.store_id)?;
 

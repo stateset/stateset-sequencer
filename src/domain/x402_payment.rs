@@ -75,6 +75,12 @@ pub enum X402Network {
     BaseSepolia,
     /// Ethereum mainnet
     Ethereum,
+    /// Ethereum Sepolia testnet
+    EthereumSepolia,
+    /// Arbitrum One
+    Arbitrum,
+    /// Optimism
+    Optimism,
 }
 
 impl X402Network {
@@ -88,12 +94,21 @@ impl X402Network {
             Self::Base => 8453,
             Self::BaseSepolia => 84532,
             Self::Ethereum => 1,
+            Self::EthereumSepolia => 11155111,
+            Self::Arbitrum => 42161,
+            Self::Optimism => 10,
         }
     }
 
     /// Check if this is a testnet
     pub fn is_testnet(&self) -> bool {
-        matches!(self, Self::SetChainTestnet | Self::ArcTestnet | Self::BaseSepolia)
+        matches!(
+            self,
+            Self::SetChainTestnet
+                | Self::ArcTestnet
+                | Self::BaseSepolia
+                | Self::EthereumSepolia
+        )
     }
 }
 
@@ -107,6 +122,9 @@ impl std::fmt::Display for X402Network {
             Self::Base => write!(f, "base"),
             Self::BaseSepolia => write!(f, "base_sepolia"),
             Self::Ethereum => write!(f, "ethereum"),
+            Self::EthereumSepolia => write!(f, "ethereum_sepolia"),
+            Self::Arbitrum => write!(f, "arbitrum"),
+            Self::Optimism => write!(f, "optimism"),
         }
     }
 }
@@ -121,17 +139,23 @@ pub enum X402Asset {
     /// Tether (USDT)
     Usdt,
     /// StateSet USD (ssUSD) - yield-bearing
+    #[serde(rename = "ssusd", alias = "ss_usd")]
     SsUsd,
+    /// Wrapped StateSet USD (ERC-4626)
+    #[serde(rename = "wssusd", alias = "wss_usd")]
+    WssUsd,
     /// DAI stablecoin
     Dai,
+    /// Native ETH (for gas)
+    Eth,
 }
 
 impl X402Asset {
     /// Get decimals for this asset
     pub fn decimals(&self) -> u8 {
         match self {
-            Self::Usdc | Self::Usdt | Self::SsUsd => 6,
-            Self::Dai => 18,
+            Self::Usdc | Self::Usdt | Self::SsUsd | Self::WssUsd => 6,
+            Self::Dai | Self::Eth => 18,
         }
     }
 
@@ -153,6 +177,18 @@ impl X402Asset {
             (Self::Usdc, X402Network::Base) => {
                 Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
             }
+            // Ethereum
+            (Self::Usdc, X402Network::Ethereum) => {
+                Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
+            }
+            (Self::Usdt, X402Network::Ethereum) => {
+                Some("0xdAC17F958D2ee523a2206206994597C13D831ec7")
+            }
+            (Self::Dai, X402Network::Ethereum) => {
+                Some("0x6B175474E89094C44Da98b954Ee4606eB48")
+            }
+            // Native ETH has no contract
+            (Self::Eth, _) => None,
             _ => None,
         }
     }
@@ -164,7 +200,9 @@ impl std::fmt::Display for X402Asset {
             Self::Usdc => write!(f, "USDC"),
             Self::Usdt => write!(f, "USDT"),
             Self::SsUsd => write!(f, "ssUSD"),
+            Self::WssUsd => write!(f, "wssUSD"),
             Self::Dai => write!(f, "DAI"),
+            Self::Eth => write!(f, "ETH"),
         }
     }
 }
@@ -594,12 +632,24 @@ pub struct X402PaymentReceipt {
     /// Leaf index
     pub leaf_index: u32,
 
+    /// Total leaves in batch
+    pub total_leaves: u32,
+
     /// Payment details
     pub payer_address: String,
     pub payee_address: String,
     pub amount: u64,
     pub asset: X402Asset,
     pub network: X402Network,
+    pub chain_id: u64,
+    pub nonce: u64,
+    pub valid_until: u64,
+    /// Signing hash (SHA-256)
+    #[serde(with = "hash256_hex_0x")]
+    pub signing_hash: Hash256,
+    /// Payer's Ed25519 signature
+    #[serde(with = "signature64_hex_0x")]
+    pub payer_signature: Signature64,
 
     /// Settlement details
     pub tx_hash: Option<String>,

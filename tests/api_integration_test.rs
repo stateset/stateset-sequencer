@@ -51,7 +51,9 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
     let sequencer = Arc::new(PgSequencer::new(pool.clone(), payload_encryption.clone()));
     let event_store = Arc::new(PgEventStore::new(pool.clone(), payload_encryption.clone()));
     let commitment_engine = Arc::new(PgCommitmentEngine::new(pool.clone()));
+    let commitment_reader = Arc::new(PgCommitmentEngine::new(pool.clone()));
     let ves_commitment_engine = Arc::new(PgVesCommitmentEngine::new(pool.clone()));
+    let ves_commitment_reader = Arc::new(PgVesCommitmentEngine::new(pool.clone()));
     let ves_validity_proof_store = Arc::new(PgVesValidityProofStore::new(
         pool.clone(),
         payload_encryption.clone(),
@@ -61,8 +63,10 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
         payload_encryption,
     ));
 
+    let cache_manager = Arc::new(stateset_sequencer::infra::CacheManager::new());
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+    let ves_sequencer_reader = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
     let schema_store = Arc::new(stateset_sequencer::infra::PgSchemaStore::new(pool.clone()));
     let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(pool.clone()));
     let metrics = Arc::new(MetricsRegistry::new());
@@ -71,14 +75,18 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
         sequencer,
         event_store,
         commitment_engine,
+        commitment_reader,
         ves_commitment_engine,
+        ves_commitment_reader,
         ves_validity_proof_store,
         ves_compliance_proof_store,
         anchor_service: None,
         ves_sequencer,
+        ves_sequencer_reader,
         agent_key_registry,
         schema_store,
         metrics,
+        cache_manager,
         x402_repository,
         // Use disabled mode for tests by default (to not break existing tests)
         schema_validation_mode: SchemaValidationMode::Disabled,

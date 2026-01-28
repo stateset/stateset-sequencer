@@ -43,7 +43,9 @@ use crate::domain::{
     AgentId, EntityType, EventBatch, EventEnvelope, IngestReceipt, RejectedEvent, RejectionReason,
     SequencedEvent, StoreId, SyncState, TenantId,
 };
-use crate::infra::{IngestService, PayloadEncryption, Result, Sequencer, SequencerError};
+use crate::infra::{
+    batch_reserve_command_ids, IngestService, PayloadEncryption, Result, Sequencer, SequencerError,
+};
 
 use super::PgEventStore;
 
@@ -482,28 +484,9 @@ impl IngestService for PgSequencer {
         }
 
         // Reserve command_ids atomically to prevent concurrent duplicates.
-        let mut duplicate_command_ids = HashSet::new();
-        let mut reserved_command_ids = HashSet::new();
-        for cmd_id in &command_ids {
-            let result = sqlx::query(
-                r#"
-                INSERT INTO event_command_dedupe (tenant_id, store_id, command_id)
-                VALUES ($1, $2, $3)
-                ON CONFLICT DO NOTHING
-                "#,
-            )
-            .bind(tenant_id.0)
-            .bind(store_id.0)
-            .bind(cmd_id)
-            .execute(&mut *tx)
-            .await?;
-
-            if result.rows_affected() == 0 {
-                duplicate_command_ids.insert(*cmd_id);
-            } else {
-                reserved_command_ids.insert(*cmd_id);
-            }
-        }
+        let command_ids_vec: Vec<Uuid> = command_ids.iter().copied().collect();
+        let (reserved_command_ids, duplicate_command_ids) =
+            batch_reserve_command_ids(&mut *tx, &tenant_id, &store_id, &command_ids_vec).await?;
 
         let mut valid_events = Vec::new();
         for event in candidates {

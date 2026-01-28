@@ -7,23 +7,32 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use jsonschema::Validator;
 use sqlx::postgres::PgPool;
+use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::domain::{
     EventType, Schema, SchemaCompatibility, SchemaId, SchemaStatus, SchemaValidationError,
     SchemaValidationResult, TenantId,
 };
-use crate::infra::{Result, SchemaStore, SequencerError};
+use crate::infra::{Result, SchemaCache, SchemaStore, SequencerError};
 
 /// PostgreSQL-backed schema registry
 pub struct PgSchemaStore {
     pool: PgPool,
+    cache: Option<Arc<SchemaCache>>,
 }
 
 impl PgSchemaStore {
     /// Create a new PostgreSQL schema store
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self { pool, cache: None }
+    }
+
+    /// Enable caching for schema lookups.
+    pub fn with_cache(mut self, cache: Arc<SchemaCache>) -> Self {
+        self.cache = Some(cache);
+        self
     }
 
     /// Initialize the database schema for the schema registry
@@ -204,7 +213,18 @@ impl SchemaStore for PgSchemaStore {
         .await;
 
         match result {
-            Ok(_) => Ok(schema),
+            Ok(_) => {
+                if let Some(cache) = &self.cache {
+                    if schema.status == SchemaStatus::Active {
+                        cache.insert_latest(schema.clone()).await;
+                    } else {
+                        cache
+                            .invalidate_latest(&schema.tenant_id.0, schema.event_type.as_str())
+                            .await;
+                    }
+                }
+                Ok(schema)
+            }
             Err(e) if e.to_string().contains("duplicate key") => Err(
                 SequencerError::SchemaCompatibilityViolation(format!(
                     "Schema version {} already exists for event type {}",
@@ -221,6 +241,26 @@ impl SchemaStore for PgSchemaStore {
         tenant_id: &TenantId,
         event_type: &EventType,
     ) -> Result<Option<Schema>> {
+        let mut lock_acquired = false;
+        if let Some(cache) = &self.cache {
+            let (cached, lock) = cache
+                .get_latest_with_lock(&tenant_id.0, event_type.as_str())
+                .await;
+            if let Some(schema) = cached {
+                return Ok(Some(schema));
+            }
+            lock_acquired = lock;
+            if !lock_acquired {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                if let Some(schema) = cache
+                    .get_latest(&tenant_id.0, event_type.as_str())
+                    .await
+                {
+                    return Ok(Some(schema));
+                }
+            }
+        }
+
         let row: Option<(
             Uuid,
             Uuid,
@@ -233,7 +273,7 @@ impl SchemaStore for PgSchemaStore {
             DateTime<Utc>,
             DateTime<Utc>,
             Option<String>,
-        )> = sqlx::query_as(
+        )> = match sqlx::query_as(
             r#"
             SELECT id, tenant_id, event_type, version, schema_json, status, compatibility, description, created_at, updated_at, created_by
             FROM event_schemas
@@ -246,9 +286,21 @@ impl SchemaStore for PgSchemaStore {
         .bind(event_type.as_str())
         .fetch_optional(&self.pool)
         .await
-        .map_err(SequencerError::Database)?;
+        {
+            Ok(row) => row,
+            Err(e) => {
+                if let Some(cache) = &self.cache {
+                    if lock_acquired {
+                        cache
+                            .release_latest_lock(&tenant_id.0, event_type.as_str())
+                            .await;
+                    }
+                }
+                return Err(SequencerError::Database(e));
+            }
+        };
 
-        Ok(row.map(
+        let schema = row.map(
             |(id, tenant_id, event_type, version, schema_json, status, compatibility, description, created_at, updated_at, created_by)| {
                 Self::row_to_schema(
                     id,
@@ -264,7 +316,20 @@ impl SchemaStore for PgSchemaStore {
                     created_by,
                 )
             },
-        ))
+        );
+
+        if let Some(cache) = &self.cache {
+            if let Some(schema) = &schema {
+                cache.insert_latest(schema.clone()).await;
+            }
+            if lock_acquired {
+                cache
+                    .release_latest_lock(&tenant_id.0, event_type.as_str())
+                    .await;
+            }
+        }
+
+        Ok(schema)
     }
 
     async fn get_version(
@@ -464,6 +529,7 @@ impl SchemaStore for PgSchemaStore {
     }
 
     async fn update_status(&self, schema_id: SchemaId, status: SchemaStatus) -> Result<()> {
+        let existing = self.get_by_id(schema_id).await?;
         let status_str = match status {
             SchemaStatus::Active => "active",
             SchemaStatus::Deprecated => "deprecated",
@@ -485,6 +551,14 @@ impl SchemaStore for PgSchemaStore {
 
         if result.rows_affected() == 0 {
             return Err(SequencerError::SchemaNotFound(schema_id.to_string()));
+        }
+
+        if let Some(cache) = &self.cache {
+            if let Some(schema) = existing {
+                cache
+                    .invalidate_latest(&schema.tenant_id.0, schema.event_type.as_str())
+                    .await;
+            }
         }
 
         Ok(())
@@ -527,6 +601,7 @@ impl SchemaStore for PgSchemaStore {
     }
 
     async fn delete(&self, schema_id: SchemaId) -> Result<()> {
+        let existing = self.get_by_id(schema_id).await?;
         let result = sqlx::query(
             r#"
             DELETE FROM event_schemas
@@ -540,6 +615,14 @@ impl SchemaStore for PgSchemaStore {
 
         if result.rows_affected() == 0 {
             return Err(SequencerError::SchemaNotFound(schema_id.to_string()));
+        }
+
+        if let Some(cache) = &self.cache {
+            if let Some(schema) = existing {
+                cache
+                    .invalidate_latest(&schema.tenant_id.0, schema.event_type.as_str())
+                    .await;
+            }
         }
 
         Ok(())

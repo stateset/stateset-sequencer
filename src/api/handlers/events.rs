@@ -41,17 +41,33 @@ pub async fn list_events(
 
     let end = from.saturating_add(limit.saturating_sub(1));
 
-    match state
+    let mut events = state
         .event_store
         .read_range(&tenant_id, &store_id, from, end)
         .await
-    {
-        Ok(events) => Ok(Json(serde_json::json!({
-            "events": events,
-            "count": events.len(),
-        }))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if events.is_empty() {
+        let head = state
+            .sequencer
+            .head(&tenant_id, &store_id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let expected_start = if from == 0 { 1 } else { from };
+        if head >= expected_start {
+            events = state
+                .sequencer
+                .event_store()
+                .read_range(&tenant_id, &store_id, from, end)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        }
     }
+
+    Ok(Json(serde_json::json!({
+        "events": events,
+        "count": events.len(),
+    })))
 }
 
 /// GET /api/v1/head - Get head sequence for a tenant/store.

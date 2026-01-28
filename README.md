@@ -245,10 +245,52 @@ GET /metrics    # Prometheus metrics
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `DATABASE_URL` | `postgres://localhost/stateset_sequencer` | PostgreSQL connection URL |
+| `READ_DATABASE_URL` | (unset) | Optional read replica URL (routes read traffic to a separate pool) |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | `8080` | Server port |
-| `MAX_DB_CONNECTIONS` | `10` | Maximum database pool connections |
+| `MAX_DB_CONNECTIONS` | `10` | Write pool max connections |
+| `MIN_DB_CONNECTIONS` | `0` | Write pool minimum idle connections |
+| `READ_MAX_DB_CONNECTIONS` | `MAX_DB_CONNECTIONS` | Read pool max connections (if `READ_DATABASE_URL` set) |
+| `READ_MIN_DB_CONNECTIONS` | `0` | Read pool minimum idle connections |
+| `DB_APPLICATION_NAME` | `stateset-sequencer` | PostgreSQL `application_name` for write pool |
+| `READ_DB_APPLICATION_NAME` | `${DB_APPLICATION_NAME}-read` | PostgreSQL `application_name` for read pool |
 | `DB_MIGRATE_ON_STARTUP` | `true` | Auto-run SQL migrations on startup |
+
+### Database Pool Tuning
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_ACQUIRE_TIMEOUT_MS` | (unset) | Write pool connection acquisition timeout |
+| `DB_IDLE_TIMEOUT_SECS` | (unset) | Write pool idle connection timeout |
+| `DB_MAX_LIFETIME_SECS` | (unset) | Write pool max connection lifetime |
+| `READ_DB_ACQUIRE_TIMEOUT_MS` | (unset) | Read pool connection acquisition timeout |
+| `READ_DB_IDLE_TIMEOUT_SECS` | (unset) | Read pool idle connection timeout |
+| `READ_DB_MAX_LIFETIME_SECS` | (unset) | Read pool max connection lifetime |
+
+### Database Session Timeouts
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB_STATEMENT_TIMEOUT_MS` | (unset) | PostgreSQL `statement_timeout` (ms) |
+| `DB_IDLE_IN_TX_TIMEOUT_MS` | (unset) | PostgreSQL `idle_in_transaction_session_timeout` (ms) |
+| `DB_LOCK_TIMEOUT_MS` | (unset) | PostgreSQL `lock_timeout` (ms) |
+
+### Cache Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CACHE_COMMITMENT_MAX` | `1000` | Max legacy commitment cache entries |
+| `CACHE_COMMITMENT_TTL_SECS` | `300` | Legacy commitment cache TTL (seconds) |
+| `CACHE_PROOF_MAX` | `5000` | Max legacy proof cache entries |
+| `CACHE_PROOF_TTL_SECS` | `600` | Legacy proof cache TTL (seconds) |
+| `CACHE_VES_COMMITMENT_MAX` | `CACHE_COMMITMENT_MAX` | Max VES commitment cache entries |
+| `CACHE_VES_COMMITMENT_TTL_SECS` | `CACHE_COMMITMENT_TTL_SECS` | VES commitment cache TTL (seconds) |
+| `CACHE_VES_PROOF_MAX` | `CACHE_PROOF_MAX` | Max VES proof cache entries |
+| `CACHE_VES_PROOF_TTL_SECS` | `CACHE_PROOF_TTL_SECS` | VES proof cache TTL (seconds) |
+| `CACHE_AGENT_KEY_MAX` | `1000` | Max agent key cache entries |
+| `CACHE_AGENT_KEY_TTL_SECS` | `3600` | Agent key cache TTL (seconds) |
+| `CACHE_SCHEMA_MAX` | `1000` | Max schema cache entries |
+| `CACHE_SCHEMA_TTL_SECS` | `600` | Schema cache TTL (seconds) |
 
 ### Authentication
 
