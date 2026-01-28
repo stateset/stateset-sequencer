@@ -166,6 +166,67 @@ impl SequencerService {
         }
     }
 
+    async fn get_commitment_cached(
+        &self,
+        batch_id: Uuid,
+    ) -> Result<DomainBatchCommitment, Status> {
+        let cache = &self.cache_manager.commitments;
+
+        if let Some(cached) = cache.get_by_batch_id(&batch_id).await {
+            return Ok(cached.commitment);
+        }
+
+        let (cached, lock_acquired) = cache.get_by_batch_id_with_lock(&batch_id).await;
+        if let Some(cached) = cached {
+            return Ok(cached.commitment);
+        }
+
+        if !lock_acquired {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Some(cached) = cache.get_by_batch_id(&batch_id).await {
+                return Ok(cached.commitment);
+            }
+        }
+
+        let commitment = match self.commitment_engine.get_commitment(batch_id).await {
+            Ok(Some(commitment)) => Some(commitment),
+            Ok(None) => match self.commitment_engine_writer.get_commitment(batch_id).await {
+                Ok(commitment) => commitment,
+                Err(e) => {
+                    if lock_acquired {
+                        cache.release_batch_id_lock(&batch_id).await;
+                    }
+                    return Err(Status::internal(e.to_string()));
+                }
+            },
+            Err(_) => match self.commitment_engine_writer.get_commitment(batch_id).await {
+                Ok(commitment) => commitment,
+                Err(e) => {
+                    if lock_acquired {
+                        cache.release_batch_id_lock(&batch_id).await;
+                    }
+                    return Err(Status::internal(e.to_string()));
+                }
+            },
+        };
+
+        let Some(commitment) = commitment else {
+            if lock_acquired {
+                cache.release_batch_id_lock(&batch_id).await;
+            }
+            return Err(Status::not_found("commitment not found"));
+        };
+
+        cache
+            .insert(commitment.clone(), commitment.events_root)
+            .await;
+        if lock_acquired {
+            cache.release_batch_id_lock(&batch_id).await;
+        }
+
+        Ok(commitment)
+    }
+
     async fn build_cached_proof_response(
         &self,
         commitment: &DomainBatchCommitment,
@@ -405,29 +466,47 @@ impl SequencerTrait for SequencerService {
                     .collect();
 
                 // Get commitment if available
-                let commitment = match self
-                    .commitment_engine
-                    .get_commitment(receipt.batch_id)
-                    .await
-                {
-                    Ok(Some(c)) => Some(Self::to_proto_commitment(&c)),
-                    Ok(None) => match self
-                        .commitment_engine_writer
-                        .get_commitment(receipt.batch_id)
-                        .await
-                    {
-                        Ok(Some(c)) => Some(Self::to_proto_commitment(&c)),
-                        _ => None,
-                    },
-                    Err(_) => match self
-                        .commitment_engine_writer
-                        .get_commitment(receipt.batch_id)
-                        .await
-                    {
-                        Ok(Some(c)) => Some(Self::to_proto_commitment(&c)),
-                        _ => None,
-                    },
-                };
+        let commitment = match self
+            .commitment_engine
+            .get_commitment(receipt.batch_id)
+            .await
+        {
+            Ok(Some(c)) => {
+                self.cache_manager
+                    .commitments
+                    .insert(c.clone(), c.events_root)
+                    .await;
+                Some(Self::to_proto_commitment(&c))
+            }
+            Ok(None) => match self
+                .commitment_engine_writer
+                .get_commitment(receipt.batch_id)
+                .await
+            {
+                Ok(Some(c)) => {
+                    self.cache_manager
+                        .commitments
+                        .insert(c.clone(), c.events_root)
+                        .await;
+                    Some(Self::to_proto_commitment(&c))
+                }
+                _ => None,
+            },
+            Err(_) => match self
+                .commitment_engine_writer
+                .get_commitment(receipt.batch_id)
+                .await
+            {
+                Ok(Some(c)) => {
+                    self.cache_manager
+                        .commitments
+                        .insert(c.clone(), c.events_root)
+                        .await;
+                    Some(Self::to_proto_commitment(&c))
+                }
+                _ => None,
+            },
+        };
 
                 Ok(Response::new(PushResponse {
                     batch_id: receipt.batch_id.to_string(),
@@ -592,12 +671,83 @@ impl SequencerTrait for SequencerService {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        let latest_commitment = self
-            .commitment_engine
-            .get_last_commitment(&tenant_id, &store_id)
+        let cache = &self.cache_manager.commitments;
+        let mut lock_acquired = false;
+        let mut latest_commitment = cache
+            .get_latest(&tenant_id.0, &store_id.0)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?
-            .map(|c| Self::to_proto_commitment(&c));
+            .map(|cached| cached.commitment);
+
+        if latest_commitment.is_none() {
+            let (cached, lock) = cache
+                .get_latest_with_lock(&tenant_id.0, &store_id.0)
+                .await;
+            lock_acquired = lock;
+            latest_commitment = cached.map(|c| c.commitment);
+
+            if latest_commitment.is_none() && !lock_acquired {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                latest_commitment = cache
+                    .get_latest(&tenant_id.0, &store_id.0)
+                    .await
+                    .map(|c| c.commitment);
+            }
+
+            if latest_commitment.is_none() {
+                let fetched = match self
+                    .commitment_engine
+                    .get_last_commitment(&tenant_id, &store_id)
+                    .await
+                {
+                    Ok(Some(commitment)) => Some(commitment),
+                    Ok(None) => match self
+                        .commitment_engine_writer
+                        .get_last_commitment(&tenant_id, &store_id)
+                        .await
+                    {
+                        Ok(commitment) => commitment,
+                        Err(e) => {
+                            if lock_acquired {
+                                cache
+                                    .release_latest_lock(&tenant_id.0, &store_id.0)
+                                    .await;
+                            }
+                            return Err(Status::internal(e.to_string()));
+                        }
+                    },
+                    Err(_) => match self
+                        .commitment_engine_writer
+                        .get_last_commitment(&tenant_id, &store_id)
+                        .await
+                    {
+                        Ok(commitment) => commitment,
+                        Err(e) => {
+                            if lock_acquired {
+                                cache
+                                    .release_latest_lock(&tenant_id.0, &store_id.0)
+                                    .await;
+                            }
+                            return Err(Status::internal(e.to_string()));
+                        }
+                    },
+                };
+
+                if let Some(commitment) = fetched {
+                    cache
+                        .insert(commitment.clone(), commitment.events_root)
+                        .await;
+                    latest_commitment = Some(commitment);
+                }
+            }
+        }
+
+        if lock_acquired {
+            cache
+                .release_latest_lock(&tenant_id.0, &store_id.0)
+                .await;
+        }
+
+        let latest_commitment = latest_commitment.map(|c| Self::to_proto_commitment(&c));
 
         Ok(Response::new(GetHeadResponse {
             head_sequence: head,
@@ -621,22 +771,8 @@ impl SequencerTrait for SequencerService {
         let event_id = Uuid::parse_str(&req.event_id)
             .map_err(|e| Status::invalid_argument(format!("invalid event_id: {}", e)))?;
 
-        // Get commitment (replica -> primary fallback)
-        let commitment = match self.commitment_engine.get_commitment(batch_id).await {
-            Ok(Some(c)) => c,
-            Ok(None) => self
-                .commitment_engine_writer
-                .get_commitment(batch_id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("commitment not found"))?,
-            Err(_) => self
-                .commitment_engine_writer
-                .get_commitment(batch_id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("commitment not found"))?,
-        };
+        // Get commitment (cache -> replica -> primary fallback)
+        let commitment = self.get_commitment_cached(batch_id).await?;
 
         Self::authorize_tenant_store(&auth_ctx, &commitment.tenant_id, &commitment.store_id)?;
 
@@ -806,21 +942,7 @@ impl SequencerTrait for SequencerService {
         let batch_id = Uuid::parse_str(&req.batch_id)
             .map_err(|e| Status::invalid_argument(format!("invalid batch_id: {}", e)))?;
 
-        let commitment = match self.commitment_engine.get_commitment(batch_id).await {
-            Ok(Some(c)) => c,
-            Ok(None) => self
-                .commitment_engine_writer
-                .get_commitment(batch_id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("commitment not found"))?,
-            Err(_) => self
-                .commitment_engine_writer
-                .get_commitment(batch_id)
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?
-                .ok_or_else(|| Status::not_found("commitment not found"))?,
-        };
+        let commitment = self.get_commitment_cached(batch_id).await?;
 
         Self::authorize_tenant_store(&auth_ctx, &commitment.tenant_id, &commitment.store_id)?;
 

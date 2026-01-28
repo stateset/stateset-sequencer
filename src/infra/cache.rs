@@ -443,6 +443,27 @@ impl CommitmentCache {
         self.latest_by_stream.get(&(*tenant_id, *store_id)).await
     }
 
+    /// Get latest commitment for a stream with a miss lock for stampede protection.
+    pub async fn get_latest_with_lock(
+        &self,
+        tenant_id: &Uuid,
+        store_id: &Uuid,
+    ) -> (Option<CachedCommitment>, bool) {
+        if let Some(cached) = self.get_latest(tenant_id, store_id).await {
+            return (Some(cached), false);
+        }
+
+        let key = (*tenant_id, *store_id);
+        let lock_acquired = self.latest_by_stream.try_acquire_refresh_lock(&key).await;
+        (None, lock_acquired)
+    }
+
+    /// Release a latest-by-stream lock.
+    pub async fn release_latest_lock(&self, tenant_id: &Uuid, store_id: &Uuid) {
+        let key = (*tenant_id, *store_id);
+        self.latest_by_stream.release_refresh_lock(&key).await;
+    }
+
     /// Insert a commitment
     pub async fn insert(&self, commitment: BatchCommitment, merkle_root: Hash256) {
         let cached = CachedCommitment {
