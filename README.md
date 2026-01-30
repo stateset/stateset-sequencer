@@ -1,5 +1,12 @@
 # StateSet Sequencer
 
+![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+![codecov](https://codecov.io/gh/stateset/stateset-sequencer/branch/main/graph/badge.svg)
+![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
+![Security](https://img.shields.io/badge/security-audited-green)
+![Documentation](https://img.shields.io/badge/docs-passing-blue)
+
 Verifiable Event Sync (VES) v1.0 service for deterministic event ordering, state projection, cryptographic commitments, and zero-knowledge compliance proofs.
 
 ## Overview

@@ -330,28 +330,28 @@ async fn build_pg_pool(
     options = options.after_connect(move |conn, _meta| {
         let session_config = session_config.clone();
         Box::pin(async move {
-            sqlx::query("SET application_name = $1")
+            sqlx::query("SELECT set_config('application_name', $1, false)")
                 .bind(&session_config.application_name)
                 .execute(&mut *conn)
                 .await?;
 
             if let Some(ms) = session_config.statement_timeout_ms {
-                sqlx::query("SET statement_timeout = $1")
-                    .bind(ms as i64)
+                sqlx::query("SELECT set_config('statement_timeout', $1, false)")
+                    .bind(format!("{ms}"))
                     .execute(&mut *conn)
                     .await?;
             }
 
             if let Some(ms) = session_config.idle_in_tx_timeout_ms {
-                sqlx::query("SET idle_in_transaction_session_timeout = $1")
-                    .bind(ms as i64)
+                sqlx::query("SELECT set_config('idle_in_transaction_session_timeout', $1, false)")
+                    .bind(format!("{ms}"))
                     .execute(&mut *conn)
                     .await?;
             }
 
             if let Some(ms) = session_config.lock_timeout_ms {
-                sqlx::query("SET lock_timeout = $1")
-                    .bind(ms as i64)
+                sqlx::query("SELECT set_config('lock_timeout', $1, false)")
+                    .bind(format!("{ms}"))
                     .execute(&mut *conn)
                     .await?;
             }
