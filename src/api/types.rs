@@ -75,10 +75,105 @@ pub struct VesIngestResponse {
 }
 
 // ============================================================================
-// Agent key types
+// Agent registration types
 // ============================================================================
 
-/// Request body for agent key registration.
+/// Request body for agent registration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRegistrationRequest {
+    /// Human-readable name for the agent.
+    pub name: String,
+    /// Optional description of the agent's purpose.
+    pub description: Option<String>,
+    /// Tenant ID is not allowed for self-service registration.
+    pub tenant_id: Option<Uuid>,
+    /// Optional store IDs this agent can access.
+    pub store_ids: Option<Vec<Uuid>>,
+    /// Whether this is a read-only agent (default: false).
+    pub read_only: Option<bool>,
+    /// Admin is not allowed for self-service registration.
+    pub admin: Option<bool>,
+    /// Optional rate limit (requests per minute).
+    pub rate_limit: Option<u32>,
+}
+
+/// Response for agent registration.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRegistrationResponse {
+    pub success: bool,
+    pub agent_id: Uuid,
+    pub tenant_id: Uuid,
+    /// The API key - only returned once, store securely!
+    pub api_key: String,
+    pub permissions: String,
+    pub message: String,
+}
+
+/// Response for agent details.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentResponse {
+    pub agent_id: Uuid,
+    pub tenant_id: Uuid,
+    pub active: bool,
+    pub permissions: String,
+    pub store_ids: Vec<Uuid>,
+    pub rate_limit: Option<u32>,
+}
+
+/// Request body for creating a new API key.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateApiKeyRequest {
+    /// Optional store IDs this key can access.
+    pub store_ids: Option<Vec<Uuid>>,
+    /// Whether this is a read-only key (default: false).
+    pub read_only: Option<bool>,
+    /// Whether this is an admin key (default: false, requires admin auth).
+    pub admin: Option<bool>,
+    /// Optional rate limit (requests per minute).
+    pub rate_limit: Option<u32>,
+}
+
+/// Response for API key creation.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyResponse {
+    pub success: bool,
+    /// The API key - only returned once, store securely!
+    pub api_key: String,
+    /// First 16 chars of key hash for identification.
+    pub key_hash_prefix: String,
+    pub permissions: String,
+    pub message: String,
+}
+
+/// Summary info for an API key (without the actual key).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiKeyInfo {
+    /// First 16 chars of key hash for identification.
+    pub key_hash_prefix: String,
+    pub active: bool,
+    pub permissions: String,
+    pub rate_limit: Option<u32>,
+}
+
+/// Response for listing API keys.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListApiKeysResponse {
+    pub keys: Vec<ApiKeyInfo>,
+    pub count: usize,
+}
+
+// ============================================================================
+// Agent signing key types
+// ============================================================================
+
+/// Request body for agent signing key registration.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterAgentKeyRequest {

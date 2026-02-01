@@ -86,12 +86,8 @@ impl Authenticator {
             return Err(AuthError::InvalidApiKey);
         }
 
-        if let Ok(context) = self.api_key_validator.validate(key) {
-            return Ok(context);
-        }
-
         let Some(store) = &self.api_key_store else {
-            return Err(AuthError::InvalidApiKey);
+            return self.api_key_validator.validate(key);
         };
 
         let key_hash = ApiKeyValidator::hash_key(key);

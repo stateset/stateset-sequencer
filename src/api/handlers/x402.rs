@@ -20,14 +20,15 @@
 //! 6. Batch is settled on Set Chain L2 via SetPaymentBatch contract
 //! 7. Agent can fetch receipt with inclusion proof
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
 use chrono::Utc;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
+use crate::api::auth_helpers::{ensure_admin, ensure_read, ensure_write};
 use crate::api::error::{ApiError, ErrorCode};
-use crate::auth::AgentKeyRegistry;
+use crate::auth::{AgentKeyRegistry, AuthContextExt};
 use crate::domain::{
     AgentId, AgentKeyId, GetX402BatchResponse, GetX402ReceiptResponse, Hash256, Signature64,
     StoreId, SubmitX402PaymentRequest, SubmitX402PaymentResponse, TenantId, X402BatchStatus,
@@ -75,6 +76,7 @@ use crate::server::AppState;
 #[instrument(skip(state, payload), fields(tenant_id = ?payload.tenant_id, amount = payload.amount))]
 pub async fn submit_payment_intent(
     State(state): State<AppState>,
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(payload): Json<SubmitX402PaymentRequest>,
 ) -> Result<Json<SubmitX402PaymentResponse>, ApiError> {
     info!(
@@ -89,6 +91,9 @@ pub async fn submit_payment_intent(
     let tenant_id = TenantId::from_uuid(payload.tenant_id);
     let store_id = StoreId::from_uuid(payload.store_id);
     let now_unix = Utc::now().timestamp() as u64;
+
+    ensure_write(&auth, tenant_id.0, store_id.0)
+        .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
 
     // Check expiry
     if payload.valid_until < now_unix {
@@ -353,6 +358,7 @@ pub async fn submit_payment_intent(
 #[instrument(skip(state), fields(intent_id = %intent_id))]
 pub async fn get_payment_intent(
     State(state): State<AppState>,
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(intent_id): Path<Uuid>,
 ) -> Result<Json<SubmitX402PaymentResponse>, ApiError> {
     debug!(intent_id = %intent_id, "Getting payment intent status");
@@ -369,13 +375,17 @@ pub async fn get_payment_intent(
         })?;
 
     match intent {
-        Some(intent) => Ok(Json(SubmitX402PaymentResponse {
-            intent_id: intent.intent_id,
-            status: intent.status,
-            sequence_number: intent.sequence_number,
-            sequenced_at: intent.sequenced_at,
-            batch_id: intent.batch_id,
-        })),
+        Some(intent) => {
+            ensure_read(&auth, intent.tenant_id.0, intent.store_id.0)
+                .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
+            Ok(Json(SubmitX402PaymentResponse {
+                intent_id: intent.intent_id,
+                status: intent.status,
+                sequence_number: intent.sequence_number,
+                sequenced_at: intent.sequenced_at,
+                batch_id: intent.batch_id,
+            }))
+        }
         None => Err(ApiError::new(
             ErrorCode::ResourceNotFound,
             format!("Payment intent {} not found", intent_id),
@@ -391,9 +401,31 @@ pub async fn get_payment_intent(
 #[instrument(skip(state), fields(intent_id = %intent_id))]
 pub async fn get_payment_receipt(
     State(state): State<AppState>,
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(intent_id): Path<Uuid>,
 ) -> Result<Json<GetX402ReceiptResponse>, ApiError> {
     debug!(intent_id = %intent_id, "Getting payment receipt");
+
+    let intent = state
+        .x402_repository
+        .get_intent(intent_id)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::InternalError,
+                format!("Failed to fetch intent: {}", e),
+            )
+        })?;
+
+    let intent = intent.ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::ResourceNotFound,
+            format!("Payment intent {} not found", intent_id),
+        )
+    })?;
+
+    ensure_read(&auth, intent.tenant_id.0, intent.store_id.0)
+        .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
 
     let receipt = state
         .x402_repository
@@ -423,9 +455,18 @@ pub async fn get_payment_receipt(
 #[instrument(skip(state, filter))]
 pub async fn list_payment_intents(
     State(state): State<AppState>,
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Query(filter): Query<X402PaymentIntentFilter>,
 ) -> Result<Json<Vec<X402PaymentIntent>>, ApiError> {
     debug!(?filter, "Listing payment intents");
+
+    let tenant_id = filter.tenant_id.ok_or_else(|| {
+        ApiError::new(ErrorCode::MissingRequiredField, "tenant_id is required")
+    })?;
+    let store_id = filter.store_id.unwrap_or_else(Uuid::nil);
+
+    ensure_read(&auth, tenant_id, store_id)
+        .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
 
     let intents = state
         .x402_repository
@@ -449,6 +490,7 @@ pub async fn list_payment_intents(
 #[instrument(skip(state), fields(batch_id = %batch_id))]
 pub async fn get_batch(
     State(state): State<AppState>,
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Path(batch_id): Path<Uuid>,
 ) -> Result<Json<GetX402BatchResponse>, ApiError> {
     debug!(batch_id = %batch_id, "Getting batch status");
@@ -465,7 +507,11 @@ pub async fn get_batch(
         })?;
 
     match batch {
-        Some(batch) => Ok(Json(GetX402BatchResponse { batch })),
+        Some(batch) => {
+            ensure_read(&auth, batch.tenant_id.0, batch.store_id.0)
+                .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
+            Ok(Json(GetX402BatchResponse { batch }))
+        }
         None => Err(ApiError::new(
             ErrorCode::BatchNotFound,
             format!("Batch {} not found", batch_id),
@@ -494,6 +540,7 @@ pub struct SettleBatchResponse {
 #[instrument(skip(state, payload))]
 pub async fn settle_batch(
     State(state): State<AppState>,
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(payload): Json<SettleBatchRequest>,
 ) -> Result<Json<SettleBatchResponse>, ApiError> {
     info!(batch_id = %payload.batch_id, "Triggering batch settlement");
@@ -516,6 +563,9 @@ pub async fn settle_batch(
             format!("Batch {} not found", payload.batch_id),
         )
     })?;
+
+    ensure_admin(&auth, batch.tenant_id.0, batch.store_id.0)
+        .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
 
     // Verify batch is in Committed status
     if batch.status != X402BatchStatus::Committed {
@@ -566,6 +616,7 @@ pub struct CreateBatchResponse {
 #[instrument(skip(state, payload))]
 pub async fn create_batch(
     State(state): State<AppState>,
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(payload): Json<CreateBatchRequest>,
 ) -> Result<Json<CreateBatchResponse>, ApiError> {
     info!(
@@ -578,6 +629,9 @@ pub async fn create_batch(
     let tenant_id = TenantId::from_uuid(payload.tenant_id);
     let store_id = StoreId::from_uuid(payload.store_id);
     let max_size = payload.max_size.unwrap_or(100);
+
+    ensure_admin(&auth, tenant_id.0, store_id.0)
+        .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
 
     let intents = if let Some(intent_ids) = payload.intent_ids.as_ref().filter(|ids| !ids.is_empty())
     {

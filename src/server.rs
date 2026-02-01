@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderValue, Method};
+use axum::http::{HeaderValue, Method, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use sqlx::postgres::PgPoolOptions;
@@ -31,8 +32,8 @@ use crate::proto::v2::sequencer_server::SequencerServer as SequencerServerV2;
 
 use crate::anchor::{AnchorConfig, AnchorService};
 use crate::auth::{
-    ApiKeyRecord, ApiKeyStore, ApiKeyValidator, AuthMiddlewareState, Authenticator, JwtValidator,
-    Permissions, PgApiKeyStore, RateLimiter, RequestLimits,
+    ApiKeyRecord, ApiKeyValidator, AuthContextExt, AuthMiddlewareState, Authenticator,
+    JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::{
@@ -391,6 +392,10 @@ pub struct AppState {
     pub pool_monitor: Option<Arc<PoolMonitor>>,
     /// Circuit breaker registry for external service calls
     pub circuit_breaker_registry: Option<Arc<CircuitBreakerRegistry>>,
+    /// API key validator (in-memory, for fast validation)
+    pub api_key_validator: Arc<ApiKeyValidator>,
+    /// API key store (database-backed, for persistence)
+    pub api_key_store: Arc<PgApiKeyStore>,
 }
 
 /// Start the HTTP server.
@@ -405,10 +410,11 @@ pub async fn run() -> anyhow::Result<()> {
 
     let api_key_validator = Arc::new(ApiKeyValidator::new());
     let mut any_auth_configured = false;
+    let mut bootstrap_record: Option<ApiKeyRecord> = None;
 
     if let Ok(bootstrap_key) = std::env::var("BOOTSTRAP_ADMIN_API_KEY") {
         let key_hash = ApiKeyValidator::hash_key(&bootstrap_key);
-        api_key_validator.register_key(ApiKeyRecord {
+        let record = ApiKeyRecord {
             key_hash,
             tenant_id: Uuid::nil(),
             store_ids: vec![],
@@ -416,7 +422,9 @@ pub async fn run() -> anyhow::Result<()> {
             agent_id: None,
             active: true,
             rate_limit: None,
-        });
+        };
+        api_key_validator.register_key(record.clone());
+        bootstrap_record = Some(record);
         any_auth_configured = true;
         info!("Bootstrap admin API key is configured");
     }
@@ -518,6 +526,12 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let api_key_store = Arc::new(PgApiKeyStore::new(pool.clone()));
+    if let Some(record) = &bootstrap_record {
+        api_key_store
+            .store(record)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to persist bootstrap API key: {e}"))?;
+    }
     match api_key_store.has_any_active().await {
         Ok(true) => {
             any_auth_configured = true;
@@ -536,7 +550,8 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     let authenticator = {
-        let authenticator = Authenticator::new(api_key_validator).with_api_key_store(api_key_store);
+        let authenticator = Authenticator::new(api_key_validator.clone())
+            .with_api_key_store(api_key_store.clone());
         match jwt_validator {
             Some(jwt) => Arc::new(authenticator.with_jwt(jwt)),
             None => Arc::new(authenticator),
@@ -679,6 +694,8 @@ pub async fn run() -> anyhow::Result<()> {
         request_limits: request_limits.clone(),
         pool_monitor: Some(pool_monitor),
         circuit_breaker_registry: Some(circuit_breaker_registry),
+        api_key_validator: api_key_validator.clone(),
+        api_key_store: api_key_store.clone(),
     };
 
     // Start component metrics collection in background
@@ -873,6 +890,7 @@ fn init_opentelemetry_tracer() -> Result<opentelemetry_sdk::trace::Tracer, opent
 }
 
 fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppState>> {
+    let public_api = crate::api::public_router();
     let api = crate::api::router().layer(axum::middleware::from_fn_with_state(
         auth_state.clone(),
         crate::auth::auth_middleware,
@@ -882,13 +900,21 @@ fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppSta
         axum::middleware::from_fn_with_state(auth_state, crate::auth::auth_middleware),
     );
 
+    let metrics_router = Router::new()
+        .route("/metrics", get(metrics_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            crate::auth::auth_middleware,
+        ));
+
     let mut router = Router::new()
+        .nest("/api", public_api)
+        .merge(metrics_router)
         .merge(anchor_compat)
         .nest("/api", api)
         .route("/health", get(crate::api::handlers::health::health_check))
         .route("/health/detailed", get(crate::api::handlers::health::detailed_health_check))
         .route("/ready", get(crate::api::handlers::health::readiness_check))
-        .route("/metrics", get(metrics_handler))
         .layer(TraceLayer::new_for_http());
 
     if let Some(cors_layer) = cors_layer_from_env()? {
@@ -938,10 +964,16 @@ fn cors_layer_from_env() -> anyhow::Result<Option<CorsLayer>> {
 /// Prometheus metrics endpoint.
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
-) -> ([(axum::http::header::HeaderName, &'static str); 1], String) {
+    axum::extract::Extension(AuthContextExt(auth)): axum::extract::Extension<AuthContextExt>,
+) -> Response {
+    if !auth.is_admin() {
+        return (StatusCode::FORBIDDEN, "Admin permission required").into_response();
+    }
+
     let metrics = state.metrics.to_prometheus().await;
     (
         [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         metrics,
     )
+        .into_response()
 }

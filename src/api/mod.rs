@@ -124,7 +124,21 @@ pub fn router() -> Router<AppState> {
             "/v1/anchor/:batch_id/verify",
             get(handlers::verify_anchor_onchain),
         )
-        // Agent key management
+        // Agent management
+        .route("/v1/agents/:agent_id", get(handlers::get_agent))
+        .route(
+            "/v1/agents/:agent_id/api-keys",
+            post(handlers::create_agent_api_key),
+        )
+        .route(
+            "/v1/agents/:agent_id/api-keys",
+            get(handlers::list_agent_api_keys),
+        )
+        .route(
+            "/v1/agents/:agent_id/api-keys/:key_prefix",
+            axum::routing::delete(handlers::revoke_agent_api_key),
+        )
+        // Agent signing key management
         .route("/v1/agents/keys", post(handlers::register_agent_key))
         // Schema registry
         .route("/v1/schemas", get(handlers::list_schemas))
@@ -149,6 +163,11 @@ pub fn router() -> Router<AppState> {
         )
         // x402 payment protocol
         .nest("/v1/x402", handlers::x402_router())
+}
+
+/// Public router for self-service endpoints (no auth middleware).
+pub fn public_router() -> Router<AppState> {
+    Router::new().route("/v1/agents/register", post(handlers::register_agent))
 }
 
 /// Minimal root-level compatibility router for Set Chain's separate anchor service.
