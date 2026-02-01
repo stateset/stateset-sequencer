@@ -15,7 +15,8 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use stateset_sequencer::auth::{
-    ApiKeyRecord, ApiKeyValidator, AuthMiddlewareState, Authenticator, Permissions, RequestLimits,
+    ApiKeyRecord, ApiKeyValidator, AuthMiddlewareState, Authenticator, Permissions, RateLimiter,
+    RequestLimits,
 };
 use stateset_sequencer::domain::{
     AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
@@ -47,6 +48,8 @@ async fn connect_db() -> Option<sqlx::PgPool> {
 /// Create full application state for testing.
 async fn create_test_state(pool: sqlx::PgPool) -> AppState {
     let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let api_key_validator = Arc::new(ApiKeyValidator::new());
+    let api_key_store = Arc::new(stateset_sequencer::auth::PgApiKeyStore::new(pool.clone()));
 
     let sequencer = Arc::new(PgSequencer::new(pool.clone(), payload_encryption.clone()));
     let event_store = Arc::new(PgEventStore::new(pool.clone(), payload_encryption.clone()));
@@ -93,6 +96,11 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
         request_limits: RequestLimits::default(),
         pool_monitor: None,
         circuit_breaker_registry: None,
+        api_key_validator,
+        api_key_store,
+        public_registration_enabled: true,
+        public_registration_limiter: None,
+        audit_logger: None,
     }
 }
 
@@ -120,12 +128,14 @@ fn create_test_router(state: AppState, require_auth: bool) -> axum::Router<()> {
         rate_limiter: None,
     };
 
+    let public_api = stateset_sequencer::api::public_router();
     let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
         auth_state,
         stateset_sequencer::auth::auth_middleware,
     ));
 
     axum::Router::new()
+        .nest("/api", public_api)
         .nest("/api", api)
         .with_state::<()>(state)
 }
@@ -212,6 +222,119 @@ async fn seed_test_events(
 // ============================================================================
 // Health & Readiness Endpoint Tests
 // ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_public_agent_registration_rate_limited() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let mut state = create_test_state(pool).await;
+    state.public_registration_limiter = Some(Arc::new(RateLimiter::new(1)));
+    let app = create_test_router(state, true);
+
+    let payload = json!({
+        "name": "public-agent"
+    });
+
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/agents/register",
+        Some(payload.clone()),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
+
+    let (status, _) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/agents/register",
+        Some(payload),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_public_agent_registration_rejects_tenant_id() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, true);
+
+    let payload = json!({
+        "name": "public-agent",
+        "tenantId": Uuid::new_v4()
+    });
+
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/agents/register",
+        Some(payload),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "TENANT_ID_NOT_ALLOWED");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_x402_list_requires_auth_and_tenant() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, true);
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let uri = format!(
+        "/api/v1/x402/payments?tenant_id={}&store_id={}",
+        tenant_id, store_id
+    );
+
+    let (status, _) = send_request(&app, Method::GET, &uri, None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body) =
+        send_request(&app, Method::GET, "/api/v1/x402/payments", None, Some("sk_test_integration_key_12345"))
+            .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "MISSING_REQUIRED_FIELD");
+
+    let (status, _) =
+        send_request(&app, Method::GET, &uri, None, Some("sk_test_integration_key_12345")).await;
+    assert_eq!(status, StatusCode::OK);
+}
 
 #[tokio::test]
 #[ignore]

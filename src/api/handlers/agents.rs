@@ -6,7 +6,7 @@
 //! - Get agent status and metadata
 
 use axum::extract::{Extension, Path, State};
-use axum::http::StatusCode;
+use axum::http::{header::USER_AGENT, HeaderMap, StatusCode};
 use axum::Json;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
@@ -16,6 +16,7 @@ use crate::api::types::{
     CreateApiKeyRequest, ListApiKeysResponse,
 };
 use crate::auth::{ApiKeyRecord, ApiKeyStore, ApiKeyValidator, AuthContextExt, Permissions};
+use crate::infra::{AuditAction, AuditLogBuilder};
 use crate::server::AppState;
 
 /// POST /api/v1/agents/register - Register a new agent and receive an API key.
@@ -25,11 +26,85 @@ use crate::server::AppState;
 #[instrument(skip(state, request), fields(agent_name = %request.name))]
 pub async fn register_agent(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<AgentRegistrationRequest>,
 ) -> Result<Json<AgentRegistrationResponse>, (StatusCode, Json<serde_json::Value>)> {
     info!("Registering new agent: {}", request.name);
 
+    let client_ip = extract_client_ip(&headers);
+    let user_agent = headers
+        .get(USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if !state.public_registration_enabled {
+        log_registration_audit(
+            &state,
+            None,
+            None,
+            client_ip.as_deref(),
+            user_agent.as_deref(),
+            request_id.as_deref(),
+            false,
+            Some("public registration disabled".to_string()),
+        )
+        .await;
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "public registration is disabled",
+                "code": "REGISTRATION_DISABLED"
+            })),
+        ));
+    }
+
+    if let Some(ref limiter) = state.public_registration_limiter {
+        let key = client_ip
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        if limiter
+            .check(&format!("public_register:{}", key))
+            .is_err()
+        {
+            log_registration_audit(
+                &state,
+                None,
+                None,
+                client_ip.as_deref(),
+                user_agent.as_deref(),
+                request_id.as_deref(),
+                false,
+                Some("rate limit exceeded".to_string()),
+            )
+            .await;
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "rate limit exceeded",
+                    "code": "RATE_LIMIT_EXCEEDED"
+                })),
+            ));
+        }
+    }
+
     if request.tenant_id.is_some() {
+        log_registration_audit(
+            &state,
+            None,
+            None,
+            client_ip.as_deref(),
+            user_agent.as_deref(),
+            request_id.as_deref(),
+            false,
+            Some("tenant_id not allowed".to_string()),
+        )
+        .await;
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -41,6 +116,17 @@ pub async fn register_agent(
     }
 
     if request.admin.unwrap_or(false) {
+        log_registration_audit(
+            &state,
+            None,
+            None,
+            client_ip.as_deref(),
+            user_agent.as_deref(),
+            request_id.as_deref(),
+            false,
+            Some("admin registration not allowed".to_string()),
+        )
+        .await;
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
@@ -81,6 +167,17 @@ pub async fn register_agent(
     // Store in database
     if let Err(e) = state.api_key_store.store(&api_key_record).await {
         warn!("Failed to store API key: {:?}", e);
+        log_registration_audit(
+            &state,
+            Some(tenant_id),
+            Some(agent_id),
+            client_ip.as_deref(),
+            user_agent.as_deref(),
+            request_id.as_deref(),
+            false,
+            Some("failed to store api key".to_string()),
+        )
+        .await;
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -99,6 +196,18 @@ pub async fn register_agent(
         agent_id, tenant_id
     );
 
+    log_registration_audit(
+        &state,
+        Some(tenant_id),
+        Some(agent_id),
+        client_ip.as_deref(),
+        user_agent.as_deref(),
+        request_id.as_deref(),
+        true,
+        None,
+    )
+    .await;
+
     Ok(Json(AgentRegistrationResponse {
         success: true,
         agent_id,
@@ -111,6 +220,89 @@ pub async fn register_agent(
         },
         message: "Agent registered successfully. Store your API key securely - it cannot be retrieved later.".to_string(),
     }))
+}
+
+fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
+    if let Some(forwarded) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let Some(first) = forwarded.split(',').next() {
+            let ip = first.trim();
+            if !ip.is_empty() {
+                return Some(ip.to_string());
+            }
+        }
+    }
+
+    if let Some(real_ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+    {
+        let ip = real_ip.trim();
+        if !ip.is_empty() {
+            return Some(ip.to_string());
+        }
+    }
+
+    if let Some(forwarded) = headers
+        .get("forwarded")
+        .and_then(|v| v.to_str().ok())
+    {
+        for part in forwarded.split(';') {
+            let part = part.trim();
+            if let Some(value) = part.strip_prefix("for=") {
+                let value = value.trim_matches('"').trim_matches('[').trim_matches(']');
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+async fn log_registration_audit(
+    state: &AppState,
+    tenant_id: Option<Uuid>,
+    agent_id: Option<Uuid>,
+    ip_address: Option<&str>,
+    user_agent: Option<&str>,
+    request_id: Option<&str>,
+    success: bool,
+    error_message: Option<String>,
+) {
+    let Some(logger) = &state.audit_logger else {
+        return;
+    };
+
+    let mut builder = AuditLogBuilder::new(
+        AuditAction::Custom("agent_registered".to_string()),
+        "self_service",
+        "public",
+    );
+
+    if let Some(tenant_id) = tenant_id {
+        builder = builder.tenant_id(tenant_id);
+    }
+    if let Some(agent_id) = agent_id {
+        builder = builder.resource("agent", agent_id.to_string());
+    }
+    if let Some(ip) = ip_address {
+        builder = builder.ip_address(ip.to_string());
+    }
+    if let Some(ua) = user_agent {
+        builder = builder.user_agent(ua.to_string());
+    }
+    if let Some(req_id) = request_id {
+        builder = builder.request_id(req_id.to_string());
+    }
+    if let Some(error) = error_message {
+        builder = builder.failed(error);
+    }
+
+    let _ = logger.log(builder.build()).await;
 }
 
 /// GET /api/v1/agents/:agent_id - Get agent details.

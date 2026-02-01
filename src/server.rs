@@ -33,14 +33,14 @@ use crate::proto::v2::sequencer_server::SequencerServer as SequencerServerV2;
 use crate::anchor::{AnchorConfig, AnchorService};
 use crate::auth::{
     ApiKeyRecord, ApiKeyValidator, AuthContextExt, AuthMiddlewareState, Authenticator,
-    JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RequestLimits,
+    JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RateLimiterConfig, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::{
-    CacheManager, CacheManagerConfig, CircuitBreakerRegistry, PayloadEncryption, PgAgentKeyRegistry,
-    PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer, PgVesCommitmentEngine,
-    PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository, PoolMonitor,
-    SchemaValidationMode, VesSequencer,
+    PgAuditLogger, CacheManager, CacheManagerConfig, CircuitBreakerRegistry, PayloadEncryption,
+    PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer,
+    PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository,
+    PoolMonitor, SchemaValidationMode, VesSequencer,
 };
 use crate::metrics::{ComponentMetrics, MetricsRegistry};
 
@@ -396,6 +396,12 @@ pub struct AppState {
     pub api_key_validator: Arc<ApiKeyValidator>,
     /// API key store (database-backed, for persistence)
     pub api_key_store: Arc<PgApiKeyStore>,
+    /// Public agent registration enabled
+    pub public_registration_enabled: bool,
+    /// Public registration rate limiter (per IP or fallback key)
+    pub public_registration_limiter: Option<Arc<RateLimiter>>,
+    /// Optional audit logger
+    pub audit_logger: Option<Arc<PgAuditLogger>>,
 }
 
 /// Start the HTTP server.
@@ -450,6 +456,40 @@ pub async fn run() -> anyhow::Result<()> {
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|v| *v > 0)
         .map(|rpm| Arc::new(RateLimiter::new(rpm)));
+
+    let public_registration_enabled = std::env::var("PUBLIC_AGENT_REGISTRATION_ENABLED")
+        .ok()
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        })
+        .unwrap_or(true);
+
+    let public_registration_limiter = std::env::var("PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| *v > 0)
+        .map(|rpm| {
+            let mut config = RateLimiterConfig {
+                requests_per_minute: rpm,
+                ..Default::default()
+            };
+            if let Some(max_entries) = std::env::var("PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                config.max_entries = max_entries;
+            }
+            if let Some(window_seconds) = std::env::var("PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                config.window_seconds = window_seconds;
+            }
+            Arc::new(RateLimiter::with_config(config))
+        });
 
     let request_limits = RequestLimits::from_env();
     info!(
@@ -548,6 +588,29 @@ pub async fn run() -> anyhow::Result<()> {
             "AUTH_MODE=required but no auth is configured; set JWT_SECRET or BOOTSTRAP_ADMIN_API_KEY (or set AUTH_MODE=disabled for local dev)"
         );
     }
+
+    let audit_enabled = std::env::var("AUDIT_LOG_ENABLED")
+        .ok()
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off"
+            )
+        })
+        .unwrap_or(true);
+
+    let audit_logger = if audit_enabled {
+        let logger = Arc::new(PgAuditLogger::new(pool.clone()));
+        if let Err(e) = logger.initialize().await {
+            warn!("Failed to initialize audit log table: {}", e);
+        } else {
+            info!("Audit logging enabled");
+        }
+        Some(logger)
+    } else {
+        info!("Audit logging disabled");
+        None
+    };
 
     let authenticator = {
         let authenticator = Authenticator::new(api_key_validator.clone())
@@ -696,6 +759,9 @@ pub async fn run() -> anyhow::Result<()> {
         circuit_breaker_registry: Some(circuit_breaker_registry),
         api_key_validator: api_key_validator.clone(),
         api_key_store: api_key_store.clone(),
+        public_registration_enabled,
+        public_registration_limiter,
+        audit_logger,
     };
 
     // Start component metrics collection in background
@@ -976,4 +1042,98 @@ async fn metrics_handler(
         metrics,
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::{Extension, State};
+    use sqlx::postgres::PgPoolOptions;
+
+    fn build_test_state() -> AppState {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://localhost/postgres")
+            .expect("connect_lazy should not require a live database");
+
+        let payload_encryption = Arc::new(PayloadEncryption::disabled());
+        let api_key_validator = Arc::new(ApiKeyValidator::new());
+        let api_key_store = Arc::new(PgApiKeyStore::new(pool.clone()));
+
+        let sequencer = Arc::new(PgSequencer::new(pool.clone(), payload_encryption.clone()));
+        let event_store = Arc::new(PgEventStore::new(pool.clone(), payload_encryption.clone()));
+        let commitment_engine = Arc::new(PgCommitmentEngine::new(pool.clone()));
+        let commitment_reader = Arc::new(PgCommitmentEngine::new(pool.clone()));
+        let ves_commitment_engine = Arc::new(PgVesCommitmentEngine::new(pool.clone()));
+        let ves_commitment_reader = Arc::new(PgVesCommitmentEngine::new(pool.clone()));
+        let ves_validity_proof_store = Arc::new(PgVesValidityProofStore::new(
+            pool.clone(),
+            payload_encryption.clone(),
+        ));
+        let ves_compliance_proof_store = Arc::new(PgVesComplianceProofStore::new(
+            pool.clone(),
+            payload_encryption,
+        ));
+
+        let cache_manager = Arc::new(CacheManager::new());
+        let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+        let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+        let ves_sequencer_reader =
+            Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+        let schema_store = Arc::new(PgSchemaStore::new(pool.clone()));
+        let x402_repository = Arc::new(PgX402Repository::new(pool.clone()));
+        let metrics = Arc::new(MetricsRegistry::new());
+
+        AppState {
+            sequencer,
+            event_store,
+            commitment_engine,
+            commitment_reader,
+            ves_commitment_engine,
+            ves_commitment_reader,
+            ves_validity_proof_store,
+            ves_compliance_proof_store,
+            anchor_service: None,
+            ves_sequencer,
+            ves_sequencer_reader,
+            agent_key_registry,
+            schema_store,
+            metrics,
+            cache_manager,
+            x402_repository,
+            schema_validation_mode: SchemaValidationMode::Disabled,
+            request_limits: RequestLimits::default(),
+            pool_monitor: None,
+            circuit_breaker_registry: None,
+            api_key_validator,
+            api_key_store,
+            public_registration_enabled: true,
+            public_registration_limiter: None,
+            audit_logger: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn metrics_requires_admin() {
+        let state = build_test_state();
+
+        let user_ctx = crate::auth::AuthContext {
+            tenant_id: Uuid::new_v4(),
+            store_ids: Vec::new(),
+            agent_id: None,
+            permissions: Permissions::read_only(),
+        };
+        let response = metrics_handler(State(state.clone()), Extension(AuthContextExt(user_ctx)))
+            .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let admin_ctx = crate::auth::AuthContext {
+            tenant_id: Uuid::nil(),
+            store_ids: Vec::new(),
+            agent_id: None,
+            permissions: Permissions::admin(),
+        };
+        let response = metrics_handler(State(state), Extension(AuthContextExt(admin_ctx))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

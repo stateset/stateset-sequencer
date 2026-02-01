@@ -345,6 +345,8 @@ async fn postgres_ves_validity_proofs_rest_flow() {
     let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(pool.clone()));
 
     let metrics = Arc::new(stateset_sequencer::metrics::MetricsRegistry::new());
+    let api_key_validator = Arc::new(ApiKeyValidator::new());
+    let api_key_store = Arc::new(stateset_sequencer::auth::PgApiKeyStore::new(pool.clone()));
 
     let state = AppState {
         sequencer,
@@ -367,9 +369,13 @@ async fn postgres_ves_validity_proofs_rest_flow() {
         request_limits: RequestLimits::default(),
         pool_monitor: None,
         circuit_breaker_registry: None,
+        api_key_validator: api_key_validator.clone(),
+        api_key_store,
+        public_registration_enabled: true,
+        public_registration_limiter: None,
+        audit_logger: None,
     };
 
-    let api_key_validator = Arc::new(ApiKeyValidator::new());
     let authenticator = Arc::new(Authenticator::new(api_key_validator));
     let auth_state = AuthMiddlewareState {
         authenticator,
@@ -648,6 +654,8 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
     let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(pool.clone()));
 
     let metrics = Arc::new(stateset_sequencer::metrics::MetricsRegistry::new());
+    let api_key_validator = Arc::new(ApiKeyValidator::new());
+    let api_key_store = Arc::new(stateset_sequencer::auth::PgApiKeyStore::new(pool.clone()));
 
     let state = AppState {
         sequencer,
@@ -670,9 +678,13 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
         request_limits: RequestLimits::default(),
         pool_monitor: None,
         circuit_breaker_registry: None,
+        api_key_validator: api_key_validator.clone(),
+        api_key_store,
+        public_registration_enabled: true,
+        public_registration_limiter: None,
+        audit_logger: None,
     };
 
-    let api_key_validator = Arc::new(ApiKeyValidator::new());
     let authenticator = Arc::new(Authenticator::new(api_key_validator));
     let auth_state = AuthMiddlewareState {
         authenticator,
