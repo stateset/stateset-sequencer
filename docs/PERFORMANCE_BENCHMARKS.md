@@ -58,7 +58,7 @@ This document captures performance characteristics, benchmarks, and service leve
 
 **Software:**
 - Rust 1.75.0
-- StateSet Sequencer v0.2.3
+- StateSet Sequencer v0.2.4
 - k6 0.48.0
 
 ### Ingestion Throughput Benchmark

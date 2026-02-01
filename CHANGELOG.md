@@ -5,6 +5,22 @@ All notable changes to stateset-sequencer will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.4] - 2026-02-01
+
+### Security
+
+- Restrict public self-service to agent registration only and issue API keys on registration
+- Require admin auth for metrics and x402 settlement operations
+- Add audit logging and rate limiting for public agent registration
+
+### Added
+
+- Public registration router plus coverage for registration and x402 auth constraints
+
+### Changed
+
+- API key validation prefers the database store when available
+
 ## [0.2.0] - 2026-01-11
 
 ### Added
@@ -37,4 +53,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic gRPC API (v1)
 - JWT and API key authentication
 - OpenTelemetry observability
-

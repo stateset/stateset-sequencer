@@ -1,6 +1,6 @@
 [package]
 name = "stateset-sequencer"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 authors = ["StateSet Core Infrastructure"]
 description = "Verifiable Event Sync (VES) sequencer for deterministic event ordering and state projection"
