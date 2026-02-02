@@ -94,6 +94,13 @@ Configure via environment variables:
 | `JWT_ISSUER` | `stateset-sequencer` | Expected JWT issuer |
 | `JWT_AUDIENCE` | `stateset-api` | Expected JWT audience |
 | `RATE_LIMIT_PER_MINUTE` | (unset) | Optional global per-tenant rate limit |
+| `RATE_LIMIT_MAX_ENTRIES` | `10000` | Max tracked rate limit entries |
+| `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window duration |
+| `PUBLIC_AGENT_REGISTRATION_ENABLED` | `true` | Enable public agent self-registration |
+| `PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE` | (unset) | Per-IP rate limit for public agent registration |
+| `PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES` | `10000` | Max tracked public registration rate limit entries |
+| `PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS` | `60` | Public registration rate limit window duration |
+| `TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `Forwarded` / `X-Real-IP` for client IPs |
 | `CORS_ALLOW_ORIGINS` | (unset) | Optional CORS origins (`*` or comma-separated) |
 | `DB_MIGRATE_ON_STARTUP` | `true` | Run SQL migrations on startup (`true|false`) |
 | `PAYLOAD_ENCRYPTION_MODE` | `required` | Payload encryption-at-rest mode for legacy `events` table (`disabled|optional|required`) |

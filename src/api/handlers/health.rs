@@ -6,11 +6,12 @@
 //! - Component health status
 //! - System information
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::AuthContextExt;
 use crate::domain::{StoreId, TenantId};
 use crate::infra::{PoolHealthStatus, Sequencer};
 use crate::server::AppState;
@@ -210,7 +211,19 @@ pub async fn readiness_check(
 /// Returns detailed status information for observability.
 pub async fn detailed_health_check(
     State(state): State<AppState>,
-) -> (StatusCode, Json<DetailedHealthResponse>) {
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
+) -> Result<(StatusCode, Json<DetailedHealthResponse>), (StatusCode, Json<serde_json::Value>)> {
+    if !auth.is_admin() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Admin permission required",
+                "code": "FORBIDDEN"
+            })),
+        ));
+    }
+
     let timestamp = chrono::Utc::now().to_rfc3339();
 
     // Check database health
@@ -340,7 +353,7 @@ pub async fn detailed_health_check(
         HealthStatus::Unhealthy => StatusCode::SERVICE_UNAVAILABLE,
     };
 
-    (status_code, Json(response))
+    Ok((status_code, Json(response)))
 }
 
 /// Determine overall health status from component statuses

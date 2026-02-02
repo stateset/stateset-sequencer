@@ -6,10 +6,12 @@
 mod common;
 
 use axum::body::Body;
+use axum::extract::ConnectInfo;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -30,6 +32,10 @@ use stateset_sequencer::metrics::MetricsRegistry;
 use stateset_sequencer::server::AppState;
 
 use common::*;
+
+const STORE_SCOPED_KEY: &str = "sk_test_store_scoped_key_12345";
+const STORE_SCOPED_TENANT: &str = "11111111-1111-1111-1111-111111111111";
+const STORE_SCOPED_STORE: &str = "22222222-2222-2222-2222-222222222222";
 
 // ============================================================================
 // Test Helpers
@@ -100,6 +106,7 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
         api_key_store,
         public_registration_enabled: true,
         public_registration_limiter: None,
+        trust_proxy_headers: false,
         audit_logger: None,
     }
 }
@@ -116,6 +123,19 @@ fn create_test_router(state: AppState, require_auth: bool) -> axum::Router<()> {
         tenant_id: Uuid::nil(),
         store_ids: vec![],
         permissions: Permissions::admin(),
+        agent_id: None,
+        active: true,
+        rate_limit: None,
+    });
+
+    let store_scoped_tenant = Uuid::parse_str(STORE_SCOPED_TENANT).unwrap();
+    let store_scoped_store = Uuid::parse_str(STORE_SCOPED_STORE).unwrap();
+    let store_scoped_hash = ApiKeyValidator::hash_key(STORE_SCOPED_KEY);
+    api_key_validator.register_key(ApiKeyRecord {
+        key_hash: store_scoped_hash,
+        tenant_id: store_scoped_tenant,
+        store_ids: vec![store_scoped_store],
+        permissions: Permissions::read_only(),
         agent_id: None,
         active: true,
         rate_limit: None,
@@ -162,10 +182,14 @@ async fn send_request(
         .map(|v| Body::from(serde_json::to_vec(&v).unwrap()))
         .unwrap_or_else(|| Body::from(Vec::new()));
 
+    let mut request = builder.body(body).unwrap();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345);
+    request.extensions_mut().insert(ConnectInfo(addr));
+
     let response = app
         .clone()
         .into_service::<Body>()
-        .oneshot(builder.body(body).unwrap())
+        .oneshot(request)
         .await
         .unwrap();
 
@@ -333,6 +357,18 @@ async fn test_x402_list_requires_auth_and_tenant() {
 
     let (status, _) =
         send_request(&app, Method::GET, &uri, None, Some("sk_test_integration_key_12345")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let scoped_uri = format!("/api/v1/x402/payments?tenant_id={}", STORE_SCOPED_TENANT);
+    let (status, body) = send_request(&app, Method::GET, &scoped_uri, None, Some(STORE_SCOPED_KEY)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"]["code"], "MISSING_REQUIRED_FIELD");
+
+    let scoped_uri = format!(
+        "/api/v1/x402/payments?tenant_id={}&store_id={}",
+        STORE_SCOPED_TENANT, STORE_SCOPED_STORE
+    );
+    let (status, _) = send_request(&app, Method::GET, &scoped_uri, None, Some(STORE_SCOPED_KEY)).await;
     assert_eq!(status, StatusCode::OK);
 }
 

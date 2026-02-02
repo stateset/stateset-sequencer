@@ -400,6 +400,8 @@ pub struct AppState {
     pub public_registration_enabled: bool,
     /// Public registration rate limiter (per IP or fallback key)
     pub public_registration_limiter: Option<Arc<RateLimiter>>,
+    /// Whether to trust proxy headers for client IP extraction
+    pub trust_proxy_headers: bool,
     /// Optional audit logger
     pub audit_logger: Option<Arc<PgAuditLogger>>,
 }
@@ -490,6 +492,11 @@ pub async fn run() -> anyhow::Result<()> {
             }
             Arc::new(RateLimiter::with_config(config))
         });
+
+    let trust_proxy_headers = std::env::var("TRUST_PROXY_HEADERS")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false);
 
     let request_limits = RequestLimits::from_env();
     info!(
@@ -761,6 +768,7 @@ pub async fn run() -> anyhow::Result<()> {
         api_key_store: api_key_store.clone(),
         public_registration_enabled,
         public_registration_limiter,
+        trust_proxy_headers,
         audit_logger,
     };
 
@@ -836,7 +844,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Run both servers
     tokio::select! {
-        result = axum::serve(listener, app) => {
+        result = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()) => {
             if let Err(e) = result {
                 tracing::error!("HTTP server error: {}", e);
             }
@@ -963,7 +971,7 @@ fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppSta
     ));
 
     let anchor_compat = crate::api::anchor_compat_router().layer(
-        axum::middleware::from_fn_with_state(auth_state, crate::auth::auth_middleware),
+        axum::middleware::from_fn_with_state(auth_state.clone(), crate::auth::auth_middleware),
     );
 
     let metrics_router = Router::new()
@@ -973,13 +981,23 @@ fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppSta
             crate::auth::auth_middleware,
         ));
 
+    let detailed_health_router = Router::new()
+        .route(
+            "/health/detailed",
+            get(crate::api::handlers::health::detailed_health_check),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            crate::auth::auth_middleware,
+        ));
+
     let mut router = Router::new()
         .nest("/api", public_api)
         .merge(metrics_router)
+        .merge(detailed_health_router)
         .merge(anchor_compat)
         .nest("/api", api)
         .route("/health", get(crate::api::handlers::health::health_check))
-        .route("/health/detailed", get(crate::api::handlers::health::detailed_health_check))
         .route("/ready", get(crate::api::handlers::health::readiness_check))
         .layer(TraceLayer::new_for_http());
 
@@ -1109,6 +1127,7 @@ mod tests {
             api_key_store,
             public_registration_enabled: true,
             public_registration_limiter: None,
+            trust_proxy_headers: false,
             audit_logger: None,
         }
     }

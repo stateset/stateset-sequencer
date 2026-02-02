@@ -262,6 +262,8 @@ GET /metrics    # Prometheus metrics
 | `DB_APPLICATION_NAME` | `stateset-sequencer` | PostgreSQL `application_name` for write pool |
 | `READ_DB_APPLICATION_NAME` | `${DB_APPLICATION_NAME}-read` | PostgreSQL `application_name` for read pool |
 | `DB_MIGRATE_ON_STARTUP` | `true` | Auto-run SQL migrations on startup |
+| `PUBLIC_AGENT_REGISTRATION_ENABLED` | `true` | Enable public agent self-registration |
+| `TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `Forwarded` / `X-Real-IP` when extracting client IPs |
 
 ### Database Pool Tuning
 
@@ -316,6 +318,9 @@ GET /metrics    # Prometheus metrics
 | `RATE_LIMIT_PER_MINUTE` | (unset) | Global per-tenant rate limit |
 | `RATE_LIMIT_MAX_ENTRIES` | `10000` | Max tracked rate limit entries |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window duration |
+| `PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE` | (unset) | Per-IP rate limit for public agent registration |
+| `PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES` | `10000` | Max tracked public registration rate limit entries |
+| `PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS` | `60` | Public registration rate limit window duration |
 
 ### Request Limits
 

@@ -5,9 +5,10 @@
 //! - List their signing keys
 //! - Get agent status and metadata
 
-use axum::extract::{Extension, Path, State};
+use axum::extract::{ConnectInfo, Extension, Path, State};
 use axum::http::{header::USER_AGENT, HeaderMap, StatusCode};
 use axum::Json;
+use std::net::SocketAddr;
 use tracing::{info, instrument, warn};
 use uuid::Uuid;
 
@@ -26,12 +27,13 @@ use crate::server::AppState;
 #[instrument(skip(state, request), fields(agent_name = %request.name))]
 pub async fn register_agent(
     State(state): State<AppState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<AgentRegistrationRequest>,
 ) -> Result<Json<AgentRegistrationResponse>, (StatusCode, Json<serde_json::Value>)> {
     info!("Registering new agent: {}", request.name);
 
-    let client_ip = extract_client_ip(&headers);
+    let client_ip = extract_client_ip(&headers, remote_addr, state.trust_proxy_headers);
     let user_agent = headers
         .get(USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -222,7 +224,21 @@ pub async fn register_agent(
     }))
 }
 
-fn extract_client_ip(headers: &HeaderMap) -> Option<String> {
+fn extract_client_ip(
+    headers: &HeaderMap,
+    remote_addr: SocketAddr,
+    trust_proxy_headers: bool,
+) -> Option<String> {
+    if trust_proxy_headers {
+        if let Some(ip) = extract_forwarded_ip(headers) {
+            return Some(ip);
+        }
+    }
+
+    Some(remote_addr.ip().to_string())
+}
+
+fn extract_forwarded_ip(headers: &HeaderMap) -> Option<String> {
     if let Some(forwarded) = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -325,34 +341,51 @@ pub async fn get_agent(
     }
 
     // Get API keys for this agent to determine status
-    let keys = state
-        .api_key_store
-        .list_for_tenant(&auth.tenant_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("Failed to fetch agent: {:?}", e),
-                    "code": "INTERNAL_ERROR"
-                })),
-            )
-        })?;
+    let agent_keys = if auth.is_admin() && auth.tenant_id.is_nil() {
+        state
+            .api_key_store
+            .list_for_agent(&agent_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to fetch agent: {:?}", e),
+                        "code": "INTERNAL_ERROR"
+                    })),
+                )
+            })?
+    } else {
+        let keys = state
+            .api_key_store
+            .list_for_tenant(&auth.tenant_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to fetch agent: {:?}", e),
+                        "code": "INTERNAL_ERROR"
+                    })),
+                )
+            })?;
+        keys.into_iter()
+            .filter(|k| k.agent_id == Some(agent_id))
+            .collect()
+    };
 
-    let agent_key = keys
-        .iter()
-        .find(|k| k.agent_id == Some(agent_id))
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": "Agent not found",
-                    "code": "NOT_FOUND"
-                })),
-            )
-        })?;
+    let agent_key = agent_keys.first().ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Agent not found",
+                "code": "NOT_FOUND"
+            })),
+        )
+    })?;
 
     Ok(Json(AgentResponse {
         agent_id,
@@ -390,8 +423,64 @@ pub async fn create_agent_api_key(
         ));
     }
 
+    let tenant_id = if auth.is_admin() && auth.tenant_id.is_nil() {
+        let keys = state
+            .api_key_store
+            .list_for_agent(&agent_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to fetch agent: {:?}", e),
+                        "code": "INTERNAL_ERROR"
+                    })),
+                )
+            })?;
+        let agent_key = keys.first().ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Agent not found",
+                    "code": "NOT_FOUND"
+                })),
+            )
+        })?;
+        agent_key.tenant_id
+    } else {
+        if auth.is_admin() && auth.agent_id != Some(agent_id) {
+            let keys = state
+                .api_key_store
+                .list_for_tenant(&auth.tenant_id)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "error": format!("Failed to fetch agent: {:?}", e),
+                            "code": "INTERNAL_ERROR"
+                        })),
+                    )
+                })?;
+            if !keys.iter().any(|k| k.agent_id == Some(agent_id)) {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": "Agent not found",
+                        "code": "NOT_FOUND"
+                    })),
+                ));
+            }
+        }
+        auth.tenant_id
+    };
+
     // Generate new API key
-    let (plaintext_key, key_hash) = ApiKeyValidator::generate_key(&auth.tenant_id);
+    let (plaintext_key, key_hash) = ApiKeyValidator::generate_key(&tenant_id);
 
     let permissions = if request.admin.unwrap_or(false) && auth.is_admin() {
         Permissions::admin()
@@ -403,7 +492,7 @@ pub async fn create_agent_api_key(
 
     let api_key_record = ApiKeyRecord {
         key_hash: key_hash.clone(),
-        tenant_id: auth.tenant_id,
+        tenant_id,
         store_ids: request.store_ids.clone().unwrap_or_default(),
         permissions,
         agent_id: Some(agent_id),
@@ -458,24 +547,44 @@ pub async fn list_agent_api_keys(
         ));
     }
 
-    let all_keys = state
-        .api_key_store
-        .list_for_tenant(&auth.tenant_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("Failed to list keys: {:?}", e),
-                    "code": "INTERNAL_ERROR"
-                })),
-            )
-        })?;
+    let agent_keys = if auth.is_admin() && auth.tenant_id.is_nil() {
+        state
+            .api_key_store
+            .list_for_agent(&agent_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to list keys: {:?}", e),
+                        "code": "INTERNAL_ERROR"
+                    })),
+                )
+            })?
+    } else {
+        let all_keys = state
+            .api_key_store
+            .list_for_tenant(&auth.tenant_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to list keys: {:?}", e),
+                        "code": "INTERNAL_ERROR"
+                    })),
+                )
+            })?;
+        all_keys
+            .into_iter()
+            .filter(|k| k.agent_id == Some(agent_id))
+            .collect()
+    };
 
-    let agent_keys: Vec<_> = all_keys
+    let agent_keys: Vec<_> = agent_keys
         .into_iter()
-        .filter(|k| k.agent_id == Some(agent_id))
         .map(|k| crate::api::types::ApiKeyInfo {
             key_hash_prefix: k.key_hash[..16].to_string(),
             active: k.active,
@@ -517,20 +626,37 @@ pub async fn revoke_agent_api_key(
     }
 
     // Find the key by prefix
-    let all_keys = state
-        .api_key_store
-        .list_for_tenant(&auth.tenant_id)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": format!("Failed to list keys: {:?}", e),
-                    "code": "INTERNAL_ERROR"
-                })),
-            )
-        })?;
+    let all_keys = if auth.is_admin() && auth.tenant_id.is_nil() {
+        state
+            .api_key_store
+            .list_for_agent(&agent_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to list keys: {:?}", e),
+                        "code": "INTERNAL_ERROR"
+                    })),
+                )
+            })?
+    } else {
+        state
+            .api_key_store
+            .list_for_tenant(&auth.tenant_id)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Failed to list keys: {:?}", e),
+                        "code": "INTERNAL_ERROR"
+                    })),
+                )
+            })?
+    };
 
     let key_to_revoke = all_keys
         .iter()

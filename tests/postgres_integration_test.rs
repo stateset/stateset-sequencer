@@ -373,6 +373,7 @@ async fn postgres_ves_validity_proofs_rest_flow() {
         api_key_store,
         public_registration_enabled: true,
         public_registration_limiter: None,
+        trust_proxy_headers: false,
         audit_logger: None,
     };
 
@@ -682,6 +683,7 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
         api_key_store,
         public_registration_enabled: true,
         public_registration_limiter: None,
+        trust_proxy_headers: false,
         audit_logger: None,
     };
 

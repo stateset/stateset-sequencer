@@ -463,6 +463,12 @@ pub async fn list_payment_intents(
     let tenant_id = filter.tenant_id.ok_or_else(|| {
         ApiError::new(ErrorCode::MissingRequiredField, "tenant_id is required")
     })?;
+    if filter.store_id.is_none() && !auth.store_ids.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::MissingRequiredField,
+            "store_id is required for store-scoped keys",
+        ));
+    }
     let store_id = filter.store_id.unwrap_or_else(Uuid::nil);
 
     ensure_read(&auth, tenant_id, store_id)

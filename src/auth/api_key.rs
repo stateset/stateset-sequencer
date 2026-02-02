@@ -152,6 +152,9 @@ pub trait ApiKeyStore: Send + Sync {
     /// List API keys for a tenant
     async fn list_for_tenant(&self, tenant_id: &Uuid) -> Result<Vec<ApiKeyRecord>, AuthError>;
 
+    /// List API keys for an agent
+    async fn list_for_agent(&self, agent_id: &Uuid) -> Result<Vec<ApiKeyRecord>, AuthError>;
+
     /// Whether any active API keys exist
     async fn has_any_active(&self) -> Result<bool, AuthError>;
 }
@@ -287,6 +290,24 @@ impl ApiKeyStore for PgApiKeyStore {
             "#,
         )
         .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|_| AuthError::InvalidApiKey)?;
+
+        Ok(rows.into_iter().map(ApiKeyRow::into_record).collect())
+    }
+
+    async fn list_for_agent(&self, agent_id: &Uuid) -> Result<Vec<ApiKeyRecord>, AuthError> {
+        let rows = sqlx::query_as::<_, ApiKeyRow>(
+            r#"
+            SELECT key_hash, tenant_id, store_ids, can_read, can_write, can_admin,
+                   agent_id, active, rate_limit
+            FROM api_keys
+            WHERE agent_id = $1
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .bind(agent_id)
         .fetch_all(&self.pool)
         .await
         .map_err(|_| AuthError::InvalidApiKey)?;
