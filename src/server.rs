@@ -32,7 +32,7 @@ use crate::proto::v2::sequencer_server::SequencerServer as SequencerServerV2;
 
 use crate::anchor::{AnchorConfig, AnchorService};
 use crate::auth::{
-    ApiKeyRecord, ApiKeyValidator, AuthContextExt, AuthMiddlewareState, Authenticator,
+    ApiKeyRecord, ApiKeyStore, ApiKeyValidator, AuthContextExt, AuthMiddlewareState, Authenticator,
     JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RateLimiterConfig, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};

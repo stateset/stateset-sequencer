@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::domain::{EventEnvelope, VesEventEnvelope};
+use crate::domain::EventEnvelope;
+pub use crate::domain::VesEventEnvelope;
 
 // ============================================================================
 // Ingest types

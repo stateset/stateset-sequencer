@@ -159,6 +159,59 @@ pub struct VesSequencer<R: AgentKeyRegistry> {
 }
 
 impl<R: AgentKeyRegistry> VesSequencer<R> {
+    const MAX_SEQUENCE: u64 = i64::MAX as u64;
+
+    fn decode_sequence(value: i64) -> Result<u64> {
+        u64::try_from(value).map_err(|_| SequencerError::InvariantViolation {
+            invariant: "sequence_counter".to_string(),
+            message: "sequence counter must be a non-negative BIGINT".to_string(),
+        })
+    }
+
+    fn encode_sequence(value: u64) -> Result<i64> {
+        i64::try_from(value).map_err(|_| SequencerError::InvariantViolation {
+            invariant: "sequence_counter".to_string(),
+            message: format!(
+                "sequence counter must be <= {}",
+                Self::MAX_SEQUENCE
+            ),
+        })
+    }
+
+    fn ensure_sequence_capacity(head: u64, count: usize) -> Result<()> {
+        if head > Self::MAX_SEQUENCE {
+            return Err(SequencerError::InvariantViolation {
+                invariant: "sequence_counter".to_string(),
+                message: format!(
+                    "sequence counter must be <= {}",
+                    Self::MAX_SEQUENCE
+                ),
+            });
+        }
+        if count == 0 {
+            return Ok(());
+        }
+        let count_u64 = u64::try_from(count).map_err(|_| SequencerError::InvariantViolation {
+            invariant: "sequence_counter".to_string(),
+            message: "sequence counter increment overflow".to_string(),
+        })?;
+        let last = head
+            .checked_add(count_u64)
+            .ok_or_else(|| SequencerError::InvariantViolation {
+                invariant: "sequence_counter".to_string(),
+                message: "sequence counter overflow".to_string(),
+            })?;
+        if last > Self::MAX_SEQUENCE {
+            return Err(SequencerError::InvariantViolation {
+                invariant: "sequence_counter".to_string(),
+                message: format!(
+                    "sequence counter must be <= {}",
+                    Self::MAX_SEQUENCE
+                ),
+            });
+        }
+        Ok(())
+    }
     fn decode_event_row(row: VesEventRow) -> Result<SequencedVesEvent> {
         let plain_hash: Hash256 = row
             .payload_plain_hash
@@ -182,6 +235,16 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             None
         };
 
+        let base_version = row
+            .base_version
+            .map(|v| {
+                u64::try_from(v).map_err(|_| SequencerError::InvariantViolation {
+                    invariant: "entity_version".to_string(),
+                    message: "entity version must be non-negative".to_string(),
+                })
+            })
+            .transpose()?;
+
         let envelope = VesEventEnvelope {
             ves_version: row.ves_version as u32,
             event_id: row.event_id,
@@ -201,10 +264,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             payload_plain_hash: plain_hash,
             payload_cipher_hash: cipher_hash,
             agent_signature: signature,
-            sequence_number: Some(row.sequence_number as u64),
+            sequence_number: Some(Self::decode_sequence(row.sequence_number)?),
             sequenced_at: Some(row.sequenced_at),
             command_id: row.command_id,
-            base_version: row.base_version.map(|v| v as u64),
+            base_version,
         };
 
         Ok(SequencedVesEvent { envelope })
@@ -281,7 +344,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .fetch_one(&mut **tx)
         .await?;
 
-        Ok(row.0 as u64)
+        Self::decode_sequence(row.0)
     }
 
     async fn set_sequence_counter(
@@ -291,6 +354,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         store_id: &StoreId,
         head: u64,
     ) -> Result<()> {
+        let head = Self::encode_sequence(head)?;
         sqlx::query(
             r#"
             UPDATE ves_sequence_counters
@@ -301,7 +365,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(head as i64)
+        .bind(head)
         .execute(&mut **tx)
         .await?;
         Ok(())
@@ -317,7 +381,30 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| r.0 as u64).unwrap_or(0))
+        Ok(row
+            .map(|r| Self::decode_sequence(r.0))
+            .transpose()?
+            .unwrap_or(0))
+    }
+
+    async fn head_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+    ) -> Result<u64> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT current_sequence FROM ves_sequence_counters WHERE tenant_id = $1 AND store_id = $2",
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        Ok(row
+            .map(|r| Self::decode_sequence(r.0))
+            .transpose()?
+            .unwrap_or(0))
     }
 
     async fn get_existing_event(
@@ -382,7 +469,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         Ok(Some(VesSequencerReceipt {
             sequencer_id: row.sequencer_id,
             event_id,
-            sequence_number: row.sequence_number as u64,
+            sequence_number: Self::decode_sequence(row.sequence_number)?,
             sequenced_at: row.sequenced_at,
             receipt_hash,
             signature_alg,
@@ -755,6 +842,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         let sequenced_at_dt = env.sequenced_at.unwrap_or_else(Utc::now);
 
         let event_signing_hash = event.compute_signing_hash();
+        let sequence_number = Self::encode_sequence(event.sequence_number())?;
 
         // Serialize payload or encrypted payload
         let (payload_json, encrypted_json) = if env.is_plaintext() {
@@ -819,7 +907,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .bind(env.payload_cipher_hash.as_slice())
         .bind(event_signing_hash.as_slice())
         .bind(env.agent_signature.as_slice())
-        .bind(event.sequence_number() as i64)
+        .bind(sequence_number)
         .bind(env.base_version.map(|v| v as i64))
         .execute(&mut **tx)
         .await?;
@@ -832,6 +920,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         tx: &mut Transaction<'_, Postgres>,
         receipt: &VesSequencerReceipt,
     ) -> Result<()> {
+        let sequence_number = Self::encode_sequence(receipt.sequence_number)?;
         sqlx::query(
             r#"
             INSERT INTO ves_sequencer_receipts (
@@ -845,7 +934,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         )
         .bind(receipt.event_id)
         .bind(receipt.sequencer_id)
-        .bind(receipt.sequence_number as i64)
+        .bind(sequence_number)
         .bind(receipt.sequenced_at)
         .bind(receipt.receipt_hash.as_slice())
         .bind(
@@ -916,7 +1005,14 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .fetch_optional(&mut **tx)
         .await?;
 
-        Ok(row.map(|(v,)| v as u64))
+        Ok(row
+            .map(|(v,)| {
+                u64::try_from(v).map_err(|_| SequencerError::InvariantViolation {
+                    invariant: "entity_version".to_string(),
+                    message: "entity version must be non-negative".to_string(),
+                })
+            })
+            .transpose()?)
     }
 
     /// Bump entity version within a transaction
@@ -981,15 +1077,9 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     /// Ingest a batch of VES events
     pub async fn ingest(&self, events: Vec<VesEventEnvelope>) -> Result<VesIngestReceipt> {
         if events.is_empty() {
-            return Ok(VesIngestReceipt {
-                batch_id: Uuid::new_v4(),
-                events_accepted: 0,
-                events_rejected: Vec::new(),
-                assigned_sequence_start: None,
-                assigned_sequence_end: None,
-                head_sequence: 0,
-                receipts: Vec::new(),
-            });
+            return Err(SequencerError::SchemaValidation(
+                "events must not be empty".to_string(),
+            ));
         }
 
         let batch_id = Uuid::new_v4();
@@ -1007,9 +1097,6 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         }
 
         let mut tx = self.pool.begin().await?;
-        let mut head = self
-            .lock_sequence_counter(&mut tx, &tenant_id, &store_id)
-            .await?;
 
         let mut rejected = Vec::new();
         let mut receipts = Vec::new();
@@ -1122,6 +1209,18 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             valid_events.push(event);
         }
 
+        let valid_events_len = valid_events.len();
+        // Lock sequence counter only after validation/dedupe to minimize lock duration.
+        let mut head = if valid_events_len == 0 {
+            self.head_tx(&mut tx, &tenant_id, &store_id).await?
+        } else {
+            let head = self
+                .lock_sequence_counter(&mut tx, &tenant_id, &store_id)
+                .await?;
+            Self::ensure_sequence_capacity(head, valid_events_len)?;
+            head
+        };
+
         for event in valid_events {
             // Check base_version for optimistic concurrency control at ingest time
             if let Some(expected_version) = event.base_version {
@@ -1159,7 +1258,12 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 }
             }
 
-            let next_seq = head.saturating_add(1);
+            let next_seq = head.checked_add(1).ok_or_else(|| {
+                SequencerError::InvariantViolation {
+                    invariant: "sequence_counter".to_string(),
+                    message: "sequence counter overflow".to_string(),
+                }
+            })?;
             let sequenced = SequencedVesEvent::new(event, next_seq);
 
             let inserted = self.store_event_tx(&mut tx, &sequenced).await?;
@@ -1875,5 +1979,28 @@ mod tests {
             }
             other => panic!("unexpected rejection: {:?}", other),
         }
+    }
+
+    #[test]
+    fn sequence_capacity_allows_within_limit() {
+        let head = 10;
+        let count = 5;
+        let result =
+            VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_capacity(head, count);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn sequence_capacity_rejects_overflow() {
+        let head = VesSequencer::<InMemoryAgentKeyRegistry>::MAX_SEQUENCE;
+        let result =
+            VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_capacity(head, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn decode_sequence_rejects_negative() {
+        let result = VesSequencer::<InMemoryAgentKeyRegistry>::decode_sequence(-1);
+        assert!(result.is_err());
     }
 }

@@ -565,6 +565,10 @@ impl SequencerTrait for SequencerServiceV2 {
             "Processing v2 Push request"
         );
 
+        if req.events.is_empty() {
+            return Err(Status::invalid_argument("events must not be empty"));
+        }
+
         let tenant_id = Uuid::parse_str(&req.tenant_id)
             .map_err(|e| Status::invalid_argument(format!("invalid tenant_id: {}", e)))?;
         let store_id = Uuid::parse_str(&req.store_id)
@@ -1569,6 +1573,11 @@ impl SequencerTrait for SequencerServiceV2 {
                                                 continue;
                                             }
                                         };
+
+                                        if push_req.events.is_empty() {
+                                            let _ = tx.send(Err(Status::invalid_argument("events must not be empty"))).await;
+                                            continue;
+                                        }
 
                                         let mut events = Vec::with_capacity(push_req.events.len());
                                         let mut has_error = false;

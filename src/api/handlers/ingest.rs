@@ -577,29 +577,34 @@ pub async fn ingest_ves_events(
     let mut tenant_id = Uuid::nil();
     let mut store_id = Uuid::nil();
 
-    if !request.events.is_empty() {
-        let first = &request.events[0];
-        tenant_id = first.tenant_id.0;
-        store_id = first.store_id.0;
-
-        for e in &request.events {
-            if e.tenant_id.0 != tenant_id || e.store_id.0 != store_id {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    "All events in a batch must share the same tenantId and storeId".to_string(),
-                ));
-            }
-        }
-
-        // If auth is scoped to an agent, require it matches the request.
-        if let Some(agent_id) = auth.agent_id {
-            if agent_id != request.agent_id {
-                return Err((StatusCode::FORBIDDEN, "Agent mismatch".to_string()));
-            }
-        }
-
-        ensure_write(&auth, tenant_id, store_id)?;
+    if request.events.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "events must not be empty".to_string(),
+        ));
     }
+
+    let first = &request.events[0];
+    tenant_id = first.tenant_id.0;
+    store_id = first.store_id.0;
+
+    for e in &request.events {
+        if e.tenant_id.0 != tenant_id || e.store_id.0 != store_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "All events in a batch must share the same tenantId and storeId".to_string(),
+            ));
+        }
+    }
+
+    // If auth is scoped to an agent, require it matches the request.
+    if let Some(agent_id) = auth.agent_id {
+        if agent_id != request.agent_id {
+            return Err((StatusCode::FORBIDDEN, "Agent mismatch".to_string()));
+        }
+    }
+
+    ensure_write(&auth, tenant_id, store_id)?;
 
     enforce_ves_limits(&state.request_limits, &request.events)?;
 

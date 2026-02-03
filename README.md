@@ -134,6 +134,7 @@ Content-Type: application/json
   ]
 }
 ```
+Note: `events` must contain at least one event.
 
 **Response:**
 ```json

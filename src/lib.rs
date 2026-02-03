@@ -34,6 +34,7 @@ pub mod telemetry;
 pub use domain::{
     AgentId, BatchCommitment, EntityType, EventBatch, EventEnvelope, EventType, Hash256,
     IngestReceipt, MerkleProof, ProjectionResult, SequencedEvent, StoreId, SyncState, TenantId,
+    VesEventEnvelope,
 };
 
 pub use infra::{
