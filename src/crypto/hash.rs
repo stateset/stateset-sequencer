@@ -770,7 +770,10 @@ mod rfc8785_tests {
     #[test]
     fn test_rfc8785_string_escaping() {
         // Control characters must be escaped
-        assert_eq!(canonicalize_json(&json!("hello\nworld")), r#""hello\nworld""#);
+        assert_eq!(
+            canonicalize_json(&json!("hello\nworld")),
+            r#""hello\nworld""#
+        );
         assert_eq!(canonicalize_json(&json!("tab\there")), r#""tab\there""#);
         assert_eq!(canonicalize_json(&json!("quote\"")), r#""quote\"""#);
         assert_eq!(canonicalize_json(&json!("backslash\\")), r#""backslash\\""#);
@@ -813,7 +816,10 @@ mod rfc8785_tests {
             }
         });
         let canonical = canonicalize_json(&value);
-        assert_eq!(canonical, r#"{"level1":{"level2":{"level3":{"value":42}}}}"#);
+        assert_eq!(
+            canonical,
+            r#"{"level1":{"level2":{"level3":{"value":42}}}}"#
+        );
     }
 
     /// Test RFC 8785 array ordering (arrays preserve order, not sorted)
@@ -859,7 +865,10 @@ mod rfc8785_tests {
         let hash1 = payload_plain_hash(&value1);
         let hash2 = payload_plain_hash(&value2);
 
-        assert_eq!(hash1, hash2, "Same content with different key order should produce identical hash");
+        assert_eq!(
+            hash1, hash2,
+            "Same content with different key order should produce identical hash"
+        );
     }
 
     /// Test known RFC 8785 test vectors (from the RFC specification)

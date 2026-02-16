@@ -57,14 +57,6 @@ impl Labels {
         self.with("circuit", name)
     }
 
-    fn to_suffix(&self) -> String {
-        if self.0.is_empty() {
-            return String::new();
-        }
-        let parts: Vec<String> = self.0.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
-        format!("{{{}}}", parts.join(","))
-    }
-
     fn to_prometheus_labels(&self) -> String {
         if self.0.is_empty() {
             return String::new();
@@ -76,12 +68,31 @@ impl Labels {
             .collect();
         format!("{{{}}}", parts.join(","))
     }
+
+    fn to_prometheus_labels_with(&self, key: &str, value: &str) -> String {
+        if self.0.is_empty() {
+            return format!("{{{}=\"{}\"}}", key, value);
+        }
+
+        let mut parts: Vec<String> = Vec::with_capacity(self.0.len() + 1);
+        parts.push(format!("{}=\"{}\"", key, value));
+        parts.extend(self.0.iter().map(|(k, v)| format!("{}=\"{}\"", k, v)));
+        format!("{{{}}}", parts.join(","))
+    }
 }
 
 impl Default for Labels {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Maximum label combinations per metric name before aggregating into overflow bucket
+const DEFAULT_MAX_CARDINALITY: usize = 1000;
+
+/// Overflow label used when cardinality limit is exceeded
+fn overflow_labels() -> Labels {
+    Labels::new().with("__overflow__", "true")
 }
 
 /// Global metrics registry
@@ -106,6 +117,12 @@ pub struct MetricsRegistry {
 
     /// Service start time
     start_time: Instant,
+
+    /// Maximum unique label combinations per metric name (prevents memory exhaustion)
+    max_cardinality_per_metric: usize,
+
+    /// Counter for cardinality overflow events
+    cardinality_overflows: AtomicU64,
 }
 
 impl MetricsRegistry {
@@ -118,7 +135,15 @@ impl MetricsRegistry {
             histograms: RwLock::new(HashMap::new()),
             labeled_histograms: RwLock::new(HashMap::new()),
             start_time: Instant::now(),
+            max_cardinality_per_metric: DEFAULT_MAX_CARDINALITY,
+            cardinality_overflows: AtomicU64::new(0),
         }
+    }
+
+    /// Create a registry with a custom cardinality limit per metric
+    pub fn with_max_cardinality(mut self, max: usize) -> Self {
+        self.max_cardinality_per_metric = max;
+        self
     }
 
     /// Increment a counter
@@ -201,7 +226,7 @@ impl MetricsRegistry {
         self.add_counter_labeled(name, labels, 1).await;
     }
 
-    /// Add to a labeled counter
+    /// Add to a labeled counter (cardinality-bounded)
     pub async fn add_counter_labeled(&self, name: &str, labels: Labels, value: u64) {
         let counters = self.labeled_counters.read().await;
         if let Some(label_map) = counters.get(name) {
@@ -212,16 +237,26 @@ impl MetricsRegistry {
         }
         drop(counters);
 
-        // Create new counter
         let mut counters = self.labeled_counters.write().await;
         let label_map = counters.entry(name.to_string()).or_default();
+
+        // Cardinality guard: if this label set is new and we're at the limit, use overflow bucket
+        let effective_labels = if !label_map.contains_key(&labels)
+            && label_map.len() >= self.max_cardinality_per_metric
+        {
+            self.cardinality_overflows.fetch_add(1, Ordering::Relaxed);
+            overflow_labels()
+        } else {
+            labels
+        };
+
         let counter = label_map
-            .entry(labels)
+            .entry(effective_labels)
             .or_insert_with(|| Arc::new(AtomicU64::new(0)));
         counter.fetch_add(value, Ordering::Relaxed);
     }
 
-    /// Set a labeled gauge value
+    /// Set a labeled gauge value (cardinality-bounded)
     pub async fn set_gauge_labeled(&self, name: &str, labels: Labels, value: u64) {
         let gauges = self.labeled_gauges.read().await;
         if let Some(label_map) = gauges.get(name) {
@@ -232,13 +267,22 @@ impl MetricsRegistry {
         }
         drop(gauges);
 
-        // Create new gauge
         let mut gauges = self.labeled_gauges.write().await;
         let label_map = gauges.entry(name.to_string()).or_default();
-        label_map.insert(labels, Arc::new(AtomicU64::new(value)));
+
+        let effective_labels = if !label_map.contains_key(&labels)
+            && label_map.len() >= self.max_cardinality_per_metric
+        {
+            self.cardinality_overflows.fetch_add(1, Ordering::Relaxed);
+            overflow_labels()
+        } else {
+            labels
+        };
+
+        label_map.insert(effective_labels, Arc::new(AtomicU64::new(value)));
     }
 
-    /// Record a labeled histogram observation
+    /// Record a labeled histogram observation (cardinality-bounded)
     pub async fn observe_histogram_labeled(&self, name: &str, labels: Labels, value: f64) {
         let histograms = self.labeled_histograms.read().await;
         if let Some(label_map) = histograms.get(name) {
@@ -249,11 +293,20 @@ impl MetricsRegistry {
         }
         drop(histograms);
 
-        // Create new histogram with default buckets
         let mut histograms = self.labeled_histograms.write().await;
         let label_map = histograms.entry(name.to_string()).or_default();
+
+        let effective_labels = if !label_map.contains_key(&labels)
+            && label_map.len() >= self.max_cardinality_per_metric
+        {
+            self.cardinality_overflows.fetch_add(1, Ordering::Relaxed);
+            overflow_labels()
+        } else {
+            labels
+        };
+
         let histogram = label_map
-            .entry(labels)
+            .entry(effective_labels)
             .or_insert_with(|| Arc::new(Histogram::default()));
         histogram.observe(value).await;
     }
@@ -331,6 +384,17 @@ impl MetricsRegistry {
             self.uptime_seconds()
         ));
 
+        // Cardinality overflow tracking
+        let overflows = self.cardinality_overflows.load(Ordering::Relaxed);
+        if overflows > 0 {
+            output.push_str("# HELP sequencer_metrics_cardinality_overflow Total label sets dropped due to cardinality limits\n");
+            output.push_str("# TYPE sequencer_metrics_cardinality_overflow counter\n");
+            output.push_str(&format!(
+                "sequencer_metrics_cardinality_overflow {}\n",
+                overflows
+            ));
+        }
+
         // Counters
         for (name, counter) in counters.iter() {
             let prometheus_name = name.replace(['.', '-'], "_");
@@ -389,8 +453,7 @@ impl MetricsRegistry {
         // Labeled histograms
         for (name, label_map) in labeled_histograms.iter() {
             for (labels, histogram) in label_map.iter() {
-                let labeled_name = format!("{}{}", name, labels.to_suffix());
-                output.push_str(&histogram.to_prometheus(&labeled_name).await);
+                output.push_str(&histogram.to_prometheus_with_labels(name, labels).await);
             }
         }
 
@@ -491,6 +554,48 @@ impl Histogram {
         output.push_str(&format!(
             "{}_count {}\n",
             prometheus_name,
+            self.count.load(Ordering::Relaxed)
+        ));
+
+        output
+    }
+
+    /// Export as Prometheus format with labels
+    pub async fn to_prometheus_with_labels(&self, name: &str, labels: &Labels) -> String {
+        let prometheus_name = name.replace(['.', '-'], "_");
+        let mut output = String::new();
+
+        output.push_str(&format!("# TYPE {} histogram\n", prometheus_name));
+
+        let counts = self.counts.read().await;
+        let mut cumulative = 0u64;
+
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            cumulative += counts[i].load(Ordering::Relaxed);
+            output.push_str(&format!(
+                "{}_bucket{} {}\n",
+                prometheus_name,
+                labels.to_prometheus_labels_with("le", &bucket.to_string()),
+                cumulative
+            ));
+        }
+
+        output.push_str(&format!(
+            "{}_bucket{} {}\n",
+            prometheus_name,
+            labels.to_prometheus_labels_with("le", "+Inf"),
+            self.count.load(Ordering::Relaxed)
+        ));
+        output.push_str(&format!(
+            "{}_sum{} {}\n",
+            prometheus_name,
+            labels.to_prometheus_labels(),
+            self.sum.load(Ordering::Relaxed) as f64 / 1000.0
+        ));
+        output.push_str(&format!(
+            "{}_count{} {}\n",
+            prometheus_name,
+            labels.to_prometheus_labels(),
             self.count.load(Ordering::Relaxed)
         ));
 
@@ -621,6 +726,12 @@ pub mod metric_names {
     pub const HTTP_REQUESTS_TOTAL: &str = "sequencer.http.requests_total";
     pub const HTTP_REQUEST_LATENCY: &str = "sequencer.http.request_latency_seconds";
     pub const HTTP_RESPONSE_SIZE: &str = "sequencer.http.response_size_bytes";
+
+    // Agent registration metrics
+    pub const AGENT_REGISTRATION_TOTAL: &str = "sequencer.agent.registration_total";
+
+    // Metrics system health
+    pub const METRICS_CARDINALITY_OVERFLOW: &str = "sequencer.metrics.cardinality_overflow";
 }
 
 /// Timer guard for measuring operation duration
@@ -704,16 +815,28 @@ impl ComponentMetrics {
             let stats = monitor.stats().await;
 
             self.metrics
-                .set_gauge(metric_names::POOL_ACTIVE_CONNECTIONS, stats.active_connections as u64)
+                .set_gauge(
+                    metric_names::POOL_ACTIVE_CONNECTIONS,
+                    stats.active_connections as u64,
+                )
                 .await;
             self.metrics
-                .set_gauge(metric_names::POOL_IDLE_CONNECTIONS, stats.idle_connections as u64)
+                .set_gauge(
+                    metric_names::POOL_IDLE_CONNECTIONS,
+                    stats.idle_connections as u64,
+                )
                 .await;
             self.metrics
-                .set_gauge(metric_names::POOL_TOTAL_CONNECTIONS, stats.total_connections as u64)
+                .set_gauge(
+                    metric_names::POOL_TOTAL_CONNECTIONS,
+                    stats.total_connections as u64,
+                )
                 .await;
             self.metrics
-                .set_gauge(metric_names::POOL_MAX_CONNECTIONS, stats.max_connections as u64)
+                .set_gauge(
+                    metric_names::POOL_MAX_CONNECTIONS,
+                    stats.max_connections as u64,
+                )
                 .await;
             self.metrics
                 .set_gauge(
@@ -765,7 +888,11 @@ impl ComponentMetrics {
                         _ => 0u64,
                     };
                     self.metrics
-                        .set_gauge_labeled(metric_names::CIRCUIT_BREAKER_STATE, labels.clone(), state_value)
+                        .set_gauge_labeled(
+                            metric_names::CIRCUIT_BREAKER_STATE,
+                            labels.clone(),
+                            state_value,
+                        )
                         .await;
 
                     // Stats from the circuit breaker
@@ -803,15 +930,29 @@ impl ComponentMetrics {
         }
     }
 
-    /// Start a background task that periodically updates metrics
+    /// Start a background task that periodically updates metrics.
+    ///
+    /// If a `ShutdownSignal` is provided, the task stops when shutdown is signaled.
+    /// Otherwise, it runs until the process exits.
     pub fn start_collection_task(
         self: Arc<Self>,
         interval: std::time::Duration,
+        shutdown: Option<crate::infra::ShutdownSignal>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(interval);
             loop {
-                tick.tick().await;
+                if let Some(ref signal) = shutdown {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = signal.wait() => {
+                            tracing::info!("Metrics collection task stopping due to shutdown");
+                            break;
+                        }
+                    }
+                } else {
+                    tick.tick().await;
+                }
                 self.update().await;
             }
         })
@@ -821,16 +962,28 @@ impl ComponentMetrics {
 /// Record pool stats directly to metrics registry
 pub async fn record_pool_stats(metrics: &MetricsRegistry, stats: &PoolStats) {
     metrics
-        .set_gauge(metric_names::POOL_ACTIVE_CONNECTIONS, stats.active_connections as u64)
+        .set_gauge(
+            metric_names::POOL_ACTIVE_CONNECTIONS,
+            stats.active_connections as u64,
+        )
         .await;
     metrics
-        .set_gauge(metric_names::POOL_IDLE_CONNECTIONS, stats.idle_connections as u64)
+        .set_gauge(
+            metric_names::POOL_IDLE_CONNECTIONS,
+            stats.idle_connections as u64,
+        )
         .await;
     metrics
-        .set_gauge(metric_names::POOL_TOTAL_CONNECTIONS, stats.total_connections as u64)
+        .set_gauge(
+            metric_names::POOL_TOTAL_CONNECTIONS,
+            stats.total_connections as u64,
+        )
         .await;
     metrics
-        .set_gauge(metric_names::POOL_MAX_CONNECTIONS, stats.max_connections as u64)
+        .set_gauge(
+            metric_names::POOL_MAX_CONNECTIONS,
+            stats.max_connections as u64,
+        )
         .await;
     metrics
         .set_gauge(
@@ -891,5 +1044,37 @@ mod tests {
         let prometheus = registry.to_prometheus().await;
         assert!(prometheus.contains("test_counter 1"));
         assert!(prometheus.contains("test_gauge 42"));
+    }
+
+    #[tokio::test]
+    async fn test_cardinality_limit_enforced() {
+        let registry = MetricsRegistry::new().with_max_cardinality(3);
+
+        // First 3 unique label sets should be stored normally
+        for i in 0..3 {
+            let labels = Labels::new().tenant(&format!("tenant-{i}"));
+            registry.inc_counter_labeled("test.metric", labels).await;
+        }
+
+        // 4th unique label set should be redirected to overflow
+        let labels = Labels::new().tenant("tenant-overflow");
+        registry.inc_counter_labeled("test.metric", labels).await;
+
+        assert_eq!(registry.cardinality_overflows.load(Ordering::Relaxed), 1);
+
+        // The overflow bucket should have the value
+        let overflow_val = registry
+            .get_counter_labeled("test.metric", &overflow_labels())
+            .await;
+        assert_eq!(overflow_val, 1);
+
+        // Original 3 should still be there
+        for i in 0..3 {
+            let labels = Labels::new().tenant(&format!("tenant-{i}"));
+            assert_eq!(
+                registry.get_counter_labeled("test.metric", &labels).await,
+                1
+            );
+        }
     }
 }

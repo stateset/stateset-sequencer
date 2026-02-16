@@ -29,7 +29,7 @@
 use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::Json;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::api::auth_helpers::ensure_write;
@@ -43,6 +43,7 @@ use crate::domain::{
     VesEventEnvelope,
 };
 use crate::infra::{IngestService, SchemaStore, SchemaValidationMode, Sequencer};
+use crate::metrics::{metric_names, TimerGuard};
 use crate::server::AppState;
 
 /// Validate events against registered schemas.
@@ -112,7 +113,10 @@ async fn validate_events_against_schemas(
             }
 
             // Log warning if in warn mode
-            if matches!(validation_mode, crate::infra::SchemaValidationMode::WarnOnly) {
+            if matches!(
+                validation_mode,
+                crate::infra::SchemaValidationMode::WarnOnly
+            ) {
                 tracing::warn!(
                     event_id = %event.event_id,
                     event_type = %event.event_type,
@@ -346,7 +350,17 @@ async fn validate_ves_events_against_schemas(
     (valid_events, rejected_events)
 }
 
-fn enforce_batch_limit(limits: &RequestLimits, events_len: usize) -> Result<(), (StatusCode, String)> {
+/// Maximum length for entity_type strings.
+const MAX_ENTITY_TYPE_LEN: usize = 128;
+/// Maximum length for entity_id strings.
+const MAX_ENTITY_ID_LEN: usize = 512;
+/// Maximum length for event_type strings.
+const MAX_EVENT_TYPE_LEN: usize = 256;
+
+fn enforce_batch_limit(
+    limits: &RequestLimits,
+    events_len: usize,
+) -> Result<(), (StatusCode, String)> {
     if events_len > limits.max_events_per_batch {
         return Err((
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -376,6 +390,42 @@ fn enforce_payload_limit(
     Ok(())
 }
 
+fn enforce_string_field_limits(
+    event_id: Uuid,
+    entity_type: &str,
+    entity_id: &str,
+    event_type: &str,
+) -> Result<(), (StatusCode, String)> {
+    if entity_type.is_empty() || entity_type.len() > MAX_ENTITY_TYPE_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Event {} entity_type must be between 1 and {} characters",
+                event_id, MAX_ENTITY_TYPE_LEN
+            ),
+        ));
+    }
+    if entity_id.is_empty() || entity_id.len() > MAX_ENTITY_ID_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Event {} entity_id must be between 1 and {} characters",
+                event_id, MAX_ENTITY_ID_LEN
+            ),
+        ));
+    }
+    if event_type.is_empty() || event_type.len() > MAX_EVENT_TYPE_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Event {} event_type must be between 1 and {} characters",
+                event_id, MAX_EVENT_TYPE_LEN
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn enforce_legacy_limits(
     limits: &RequestLimits,
     events: &[EventEnvelope],
@@ -387,11 +437,21 @@ fn enforce_legacy_limits(
     enforce_batch_limit(limits, events.len())?;
 
     for event in events {
+        enforce_string_field_limits(
+            event.event_id,
+            event.entity_type.as_str(),
+            &event.entity_id,
+            event.event_type.as_str(),
+        )?;
+
         let payload_len = serde_json::to_vec(&event.payload)
             .map_err(|e| {
                 (
                     StatusCode::BAD_REQUEST,
-                    format!("Event {} payload serialization failed: {}", event.event_id, e),
+                    format!(
+                        "Event {} payload serialization failed: {}",
+                        event.event_id, e
+                    ),
                 )
             })?
             .len();
@@ -412,6 +472,13 @@ fn enforce_ves_limits(
     enforce_batch_limit(limits, events.len())?;
 
     for event in events {
+        enforce_string_field_limits(
+            event.event_id,
+            event.entity_type.as_str(),
+            &event.entity_id,
+            event.event_type.as_str(),
+        )?;
+
         let payload_bytes = if event.is_plaintext() {
             let payload = event.payload.as_ref().ok_or((
                 StatusCode::BAD_REQUEST,
@@ -440,7 +507,10 @@ fn enforce_ves_limits(
         let payload_bytes = payload_bytes.map_err(|e| {
             (
                 StatusCode::BAD_REQUEST,
-                format!("Event {} payload serialization failed: {}", event.event_id, e),
+                format!(
+                    "Event {} payload serialization failed: {}",
+                    event.event_id, e
+                ),
             )
         })?;
 
@@ -460,7 +530,12 @@ pub async fn ingest_events(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<IngestRequest>,
 ) -> Result<Json<IngestResponse>, (StatusCode, String)> {
+    let _timer = TimerGuard::new(state.metrics.clone(), metric_names::INGEST_LATENCY);
     info!("Ingesting {} events via legacy API", request.events.len());
+    state
+        .metrics
+        .observe_histogram(metric_names::EVENTS_PER_BATCH, request.events.len() as f64)
+        .await;
     // Require tenant/store consistency and authorization.
     let (tenant_id, store_id) = request
         .events
@@ -497,17 +572,39 @@ pub async fn ingest_events(
         request.events,
     )
     .await;
+    if !schema_rejections.is_empty() {
+        state
+            .metrics
+            .add_counter(
+                metric_names::SCHEMA_VALIDATION_ERRORS,
+                schema_rejections.len() as u64,
+            )
+            .await;
+        state
+            .metrics
+            .add_counter(
+                metric_names::EVENTS_REJECTED,
+                schema_rejections.len() as u64,
+            )
+            .await;
+    }
 
     // If all events were rejected by schema validation, return early
     if valid_events.is_empty() && !schema_rejections.is_empty() {
-        let head = state
+        let head = match state
             .sequencer
             .head(
                 &TenantId::from_uuid(tenant_id),
                 &crate::domain::StoreId::from_uuid(store_id),
             )
             .await
-            .unwrap_or(0);
+        {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Failed to read head sequence: {}", e);
+                0
+            }
+        };
 
         let rejections: Vec<RejectionInfo> = schema_rejections
             .iter()
@@ -533,6 +630,20 @@ pub async fn ingest_events(
 
     match state.sequencer.ingest(batch).await {
         Ok(receipt) => {
+            state
+                .metrics
+                .add_counter(
+                    metric_names::EVENTS_INGESTED,
+                    receipt.events_accepted as u64,
+                )
+                .await;
+            state
+                .metrics
+                .add_counter(
+                    metric_names::EVENTS_SEQUENCED,
+                    receipt.events_accepted as u64,
+                )
+                .await;
             // Combine schema rejections with sequencer rejections
             let mut all_rejections: Vec<RejectionInfo> = schema_rejections
                 .iter()
@@ -548,6 +659,15 @@ pub async fn ingest_events(
                 reason: format!("{:?}", r.reason),
                 message: r.message.clone(),
             }));
+            if !receipt.events_rejected.is_empty() {
+                state
+                    .metrics
+                    .add_counter(
+                        metric_names::EVENTS_REJECTED,
+                        receipt.events_rejected.len() as u64,
+                    )
+                    .await;
+            }
 
             Ok(Json(IngestResponse {
                 batch_id: receipt.batch_id,
@@ -559,7 +679,13 @@ pub async fn ingest_events(
                 rejections: all_rejections,
             }))
         }
-        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+        Err(e) => {
+            state
+                .metrics
+                .inc_counter(metric_names::DATABASE_ERRORS)
+                .await;
+            Err((StatusCode::BAD_REQUEST, e.to_string()))
+        }
     }
 }
 
@@ -573,9 +699,19 @@ pub async fn ingest_ves_events(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<VesIngestRequest>,
 ) -> Result<Json<VesIngestResponse>, (StatusCode, String)> {
+    let _timer = TimerGuard::new(state.metrics.clone(), metric_names::INGEST_LATENCY);
     info!("Ingesting {} VES events", request.events.len());
-    let mut tenant_id = Uuid::nil();
-    let mut store_id = Uuid::nil();
+    state
+        .metrics
+        .observe_histogram(metric_names::EVENTS_PER_BATCH, request.events.len() as f64)
+        .await;
+    state
+        .metrics
+        .add_counter(
+            metric_names::VES_EVENTS_RECEIVED,
+            request.events.len() as u64,
+        )
+        .await;
 
     if request.events.is_empty() {
         return Err((
@@ -585,8 +721,8 @@ pub async fn ingest_ves_events(
     }
 
     let first = &request.events[0];
-    tenant_id = first.tenant_id.0;
-    store_id = first.store_id.0;
+    let tenant_id = first.tenant_id.0;
+    let store_id = first.store_id.0;
 
     for e in &request.events {
         if e.tenant_id.0 != tenant_id || e.store_id.0 != store_id {
@@ -614,16 +750,38 @@ pub async fn ingest_ves_events(
         request.events,
     )
     .await;
+    if !schema_rejections.is_empty() {
+        state
+            .metrics
+            .add_counter(
+                metric_names::SCHEMA_VALIDATION_ERRORS,
+                schema_rejections.len() as u64,
+            )
+            .await;
+        state
+            .metrics
+            .add_counter(
+                metric_names::EVENTS_REJECTED,
+                schema_rejections.len() as u64,
+            )
+            .await;
+    }
 
     if valid_events.is_empty() && !schema_rejections.is_empty() {
-        let head = state
+        let head = match state
             .ves_sequencer
             .head(
                 &TenantId::from_uuid(tenant_id),
                 &StoreId::from_uuid(store_id),
             )
             .await
-            .unwrap_or(0);
+        {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Failed to read VES head sequence: {}", e);
+                0
+            }
+        };
 
         return Ok(Json(VesIngestResponse {
             batch_id: Uuid::new_v4(),
@@ -639,12 +797,42 @@ pub async fn ingest_ves_events(
 
     match state.ves_sequencer.ingest(valid_events).await {
         Ok(receipt) => {
+            state
+                .metrics
+                .add_counter(
+                    metric_names::EVENTS_INGESTED,
+                    receipt.events_accepted as u64,
+                )
+                .await;
+            state
+                .metrics
+                .add_counter(
+                    metric_names::VES_EVENTS_VERIFIED,
+                    receipt.events_accepted as u64,
+                )
+                .await;
+            state
+                .metrics
+                .add_counter(
+                    metric_names::EVENTS_SEQUENCED,
+                    receipt.events_accepted as u64,
+                )
+                .await;
             let mut rejections: Vec<RejectionInfo> = schema_rejections;
             rejections.extend(receipt.events_rejected.iter().map(|r| RejectionInfo {
                 event_id: r.event_id,
                 reason: r.reason.to_string(),
                 message: r.message.clone(),
             }));
+            if !receipt.events_rejected.is_empty() {
+                state
+                    .metrics
+                    .add_counter(
+                        metric_names::EVENTS_REJECTED,
+                        receipt.events_rejected.len() as u64,
+                    )
+                    .await;
+            }
 
             let receipts: Vec<VesReceiptResponse> = receipt
                 .receipts
@@ -675,7 +863,13 @@ pub async fn ingest_ves_events(
                 receipts,
             }))
         }
-        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+        Err(e) => {
+            state
+                .metrics
+                .inc_counter(metric_names::DATABASE_ERRORS)
+                .await;
+            Err((StatusCode::BAD_REQUEST, e.to_string()))
+        }
     }
 }
 

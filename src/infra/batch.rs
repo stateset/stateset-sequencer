@@ -11,12 +11,15 @@ use std::hash::Hash;
 use sqlx::{Executor, Postgres};
 use uuid::Uuid;
 
-use crate::domain::{StoreId, TenantId};
 use super::error::Result;
+use crate::domain::{StoreId, TenantId};
 
-/// Batch size for SQL operations to avoid exceeding parameter limits
-/// PostgreSQL has a limit of ~32k parameters per query
+/// Batch size for SQL operations to avoid exceeding parameter limits.
+/// PostgreSQL has a limit of ~32k parameters per query.
 pub const DEFAULT_BATCH_SIZE: usize = 1000;
+
+/// Absolute upper bound for batch size to prevent resource exhaustion.
+pub const MAX_BATCH_SIZE: usize = 10_000;
 
 /// Configuration for batch operations
 #[derive(Debug, Clone)]
@@ -25,6 +28,16 @@ pub struct BatchConfig {
     pub batch_size: usize,
     /// Maximum concurrent operations (for parallel processing)
     pub max_concurrency: usize,
+}
+
+impl BatchConfig {
+    /// Create a new `BatchConfig` with the given batch size, clamped to `MAX_BATCH_SIZE`.
+    pub fn new(batch_size: usize, max_concurrency: usize) -> Self {
+        Self {
+            batch_size: batch_size.min(MAX_BATCH_SIZE),
+            max_concurrency: max_concurrency.max(1),
+        }
+    }
 }
 
 impl Default for BatchConfig {
@@ -133,12 +146,10 @@ where
 
     let ids: Vec<Uuid> = event_ids.to_vec();
 
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
-        "SELECT event_id FROM events WHERE event_id = ANY($1)",
-    )
-    .bind(&ids)
-    .fetch_all(executor)
-    .await?;
+    let rows: Vec<(Uuid,)> = sqlx::query_as("SELECT event_id FROM events WHERE event_id = ANY($1)")
+        .bind(&ids)
+        .fetch_all(executor)
+        .await?;
 
     Ok(rows.into_iter().map(|(id,)| id).collect())
 }

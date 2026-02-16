@@ -64,12 +64,14 @@ impl PgVesCommitmentEngine {
             )));
         }
 
-        let payload_plain_hash: Hash256 = row.payload_plain_hash.as_slice().try_into().map_err(
-            |_| SequencerError::Internal("invalid payload_plain_hash length".to_string()),
-        )?;
-        let payload_cipher_hash: Hash256 = row.payload_cipher_hash.as_slice().try_into().map_err(
-            |_| SequencerError::Internal("invalid payload_cipher_hash length".to_string()),
-        )?;
+        let payload_plain_hash: Hash256 =
+            row.payload_plain_hash.as_slice().try_into().map_err(|_| {
+                SequencerError::Internal("invalid payload_plain_hash length".to_string())
+            })?;
+        let payload_cipher_hash: Hash256 =
+            row.payload_cipher_hash.as_slice().try_into().map_err(|_| {
+                SequencerError::Internal("invalid payload_cipher_hash length".to_string())
+            })?;
 
         let created_at = match row.created_at_str.as_deref() {
             Some(value) => Cow::Borrowed(value),
@@ -206,8 +208,7 @@ impl PgVesCommitmentEngine {
                 )));
             }
 
-            let event_signing_hash =
-                Self::event_signing_hash_from_row(tenant_id, store_id, &row)?;
+            let event_signing_hash = Self::event_signing_hash_from_row(tenant_id, store_id, &row)?;
             let agent_signature: [u8; 64] = row.agent_signature.try_into().map_err(|_| {
                 SequencerError::Internal("invalid agent_signature length".to_string())
             })?;
@@ -294,8 +295,7 @@ impl PgVesCommitmentEngine {
                 )));
             }
 
-            let event_signing_hash =
-                Self::event_signing_hash_from_row(tenant_id, store_id, &row)?;
+            let event_signing_hash = Self::event_signing_hash_from_row(tenant_id, store_id, &row)?;
             let agent_signature: [u8; 64] = row.agent_signature.try_into().map_err(|_| {
                 SequencerError::Internal("invalid agent_signature length".to_string())
             })?;
@@ -316,9 +316,9 @@ impl PgVesCommitmentEngine {
 
     fn stream_lock_key(tenant_id: &TenantId, store_id: &StoreId) -> i64 {
         let stream_id = compute_stream_id(&tenant_id.0, &store_id.0);
-        let bytes: [u8; 8] = stream_id[..8]
-            .try_into()
-            .expect("stream_id is always 32 bytes");
+        // Safety: stream_id is Hash256 = [u8; 32], so first 8 bytes always exist
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&stream_id[..8]);
         i64::from_be_bytes(bytes)
     }
 
@@ -342,8 +342,13 @@ impl PgVesCommitmentEngine {
 
         levels.push(self.pad_leaves(leaves));
 
-        while levels.last().map_or(0, Vec::len) > 1 {
-            let current = levels.last().expect("levels is non-empty");
+        loop {
+            let Some(current) = levels.last() else {
+                break;
+            };
+            if current.len() <= 1 {
+                break;
+            }
             let mut next = Vec::with_capacity(current.len() / 2);
             for pair in current.chunks_exact(2) {
                 next.push(compute_node_hash(&pair[0], &pair[1]));
@@ -1368,8 +1373,10 @@ mod tests {
 
     #[test]
     fn stream_lock_key_is_deterministic() {
-        let tenant_id = TenantId::from_uuid(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
-        let store_id = StoreId::from_uuid(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+        let tenant_id =
+            TenantId::from_uuid(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
+        let store_id =
+            StoreId::from_uuid(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
 
         let key1 = PgVesCommitmentEngine::stream_lock_key(&tenant_id, &store_id);
         let key2 = PgVesCommitmentEngine::stream_lock_key(&tenant_id, &store_id);
@@ -1379,9 +1386,12 @@ mod tests {
 
     #[test]
     fn stream_lock_key_different_for_different_stores() {
-        let tenant_id = TenantId::from_uuid(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
-        let store_id1 = StoreId::from_uuid(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
-        let store_id2 = StoreId::from_uuid(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
+        let tenant_id =
+            TenantId::from_uuid(Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap());
+        let store_id1 =
+            StoreId::from_uuid(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap());
+        let store_id2 =
+            StoreId::from_uuid(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
 
         let key1 = PgVesCommitmentEngine::stream_lock_key(&tenant_id, &store_id1);
         let key2 = PgVesCommitmentEngine::stream_lock_key(&tenant_id, &store_id2);

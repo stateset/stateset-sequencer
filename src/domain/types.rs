@@ -94,7 +94,6 @@ impl PayloadKind {
     }
 }
 
-
 /// Agent key identifier for key rotation
 /// Each agent can have multiple signing keys identified by this ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -242,8 +241,7 @@ pub mod signature64_hex_0x {
     {
         let s = String::deserialize(deserializer)?;
         if super::strict_ves_format_enabled() {
-            super::validate_hex_0x_strict(&s, 64, "signature")
-                .map_err(serde::de::Error::custom)?;
+            super::validate_hex_0x_strict(&s, 64, "signature").map_err(serde::de::Error::custom)?;
         }
         let hex_str = s.strip_prefix("0x").unwrap_or(&s);
         let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
@@ -646,7 +644,10 @@ mod tests {
     fn test_tenant_id_display() {
         let uuid = uuid::Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
         let tenant_id = TenantId::from_uuid(uuid);
-        assert_eq!(format!("{}", tenant_id), "12345678-1234-1234-1234-123456789abc");
+        assert_eq!(
+            format!("{}", tenant_id),
+            "12345678-1234-1234-1234-123456789abc"
+        );
     }
 
     #[test]
@@ -696,7 +697,10 @@ mod tests {
     fn test_store_id_display() {
         let uuid = uuid::Uuid::parse_str("abcdef12-3456-7890-abcd-ef1234567890").unwrap();
         let store_id = StoreId::from_uuid(uuid);
-        assert_eq!(format!("{}", store_id), "abcdef12-3456-7890-abcd-ef1234567890");
+        assert_eq!(
+            format!("{}", store_id),
+            "abcdef12-3456-7890-abcd-ef1234567890"
+        );
     }
 
     // ============================================================================
@@ -721,7 +725,10 @@ mod tests {
     fn test_agent_id_display() {
         let uuid = uuid::Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
         let agent_id = AgentId::from_uuid(uuid);
-        assert_eq!(format!("{}", agent_id), "11111111-2222-3333-4444-555555555555");
+        assert_eq!(
+            format!("{}", agent_id),
+            "11111111-2222-3333-4444-555555555555"
+        );
     }
 
     // ============================================================================
@@ -859,9 +866,7 @@ mod tests {
             hash: Hash256,
         }
 
-        let original = TestStruct {
-            hash: [0xab; 32],
-        };
+        let original = TestStruct { hash: [0xab; 32] };
 
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("abababab")); // hex encoded
@@ -910,9 +915,7 @@ mod tests {
             hash: Hash256,
         }
 
-        let original = TestStruct {
-            hash: [0xef; 32],
-        };
+        let original = TestStruct { hash: [0xef; 32] };
 
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("0x")); // has 0x prefix
@@ -947,9 +950,7 @@ mod tests {
             sig: Signature64,
         }
 
-        let original = TestStruct {
-            sig: [0x42; 64],
-        };
+        let original = TestStruct { sig: [0x42; 64] };
 
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("0x")); // has 0x prefix
@@ -993,9 +994,7 @@ mod tests {
             key: PublicKey32,
         }
 
-        let original = TestStruct {
-            key: [0x77; 32],
-        };
+        let original = TestStruct { key: [0x77; 32] };
 
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("0x"));
@@ -1022,7 +1021,8 @@ mod tests {
         assert!(serde_json::from_str::<TestStruct>(json).is_err());
 
         // Too long
-        let json = r#"{"hash":"abababababababababababababababababababababababababababababababababab"}"#;
+        let json =
+            r#"{"hash":"abababababababababababababababababababababababababababababababababab"}"#;
         assert!(serde_json::from_str::<TestStruct>(json).is_err());
     }
 

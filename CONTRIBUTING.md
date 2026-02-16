@@ -97,6 +97,13 @@ curl http://localhost:8080/health
 cargo test
 ```
 
+If you see `Invalid cross-device link (os error 18)` in local builds, use the helper:
+
+```bash
+./scripts/cargo-local.sh build
+./scripts/cargo-local.sh test
+```
+
 ## Making Changes
 
 ### Branch Naming

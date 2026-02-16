@@ -7,16 +7,20 @@
 //! - the Axum HTTP router
 //! - the Tonic gRPC server (v1 and v2 APIs)
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::DefaultBodyLimit;
-use axum::http::{HeaderValue, Method, StatusCode};
+use axum::body::Body;
+use axum::extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Request, State};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
+use ipnet::IpNet;
 use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use tonic::transport::Server as TonicServer;
 use tower_http::cors::AllowOrigin;
 use tower_http::cors::CorsLayer;
@@ -25,9 +29,11 @@ use tracing::{info, warn, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use uuid::Uuid;
 
-use crate::grpc::{GrpcAuthInterceptor, KeyManagementServiceV2, SequencerService, SequencerServiceV2};
-use crate::proto::v2::key_management_server::KeyManagementServer;
+use crate::grpc::{
+    GrpcAuthInterceptor, KeyManagementServiceV2, SequencerService, SequencerServiceV2,
+};
 use crate::proto::sequencer_server::SequencerServer as SequencerServerV1;
+use crate::proto::v2::key_management_server::KeyManagementServer;
 use crate::proto::v2::sequencer_server::SequencerServer as SequencerServerV2;
 
 use crate::anchor::{AnchorConfig, AnchorService};
@@ -36,13 +42,18 @@ use crate::auth::{
     JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RateLimiterConfig, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
+use crate::infra::ShutdownCoordinator;
 use crate::infra::{
-    PgAuditLogger, CacheManager, CacheManagerConfig, CircuitBreakerRegistry, PayloadEncryption,
-    PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer,
-    PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository,
-    PoolMonitor, SchemaValidationMode, VesSequencer,
+    extract_client_ip, BatchWorkerMessage, CacheManager, CacheManagerConfig,
+    CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry, PgAuditLogger,
+    PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer, PgVesCommitmentEngine,
+    PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository, PoolMonitor,
+    SchemaValidationMode, SecretsProvider, VesSequencer, X402BatchWorkerConfig, spawn_batch_worker,
 };
 use crate::metrics::{ComponentMetrics, MetricsRegistry};
+
+/// Interval for pool health monitoring and component metrics collection.
+const MONITORING_INTERVAL: Duration = Duration::from_secs(15);
 
 /// PostgreSQL connection pool configuration.
 #[derive(Debug, Clone)]
@@ -106,19 +117,37 @@ pub struct DbSessionConfig {
     pub application_name: String,
 }
 
+/// Default statement timeout (30 seconds) — prevents runaway queries.
+const DEFAULT_STATEMENT_TIMEOUT_MS: u64 = 30_000;
+/// Default idle-in-transaction timeout (60 seconds) — prevents long-held connections.
+const DEFAULT_IDLE_IN_TX_TIMEOUT_MS: u64 = 60_000;
+/// Default lock timeout (10 seconds) — prevents lock contention deadlocks.
+const DEFAULT_LOCK_TIMEOUT_MS: u64 = 10_000;
+/// Default HTTP request timeout (30 seconds).
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
 impl DbSessionConfig {
     fn from_env() -> Self {
-        let statement_timeout_ms = std::env::var("DB_STATEMENT_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok());
+        let statement_timeout_ms = Some(
+            std::env::var("DB_STATEMENT_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_MS),
+        );
 
-        let idle_in_tx_timeout_ms = std::env::var("DB_IDLE_IN_TX_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok());
+        let idle_in_tx_timeout_ms = Some(
+            std::env::var("DB_IDLE_IN_TX_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_IDLE_IN_TX_TIMEOUT_MS),
+        );
 
-        let lock_timeout_ms = std::env::var("DB_LOCK_TIMEOUT_MS")
-            .ok()
-            .and_then(|v| v.parse().ok());
+        let lock_timeout_ms = Some(
+            std::env::var("DB_LOCK_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_LOCK_TIMEOUT_MS),
+        );
 
         let application_name = std::env::var("DB_APPLICATION_NAME")
             .unwrap_or_else(|_| "stateset-sequencer".to_string());
@@ -154,14 +183,15 @@ impl CacheConfig {
         let defaults = CacheManagerConfig::default();
 
         let commitment_max = read_usize_env("CACHE_COMMITMENT_MAX", defaults.commitment_max);
-        let commitment_ttl_secs =
-            read_u64_env("CACHE_COMMITMENT_TTL_SECS", defaults.commitment_ttl.as_secs());
+        let commitment_ttl_secs = read_u64_env(
+            "CACHE_COMMITMENT_TTL_SECS",
+            defaults.commitment_ttl.as_secs(),
+        );
 
         let proof_max = read_usize_env("CACHE_PROOF_MAX", defaults.proof_max);
         let proof_ttl_secs = read_u64_env("CACHE_PROOF_TTL_SECS", defaults.proof_ttl.as_secs());
 
-        let ves_commitment_max =
-            read_usize_env("CACHE_VES_COMMITMENT_MAX", commitment_max);
+        let ves_commitment_max = read_usize_env("CACHE_VES_COMMITMENT_MAX", commitment_max);
         let ves_commitment_ttl_secs =
             read_u64_env("CACHE_VES_COMMITMENT_TTL_SECS", commitment_ttl_secs);
 
@@ -173,8 +203,7 @@ impl CacheConfig {
             read_u64_env("CACHE_AGENT_KEY_TTL_SECS", defaults.agent_key_ttl.as_secs());
 
         let schema_max = read_usize_env("CACHE_SCHEMA_MAX", defaults.schema_max);
-        let schema_ttl_secs =
-            read_u64_env("CACHE_SCHEMA_TTL_SECS", defaults.schema_ttl.as_secs());
+        let schema_ttl_secs = read_u64_env("CACHE_SCHEMA_TTL_SECS", defaults.schema_ttl.as_secs());
 
         Self {
             commitment_max,
@@ -226,6 +255,35 @@ fn read_u64_env(var: &str, default: u64) -> u64 {
         .max(1)
 }
 
+#[derive(Debug, Clone, Copy)]
+enum AuthMode {
+    Required,
+    Disabled,
+}
+
+fn parse_auth_mode() -> anyhow::Result<AuthMode> {
+    let auth_mode = std::env::var("AUTH_MODE").unwrap_or_else(|_| "required".to_string());
+    match auth_mode.trim().to_lowercase().as_str() {
+        "required" => Ok(AuthMode::Required),
+        "disabled" => Ok(AuthMode::Disabled),
+        _ => Err(anyhow::anyhow!(
+            "Invalid AUTH_MODE value: {auth_mode}; expected required or disabled"
+        )),
+    }
+}
+
+fn parse_truthy_env(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -251,7 +309,7 @@ pub struct Config {
 
 impl Config {
     /// Load configuration from environment variables.
-    pub fn from_env() -> Self {
+    pub fn from_env() -> anyhow::Result<Self> {
         let database_url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://localhost/stateset_sequencer".to_string());
 
@@ -268,18 +326,21 @@ impl Config {
 
         let listen_addr: SocketAddr = format!("{host}:{port}")
             .parse()
-            .expect("Invalid listen address");
+            .map_err(|e| anyhow::anyhow!("Invalid listen address '{host}:{port}': {e}"))?;
 
         // gRPC port configuration (defaults to HTTP port + 1, e.g., 8081 if HTTP is 8080)
-        let grpc_addr: Option<SocketAddr> = if std::env::var("GRPC_DISABLED").is_ok() {
-            None
-        } else {
-            let grpc_port: u16 = std::env::var("GRPC_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(port + 1);
-            Some(format!("{host}:{grpc_port}").parse().expect("Invalid gRPC address"))
-        };
+        let grpc_addr: Option<SocketAddr> =
+            if std::env::var("GRPC_DISABLED").is_ok() {
+                None
+            } else {
+                let grpc_port: u16 = std::env::var("GRPC_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(port + 1);
+                Some(format!("{host}:{grpc_port}").parse().map_err(|e| {
+                    anyhow::anyhow!("Invalid gRPC address '{host}:{grpc_port}': {e}")
+                })?)
+            };
 
         let write_pool = DbPoolConfig::from_env("", 10);
         let read_pool = DbPoolConfig::from_env("READ_", write_pool.max_connections);
@@ -294,7 +355,7 @@ impl Config {
         };
         let cache = CacheConfig::from_env();
 
-        Self {
+        Ok(Self {
             database_url,
             read_database_url,
             listen_addr,
@@ -304,7 +365,7 @@ impl Config {
             session,
             read_session,
             cache,
-        }
+        })
     }
 }
 
@@ -367,6 +428,7 @@ async fn build_pg_pool(
 /// Application state shared across handlers.
 #[derive(Clone)]
 pub struct AppState {
+    pub read_pool: PgPool,
     pub sequencer: Arc<PgSequencer>,
     pub event_store: Arc<PgEventStore>,
     pub commitment_engine: Arc<PgCommitmentEngine>,
@@ -406,21 +468,126 @@ pub struct AppState {
     pub audit_logger: Option<Arc<PgAuditLogger>>,
 }
 
+#[derive(Debug, Clone)]
+enum AllowedIp {
+    Exact(IpAddr),
+    Cidr(IpNet),
+}
+
+impl AllowedIp {
+    fn matches(&self, ip: IpAddr) -> bool {
+        match self {
+            AllowedIp::Exact(addr) => *addr == ip,
+            AllowedIp::Cidr(net) => net.contains(&ip),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AdminAccessState {
+    allowlist: Option<Arc<Vec<AllowedIp>>>,
+    trust_proxy_headers: bool,
+}
+
+async fn admin_ip_allowlist_middleware(
+    State(state): State<AdminAccessState>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(allowlist) = &state.allowlist else {
+        return next.run(request).await;
+    };
+
+    let client_ip = extract_client_ip(&headers, remote_addr, state.trust_proxy_headers)
+        .unwrap_or(remote_addr.ip());
+    let allowed = allowlist.iter().any(|entry| entry.matches(client_ip));
+    if !allowed {
+        warn!("Admin access denied for IP {}", client_ip);
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "admin access denied",
+                "code": "ADMIN_IP_DENIED"
+            })),
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
+fn parse_admin_allowlist() -> anyhow::Result<Option<Arc<Vec<AllowedIp>>>> {
+    let raw = match std::env::var("ADMIN_IP_ALLOWLIST") {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+
+    let mut entries = Vec::new();
+    for token in raw.split(',') {
+        let item = token.trim();
+        if item.is_empty() {
+            continue;
+        }
+        if item.contains('/') {
+            let net: IpNet = item.parse().map_err(|e| {
+                anyhow::anyhow!("invalid CIDR in ADMIN_IP_ALLOWLIST: {} ({})", item, e)
+            })?;
+            entries.push(AllowedIp::Cidr(net));
+        } else {
+            let ip: IpAddr = item.parse().map_err(|e| {
+                anyhow::anyhow!("invalid IP in ADMIN_IP_ALLOWLIST: {} ({})", item, e)
+            })?;
+            entries.push(AllowedIp::Exact(ip));
+        }
+    }
+
+    if entries.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(Arc::new(entries)))
+    }
+}
+
 /// Start the HTTP server.
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
 
     info!("Starting StateSet Sequencer v{}", env!("CARGO_PKG_VERSION"));
 
+    // Initialize shutdown coordinator for background task lifecycle
+    let shutdown_coordinator = Arc::new(ShutdownCoordinator::new());
+
+    // Initialize secrets provider (swap implementation for Vault/KMS/HSM)
+    let secrets: Box<dyn SecretsProvider> = Box::new(EnvSecretsProvider::new());
+
     // Auth configuration
-    let auth_mode = std::env::var("AUTH_MODE").unwrap_or_else(|_| "required".to_string());
-    let require_auth = auth_mode != "disabled";
+    let auth_mode = parse_auth_mode()?;
+    let allow_auth_disabled = parse_truthy_env("ALLOW_AUTH_DISABLED");
+    let require_auth = match auth_mode {
+        AuthMode::Required => true,
+        AuthMode::Disabled if !allow_auth_disabled => {
+            anyhow::bail!(
+                "AUTH_MODE=disabled requires explicit opt-in via ALLOW_AUTH_DISABLED=true"
+            );
+        }
+        AuthMode::Disabled => {
+            info!(
+                "AUTH_MODE=disabled is enabled via ALLOW_AUTH_DISABLED=true; authentication checks are skipped"
+            );
+            false
+        }
+    };
 
     let api_key_validator = Arc::new(ApiKeyValidator::new());
     let mut any_auth_configured = false;
     let mut bootstrap_record: Option<ApiKeyRecord> = None;
 
-    if let Ok(bootstrap_key) = std::env::var("BOOTSTRAP_ADMIN_API_KEY") {
+    if let Some(bootstrap_key) = secrets
+        .bootstrap_api_key()
+        .map_err(|e| anyhow::anyhow!("Failed to load bootstrap API key: {e}"))?
+    {
         let key_hash = ApiKeyValidator::hash_key(&bootstrap_key);
         let record = ApiKeyRecord {
             key_hash,
@@ -437,12 +604,17 @@ pub async fn run() -> anyhow::Result<()> {
         info!("Bootstrap admin API key is configured");
     }
 
-    let jwt_validator = match std::env::var("JWT_SECRET") {
-        Ok(secret) => {
-            let issuer =
-                std::env::var("JWT_ISSUER").unwrap_or_else(|_| "stateset-sequencer".to_string());
-            let audience =
-                std::env::var("JWT_AUDIENCE").unwrap_or_else(|_| "stateset-api".to_string());
+    let jwt_validator = match secrets
+        .jwt_secret()
+        .map_err(|e| anyhow::anyhow!("Failed to load JWT secret: {e}"))?
+    {
+        Some(secret) => {
+            let issuer = secrets
+                .jwt_issuer()
+                .map_err(|e| anyhow::anyhow!("Failed to load JWT issuer: {e}"))?;
+            let audience = secrets
+                .jwt_audience()
+                .map_err(|e| anyhow::anyhow!("Failed to load JWT audience: {e}"))?;
             any_auth_configured = true;
             Some(Arc::new(JwtValidator::new(
                 secret.as_bytes(),
@@ -450,7 +622,7 @@ pub async fn run() -> anyhow::Result<()> {
                 &audience,
             )))
         }
-        Err(_) => None,
+        None => None,
     };
 
     let rate_limiter = std::env::var("RATE_LIMIT_PER_MINUTE")
@@ -469,34 +641,46 @@ pub async fn run() -> anyhow::Result<()> {
         })
         .unwrap_or(true);
 
-    let public_registration_limiter = std::env::var("PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|v| *v > 0)
-        .map(|rpm| {
-            let mut config = RateLimiterConfig {
-                requests_per_minute: rpm,
-                ..Default::default()
-            };
-            if let Some(max_entries) = std::env::var("PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-            {
-                config.max_entries = max_entries;
-            }
-            if let Some(window_seconds) = std::env::var("PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                config.window_seconds = window_seconds;
-            }
-            Arc::new(RateLimiter::with_config(config))
-        });
+    let public_registration_limiter =
+        std::env::var("PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .map(|rpm| {
+                let mut config = RateLimiterConfig {
+                    requests_per_minute: rpm,
+                    ..Default::default()
+                };
+                if let Some(max_entries) = std::env::var("PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                {
+                    config.max_entries = max_entries;
+                }
+                if let Some(window_seconds) =
+                    std::env::var("PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                {
+                    config.window_seconds = window_seconds;
+                }
+                Arc::new(RateLimiter::with_config(config))
+            });
 
     let trust_proxy_headers = std::env::var("TRUST_PROXY_HEADERS")
         .ok()
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
         .unwrap_or(false);
+
+    let admin_allowlist = parse_admin_allowlist()?;
+    if let Some(list) = &admin_allowlist {
+        info!("Admin IP allowlist enabled ({} entries)", list.len());
+    }
 
     let request_limits = RequestLimits::from_env();
     info!(
@@ -507,7 +691,7 @@ pub async fn run() -> anyhow::Result<()> {
     );
 
     // Load configuration
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     info!("Configuration loaded");
     info!("  HTTP listen address: {}", config.listen_addr);
     if let Some(grpc_addr) = config.grpc_addr {
@@ -592,7 +776,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     if require_auth && !any_auth_configured {
         anyhow::bail!(
-            "AUTH_MODE=required but no auth is configured; set JWT_SECRET or BOOTSTRAP_ADMIN_API_KEY (or set AUTH_MODE=disabled for local dev)"
+            "AUTH_MODE=required but no auth is configured; set JWT_SECRET or BOOTSTRAP_ADMIN_API_KEY (or set AUTH_MODE=disabled and ALLOW_AUTH_DISABLED=true for local dev)"
         );
     }
 
@@ -620,18 +804,12 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     let authenticator = {
-        let authenticator = Authenticator::new(api_key_validator.clone())
-            .with_api_key_store(api_key_store.clone());
+        let authenticator =
+            Authenticator::new(api_key_validator.clone()).with_api_key_store(api_key_store.clone());
         match jwt_validator {
             Some(jwt) => Arc::new(authenticator.with_jwt(jwt)),
             None => Arc::new(authenticator),
         }
-    };
-
-    let auth_state = AuthMiddlewareState {
-        authenticator,
-        require_auth,
-        rate_limiter,
     };
 
     // Payload encryption-at-rest (legacy `events` table)
@@ -649,7 +827,10 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Initialize services
     let sequencer = Arc::new(PgSequencer::new(pool.clone(), payload_encryption.clone()));
-    let event_store = Arc::new(PgEventStore::new(read_pool.clone(), payload_encryption.clone()));
+    let event_store = Arc::new(PgEventStore::new(
+        read_pool.clone(),
+        payload_encryption.clone(),
+    ));
     let commitment_engine = Arc::new(PgCommitmentEngine::new(pool.clone()));
     let commitment_reader = Arc::new(PgCommitmentEngine::new(read_pool.clone()));
     let ves_commitment_engine = Arc::new(PgVesCommitmentEngine::new(pool.clone()));
@@ -669,14 +850,14 @@ pub async fn run() -> anyhow::Result<()> {
     );
     let mut ves_sequencer = VesSequencer::new(pool.clone(), agent_key_registry.clone());
     let mut ves_sequencer_reader = VesSequencer::new(read_pool.clone(), agent_key_registry.clone());
-    if let Some(sequencer_id) = load_ves_sequencer_id()? {
+    if let Some(sequencer_id) = load_ves_sequencer_id(secrets.as_ref())? {
         info!("VES sequencer id configured: {}", sequencer_id);
         ves_sequencer = ves_sequencer.with_sequencer_id(sequencer_id);
         ves_sequencer_reader = ves_sequencer_reader.with_sequencer_id(sequencer_id);
     } else {
         info!("VES sequencer id not configured (set VES_SEQUENCER_ID to pin)");
     }
-    if let Some(signing_key) = load_ves_sequencer_signing_key()? {
+    if let Some(signing_key) = load_ves_sequencer_signing_key(secrets.as_ref())? {
         info!("VES sequencer receipt signing enabled");
         ves_sequencer = ves_sequencer.with_signing_key(signing_key.clone());
         ves_sequencer_reader = ves_sequencer_reader.with_signing_key(signing_key);
@@ -687,15 +868,27 @@ pub async fn run() -> anyhow::Result<()> {
     let ves_sequencer_reader = Arc::new(ves_sequencer_reader);
 
     // Initialize schema registry
-    let schema_store = Arc::new(
-        PgSchemaStore::new(pool.clone()).with_cache(cache_manager.schemas.clone()),
-    );
+    let schema_store =
+        Arc::new(PgSchemaStore::new(pool.clone()).with_cache(cache_manager.schemas.clone()));
     schema_store.initialize().await?;
     info!("Schema registry initialized");
 
     // Initialize x402 payment repository
     let x402_repository = Arc::new(PgX402Repository::new(pool.clone()));
     info!("x402 payment repository initialized");
+
+    // Start x402 batch worker
+    let (x402_batch_worker_task, x402_batch_worker_control) =
+        spawn_batch_worker(X402BatchWorkerConfig::from_env(), x402_repository.clone());
+    let mut batch_worker_shutdown = shutdown_coordinator.signal();
+    tokio::spawn(async move {
+        batch_worker_shutdown.wait().await;
+        let _ = x402_batch_worker_control
+            .send(BatchWorkerMessage::Shutdown)
+            .await;
+        let _ = x402_batch_worker_task.await;
+    });
+    info!("x402 batch worker started");
 
     // Schema validation mode for event ingestion
     let schema_validation_mode = SchemaValidationMode::from_env();
@@ -711,11 +904,19 @@ pub async fn run() -> anyhow::Result<()> {
     let _pool_monitor_task = {
         let pool = pool.clone();
         let monitor = pool_monitor.clone();
+        let signal = shutdown_coordinator.signal();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            let mut interval = tokio::time::interval(MONITORING_INTERVAL);
             loop {
-                interval.tick().await;
-                monitor.update_from_pool(&pool).await;
+                tokio::select! {
+                    _ = interval.tick() => {
+                        monitor.update_from_pool(&pool).await;
+                    }
+                    _ = signal.wait() => {
+                        info!("Pool monitor task stopping due to shutdown");
+                        break;
+                    }
+                }
             }
         })
     };
@@ -742,8 +943,16 @@ pub async fn run() -> anyhow::Result<()> {
         }
     };
 
+    let auth_state = AuthMiddlewareState {
+        authenticator,
+        require_auth,
+        rate_limiter,
+        pool_monitor: Some(pool_monitor.clone()),
+    };
+
     // Create application state
     let state = AppState {
+        read_pool: read_pool.clone(),
         sequencer,
         event_store,
         commitment_engine,
@@ -778,8 +987,12 @@ pub async fn run() -> anyhow::Result<()> {
         state.pool_monitor.clone(),
         state.circuit_breaker_registry.clone(),
     ));
-    let _metrics_task = component_metrics.start_collection_task(std::time::Duration::from_secs(15));
-    info!("Component metrics collection started (15s interval)");
+    let _metrics_task = component_metrics
+        .start_collection_task(MONITORING_INTERVAL, Some(shutdown_coordinator.signal()));
+    info!(
+        "Component metrics collection started ({}s interval)",
+        MONITORING_INTERVAL.as_secs()
+    );
 
     // Start gRPC server (if enabled) - must happen before build_router consumes auth_state
     let grpc_handle = if let Some(grpc_addr) = config.grpc_addr {
@@ -798,13 +1011,13 @@ pub async fn run() -> anyhow::Result<()> {
             state.ves_commitment_reader.clone(),
             state.cache_manager.clone(),
         );
-        let key_management_service =
-            KeyManagementServiceV2::new(state.agent_key_registry.clone());
+        let key_management_service = KeyManagementServiceV2::new(state.agent_key_registry.clone());
 
-        // Create auth interceptor for gRPC
+        // Create auth interceptor for gRPC (with shared rate limiter)
         let grpc_auth_interceptor = GrpcAuthInterceptor::new(
             auth_state.authenticator.clone(),
             auth_state.require_auth,
+            auth_state.rate_limiter.clone(),
         );
 
         let grpc_server = TonicServer::builder()
@@ -822,19 +1035,45 @@ pub async fn run() -> anyhow::Result<()> {
             ));
 
         info!("Starting gRPC server on {}", grpc_addr);
+        let grpc_shutdown = shutdown_coordinator.signal();
         Some(tokio::spawn(async move {
-            if let Err(e) = grpc_server.serve(grpc_addr).await {
+            if let Err(e) = grpc_server
+                .serve_with_shutdown(grpc_addr, grpc_shutdown.wait())
+                .await
+            {
                 tracing::error!("gRPC server error: {}", e);
             }
+            info!("gRPC server shut down gracefully");
         }))
     } else {
         None
     };
 
+    let admin_access_state = AdminAccessState {
+        allowlist: admin_allowlist,
+        trust_proxy_headers,
+    };
+
     // Build HTTP router
-    let app = build_router(auth_state)?
+    let request_timeout = Duration::from_secs(
+        std::env::var("REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+    );
+    let app = build_router(auth_state, admin_access_state)?
         .with_state(state.clone())
-        .layer(DefaultBodyLimit::max(request_limits.max_body_size));
+        .layer(DefaultBodyLimit::max(request_limits.max_body_size))
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            request_timeout,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.metrics.clone(),
+            http_metrics_middleware,
+        ))
+        .layer(axum::middleware::from_fn(request_id_middleware));
 
     // Start HTTP server
     info!("Starting HTTP server on {}", config.listen_addr);
@@ -842,12 +1081,15 @@ pub async fn run() -> anyhow::Result<()> {
 
     info!("StateSet Sequencer is ready to accept connections");
 
-    // Run both servers
+    // Run both servers with coordinated shutdown
+    let http_shutdown = shutdown_coordinator.signal();
     tokio::select! {
-        result = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()) => {
+        result = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .with_graceful_shutdown(async move { http_shutdown.wait().await }) => {
             if let Err(e) = result {
                 tracing::error!("HTTP server error: {}", e);
             }
+            info!("HTTP server shut down gracefully");
         }
         _ = async {
             if let Some(handle) = grpc_handle {
@@ -899,7 +1141,9 @@ fn init_tracing() {
                 return;
             }
             Err(e) => {
-                eprintln!("Failed to initialize OpenTelemetry: {e}. Falling back to basic tracing.");
+                eprintln!(
+                    "Failed to initialize OpenTelemetry: {e}. Falling back to basic tracing."
+                );
             }
         }
     }
@@ -911,10 +1155,15 @@ fn init_tracing() {
         .init();
 }
 
-fn load_ves_sequencer_signing_key() -> anyhow::Result<Option<AgentSigningKey>> {
-    let key_value = match std::env::var("VES_SEQUENCER_SIGNING_KEY") {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
+fn load_ves_sequencer_signing_key(
+    secrets: &dyn SecretsProvider,
+) -> anyhow::Result<Option<AgentSigningKey>> {
+    let key_value = match secrets
+        .ves_sequencer_signing_key()
+        .map_err(|e| anyhow::anyhow!("failed to load VES_SEQUENCER_SIGNING_KEY: {e}"))?
+    {
+        Some(value) => value,
+        None => return Ok(None),
     };
 
     let secret = secret_key_from_str(&key_value)
@@ -925,10 +1174,13 @@ fn load_ves_sequencer_signing_key() -> anyhow::Result<Option<AgentSigningKey>> {
     Ok(Some(signing_key))
 }
 
-fn load_ves_sequencer_id() -> anyhow::Result<Option<Uuid>> {
-    let value = match std::env::var("VES_SEQUENCER_ID") {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
+fn load_ves_sequencer_id(secrets: &dyn SecretsProvider) -> anyhow::Result<Option<Uuid>> {
+    let value = match secrets
+        .ves_sequencer_id()
+        .map_err(|e| anyhow::anyhow!("failed to load VES_SEQUENCER_ID: {e}"))?
+    {
+        Some(value) => value,
+        None => return Ok(None),
     };
 
     let id = Uuid::parse_str(value.trim())
@@ -937,38 +1189,48 @@ fn load_ves_sequencer_id() -> anyhow::Result<Option<Uuid>> {
 }
 
 /// Initialize OpenTelemetry tracer with OTLP exporter
-fn init_opentelemetry_tracer() -> Result<opentelemetry_sdk::trace::Tracer, opentelemetry::trace::TraceError> {
+fn init_opentelemetry_tracer(
+) -> Result<opentelemetry_sdk::trace::Tracer, opentelemetry::trace::TraceError> {
     use opentelemetry::trace::TracerProvider;
     use opentelemetry_otlp::WithExportConfig;
 
-    let exporter = opentelemetry_otlp::new_exporter()
-        .tonic()
-        .with_endpoint(
-            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                .unwrap_or_else(|_| "http://localhost:4317".to_string()),
-        );
+    let exporter = opentelemetry_otlp::new_exporter().tonic().with_endpoint(
+        std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .unwrap_or_else(|_| "http://localhost:4317".to_string()),
+    );
 
     let provider = opentelemetry_otlp::new_pipeline()
         .tracing()
         .with_exporter(exporter)
-        .with_trace_config(
-            opentelemetry_sdk::trace::Config::default()
-                .with_resource(opentelemetry_sdk::Resource::new(vec![
-                    opentelemetry::KeyValue::new("service.name", "stateset-sequencer"),
-                    opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-                ])),
-        )
+        .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(
+            opentelemetry_sdk::Resource::new(vec![
+                opentelemetry::KeyValue::new("service.name", "stateset-sequencer"),
+                opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            ]),
+        ))
         .install_batch(opentelemetry_sdk::runtime::Tokio)?;
 
     Ok(provider.tracer("stateset-sequencer"))
 }
 
-fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppState>> {
+fn build_router(
+    auth_state: AuthMiddlewareState,
+    admin_access_state: AdminAccessState,
+) -> anyhow::Result<Router<AppState>> {
     let public_api = crate::api::public_router();
+    let public_api_root = crate::api::public_router();
+    let admin_allowlist_layer =
+        axum::middleware::from_fn_with_state(admin_access_state, admin_ip_allowlist_middleware);
     let api = crate::api::router().layer(axum::middleware::from_fn_with_state(
         auth_state.clone(),
         crate::auth::auth_middleware,
     ));
+    let admin_api = crate::api::admin_router()
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            crate::auth::auth_middleware,
+        ))
+        .layer(admin_allowlist_layer.clone());
 
     let anchor_compat = crate::api::anchor_compat_router().layer(
         axum::middleware::from_fn_with_state(auth_state.clone(), crate::auth::auth_middleware),
@@ -979,7 +1241,8 @@ fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppSta
         .layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
             crate::auth::auth_middleware,
-        ));
+        ))
+        .layer(admin_allowlist_layer.clone());
 
     let detailed_health_router = Router::new()
         .route(
@@ -989,14 +1252,23 @@ fn build_router(auth_state: AuthMiddlewareState) -> anyhow::Result<Router<AppSta
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             crate::auth::auth_middleware,
-        ));
+        ))
+        .layer(admin_allowlist_layer.clone());
+
+    let admin_dashboard = Router::new()
+        .route("/admin", get(crate::api::handlers::admin::admin_dashboard))
+        .route("/admin/", get(crate::api::handlers::admin::admin_dashboard))
+        .layer(admin_allowlist_layer.clone());
 
     let mut router = Router::new()
         .nest("/api", public_api)
+        .merge(public_api_root)
         .merge(metrics_router)
         .merge(detailed_health_router)
         .merge(anchor_compat)
         .nest("/api", api)
+        .nest("/api", admin_api)
+        .merge(admin_dashboard)
         .route("/health", get(crate::api::handlers::health::health_check))
         .route("/ready", get(crate::api::handlers::health::readiness_check))
         .layer(TraceLayer::new_for_http());
@@ -1037,12 +1309,141 @@ fn cors_layer_from_env() -> anyhow::Result<Option<CorsLayer>> {
     Ok(Some(
         CorsLayer::new()
             .allow_origin(allow_origin)
-            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
             .allow_headers([
                 axum::http::header::AUTHORIZATION,
                 axum::http::header::CONTENT_TYPE,
+            ])
+            .expose_headers([
+                axum::http::header::HeaderName::from_static("x-request-id"),
+                axum::http::header::HeaderName::from_static("x-error-code"),
+                axum::http::header::RETRY_AFTER,
             ]),
     ))
+}
+
+fn normalize_metrics_path(path: &str) -> String {
+    if path == "/" {
+        return "/".to_string();
+    }
+
+    let normalized: Vec<String> = path
+        .trim_start_matches('/')
+        .split('/')
+        .map(|segment| {
+            if looks_like_uuid(segment) {
+                ":id".to_string()
+            } else {
+                segment.to_string()
+            }
+        })
+        .collect();
+
+    format!("/{}", normalized.join("/"))
+}
+
+fn looks_like_uuid(segment: &str) -> bool {
+    if segment.len() != 36 {
+        return false;
+    }
+
+    let mut dash_count = 0;
+    for ch in segment.chars() {
+        if ch == '-' {
+            dash_count += 1;
+            continue;
+        }
+        if !ch.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+
+    dash_count == 4
+}
+
+/// Middleware that extracts or generates a request ID and adds it to the
+/// tracing span and response headers for cross-service correlation.
+async fn request_id_middleware(mut req: Request<Body>, next: Next) -> Response {
+    let request_id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    req.extensions_mut().insert(RequestId(request_id.clone()));
+
+    let span = tracing::Span::current();
+    span.record("request_id", &request_id);
+
+    let mut response = next.run(req).await;
+    let headers = response.headers_mut();
+    if let Ok(val) = HeaderValue::from_str(&request_id) {
+        headers.insert("x-request-id", val);
+    }
+    // Security headers
+    headers.insert(
+        axum::http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Request ID extracted from `x-request-id` header or auto-generated.
+#[derive(Clone, Debug)]
+pub struct RequestId(pub String);
+
+async fn http_metrics_middleware(
+    State(metrics): State<Arc<MetricsRegistry>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response {
+    let method = req.method().as_str().to_string();
+    let path = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| normalize_metrics_path(req.uri().path()));
+
+    let start = std::time::Instant::now();
+    let response = next.run(req).await;
+    let status = response.status().as_u16().to_string();
+    let duration = start.elapsed().as_secs_f64();
+
+    let labels = crate::metrics::Labels::new()
+        .method(&method)
+        .with("path", &path)
+        .status(&status);
+
+    metrics
+        .inc_counter_labeled(
+            crate::metrics::metric_names::HTTP_REQUESTS_TOTAL,
+            labels.clone(),
+        )
+        .await;
+    metrics
+        .observe_histogram_labeled(
+            crate::metrics::metric_names::HTTP_REQUEST_LATENCY,
+            labels,
+            duration,
+        )
+        .await;
+
+    response
 }
 
 /// Prometheus metrics endpoint.
@@ -1056,7 +1457,10 @@ async fn metrics_handler(
 
     let metrics = state.metrics.to_prometheus().await;
     (
-        [(axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; charset=utf-8",
+        )],
         metrics,
     )
         .into_response()
@@ -1065,8 +1469,15 @@ async fn metrics_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::{Extension, State};
+    use axum::body::Body;
+    use axum::extract::{ConnectInfo, Extension, State};
+    use axum::http::Request;
+    use axum::routing::get;
+    use axum::Router;
+    use serial_test::serial;
     use sqlx::postgres::PgPoolOptions;
+    use std::net::{IpAddr, SocketAddr};
+    use tower::ServiceExt;
 
     fn build_test_state() -> AppState {
         let pool = PgPoolOptions::new()
@@ -1103,6 +1514,7 @@ mod tests {
         let metrics = Arc::new(MetricsRegistry::new());
 
         AppState {
+            read_pool: pool.clone(),
             sequencer,
             event_store,
             commitment_engine,
@@ -1142,8 +1554,8 @@ mod tests {
             agent_id: None,
             permissions: Permissions::read_only(),
         };
-        let response = metrics_handler(State(state.clone()), Extension(AuthContextExt(user_ctx)))
-            .await;
+        let response =
+            metrics_handler(State(state.clone()), Extension(AuthContextExt(user_ctx))).await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         let admin_ctx = crate::auth::AuthContext {
@@ -1153,6 +1565,77 @@ mod tests {
             permissions: Permissions::admin(),
         };
         let response = metrics_handler(State(state), Extension(AuthContextExt(admin_ctx))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    #[serial]
+    fn parse_admin_allowlist_accepts_ips_and_cidr() {
+        std::env::set_var("ADMIN_IP_ALLOWLIST", "203.0.113.10,10.0.0.0/8");
+        let allowlist = parse_admin_allowlist().unwrap().unwrap();
+        assert_eq!(allowlist.len(), 2);
+
+        let ip_match = "203.0.113.10".parse::<IpAddr>().unwrap();
+        let cidr_match = "10.1.2.3".parse::<IpAddr>().unwrap();
+        assert!(allowlist.iter().any(|entry| entry.matches(ip_match)));
+        assert!(allowlist.iter().any(|entry| entry.matches(cidr_match)));
+
+        std::env::remove_var("ADMIN_IP_ALLOWLIST");
+    }
+
+    #[tokio::test]
+    async fn admin_allowlist_blocks_unlisted_ip() {
+        let allowlist = Arc::new(vec![AllowedIp::Exact(
+            "203.0.113.10".parse::<IpAddr>().unwrap(),
+        )]);
+        let state = AdminAccessState {
+            allowlist: Some(allowlist),
+            trust_proxy_headers: false,
+        };
+
+        let app = Router::new()
+            .route("/admin", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                admin_ip_allowlist_middleware,
+            ));
+
+        let remote = SocketAddr::from(([198, 51, 100, 2], 1234));
+        let mut req = Request::builder()
+            .uri("/admin")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(remote));
+
+        let response = app.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_allowlist_allows_listed_ip() {
+        let allowlist = Arc::new(vec![AllowedIp::Exact(
+            "203.0.113.10".parse::<IpAddr>().unwrap(),
+        )]);
+        let state = AdminAccessState {
+            allowlist: Some(allowlist),
+            trust_proxy_headers: false,
+        };
+
+        let app = Router::new()
+            .route("/admin", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                admin_ip_allowlist_middleware,
+            ));
+
+        let remote = SocketAddr::from(([203, 0, 113, 10], 1234));
+        let mut req = Request::builder()
+            .uri("/admin")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(remote));
+
+        let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
 }

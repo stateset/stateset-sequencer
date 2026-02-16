@@ -1,0 +1,16 @@
+apiVersion: v2
+name: stateset-sequencer
+description: Verifiable Event Sync (VES) sequencer for deterministic event ordering
+type: application
+version: 0.2.4
+appVersion: "0.2.4"
+keywords:
+  - sequencer
+  - event-sourcing
+  - ves
+  - blockchain
+  - zero-knowledge
+home: https://github.com/stateset/stateset-sequencer
+maintainers:
+  - name: StateSet
+    email: engineering@stateset.io

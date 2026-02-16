@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sequencer-config
+  namespace: sequencer
+  labels:
+    app.kubernetes.io/name: stateset-sequencer
+data:
+  RUST_LOG: "info"
+  HOST: "0.0.0.0"
+  PORT: "8080"
+  AUTH_MODE: "required"
+  MAX_DB_CONNECTIONS: "20"
+  PAYLOAD_ENCRYPTION_MODE: "required"
+  L2_CHAIN_ID: "84532001"
+  PUBLIC_AGENT_REGISTRATION_ENABLED: "true"
+  PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE: "30"
+  PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES: "10000"
+  PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS: "60"
+  TRUST_PROXY_HEADERS: "true"

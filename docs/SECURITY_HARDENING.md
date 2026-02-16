@@ -198,6 +198,27 @@ iptables -A INPUT -j DROP
 - SHA-256 hashed in database
 - Never logged or exposed in errors
 - Rotation every 90 days
+
+### Public Agent Registration
+
+If self-service registration is not required, disable it in production:
+
+```bash
+export PUBLIC_AGENT_REGISTRATION_ENABLED=false
+```
+
+If it is required, set an explicit rate limit:
+
+```bash
+export PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE=60
+export PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES=10000
+export PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS=60
+```
+
+This endpoint is unauthenticated by design; protect it with WAF rules and monitoring. Recommended:
+- Block suspicious user agents and bots
+- Enforce IP-based throttling at the edge
+- Alert on spikes in 4xx/5xx for `/v1/agents/register`
 - Expiration dates enforced
 
 ```bash

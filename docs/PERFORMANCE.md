@@ -137,6 +137,31 @@ The StateSet Sequencer is designed for high-throughput, low-latency event sequen
 | Schemas | 92.8% | 0.32ms |
 | Merkle Proofs | 88.5% | 0.35ms |
 
+## Load Test Plan (Validation)
+
+Use the `load/` k6 scripts to validate SLOs before releases:
+
+1. **Ingest Baseline**: `load/sequencer_ingest.js` (legacy ingest for raw throughput)
+2. **Query Baseline**: `load/sequencer_query.js` (head + read latency)
+3. **Mixed Workload**: `load/mixed_workload.js`
+4. **Public Registration (Optional)**: `load/agents_register.js` (staging only)
+
+Recommended run sequence:
+
+```bash
+export SEQUENCER_BASE_URL=https://api.sequencer.stateset.app
+export API_KEY=<admin-or-test-key>
+export TENANT_ID=<tenant-uuid>
+export STORE_ID=<store-uuid>
+export AGENT_ID=<agent-uuid>
+
+k6 run load/sequencer_ingest.js --vus 20 --duration 2m
+k6 run load/sequencer_query.js --vus 20 --duration 2m
+k6 run load/mixed_workload.js --vus 50 --duration 5m
+```
+
+Validate against `docs/SLO.md` and record results in `docs/PERFORMANCE_BENCHMARKS.md`.
+
 ## Service Level Agreements (SLA)
 
 ### Uptime Commitment

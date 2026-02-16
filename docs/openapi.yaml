@@ -7,7 +7,10 @@ info:
 
     ## Authentication
 
-    All API endpoints require authentication via API key or JWT token:
+    All API endpoints require authentication via API key or JWT token, except:
+    - `POST /v1/agents/register` (public self-service registration)
+    - `GET /health`
+    - `GET /ready`
     - **API Key**: Pass in `X-API-Key` header
     - **JWT**: Pass in `Authorization: Bearer <token>` header
 
@@ -19,7 +22,7 @@ info:
     - Merkle tree commitments
     - L2 anchoring for finality
     - Inclusion proofs for any event
-  version: 0.1.1
+  version: 0.2.7
   contact:
     email: engineering@stateset.io
     url: https://github.com/stateset/stateset-sequencer
@@ -32,6 +35,8 @@ servers:
     description: Local development
   - url: https://sequencer.stateset.io/api
     description: Production
+  - url: https://api.sequencer.stateset.app/api
+    description: Production (sequencer)
 
 tags:
   - name: Events
@@ -48,6 +53,8 @@ tags:
     description: Event schema registry
   - name: Agents
     description: Agent key management
+  - name: Admin
+    description: Admin dashboard and operational insights
 
 security:
   - apiKey: []
@@ -81,7 +88,28 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '429':
-          $ref: '#/components/responses/RateLimited'
+          description: Rate limit exceeded
+          headers:
+            Retry-After:
+              description: Seconds until rate limit resets
+              schema:
+                type: integer
+            RateLimit-Limit:
+              description: Requests per minute for this client
+              schema:
+                type: integer
+            RateLimit-Remaining:
+              description: Remaining requests in the current window
+              schema:
+                type: integer
+            RateLimit-Reset:
+              description: Seconds until the window resets
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
 
   /v1/ves/events/ingest:
     post:
@@ -401,6 +429,166 @@ paths:
           $ref: '#/components/responses/BadRequest'
 
   # ==========================================================================
+  # VES Compliance Proofs
+  # ==========================================================================
+  /v1/ves/compliance/{event_id}/inputs:
+    post:
+      summary: Get compliance proof public inputs
+      description: Get the canonical public inputs needed to generate a compliance proof for an event + policy.
+      operationId: getVesCompliancePublicInputs
+      tags: [VES, Proofs]
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          description: Event identifier
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VesComplianceInputsRequest'
+      responses:
+        '200':
+          description: Public inputs for compliance proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComplianceInputsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/ves/compliance/{event_id}/proofs:
+    get:
+      summary: List compliance proofs
+      description: List all compliance proofs for an event.
+      operationId: listVesComplianceProofs
+      tags: [VES, Proofs]
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          description: Event identifier
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Proof list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComplianceProofListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      summary: Submit compliance proof
+      description: |
+        Submit a compliance proof for an event + policy.
+
+        For STARK proofs, callers must include `witnessCommitment`.
+      operationId: submitVesComplianceProof
+      tags: [VES, Proofs]
+      parameters:
+        - name: event_id
+          in: path
+          required: true
+          description: Event identifier
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitComplianceProofRequest'
+      responses:
+        '200':
+          description: Proof submitted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComplianceProofSummary'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Proof conflict (idempotency key already exists with different proof)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /v1/ves/compliance/proofs/{proof_id}:
+    get:
+      summary: Get compliance proof
+      description: Get a stored compliance proof by ID (includes proof bytes).
+      operationId: getVesComplianceProof
+      tags: [VES, Proofs]
+      parameters:
+        - name: proof_id
+          in: path
+          required: true
+          description: Proof identifier
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Proof details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComplianceProofDetails'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/ves/compliance/proofs/{proof_id}/verify:
+    get:
+      summary: Verify compliance proof
+      description: |
+        Verify a stored compliance proof.
+
+        For STARK proofs, this also performs cryptographic proof verification.
+      operationId: verifyVesComplianceProof
+      tags: [VES, Proofs]
+      parameters:
+        - name: proof_id
+          in: path
+          required: true
+          description: Proof identifier
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ComplianceProofVerifyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==========================================================================
   # VES Anchoring
   # ==========================================================================
   /v1/ves/anchor:
@@ -609,6 +797,63 @@ paths:
           $ref: '#/components/responses/BadRequest'
 
   # ==========================================================================
+  # Agent Registration
+  # ==========================================================================
+  /v1/agents/register:
+    post:
+      summary: Register agent (public)
+      description: Self-service agent registration (returns API key once)
+      operationId: registerAgent
+      tags: [Agents]
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentRegistrationRequest'
+      responses:
+        '200':
+          description: Agent registered
+          headers:
+            Cache-Control:
+              description: Prevent caching of API key response
+              schema:
+                type: string
+            RateLimit-Limit:
+              description: Requests per minute for this client (when enabled)
+              schema:
+                type: integer
+            RateLimit-Remaining:
+              description: Remaining requests in the current window
+              schema:
+                type: integer
+            RateLimit-Reset:
+              description: Seconds until the window resets
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRegistrationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          description: Forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  # ==========================================================================
   # Agent Keys
   # ==========================================================================
   /v1/agents/keys:
@@ -642,6 +887,119 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+
+  # ==========================================================================
+  # Admin
+  # ==========================================================================
+  /v1/admin/overview:
+    get:
+      summary: Admin overview
+      description: Summary counts for tenants, stores, agents, and API keys
+      operationId: adminOverview
+      tags: [Admin]
+      responses:
+        '200':
+          description: Overview summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminOverviewResponse'
+        '403':
+          description: Admin permission required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /v1/admin/tenants:
+    get:
+      summary: List tenants
+      description: Tenant summaries for the admin dashboard
+      operationId: adminTenants
+      tags: [Admin]
+      responses:
+        '200':
+          description: Tenant list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AdminTenantSummary'
+        '403':
+          description: Admin permission required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /v1/admin/stores:
+    get:
+      summary: List stores
+      description: Store summaries for the admin dashboard
+      operationId: adminStores
+      tags: [Admin]
+      responses:
+        '200':
+          description: Store list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AdminStoreSummary'
+        '403':
+          description: Admin permission required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /v1/admin/agents:
+    get:
+      summary: List agents
+      description: Agent summaries for the admin dashboard
+      operationId: adminAgents
+      tags: [Admin]
+      responses:
+        '200':
+          description: Agent list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AdminAgentSummary'
+        '403':
+          description: Admin permission required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
 
   # ==========================================================================
   # Health & Metrics
@@ -701,7 +1059,6 @@ paths:
       description: Get Prometheus-format metrics
       operationId: getMetrics
       tags: [Health]
-      security: []
       responses:
         '200':
           description: Prometheus metrics
@@ -814,6 +1171,219 @@ components:
           type: string
           format: uri
           description: Link to error documentation
+
+    AgentRegistrationRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          description: Human-readable agent name
+          minLength: 1
+          maxLength: 128
+        description:
+          type: string
+          description: Optional agent description
+          maxLength: 1024
+        tenantId:
+          type: string
+          format: uuid
+          description: Not allowed for self-service registration
+        storeIds:
+          type: array
+          maxItems: 50
+          items:
+            type: string
+            format: uuid
+          description: Store IDs this agent can access
+        readOnly:
+          type: boolean
+          description: Register as read-only
+        admin:
+          type: boolean
+          description: Not allowed for self-service registration
+        rateLimit:
+          type: integer
+          description: Optional requests-per-minute limit
+          minimum: 1
+          maximum: 10000
+
+    AgentRegistrationResponse:
+      type: object
+      required:
+        - success
+        - agentId
+        - tenantId
+        - apiKey
+        - permissions
+        - message
+      properties:
+        success:
+          type: boolean
+        agentId:
+          type: string
+          format: uuid
+        tenantId:
+          type: string
+          format: uuid
+        apiKey:
+          type: string
+        permissions:
+          type: string
+        message:
+          type: string
+
+    AdminOverviewResponse:
+      type: object
+      required:
+        - tenants
+        - stores
+        - agents
+        - apiKeys
+        - activeApiKeys
+        - totalHeadSequence
+        - activeStores24h
+        - maxProjectionLag
+      properties:
+        tenants:
+          type: integer
+        stores:
+          type: integer
+        agents:
+          type: integer
+        apiKeys:
+          type: integer
+        activeApiKeys:
+          type: integer
+        totalHeadSequence:
+          type: integer
+        activeStores24h:
+          type: integer
+        maxProjectionLag:
+          type: integer
+        lastActivityAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    AdminTenantSummary:
+      type: object
+      required:
+        - tenantId
+        - agentCount
+        - apiKeyCount
+        - activeApiKeys
+        - storeCount
+        - totalHeadSequence
+        - activeStores24h
+        - maxProjectionLag
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        agentCount:
+          type: integer
+        apiKeyCount:
+          type: integer
+        activeApiKeys:
+          type: integer
+        storeCount:
+          type: integer
+        totalHeadSequence:
+          type: integer
+        activeStores24h:
+          type: integer
+        maxProjectionLag:
+          type: integer
+        lastKeyAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastActivityAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    AdminStoreSummary:
+      type: object
+      required:
+        - tenantId
+        - storeId
+        - headSequence
+        - lastProjectedSequence
+        - projectionLag
+        - agentCount
+        - updatedAt
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        storeId:
+          type: string
+          format: uuid
+        headSequence:
+          type: integer
+        lastProjectedSequence:
+          type: integer
+        projectionLag:
+          type: integer
+        agentCount:
+          type: integer
+        lastAgentSyncAt:
+          type: string
+          format: date-time
+          nullable: true
+        updatedAt:
+          type: string
+          format: date-time
+
+    AdminAgentSummary:
+      type: object
+      required:
+        - tenantId
+        - agentId
+        - permissions
+        - storeScope
+        - apiKeyCount
+        - activeApiKeys
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        agentId:
+          type: string
+          format: uuid
+        permissions:
+          type: string
+        storeScope:
+          type: string
+        apiKeyCount:
+          type: integer
+        activeApiKeys:
+          type: integer
+        firstKeyAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastKeyAt:
+          type: string
+          format: date-time
+          nullable: true
+        storeId:
+          type: string
+          format: uuid
+          nullable: true
+        lastSyncAt:
+          type: string
+          format: date-time
+          nullable: true
+        lastPulledSequence:
+          type: integer
+          nullable: true
+        lastPushedSequence:
+          type: integer
+          nullable: true
 
     IngestRequest:
       type: object
@@ -1220,6 +1790,202 @@ components:
           format: byte
         publicInputs:
           type: object
+
+    VesComplianceInputsRequest:
+      type: object
+      required:
+        - policyId
+      properties:
+        policyId:
+          type: string
+          description: Policy identifier (e.g., "aml.threshold")
+          maxLength: 64
+        policyParams:
+          type: object
+          description: Policy parameters object
+          additionalProperties: true
+
+    WitnessCommitment:
+      description: |
+        Witness commitment used by STARK compliance proofs.
+
+        Accepted forms:
+        - a 64-char lowercase hex string (32 bytes), optionally prefixed with `0x`
+        - an array of 4 u64 limbs (Rust-friendly, not JavaScript-safe for large values)
+      oneOf:
+        - type: string
+          description: 32-byte commitment encoded as lowercase hex
+          example: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+        - type: array
+          minItems: 4
+          maxItems: 4
+          items:
+            type: integer
+
+    SubmitComplianceProofRequest:
+      type: object
+      required:
+        - proofType
+        - proofB64
+        - policyId
+      properties:
+        proofType:
+          type: string
+          maxLength: 32
+        proofVersion:
+          type: integer
+          default: 1
+        policyId:
+          type: string
+          maxLength: 64
+        policyParams:
+          type: object
+          additionalProperties: true
+        proofB64:
+          type: string
+          format: byte
+        witnessCommitment:
+          $ref: '#/components/schemas/WitnessCommitment'
+        publicInputs:
+          type: object
+          description: Optional public inputs; if provided, must match sequencer canonical inputs
+
+    ComplianceInputsResponse:
+      type: object
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        public_inputs:
+          type: object
+          additionalProperties: true
+        public_inputs_hash:
+          type: string
+          description: Hex-encoded SHA-256 of canonical public_inputs
+
+    ComplianceProofSummary:
+      type: object
+      properties:
+        proof_id:
+          type: string
+          format: uuid
+        event_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+        store_id:
+          type: string
+          format: uuid
+        proof_type:
+          type: string
+        proof_version:
+          type: integer
+        policy_id:
+          type: string
+        policy_params:
+          type: object
+          additionalProperties: true
+        policy_hash:
+          type: string
+          description: Hex-encoded policy hash
+        proof_hash:
+          type: string
+          description: Hex-encoded proof hash
+        witness_commitment:
+          type: array
+          items:
+            type: integer
+          nullable: true
+        witness_commitment_hex:
+          type: string
+          nullable: true
+        public_inputs:
+          type: object
+          nullable: true
+        submitted_at:
+          type: string
+          format: date-time
+
+    ComplianceProofDetails:
+      allOf:
+        - $ref: '#/components/schemas/ComplianceProofSummary'
+        - type: object
+          properties:
+            proof_b64:
+              type: string
+              format: byte
+
+    ComplianceProofListResponse:
+      type: object
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        proofs:
+          type: array
+          items:
+            $ref: '#/components/schemas/ComplianceProofSummary'
+        count:
+          type: integer
+
+    ComplianceProofVerifyResponse:
+      type: object
+      properties:
+        proof_id:
+          type: string
+          format: uuid
+        event_id:
+          type: string
+          format: uuid
+        tenant_id:
+          type: string
+          format: uuid
+        store_id:
+          type: string
+          format: uuid
+        proof_type:
+          type: string
+        proof_version:
+          type: integer
+        policy_id:
+          type: string
+        policy_hash:
+          type: string
+        proof_hash:
+          type: string
+        proof_hash_match:
+          type: boolean
+        public_inputs_hash:
+          type: string
+          nullable: true
+        canonical_public_inputs_hash:
+          type: string
+        public_inputs_match:
+          type: boolean
+        witness_commitment:
+          type: array
+          items:
+            type: integer
+          nullable: true
+        witness_commitment_hex:
+          type: string
+          nullable: true
+        stark_valid:
+          type: boolean
+          nullable: true
+        stark_error:
+          type: string
+          nullable: true
+        stark_verification_time_ms:
+          type: integer
+          nullable: true
+        valid:
+          type: boolean
+        reason:
+          type: string
+          nullable: true
 
     RegisterAgentKeyRequest:
       type: object

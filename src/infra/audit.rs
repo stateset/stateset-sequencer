@@ -129,7 +129,11 @@ pub struct AuditLogBuilder {
 
 impl AuditLogBuilder {
     /// Create a new audit log builder
-    pub fn new(action: AuditAction, actor: impl Into<String>, actor_type: impl Into<String>) -> Self {
+    pub fn new(
+        action: AuditAction,
+        actor: impl Into<String>,
+        actor_type: impl Into<String>,
+    ) -> Self {
         Self {
             action,
             actor: actor.into(),
@@ -153,7 +157,11 @@ impl AuditLogBuilder {
     }
 
     /// Set the resource type and ID
-    pub fn resource(mut self, resource_type: impl Into<String>, resource_id: impl Into<String>) -> Self {
+    pub fn resource(
+        mut self,
+        resource_type: impl Into<String>,
+        resource_id: impl Into<String>,
+    ) -> Self {
         self.resource_type = Some(resource_type.into());
         self.resource_id = Some(resource_id.into());
         self
@@ -254,23 +262,17 @@ impl PgAuditLogger {
         .execute(&self.pool)
         .await?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log (actor)",
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_actor ON audit_log (actor)")
+            .execute(&self.pool)
+            .await?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action)",
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action)")
+            .execute(&self.pool)
+            .await?;
 
-        sqlx::query(
-            "CREATE INDEX IF NOT EXISTS idx_audit_log_tenant ON audit_log (tenant_id)",
-        )
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_log_tenant ON audit_log (tenant_id)")
+            .execute(&self.pool)
+            .await?;
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_audit_log_resource ON audit_log (resource_type, resource_id)",
@@ -564,7 +566,10 @@ mod tests {
     #[test]
     fn test_audit_action_display() {
         assert_eq!(AuditAction::ApiKeyCreated.to_string(), "api_key_created");
-        assert_eq!(AuditAction::SchemaRegistered.to_string(), "schema_registered");
+        assert_eq!(
+            AuditAction::SchemaRegistered.to_string(),
+            "schema_registered"
+        );
         assert_eq!(
             AuditAction::Custom("test".to_string()).to_string(),
             "custom:test"
@@ -573,16 +578,12 @@ mod tests {
 
     #[test]
     fn test_audit_log_builder() {
-        let entry = AuditLogBuilder::new(
-            AuditAction::ApiKeyCreated,
-            "admin@example.com",
-            "jwt",
-        )
-        .tenant_id(Uuid::new_v4())
-        .resource("api_key", "key-123")
-        .ip_address("192.168.1.1")
-        .details(serde_json::json!({"permissions": ["read", "write"]}))
-        .build();
+        let entry = AuditLogBuilder::new(AuditAction::ApiKeyCreated, "admin@example.com", "jwt")
+            .tenant_id(Uuid::new_v4())
+            .resource("api_key", "key-123")
+            .ip_address("192.168.1.1")
+            .details(serde_json::json!({"permissions": ["read", "write"]}))
+            .build();
 
         assert_eq!(entry.actor, "admin@example.com");
         assert_eq!(entry.actor_type, "jwt");
@@ -592,13 +593,9 @@ mod tests {
 
     #[test]
     fn test_audit_log_builder_failed() {
-        let entry = AuditLogBuilder::new(
-            AuditAction::LoginFailure,
-            "unknown",
-            "api_key",
-        )
-        .failed("Invalid credentials")
-        .build();
+        let entry = AuditLogBuilder::new(AuditAction::LoginFailure, "unknown", "api_key")
+            .failed("Invalid credentials")
+            .build();
 
         assert!(!entry.success);
         assert_eq!(entry.error_message, Some("Invalid credentials".to_string()));

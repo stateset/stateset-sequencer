@@ -1079,7 +1079,7 @@ See [SECURITY.md](docs/SECURITY.md) for detailed security guidance.
 | `PORT` | HTTP listen port (default: 8080) |
 | `GRPC_PORT` | gRPC listen port (default: PORT + 1) |
 | `GRPC_DISABLED` | Disable gRPC server |
-| `AUTH_MODE` | `required` (default) or `disabled` |
+| `AUTH_MODE` | `required` (default) or `disabled` (set `ALLOW_AUTH_DISABLED=true`) |
 | `BOOTSTRAP_ADMIN_API_KEY` | Initial admin API key |
 | `JWT_SECRET` | JWT signing secret |
 | `VES_SEQUENCER_ID` | Pinned sequencer UUID |

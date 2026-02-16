@@ -1,0 +1,62 @@
+groups:
+  - name: stateset-sequencer.slo
+    rules:
+      - alert: SequencerHighErrorRate
+        expr: |
+          (
+            sum(rate(sequencer_http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(sequencer_http_requests_total[5m]))
+          ) > 0.001
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Sequencer 5xx error rate > 0.1% (10m)"
+          description: "Investigate upstream dependencies, DB health, or deployment regressions."
+
+      - alert: SequencerHighLatencyP95Ingest
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(sequencer_http_request_latency_seconds_bucket{path="/api/v1/ves/events/ingest"}[5m])) by (le)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Sequencer ingest p95 latency > 50ms (10m)"
+          description: "Check DB saturation, payload sizes, or hot tenants."
+
+      - alert: SequencerHighLatencyP95Read
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(sequencer_http_request_latency_seconds_bucket{path="/api/v1/events"}[5m])) by (le)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: page
+        annotations:
+          summary: "Sequencer read p95 latency > 50ms (10m)"
+          description: "Check DB indexes, connection pool pressure, or cache hit rates."
+
+  - name: stateset-sequencer.resources
+    rules:
+      - alert: SequencerDbPoolSaturation
+        expr: sequencer_pool_utilization > 0.9
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sequencer DB pool utilization > 90% (5m)"
+          description: "Consider increasing pool size or optimizing queries."
+
+      - alert: SequencerDbAcquireTimeouts
+        expr: rate(sequencer_pool_timed_out_acquisitions[5m]) > 0
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "Sequencer DB acquisition timeouts detected"
+          description: "Pool contention or database saturation is causing timeouts."

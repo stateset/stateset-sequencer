@@ -20,6 +20,8 @@ pub struct VesComplianceProof {
     pub policy_id: String,
     pub policy_params: serde_json::Value,
     pub policy_hash: Hash256,
+    /// Optional witness commitment (Rescue output) required for STARK proof verification.
+    pub witness_commitment: Option<Hash256>,
     pub proof: Vec<u8>,
     pub proof_hash: Hash256,
     pub public_inputs: Option<serde_json::Value>,
@@ -38,6 +40,8 @@ pub struct VesComplianceProofSummary {
     pub policy_params: serde_json::Value,
     pub policy_hash: Hash256,
     pub proof_hash: Hash256,
+    /// Optional witness commitment (Rescue output) required for STARK proof verification.
+    pub witness_commitment: Option<Hash256>,
     pub public_inputs: Option<serde_json::Value>,
     pub submitted_at: DateTime<Utc>,
 }

@@ -66,6 +66,13 @@ repos:
         types: [rust]
         stages: [commit]
 
+      # Catch obvious hardcoded secrets before they can be staged
+      - id: no-obvious-secrets
+        name: no obvious hardcoded secrets
+        entry: bash -c 'files="$(git diff --cached --name-only --diff-filter=ACM | grep -E "\\.(rs|ts|tsx|js|mjs|sh|bash|yaml|yml|toml|json)$" || true)"; if [ -z "$files" ]; then exit 0; fi; echo "$files" | xargs -r grep -nE "BEGIN (RSA |EC )?PRIVATE KEY|BEGIN OPENSSH PRIVATE KEY|-----BEGIN PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pso]_[0-9A-Za-z]{36,}|sk_live_[A-Za-z0-9]{24,}|xox[baprs]-[0-9]{10,}-[0-9]{12,}-[A-Za-z0-9-]{24,}|AIza[0-9A-Za-z_-]{35}|eyJ[a-zA-Z0-9_-]{100,}\\.[a-zA-Z0-9_-]{100,}";'
+        language: system
+        stages: [commit]
+
       # Security audit (on push only, slow)
       - id: cargo-audit
         name: cargo audit

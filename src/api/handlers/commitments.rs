@@ -3,12 +3,14 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use std::time::Duration;
 use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
+use crate::infra::CACHE_STAMPEDE_DELAY;
+
 use crate::api::auth_helpers::{ensure_read, ensure_write};
 use crate::api::types::{CreateCommitmentRequest, HeadQuery};
+use crate::api::utils::internal_error;
 use crate::auth::AuthContextExt;
 use crate::domain::{StoreId, TenantId};
 use crate::infra::CommitmentEngine;
@@ -24,20 +26,32 @@ pub async fn get_commitment(
     debug!("Getting commitment by ID");
     let cache = &state.cache_manager.commitments;
     if let Some(cached) = cache.get_by_batch_id(&batch_id).await {
-        ensure_read(&auth, cached.commitment.tenant_id.0, cached.commitment.store_id.0)?;
+        ensure_read(
+            &auth,
+            cached.commitment.tenant_id.0,
+            cached.commitment.store_id.0,
+        )?;
         return Ok(Json(serde_json::json!(cached.commitment)));
     }
 
     let (cached, lock_acquired) = cache.get_by_batch_id_with_lock(&batch_id).await;
     if let Some(cached) = cached {
-        ensure_read(&auth, cached.commitment.tenant_id.0, cached.commitment.store_id.0)?;
+        ensure_read(
+            &auth,
+            cached.commitment.tenant_id.0,
+            cached.commitment.store_id.0,
+        )?;
         return Ok(Json(serde_json::json!(cached.commitment)));
     }
 
     if !lock_acquired {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
         if let Some(cached) = cache.get_by_batch_id(&batch_id).await {
-            ensure_read(&auth, cached.commitment.tenant_id.0, cached.commitment.store_id.0)?;
+            ensure_read(
+                &auth,
+                cached.commitment.tenant_id.0,
+                cached.commitment.store_id.0,
+            )?;
             return Ok(Json(serde_json::json!(cached.commitment)));
         }
     }
@@ -52,7 +66,7 @@ pub async fn get_commitment(
                     if lock_acquired {
                         cache.release_batch_id_lock(&batch_id).await;
                     }
-                    return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                    return Err(internal_error(e));
                 }
             }
         }
@@ -60,7 +74,7 @@ pub async fn get_commitment(
             if lock_acquired {
                 cache.release_batch_id_lock(&batch_id).await;
             }
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            return Err(internal_error(e));
         }
     };
 
@@ -98,7 +112,10 @@ pub async fn create_commitment(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<CreateCommitmentRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    info!("Creating commitment for sequence range {}..{}", request.sequence_start, request.sequence_end);
+    info!(
+        "Creating commitment for sequence range {}..{}",
+        request.sequence_start, request.sequence_end
+    );
     ensure_write(&auth, request.tenant_id, request.store_id)?;
 
     let tenant_id = TenantId::from_uuid(request.tenant_id);
@@ -157,7 +174,7 @@ pub async fn list_commitments(
             None,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     let response: Vec<serde_json::Value> = commitments
         .iter()

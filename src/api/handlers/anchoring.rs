@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::api::auth_helpers::{ensure_admin, ensure_read};
 use crate::api::types::AnchorRequest;
+use crate::api::utils::internal_error;
 use crate::auth::AuthContextExt;
 use crate::infra::CommitmentEngine;
 use crate::server::AppState;
@@ -31,7 +32,7 @@ pub async fn anchor_commitment(
         .commitment_engine
         .get_commitment(request.batch_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(internal_error)?
         .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?;
 
     ensure_admin(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
@@ -49,14 +50,14 @@ pub async fn anchor_commitment(
     let tx_hash = anchor_service
         .anchor_commitment(&commitment)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     // Update commitment with chain tx hash
     state
         .commitment_engine
         .update_chain_tx(request.batch_id, tx_hash)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     state
         .cache_manager
@@ -117,7 +118,7 @@ pub async fn verify_anchor_onchain(
     let is_anchored = anchor_service
         .verify_anchored(batch_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     // If we can find a local commitment, enforce tenant/store access.
     if let Ok(Some(commitment)) = state.commitment_reader.get_commitment(batch_id).await {

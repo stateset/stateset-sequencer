@@ -20,11 +20,13 @@ mod commitment;
 mod dead_letter;
 mod error;
 mod graceful_shutdown;
+mod net;
 mod payload_encryption;
 mod pool_monitor;
 pub mod postgres;
 mod retry;
 mod schema_validation;
+mod secrets;
 pub mod sqlite;
 mod traits;
 mod ves_commitment;
@@ -41,27 +43,30 @@ pub use batch::{
 pub use cache::{
     AgentKeyCache, CacheManager, CacheManagerConfig, CacheRefreshConfig, CacheStats,
     CachedCommitment, CommitmentCache, LruCache, ProofCache, SchemaCache, VesCommitmentCache,
+    CACHE_STAMPEDE_DELAY,
 };
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, CircuitBreakerRegistry, CircuitState,
 };
 pub use commitment::PgCommitmentEngine;
 pub use dead_letter::{
-    DeadLetterEvent, DeadLetterReason, DeadLetterRetryConfig, DeadLetterStats, DeadLetterStatus,
-    EnqueueParams, PgDeadLetterQueue,
+    spawn_dlq_cleanup, DeadLetterEvent, DeadLetterReason, DeadLetterRetryConfig, DeadLetterStats,
+    DeadLetterStatus, EnqueueParams, PgDeadLetterQueue,
 };
-pub use error::{
-    contexts, ContextualError, ErrorContext, Result, ResultExt, SequencerError,
-};
+pub use error::{contexts, ContextualError, ErrorContext, Result, ResultExt, SequencerError};
 pub use graceful_shutdown::{
     serve_with_shutdown, shutdown_signal, spawn_until_shutdown, GracefulShutdownConfig,
     RequestGuard, RequestTracker, ShutdownCoordinator, ShutdownSignal,
 };
+pub use net::extract_client_ip;
 pub use payload_encryption::{PayloadEncryption, PayloadEncryptionMode};
 pub use pool_monitor::{PoolHealthStatus, PoolMonitor, PoolMonitorConfig, PoolStats};
-pub use postgres::{PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer, PgX402Repository, VesSequencer};
+pub use postgres::{
+    PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer, PgX402Repository, VesSequencer,
+};
 pub use retry::{is_retryable_db_error, retry, retry_with_config, Retry, RetryConfig, RetryResult};
 pub use schema_validation::SchemaValidationMode;
+pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
 pub use sqlite::SqliteOutbox;
 pub use traits::*;
 pub use ves_commitment::PgVesCommitmentEngine;

@@ -2,6 +2,8 @@
 
 This guide explains how to set up monitoring for the StateSet Sequencer using the provided Grafana dashboards.
 
+See `docs/SLO.md` for service level objectives and alerting targets.
+
 ## Prerequisites
 
 - Kubernetes cluster with Helm installed
@@ -33,7 +35,7 @@ helm install sequencer ./charts/stateset-sequencer \
 Option 1: Import via Grafana UI
 1. Open Grafana
 2. Navigate to Dashboards → Import
-3. Upload `docs/monitoring/stateset-sequencer-dashboard.json`
+3. Upload `docs/monitoring/grafana-dashboard.json`
 4. Select your Prometheus data source
 
 Option 2: Import via Grafana API
@@ -46,7 +48,7 @@ DATASOURCE_UID="your-prometheus-uid"
 curl -X POST "$GRAFANA_URL/api/dashboards/db" \
   -H "Authorization: Bearer $GRAFANA_API_KEY" \
   -H "Content-Type: application/json" \
-  -d @docs/monitoring/stateset-sequencer-dashboard.json | \
+  -d @docs/monitoring/grafana-dashboard.json | \
   jq -r '.datasources[] |= .uid = "'$DATASOURCE_UID'"' | \
   curl -X POST "$GRAFANA_URL/api/dashboards/db" \
     -H "Authorization: Bearer $GRAFANA_API_KEY" \
@@ -61,6 +63,23 @@ The Helm chart creates a ServiceMonitor for the Prometheus Operator. Ensure your
 ```bash
 # Verify ServiceMonitor was created
 kubectl get servicemonitor -n <namespace>
+```
+
+**Note:** The `/metrics` endpoint requires admin auth. Configure your ServiceMonitor to add the
+`Authorization: ApiKey <admin-key>` header, or route metrics via a trusted sidecar/proxy that
+injects the header.
+
+Example ServiceMonitor auth stanza (Prometheus Operator):
+
+```yaml
+endpoints:
+  - port: http
+    path: /metrics
+    authorization:
+      type: ApiKey
+      credentials:
+        name: sequencer-secrets
+        key: BOOTSTRAP_ADMIN_API_KEY
 ```
 
 ### 4. Create Alerts
@@ -79,17 +98,26 @@ spec:
       rules:
         - alert: SequencerHighErrorRate
           expr: |
-            rate(stateset_sequencer_errors_total[5m]) > 0.1
+            (
+              sum(rate(sequencer_http_requests_total{status=~"5.."}[5m]))
+              /
+              clamp_min(sum(rate(sequencer_http_requests_total[5m])), 0.001)
+            ) > 0.001
           for: 5m
           labels:
             severity: warning
           annotations:
-            summary: High error rate detected
-            description: "Error rate is {{ $value }} errors/sec"
+            summary: High 5xx error rate detected
+            description: "5xx error rate is {{ $value }} (> 0.1%)"
 
         - alert: SequencerHighLatency
           expr: |
-            histogram_quantile(0.95, rate(stateset_sequencer_request_duration_seconds_bucket[5m])) > 1
+            histogram_quantile(
+              0.95,
+              sum by (le) (
+                rate(sequencer_http_request_latency_seconds_bucket{status=~"2.."}[5m])
+              )
+            ) > 1
           for: 5m
           labels:
             severity: warning
@@ -99,7 +127,7 @@ spec:
 
         - alert: SequencerDatabasePoolExhausted
           expr: |
-            stateset_sequencer_db_pool_active_connections / stateset_sequencer_db_pool_max_connections > 0.9
+            sequencer_pool_utilization > 0.9
           for: 5m
           labels:
             severity: critical
@@ -107,25 +135,35 @@ spec:
             summary: Database pool nearly exhausted
             description: "Pool usage at {{ $value }}"
 
-        - alert: SequencerCircuitBreakerOpen
-          expr: |
-            stateset_sequencer_circuit_breaker_state{state="open"} == 1
-          for: 1m
-          labels:
-            severity: critical
-          annotations:
-            summary: Circuit breaker is open
-            description: "Circuit breaker for service {{ $labels.service }} is open"
-
         - alert: SequencerLowThroughput
           expr: |
-            rate(stateset_sequencer_events_ingested_total[5m]) < 10
+            rate(sequencer_events_ingested[5m]) < 10
           for: 10m
           labels:
             severity: warning
           annotations:
             summary: Low event throughput
             description: "Events per sec is {{ $value }}"
+
+        - alert: SequencerAgentRegistrationErrors
+          expr: |
+            rate(sequencer_http_requests_total{path=~\"/v1/agents/register|/api/v1/agents/register\",status=~\"5..\"}[5m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Agent registration errors detected
+            description: "5xx responses for agent registration: {{ $value }} req/s"
+
+        - alert: SequencerAgentRegistrationLatency
+          expr: |
+            histogram_quantile(0.95, rate(sequencer_http_request_latency_seconds_bucket{path=~\"/v1/agents/register|/api/v1/agents/register\"}[5m])) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Agent registration latency elevated
+            description: "P95 registration latency is {{ $value }}s"
 ```
 
 ## Dashboard Panels
@@ -145,6 +183,12 @@ spec:
 - Request duration histograms
 - P50, P95, P99 quantiles
 - Latency trends
+
+HTTP metrics include labels for `method`, `path`, and `status` via
+`sequencer_http_requests_total` and `sequencer_http_request_latency_seconds_bucket`.
+
+Agent self-registration outcomes are tracked via
+`sequencer.agent.registration_total` with `outcome` and `reason` labels.
 
 ### Error Rate
 - Total errors

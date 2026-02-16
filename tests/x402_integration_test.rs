@@ -9,7 +9,7 @@
 mod common;
 
 use chrono::Utc;
-use ed25519_dalek::{SigningKey, Signer};
+use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -199,7 +199,9 @@ fn test_ed25519_signature() {
 
     // Sign and verify
     let signature = signing_key.sign(&signing_hash);
-    assert!(verifying_key.verify_strict(&signing_hash, &signature).is_ok());
+    assert!(verifying_key
+        .verify_strict(&signing_hash, &signature)
+        .is_ok());
 }
 
 #[test]
@@ -235,9 +237,12 @@ fn test_batch_creation() {
     let tenant_id = TenantId::new();
     let store_id = StoreId::new();
 
-    let mut batch = X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
+    let batch = X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
 
-    assert_eq!(batch.status, stateset_sequencer::domain::X402BatchStatus::Pending);
+    assert_eq!(
+        batch.status,
+        stateset_sequencer::domain::X402BatchStatus::Pending
+    );
     assert_eq!(batch.payment_count, 0);
     assert!(batch.can_accept(100));
 }
@@ -248,7 +253,8 @@ fn test_batch_add_payment() {
     let tenant_id = TenantId::new();
     let store_id = StoreId::new();
 
-    let mut batch = X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
+    let mut batch =
+        X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
 
     // Create and add intents with sequence numbers
     for i in 0..5 {
@@ -281,7 +287,7 @@ fn test_merkle_tree_computation() {
     let store_id = StoreId::new();
 
     // Create test intents with sequence numbers
-    let mut intents: Vec<X402PaymentIntent> = (0..4)
+    let intents: Vec<X402PaymentIntent> = (0..4)
         .map(|i| {
             let mut intent = create_test_intent(
                 &signing_key,
@@ -451,7 +457,9 @@ mod integration {
         );
 
         // Insert intent
-        repo.insert_intent(&intent).await.expect("Failed to insert intent");
+        repo.insert_intent(&intent)
+            .await
+            .expect("Failed to insert intent");
 
         // Retrieve intent
         let retrieved = repo
@@ -484,7 +492,9 @@ mod integration {
                 &format!("0x{:040x}", i + 1),
                 1_000_000,
             );
-            repo.insert_intent(&intent).await.expect("Failed to insert intent");
+            repo.insert_intent(&intent)
+                .await
+                .expect("Failed to insert intent");
             intents.push(intent);
         }
 
@@ -498,11 +508,23 @@ mod integration {
         }
 
         // Verify sequence numbers are sequential
-        let retrieved = repo.get_intent(intents[0].intent_id).await.unwrap().unwrap();
-        let seq1 = retrieved.sequence_number.expect("Should have sequence number");
+        let retrieved = repo
+            .get_intent(intents[0].intent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let seq1 = retrieved
+            .sequence_number
+            .expect("Should have sequence number");
 
-        let retrieved = repo.get_intent(intents[1].intent_id).await.unwrap().unwrap();
-        let seq2 = retrieved.sequence_number.expect("Should have sequence number");
+        let retrieved = repo
+            .get_intent(intents[1].intent_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let seq2 = retrieved
+            .sequence_number
+            .expect("Should have sequence number");
 
         assert_eq!(seq2, seq1 + 1);
     }
@@ -526,7 +548,9 @@ mod integration {
                 &format!("0x{:040x}", i + 1),
                 1_000_000,
             );
-            repo.insert_intent(&intent).await.expect("Failed to insert intent");
+            repo.insert_intent(&intent)
+                .await
+                .expect("Failed to insert intent");
             repo.assign_sequence_number(intent.intent_id, &tenant_id, &store_id)
                 .await
                 .expect("Failed to assign sequence number");
@@ -542,12 +566,15 @@ mod integration {
         assert_eq!(pending.len(), 4);
 
         // Create batch
-        let mut batch = X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
+        let mut batch =
+            X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
         for intent in &pending {
             batch.add_payment(intent);
         }
 
-        repo.insert_batch(&batch).await.expect("Failed to insert batch");
+        repo.insert_batch(&batch)
+            .await
+            .expect("Failed to insert batch");
 
         // Commit batch with Merkle root
         let (merkle_root, state_root) = repo

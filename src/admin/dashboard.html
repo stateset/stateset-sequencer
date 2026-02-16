@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>StateSet Sequencer Admin</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #0c1a20;
+        --muted: #3e4b56;
+        --muted-2: #657382;
+        --surface: #f6f3ef;
+        --surface-2: #ffffff;
+        --surface-3: rgba(255, 255, 255, 0.7);
+        --accent: #0c8b7d;
+        --accent-2: #f4b860;
+        --accent-3: #1e5aa8;
+        --line: rgba(12, 26, 32, 0.1);
+        --shadow: 0 20px 60px rgba(12, 26, 32, 0.12);
+        --radius-lg: 26px;
+        --radius-md: 18px;
+        --radius-sm: 12px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", system-ui, sans-serif;
+        color: var(--ink);
+        background: linear-gradient(135deg, #f3f1ec 0%, #fdfcf9 45%, #f2f8f7 100%);
+        min-height: 100vh;
+      }
+
+      .bg-orbs::before,
+      .bg-orbs::after {
+        content: "";
+        position: fixed;
+        z-index: 0;
+        width: 460px;
+        height: 460px;
+        border-radius: 50%;
+        filter: blur(80px);
+        opacity: 0.35;
+      }
+
+      .bg-orbs::before {
+        top: -120px;
+        right: -140px;
+        background: radial-gradient(circle, #f4b860, transparent 70%);
+      }
+
+      .bg-orbs::after {
+        bottom: -140px;
+        left: -120px;
+        background: radial-gradient(circle, #0c8b7d, transparent 70%);
+      }
+
+      .shell {
+        position: relative;
+        z-index: 1;
+        max-width: 1200px;
+        margin: 0 auto;
+        padding: 48px 24px 64px;
+      }
+
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 24px;
+        flex-wrap: wrap;
+      }
+
+      .brand {
+        display: grid;
+        gap: 10px;
+      }
+
+      .brand h1 {
+        margin: 0;
+        font-size: clamp(2rem, 2.8vw, 3.2rem);
+        letter-spacing: -0.02em;
+      }
+
+      .brand p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 1rem;
+      }
+
+      .status-pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 16px;
+        border-radius: 999px;
+        background: var(--surface-3);
+        border: 1px solid var(--line);
+        font-size: 0.95rem;
+      }
+
+      .status-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 0 4px rgba(12, 139, 125, 0.2);
+      }
+
+      .toolbar {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+
+      button,
+      input {
+        font-family: inherit;
+      }
+
+      .btn {
+        border: none;
+        border-radius: 999px;
+        padding: 10px 18px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 0.2s ease, box-shadow 0.2s ease;
+      }
+
+      .btn-primary {
+        background: var(--accent);
+        color: white;
+        box-shadow: 0 10px 24px rgba(12, 139, 125, 0.28);
+      }
+
+      .btn-secondary {
+        background: var(--surface-2);
+        color: var(--ink);
+        border: 1px solid var(--line);
+      }
+
+      .btn:hover {
+        transform: translateY(-1px);
+      }
+
+      .stats {
+        margin-top: 36px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 18px;
+      }
+
+      .card {
+        background: var(--surface-2);
+        border-radius: var(--radius-md);
+        padding: 18px 20px;
+        border: 1px solid var(--line);
+        box-shadow: var(--shadow);
+        position: relative;
+        overflow: hidden;
+        animation: rise 0.6s ease forwards;
+      }
+
+      .card .label {
+        font-size: 0.85rem;
+        color: var(--muted-2);
+      }
+
+      .card .value {
+        font-size: 1.8rem;
+        font-weight: 700;
+        margin-top: 8px;
+      }
+
+      .card .meta {
+        font-size: 0.85rem;
+        margin-top: 8px;
+        color: var(--muted);
+      }
+
+      .card::after {
+        content: "";
+        position: absolute;
+        width: 120px;
+        height: 120px;
+        border-radius: 50%;
+        right: -40px;
+        top: -40px;
+        background: rgba(12, 139, 125, 0.08);
+      }
+
+      .grid {
+        margin-top: 36px;
+        display: grid;
+        gap: 24px;
+      }
+
+      .panel {
+        background: var(--surface-2);
+        border-radius: var(--radius-lg);
+        border: 1px solid var(--line);
+        box-shadow: var(--shadow);
+        padding: 20px 22px 16px;
+      }
+
+      .panel-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-bottom: 12px;
+      }
+
+      .panel h2 {
+        margin: 0;
+        font-size: 1.35rem;
+      }
+
+      .panel-actions {
+        display: flex;
+        gap: 12px;
+      }
+
+      .table-wrap {
+        overflow-x: auto;
+      }
+
+      .search {
+        padding: 10px 14px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        min-width: 220px;
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.92rem;
+      }
+
+      thead th {
+        text-align: left;
+        color: var(--muted-2);
+        font-weight: 600;
+        padding: 10px 8px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      tbody td {
+        padding: 12px 8px;
+        border-bottom: 1px solid rgba(12, 26, 32, 0.06);
+      }
+
+      tbody tr:hover {
+        background: rgba(12, 139, 125, 0.04);
+      }
+
+      .mono {
+        font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 0.85rem;
+      }
+
+      .overlay {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(12, 26, 32, 0.45);
+        backdrop-filter: blur(8px);
+        z-index: 10;
+        padding: 24px;
+      }
+
+      .overlay.hidden {
+        display: none;
+      }
+
+      .auth-card {
+        background: var(--surface-2);
+        border-radius: var(--radius-lg);
+        padding: 28px 30px;
+        width: min(420px, 100%);
+        box-shadow: var(--shadow);
+        display: grid;
+        gap: 16px;
+      }
+
+      .auth-card h3 {
+        margin: 0;
+        font-size: 1.4rem;
+      }
+
+      .auth-card input {
+        padding: 12px 14px;
+        border-radius: var(--radius-sm);
+        border: 1px solid var(--line);
+      }
+
+      .hint {
+        color: var(--muted-2);
+        font-size: 0.85rem;
+        margin: 0;
+      }
+
+      .error {
+        color: #b0392c;
+        font-size: 0.85rem;
+      }
+
+      @keyframes rise {
+        from {
+          transform: translateY(12px);
+          opacity: 0;
+        }
+        to {
+          transform: translateY(0);
+          opacity: 1;
+        }
+      }
+
+      @media (max-width: 720px) {
+        header {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
+        .panel-actions {
+          width: 100%;
+          justify-content: space-between;
+        }
+
+        .search {
+          flex: 1;
+          min-width: 0;
+        }
+      }
+    </style>
+  </head>
+  <body class="bg-orbs">
+    <div class="shell">
+      <header>
+        <div class="brand">
+          <h1>Sequencer Control</h1>
+          <p>Operational view of tenants, stores, and registered agents.</p>
+          <div class="status-pill">
+            <span class="status-dot"></span>
+            <span id="statusText">Disconnected</span>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button class="btn btn-secondary" id="clearKey">Clear Key</button>
+          <button class="btn btn-primary" id="refreshBtn">Refresh</button>
+        </div>
+      </header>
+
+      <section class="stats" id="stats">
+        <div class="card">
+          <div class="label">Tenants</div>
+          <div class="value" id="countTenants">--</div>
+          <div class="meta" id="metaTenants">Last activity: --</div>
+        </div>
+        <div class="card">
+          <div class="label">Stores</div>
+          <div class="value" id="countStores">--</div>
+          <div class="meta" id="metaStores">Active streams tracked</div>
+        </div>
+        <div class="card">
+          <div class="label">Agents</div>
+          <div class="value" id="countAgents">--</div>
+          <div class="meta" id="metaAgents">Registered API agents</div>
+        </div>
+        <div class="card">
+          <div class="label">API Keys</div>
+          <div class="value" id="countKeys">--</div>
+          <div class="meta" id="metaKeys">Active: --</div>
+        </div>
+      </section>
+
+      <section class="grid">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Tenants</h2>
+            <div class="panel-actions">
+              <input class="search" id="tenantSearch" placeholder="Search tenant ID" />
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Tenant</th>
+                  <th>Agents</th>
+                  <th>API Keys</th>
+                  <th>Stores</th>
+                  <th>Total Head</th>
+                  <th>Active 24h</th>
+                  <th>Max Lag</th>
+                  <th>Last Key</th>
+                  <th>Last Activity</th>
+                </tr>
+              </thead>
+              <tbody id="tenantsBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Stores</h2>
+            <div class="panel-actions">
+              <input class="search" id="storeSearch" placeholder="Search store or tenant" />
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Tenant</th>
+                  <th>Store</th>
+                  <th>Head Seq</th>
+                  <th>Projected</th>
+                  <th>Lag</th>
+                  <th>Agents</th>
+                  <th>Last Sync</th>
+                  <th>Updated</th>
+                </tr>
+              </thead>
+              <tbody id="storesBody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-header">
+            <h2>Agents</h2>
+            <div class="panel-actions">
+              <input class="search" id="agentSearch" placeholder="Search agent or tenant" />
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Agent</th>
+                  <th>Tenant</th>
+                  <th>Permissions</th>
+                  <th>Store Scope</th>
+                  <th>Active Keys</th>
+                  <th>Total Keys</th>
+                  <th>Store</th>
+                  <th>Last Key</th>
+                  <th>Last Sync</th>
+                  <th>Last Pulled</th>
+                  <th>Last Pushed</th>
+                </tr>
+              </thead>
+              <tbody id="agentsBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div class="overlay" id="authOverlay">
+      <div class="auth-card">
+        <h3>Admin Access</h3>
+        <p class="hint">Enter a bootstrap admin API key to load the dashboard.</p>
+        <input id="apiKeyInput" type="password" placeholder="ApiKey sk_live_..." />
+        <div class="toolbar">
+          <button class="btn btn-secondary" id="cancelAuth">Cancel</button>
+          <button class="btn btn-primary" id="connectBtn">Connect</button>
+        </div>
+        <p class="error" id="authError"></p>
+        <p class="hint">Key is stored in session storage only.</p>
+      </div>
+    </div>
+
+    <script>
+      const API_BASE = "/api/v1/admin";
+      const state = {
+        apiKey: sessionStorage.getItem("admin_api_key") || "",
+        tenants: [],
+        stores: [],
+        agents: [],
+        overview: null,
+      };
+
+      const overlay = document.getElementById("authOverlay");
+      const authError = document.getElementById("authError");
+      const statusText = document.getElementById("statusText");
+
+      function showOverlay(message) {
+        authError.textContent = message || "";
+        overlay.classList.remove("hidden");
+        statusText.textContent = "Disconnected";
+      }
+
+      function hideOverlay() {
+        overlay.classList.add("hidden");
+      }
+
+      function formatDate(value) {
+        if (!value) return "--";
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) return value;
+        return date.toLocaleString();
+      }
+
+      function setStatus(connected, message) {
+        statusText.textContent = message || (connected ? "Connected" : "Disconnected");
+      }
+
+      async function apiRequest(path) {
+        if (!state.apiKey) {
+          throw new Error("missing-key");
+        }
+        const res = await fetch(`${API_BASE}/${path}`, {
+          headers: {
+            Authorization: `ApiKey ${state.apiKey}`,
+          },
+        });
+        if (res.status === 401 || res.status === 403) {
+          throw new Error("unauthorized");
+        }
+        if (!res.ok) {
+          throw new Error(`request-failed:${res.status}`);
+        }
+        return res.json();
+      }
+
+      function updateOverview() {
+        const overview = state.overview;
+        if (!overview) return;
+        document.getElementById("countTenants").textContent = overview.tenants;
+        document.getElementById("countStores").textContent = overview.stores;
+        document.getElementById("countAgents").textContent = overview.agents;
+        document.getElementById("countKeys").textContent = overview.apiKeys;
+        document.getElementById(
+          "metaKeys"
+        ).textContent = `Active: ${overview.activeApiKeys} | Head: ${overview.totalHeadSequence}`;
+        document.getElementById("metaTenants").textContent = `Last activity: ${formatDate(
+          overview.lastActivityAt
+        )}`;
+        document.getElementById(
+          "metaStores"
+        ).textContent = `Active 24h: ${overview.activeStores24h}`;
+        document.getElementById(
+          "metaAgents"
+        ).textContent = `Max lag: ${overview.maxProjectionLag}`;
+      }
+
+      function renderTable(body, rows, columns) {
+        body.innerHTML = "";
+        rows.forEach((row) => {
+          const tr = document.createElement("tr");
+          columns.forEach((col) => {
+            const td = document.createElement("td");
+            const value = col.render ? col.render(row) : row[col.key];
+            td.textContent = value ?? "--";
+            if (col.mono) {
+              td.classList.add("mono");
+            }
+            tr.appendChild(td);
+          });
+          body.appendChild(tr);
+        });
+        if (!rows.length) {
+          const tr = document.createElement("tr");
+          const td = document.createElement("td");
+          td.colSpan = columns.length;
+          td.textContent = "No data";
+          td.classList.add("mono");
+          tr.appendChild(td);
+          body.appendChild(tr);
+        }
+      }
+
+      function applyFilters() {
+        const tenantTerm = document.getElementById("tenantSearch").value.trim().toLowerCase();
+        const storeTerm = document.getElementById("storeSearch").value.trim().toLowerCase();
+        const agentTerm = document.getElementById("agentSearch").value.trim().toLowerCase();
+
+        const tenants = state.tenants.filter((row) => row.tenantId.toLowerCase().includes(tenantTerm));
+        const stores = state.stores.filter((row) =>
+          `${row.tenantId} ${row.storeId}`.toLowerCase().includes(storeTerm)
+        );
+        const agents = state.agents.filter((row) =>
+          `${row.tenantId} ${row.agentId}`.toLowerCase().includes(agentTerm)
+        );
+
+        renderTable(document.getElementById("tenantsBody"), tenants, [
+          { key: "tenantId", mono: true },
+          { key: "agentCount" },
+          { key: "apiKeyCount", render: (row) => `${row.activeApiKeys}/${row.apiKeyCount}` },
+          { key: "storeCount" },
+          { key: "totalHeadSequence", mono: true },
+          { key: "activeStores24h" },
+          { key: "maxProjectionLag", mono: true },
+          { key: "lastKeyAt", render: (row) => formatDate(row.lastKeyAt) },
+          { key: "lastActivityAt", render: (row) => formatDate(row.lastActivityAt) },
+        ]);
+
+        renderTable(document.getElementById("storesBody"), stores, [
+          { key: "tenantId", mono: true },
+          { key: "storeId", mono: true },
+          { key: "headSequence", mono: true },
+          { key: "lastProjectedSequence", mono: true },
+          { key: "projectionLag", mono: true },
+          { key: "agentCount" },
+          { key: "lastAgentSyncAt", render: (row) => formatDate(row.lastAgentSyncAt) },
+          { key: "updatedAt", render: (row) => formatDate(row.updatedAt) },
+        ]);
+
+        renderTable(document.getElementById("agentsBody"), agents, [
+          { key: "agentId", mono: true },
+          { key: "tenantId", mono: true },
+          { key: "permissions" },
+          { key: "storeScope" },
+          { key: "activeApiKeys" },
+          { key: "apiKeyCount" },
+          { key: "storeId", mono: true, render: (row) => row.storeId || "--" },
+          { key: "lastKeyAt", render: (row) => formatDate(row.lastKeyAt) },
+          { key: "lastSyncAt", render: (row) => formatDate(row.lastSyncAt) },
+          { key: "lastPulledSequence", mono: true },
+          { key: "lastPushedSequence", mono: true },
+        ]);
+      }
+
+      async function loadDashboard() {
+        try {
+          const [overview, tenants, stores, agents] = await Promise.all([
+            apiRequest("overview"),
+            apiRequest("tenants"),
+            apiRequest("stores"),
+            apiRequest("agents"),
+          ]);
+          state.overview = overview;
+          state.tenants = tenants;
+          state.stores = stores;
+          state.agents = agents;
+          updateOverview();
+          applyFilters();
+          setStatus(true, "Connected");
+        } catch (err) {
+          if (err.message === "missing-key") {
+            showOverlay("Enter an admin API key to continue.");
+          } else if (err.message === "unauthorized") {
+            showOverlay("Admin key rejected. Check permissions.");
+          } else {
+            showOverlay("Failed to load data. Try again.");
+          }
+        }
+      }
+
+      document.getElementById("refreshBtn").addEventListener("click", loadDashboard);
+      document.getElementById("clearKey").addEventListener("click", () => {
+        sessionStorage.removeItem("admin_api_key");
+        state.apiKey = "";
+        showOverlay("API key cleared.");
+      });
+
+      document.getElementById("connectBtn").addEventListener("click", () => {
+        const input = document.getElementById("apiKeyInput");
+        const value = input.value.trim();
+        if (!value) {
+          authError.textContent = "Enter a valid API key.";
+          return;
+        }
+        sessionStorage.setItem("admin_api_key", value);
+        state.apiKey = value;
+        input.value = "";
+        hideOverlay();
+        loadDashboard();
+      });
+
+      document.getElementById("cancelAuth").addEventListener("click", () => {
+        document.getElementById("apiKeyInput").value = "";
+        showOverlay("Admin key required.");
+      });
+
+      document.getElementById("tenantSearch").addEventListener("input", applyFilters);
+      document.getElementById("storeSearch").addEventListener("input", applyFilters);
+      document.getElementById("agentSearch").addEventListener("input", applyFilters);
+
+      if (state.apiKey) {
+        hideOverlay();
+        loadDashboard();
+      } else {
+        showOverlay("Admin key required.");
+      }
+    </script>
+  </body>
+</html>

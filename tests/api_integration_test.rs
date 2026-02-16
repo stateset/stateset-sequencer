@@ -24,9 +24,9 @@ use stateset_sequencer::domain::{
     AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
 };
 use stateset_sequencer::infra::{
-    IngestService, PayloadEncryption, PgAgentKeyRegistry,
-    PgCommitmentEngine, PgEventStore, PgSequencer, PgVesCommitmentEngine,
-    PgVesComplianceProofStore, PgVesValidityProofStore, SchemaValidationMode, VesSequencer,
+    IngestService, PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore,
+    PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore,
+    SchemaValidationMode, VesSequencer,
 };
 use stateset_sequencer::metrics::MetricsRegistry;
 use stateset_sequencer::server::AppState;
@@ -75,12 +75,16 @@ async fn create_test_state(pool: sqlx::PgPool) -> AppState {
     let cache_manager = Arc::new(stateset_sequencer::infra::CacheManager::new());
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
-    let ves_sequencer_reader = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+    let ves_sequencer_reader =
+        Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
     let schema_store = Arc::new(stateset_sequencer::infra::PgSchemaStore::new(pool.clone()));
-    let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(pool.clone()));
+    let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(
+        pool.clone(),
+    ));
     let metrics = Arc::new(MetricsRegistry::new());
 
     AppState {
+        read_pool: pool.clone(),
         sequencer,
         event_store,
         commitment_engine,
@@ -146,9 +150,11 @@ fn create_test_router(state: AppState, require_auth: bool) -> axum::Router<()> {
         authenticator,
         require_auth,
         rate_limiter: None,
+        pool_monitor: None,
     };
 
     let public_api = stateset_sequencer::api::public_router();
+    let public_api_root = stateset_sequencer::api::public_router();
     let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
         auth_state,
         stateset_sequencer::auth::auth_middleware,
@@ -156,6 +162,7 @@ fn create_test_router(state: AppState, require_auth: bool) -> axum::Router<()> {
 
     axum::Router::new()
         .nest("/api", public_api)
+        .merge(public_api_root)
         .nest("/api", api)
         .with_state::<()>(state)
 }
@@ -205,7 +212,8 @@ async fn send_request(
     let json = if bytes.is_empty() {
         json!({})
     } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) }))
+        serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) }))
     };
 
     (status, json)
@@ -326,6 +334,38 @@ async fn test_public_agent_registration_rejects_tenant_id() {
 
 #[tokio::test]
 #[ignore]
+async fn test_public_agent_registration_root_alias() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, true);
+
+    let payload = json!({
+        "name": "public-agent-root"
+    });
+
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/v1/agents/register",
+        Some(payload),
+        None,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_x402_list_requires_auth_and_tenant() {
     let Some(pool) = connect_db().await else {
         eprintln!("DATABASE_URL not set; skipping");
@@ -349,18 +389,30 @@ async fn test_x402_list_requires_auth_and_tenant() {
     let (status, _) = send_request(&app, Method::GET, &uri, None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    let (status, body) =
-        send_request(&app, Method::GET, "/api/v1/x402/payments", None, Some("sk_test_integration_key_12345"))
-            .await;
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        "/api/v1/x402/payments",
+        None,
+        Some("sk_test_integration_key_12345"),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "MISSING_REQUIRED_FIELD");
 
-    let (status, _) =
-        send_request(&app, Method::GET, &uri, None, Some("sk_test_integration_key_12345")).await;
+    let (status, _) = send_request(
+        &app,
+        Method::GET,
+        &uri,
+        None,
+        Some("sk_test_integration_key_12345"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     let scoped_uri = format!("/api/v1/x402/payments?tenant_id={}", STORE_SCOPED_TENANT);
-    let (status, body) = send_request(&app, Method::GET, &scoped_uri, None, Some(STORE_SCOPED_KEY)).await;
+    let (status, body) =
+        send_request(&app, Method::GET, &scoped_uri, None, Some(STORE_SCOPED_KEY)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"]["code"], "MISSING_REQUIRED_FIELD");
 
@@ -368,7 +420,8 @@ async fn test_x402_list_requires_auth_and_tenant() {
         "/api/v1/x402/payments?tenant_id={}&store_id={}",
         STORE_SCOPED_TENANT, STORE_SCOPED_STORE
     );
-    let (status, _) = send_request(&app, Method::GET, &scoped_uri, None, Some(STORE_SCOPED_KEY)).await;
+    let (status, _) =
+        send_request(&app, Method::GET, &scoped_uri, None, Some(STORE_SCOPED_KEY)).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -386,9 +439,10 @@ async fn test_health_endpoint_returns_healthy() {
 
     let state = create_test_state(pool).await;
     let app = axum::Router::new()
-        .route("/health", axum::routing::get(|| async {
-            axum::Json(json!({ "status": "healthy" }))
-        }))
+        .route(
+            "/health",
+            axum::routing::get(|| async { axum::Json(json!({ "status": "healthy" })) }),
+        )
         .with_state::<()>(state);
 
     let (status, body) = send_request(&app, Method::GET, "/health", None, None).await;
@@ -481,7 +535,10 @@ async fn test_ingest_events_batch_success() {
                 .entity_type("order")
                 .entity_id(&format!("ord-{:03}", i))
                 .event_type("order.created")
-                .payload(order_created_payload(&format!("cust-{}", i), (i + 1) as f64 * 10.0))
+                .payload(order_created_payload(
+                    &format!("cust-{}", i),
+                    (i + 1) as f64 * 10.0,
+                ))
                 .build_json()
         })
         .collect();
@@ -695,6 +752,89 @@ async fn test_list_events_pagination() {
 
 #[tokio::test]
 #[ignore]
+async fn test_list_events_limit_zero_rejected() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, false);
+
+    let uri = format!(
+        "/api/v1/events?tenant_id={}&store_id={}&from=1&limit=0",
+        tenant_id, store_id
+    );
+    let (status, _) = send_request(&app, Method::GET, &uri, None, None).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_list_events_limit_cap_is_1000() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    seed_test_events(&pool, tenant_id, store_id, 1200).await;
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, false);
+
+    let uri = format!(
+        "/api/v1/events?tenant_id={}&store_id={}&from=1&limit=5000",
+        tenant_id, store_id
+    );
+    let (status, body) = send_request(&app, Method::GET, &uri, None, None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 1000);
+}
+
+#[tokio::test]
+async fn test_list_events_from_beyond_head_returns_empty() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    seed_test_events(&pool, tenant_id, store_id, 10).await;
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, false);
+
+    let uri = format!(
+        "/api/v1/events?tenant_id={}&store_id={}&from=20&limit=10",
+        tenant_id, store_id
+    );
+    let (status, body) = send_request(&app, Method::GET, &uri, None, None).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+    assert_eq!(body["count"], 0);
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_get_head_success() {
     let Some(pool) = connect_db().await else {
         eprintln!("DATABASE_URL not set; skipping");
@@ -751,7 +891,6 @@ async fn test_get_head_returns_zero_for_empty_store() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_get_entity_history_success() {
     let Some(pool) = connect_db().await else {
         eprintln!("DATABASE_URL not set; skipping");
@@ -819,6 +958,222 @@ async fn test_get_entity_history_success() {
     assert_eq!(body["entity_type"], "order");
     assert_eq!(body["entity_id"], entity_id);
     assert_eq!(body["count"], 3);
+}
+
+#[tokio::test]
+async fn test_get_entity_history_limit_zero_defaults() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let entity_id = "ord-history-limit-test";
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption);
+    let agent_id = AgentId::new();
+
+    let events: Vec<EventEnvelope> = (0..150)
+        .map(|i| {
+            EventEnvelope::new(
+                TenantId::from_uuid(tenant_id),
+                StoreId::from_uuid(store_id),
+                EntityType::order(),
+                entity_id.to_string(),
+                EventType::new("order.updated"),
+                json!({ "status": format!("step-{i}") }),
+                agent_id.clone(),
+            )
+        })
+        .collect();
+
+    sequencer
+        .ingest(EventBatch::new(agent_id, events))
+        .await
+        .unwrap();
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, false);
+
+    let uri = format!(
+        "/api/v1/entities/order/{}?tenant_id={}&store_id={}&limit=0",
+        entity_id, tenant_id, store_id
+    );
+    let (status, body) = send_request(&app, Method::GET, &uri, None, None).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+    assert_eq!(body["count"], 100);
+    assert_eq!(body["total"], 150);
+    assert_eq!(body["has_more"], true);
+}
+
+#[tokio::test]
+async fn test_get_entity_history_from_zero_defaults_to_start() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let entity_id = "ord-history-from-zero-test";
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption);
+    let agent_id = AgentId::new();
+
+    let events: Vec<EventEnvelope> = (0..5)
+        .map(|i| {
+            EventEnvelope::new(
+                TenantId::from_uuid(tenant_id),
+                StoreId::from_uuid(store_id),
+                EntityType::order(),
+                entity_id.to_string(),
+                EventType::new("order.updated"),
+                json!({ "step": i }),
+                agent_id.clone(),
+            )
+        })
+        .collect();
+
+    sequencer
+        .ingest(EventBatch::new(agent_id, events))
+        .await
+        .unwrap();
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, false);
+
+    let base_uri = format!(
+        "/api/v1/entities/order/{}?tenant_id={}&store_id={}",
+        entity_id, tenant_id, store_id
+    );
+    let zero_uri = format!("{}&from=0", base_uri);
+
+    let (base_status, base_body) = send_request(&app, Method::GET, &base_uri, None, None).await;
+    let (zero_status, zero_body) = send_request(&app, Method::GET, &zero_uri, None, None).await;
+
+    assert_eq!(base_status, StatusCode::OK, "body: {:?}", base_body);
+    assert_eq!(zero_status, StatusCode::OK, "body: {:?}", zero_body);
+    assert_eq!(base_body["count"], 5);
+    assert_eq!(zero_body["count"], 5);
+    assert_eq!(base_body["events"], zero_body["events"]);
+}
+
+#[tokio::test]
+async fn test_get_entity_history_limit_is_capped() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let entity_id = "ord-history-limit-cap-test";
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption);
+    let agent_id = AgentId::new();
+
+    let events: Vec<EventEnvelope> = (0..150)
+        .map(|i| {
+            EventEnvelope::new(
+                TenantId::from_uuid(tenant_id),
+                StoreId::from_uuid(store_id),
+                EntityType::order(),
+                entity_id.to_string(),
+                EventType::new("order.updated"),
+                json!({ "status": format!("step-{i}") }),
+                agent_id.clone(),
+            )
+        })
+        .collect();
+
+    sequencer
+        .ingest(EventBatch::new(agent_id, events))
+        .await
+        .unwrap();
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, false);
+
+    let uri = format!(
+        "/api/v1/entities/order/{}?tenant_id={}&store_id={}&limit=250",
+        entity_id, tenant_id, store_id
+    );
+    let (status, body) = send_request(&app, Method::GET, &uri, None, None).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+    assert_eq!(body["count"], 100);
+    assert_eq!(body["total"], 150);
+    assert_eq!(body["has_more"], true);
+}
+
+#[tokio::test]
+async fn test_get_entity_history_from_beyond_total() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let entity_id = "ord-history-beyond-total";
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption);
+    let agent_id = AgentId::new();
+
+    let events: Vec<EventEnvelope> = (0..10)
+        .map(|i| {
+            EventEnvelope::new(
+                TenantId::from_uuid(tenant_id),
+                StoreId::from_uuid(store_id),
+                EntityType::order(),
+                entity_id.to_string(),
+                EventType::new("order.updated"),
+                json!({ "status": format!("step-{i}") }),
+                agent_id.clone(),
+            )
+        })
+        .collect();
+
+    sequencer
+        .ingest(EventBatch::new(agent_id, events))
+        .await
+        .unwrap();
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, false);
+
+    let uri = format!(
+        "/api/v1/entities/order/{}?tenant_id={}&store_id={}&from=20&limit=10",
+        entity_id, tenant_id, store_id
+    );
+    let (status, body) = send_request(&app, Method::GET, &uri, None, None).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {:?}", body);
+    assert_eq!(body["count"], 0);
+    assert_eq!(body["total"], 10);
+    assert_eq!(body["has_more"], false);
 }
 
 // ============================================================================
@@ -1099,14 +1454,7 @@ async fn test_auth_rejects_invalid_api_key() {
     let store_id = Uuid::new_v4();
 
     let uri = format!("/api/v1/head?tenant_id={}&store_id={}", tenant_id, store_id);
-    let (status, _) = send_request(
-        &app,
-        Method::GET,
-        &uri,
-        None,
-        Some("sk_invalid_key"),
-    )
-    .await;
+    let (status, _) = send_request(&app, Method::GET, &uri, None, Some("sk_invalid_key")).await;
 
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
@@ -1226,11 +1574,7 @@ async fn test_invalid_json_body_returns_bad_request() {
         .body(Body::from(b"{ invalid json }".to_vec()))
         .unwrap();
 
-    let response = app
-        .into_service::<Body>()
-        .oneshot(request)
-        .await
-        .unwrap();
+    let response = app.into_service::<Body>().oneshot(request).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
@@ -1354,6 +1698,7 @@ fn create_tenant_scoped_router(
         authenticator,
         require_auth: true,
         rate_limiter: None,
+        pool_monitor: None,
     };
 
     let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
@@ -1496,6 +1841,7 @@ async fn test_cross_tenant_schema_delete_denied() {
         authenticator,
         require_auth: true,
         rate_limiter: None,
+        pool_monitor: None,
     };
 
     let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
@@ -1592,7 +1938,8 @@ async fn test_agent_scoped_ingest_denies_mismatched_agent() {
     let state = create_test_state(pool).await;
 
     // Create router scoped to agent_a
-    let (app, api_key) = create_tenant_scoped_router(state, tenant_id, vec![store_id], Some(agent_a));
+    let (app, api_key) =
+        create_tenant_scoped_router(state, tenant_id, vec![store_id], Some(agent_a));
 
     // Try to ingest events claiming to be from agent_b
     let event = TestEventBuilder::new()
@@ -1650,7 +1997,8 @@ async fn test_agent_scoped_ingest_allows_matching_agent() {
     let state = create_test_state(pool).await;
 
     // Create router scoped to the correct agent
-    let (app, api_key) = create_tenant_scoped_router(state, tenant_id, vec![store_id], Some(agent_id));
+    let (app, api_key) =
+        create_tenant_scoped_router(state, tenant_id, vec![store_id], Some(agent_id));
 
     // Ingest events with matching agent
     let event = TestEventBuilder::new()

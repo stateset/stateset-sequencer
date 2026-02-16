@@ -4,6 +4,19 @@
 
 use axum::http::StatusCode;
 use base64::Engine;
+use tracing::error;
+
+/// Convert an internal error into a safe API response.
+///
+/// Logs the full error details at ERROR level for internal observability,
+/// but returns only a generic message to the caller to prevent information leakage.
+pub fn internal_error(e: impl std::fmt::Display) -> (StatusCode, String) {
+    error!("Internal error: {e}");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error".to_string(),
+    )
+}
 
 /// Decode base64 with flexible format support (standard, URL-safe, with/without padding).
 ///
@@ -63,7 +76,10 @@ mod tests {
     #[test]
     fn test_decode_base64_with_whitespace() {
         let original = b"hello world";
-        let encoded = format!("  {}  ", base64::engine::general_purpose::STANDARD.encode(original));
+        let encoded = format!(
+            "  {}  ",
+            base64::engine::general_purpose::STANDARD.encode(original)
+        );
         let decoded = decode_base64_any(&encoded).unwrap();
         assert_eq!(decoded, original);
     }

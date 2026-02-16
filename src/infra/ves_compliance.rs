@@ -98,6 +98,7 @@ impl PgVesComplianceProofStore {
         proof_version: u32,
         policy_id: &str,
         policy_params: serde_json::Value,
+        witness_commitment: Option<Hash256>,
         proof: Vec<u8>,
         public_inputs: Option<serde_json::Value>,
     ) -> Result<VesComplianceProofSummary> {
@@ -154,10 +155,11 @@ impl PgVesComplianceProofStore {
                 policy_id,
                 policy_params,
                 policy_hash,
+                witness_commitment,
                 proof,
                 proof_hash,
                 public_inputs
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
             ON CONFLICT (event_id, proof_type, proof_version, policy_hash) DO NOTHING
             RETURNING
                 proof_id,
@@ -170,6 +172,7 @@ impl PgVesComplianceProofStore {
                 policy_params,
                 policy_hash,
                 proof_hash,
+                witness_commitment,
                 public_inputs,
                 submitted_at
             "#,
@@ -183,6 +186,7 @@ impl PgVesComplianceProofStore {
         .bind(policy_id)
         .bind(policy_params.clone())
         .bind(&policy_hash[..])
+        .bind(witness_commitment.as_ref().map(|v| v.to_vec()))
         .bind(ciphertext)
         .bind(&proof_hash[..])
         .bind(public_inputs.clone())
@@ -206,6 +210,7 @@ impl PgVesComplianceProofStore {
                 policy_params,
                 policy_hash,
                 proof_hash,
+                witness_commitment,
                 public_inputs,
                 submitted_at
             FROM ves_compliance_proofs
@@ -262,6 +267,35 @@ impl PgVesComplianceProofStore {
             }
         }
 
+        if let Some(new_commitment) = witness_commitment {
+            match &existing.witness_commitment {
+                Some(existing_commitment) if existing_commitment != &new_commitment.to_vec() => {
+                    return Err(SequencerError::InvariantViolation {
+                        invariant: "ves_compliance_proof_witness_commitment_conflict".to_string(),
+                        message: format!(
+                            "witness_commitment mismatch for existing proof_id={} (event_id={event_id})",
+                            existing.proof_id
+                        ),
+                    });
+                }
+                None => {
+                    sqlx::query(
+                        r#"
+                        UPDATE ves_compliance_proofs
+                        SET witness_commitment = $1
+                        WHERE proof_id = $2
+                        "#,
+                    )
+                    .bind(new_commitment.to_vec())
+                    .bind(existing.proof_id)
+                    .execute(&self.pool)
+                    .await?;
+                    existing.witness_commitment = Some(new_commitment.to_vec());
+                }
+                Some(_) => {}
+            }
+        }
+
         existing.try_into()
     }
 
@@ -282,6 +316,7 @@ impl PgVesComplianceProofStore {
                 policy_params,
                 policy_hash,
                 proof_hash,
+                witness_commitment,
                 public_inputs,
                 submitted_at
             FROM ves_compliance_proofs
@@ -309,6 +344,7 @@ impl PgVesComplianceProofStore {
                 policy_id,
                 policy_params,
                 policy_hash,
+                witness_commitment,
                 proof,
                 proof_hash,
                 public_inputs,
@@ -367,6 +403,14 @@ impl PgVesComplianceProofStore {
             policy_id: row.policy_id,
             policy_params: row.policy_params,
             policy_hash,
+            witness_commitment: row
+                .witness_commitment
+                .as_ref()
+                .map(|v| v.clone().try_into())
+                .transpose()
+                .map_err(|_| {
+                    SequencerError::Internal("invalid witness_commitment length".to_string())
+                })?,
             proof: plaintext,
             proof_hash,
             public_inputs: row.public_inputs,
@@ -398,6 +442,7 @@ struct VesComplianceProofRow {
     policy_id: String,
     policy_params: serde_json::Value,
     policy_hash: Vec<u8>,
+    witness_commitment: Option<Vec<u8>>,
     proof: Vec<u8>,
     proof_hash: Vec<u8>,
     public_inputs: Option<serde_json::Value>,
@@ -416,6 +461,7 @@ struct VesComplianceProofSummaryRow {
     policy_params: serde_json::Value,
     policy_hash: Vec<u8>,
     proof_hash: Vec<u8>,
+    witness_commitment: Option<Vec<u8>>,
     public_inputs: Option<serde_json::Value>,
     submitted_at: DateTime<Utc>,
 }
@@ -432,6 +478,14 @@ impl TryFrom<VesComplianceProofSummaryRow> for VesComplianceProofSummary {
             .proof_hash
             .try_into()
             .map_err(|_| SequencerError::Internal("invalid proof_hash length".to_string()))?;
+        let witness_commitment: Option<Hash256> = row
+            .witness_commitment
+            .as_ref()
+            .map(|v| v.clone().try_into())
+            .transpose()
+            .map_err(|_| {
+                SequencerError::Internal("invalid witness_commitment length".to_string())
+            })?;
 
         Ok(Self {
             proof_id: row.proof_id,
@@ -444,6 +498,7 @@ impl TryFrom<VesComplianceProofSummaryRow> for VesComplianceProofSummary {
             policy_params: row.policy_params,
             policy_hash,
             proof_hash,
+            witness_commitment,
             public_inputs: row.public_inputs,
             submitted_at: row.submitted_at,
         })

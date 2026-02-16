@@ -6,10 +6,11 @@
 //! - Get agent status and metadata
 
 use axum::extract::{ConnectInfo, Extension, Path, State};
-use axum::http::{header::USER_AGENT, HeaderMap, StatusCode};
+use axum::http::header::{CACHE_CONTROL, RETRY_AFTER, USER_AGENT};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::Json;
 use std::net::SocketAddr;
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::api::types::{
@@ -17,23 +18,33 @@ use crate::api::types::{
     CreateApiKeyRequest, ListApiKeysResponse,
 };
 use crate::auth::{ApiKeyRecord, ApiKeyStore, ApiKeyValidator, AuthContextExt, Permissions};
-use crate::infra::{AuditAction, AuditLogBuilder};
+use crate::infra::{extract_client_ip, AuditAction, AuditLogBuilder};
 use crate::server::AppState;
+
+const MAX_AGENT_NAME_LEN: usize = 128;
+const MAX_DESCRIPTION_LEN: usize = 1024;
+const MAX_STORE_IDS: usize = 50;
+const MAX_RATE_LIMIT_RPM: u32 = 10_000;
 
 /// POST /api/v1/agents/register - Register a new agent and receive an API key.
 ///
 /// This endpoint allows AI agents to self-register with the sequencer.
 /// Upon successful registration, the agent receives an API key for authentication.
+#[allow(clippy::type_complexity)]
 #[instrument(skip(state, request), fields(agent_name = %request.name))]
 pub async fn register_agent(
     State(state): State<AppState>,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(request): Json<AgentRegistrationRequest>,
-) -> Result<Json<AgentRegistrationResponse>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<
+    (HeaderMap, Json<AgentRegistrationResponse>),
+    (StatusCode, HeaderMap, Json<serde_json::Value>),
+> {
     info!("Registering new agent: {}", request.name);
 
-    let client_ip = extract_client_ip(&headers, remote_addr, state.trust_proxy_headers);
+    let client_ip = extract_client_ip(&headers, remote_addr, state.trust_proxy_headers)
+        .map(|ip| ip.to_string());
     let user_agent = headers
         .get(USER_AGENT)
         .and_then(|v| v.to_str().ok())
@@ -44,19 +55,21 @@ pub async fn register_agent(
         .map(|s| s.to_string());
 
     if !state.public_registration_enabled {
+        record_registration_metric(&state, "error", "REGISTRATION_DISABLED").await;
         log_registration_audit(
             &state,
+            &request,
             None,
             None,
             client_ip.as_deref(),
             user_agent.as_deref(),
             request_id.as_deref(),
-            false,
             Some("public registration disabled".to_string()),
         )
         .await;
         return Err((
             StatusCode::FORBIDDEN,
+            HeaderMap::new(),
             Json(serde_json::json!({
                 "success": false,
                 "error": "public registration is disabled",
@@ -65,27 +78,32 @@ pub async fn register_agent(
         ));
     }
 
+    let mut rate_limit_headers = HeaderMap::new();
     if let Some(ref limiter) = state.public_registration_limiter {
-        let key = client_ip
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
-        if limiter
-            .check(&format!("public_register:{}", key))
-            .is_err()
-        {
+        let key = client_ip.clone().unwrap_or_else(|| "unknown".to_string());
+        let limiter_key = format!("public_register:{}", key);
+        if limiter.check(&limiter_key).is_err() {
+            record_registration_metric(&state, "error", "RATE_LIMIT_EXCEEDED").await;
             log_registration_audit(
                 &state,
+                &request,
                 None,
                 None,
                 client_ip.as_deref(),
                 user_agent.as_deref(),
                 request_id.as_deref(),
-                false,
                 Some("rate limit exceeded".to_string()),
             )
             .await;
+            let (mut headers, reset_after) = rate_limit_headers_snapshot(limiter, &limiter_key);
+            headers.insert(
+                RETRY_AFTER,
+                HeaderValue::from_str(&reset_after.to_string())
+                    .unwrap_or_else(|_| HeaderValue::from_static("60")),
+            );
             return Err((
                 StatusCode::TOO_MANY_REQUESTS,
+                headers,
                 Json(serde_json::json!({
                     "success": false,
                     "error": "rate limit exceeded",
@@ -93,22 +111,154 @@ pub async fn register_agent(
                 })),
             ));
         }
+
+        let (headers, _) = rate_limit_headers_snapshot(limiter, &limiter_key);
+        rate_limit_headers = headers;
     }
 
-    if request.tenant_id.is_some() {
+    let trimmed_name = request.name.trim();
+    if trimmed_name.is_empty() {
+        record_registration_metric(&state, "error", "INVALID_NAME").await;
         log_registration_audit(
             &state,
+            &request,
             None,
             None,
             client_ip.as_deref(),
             user_agent.as_deref(),
             request_id.as_deref(),
-            false,
+            Some("name is required".to_string()),
+        )
+        .await;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            Json(serde_json::json!({
+                "success": false,
+                "error": "name is required",
+                "code": "INVALID_NAME"
+            })),
+        ));
+    }
+
+    if trimmed_name.len() > MAX_AGENT_NAME_LEN {
+        record_registration_metric(&state, "error", "NAME_TOO_LONG").await;
+        log_registration_audit(
+            &state,
+            &request,
+            None,
+            None,
+            client_ip.as_deref(),
+            user_agent.as_deref(),
+            request_id.as_deref(),
+            Some("name exceeds maximum length".to_string()),
+        )
+        .await;
+        return Err((
+            StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
+            Json(serde_json::json!({
+                "success": false,
+                "error": "name exceeds maximum length",
+                "code": "NAME_TOO_LONG"
+            })),
+        ));
+    }
+
+    if let Some(description) = request.description.as_deref() {
+        if description.len() > MAX_DESCRIPTION_LEN {
+            record_registration_metric(&state, "error", "DESCRIPTION_TOO_LONG").await;
+            log_registration_audit(
+                &state,
+                &request,
+                None,
+                None,
+                client_ip.as_deref(),
+                user_agent.as_deref(),
+                request_id.as_deref(),
+                Some("description exceeds maximum length".to_string()),
+            )
+            .await;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "description exceeds maximum length",
+                    "code": "DESCRIPTION_TOO_LONG"
+                })),
+            ));
+        }
+    }
+
+    if let Some(store_ids) = request.store_ids.as_deref() {
+        if store_ids.len() > MAX_STORE_IDS {
+            record_registration_metric(&state, "error", "STORE_IDS_TOO_MANY").await;
+            log_registration_audit(
+                &state,
+                &request,
+                None,
+                None,
+                client_ip.as_deref(),
+                user_agent.as_deref(),
+                request_id.as_deref(),
+                Some("too many store IDs".to_string()),
+            )
+            .await;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "too many store IDs",
+                    "code": "STORE_IDS_TOO_MANY"
+                })),
+            ));
+        }
+    }
+
+    if let Some(rate_limit) = request.rate_limit {
+        if rate_limit == 0 || rate_limit > MAX_RATE_LIMIT_RPM {
+            record_registration_metric(&state, "error", "RATE_LIMIT_INVALID").await;
+            log_registration_audit(
+                &state,
+                &request,
+                None,
+                None,
+                client_ip.as_deref(),
+                user_agent.as_deref(),
+                request_id.as_deref(),
+                Some("rate limit out of range".to_string()),
+            )
+            .await;
+            return Err((
+                StatusCode::BAD_REQUEST,
+                HeaderMap::new(),
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "rate limit out of range",
+                    "code": "RATE_LIMIT_INVALID"
+                })),
+            ));
+        }
+    }
+
+    if request.tenant_id.is_some() {
+        record_registration_metric(&state, "error", "TENANT_ID_NOT_ALLOWED").await;
+        log_registration_audit(
+            &state,
+            &request,
+            None,
+            None,
+            client_ip.as_deref(),
+            user_agent.as_deref(),
+            request_id.as_deref(),
             Some("tenant_id not allowed".to_string()),
         )
         .await;
         return Err((
             StatusCode::BAD_REQUEST,
+            HeaderMap::new(),
             Json(serde_json::json!({
                 "success": false,
                 "error": "tenant_id is not allowed for self-service registration",
@@ -118,19 +268,21 @@ pub async fn register_agent(
     }
 
     if request.admin.unwrap_or(false) {
+        record_registration_metric(&state, "error", "ADMIN_NOT_ALLOWED").await;
         log_registration_audit(
             &state,
+            &request,
             None,
             None,
             client_ip.as_deref(),
             user_agent.as_deref(),
             request_id.as_deref(),
-            false,
             Some("admin registration not allowed".to_string()),
         )
         .await;
         return Err((
             StatusCode::FORBIDDEN,
+            HeaderMap::new(),
             Json(serde_json::json!({
                 "success": false,
                 "error": "admin registration is not permitted",
@@ -169,19 +321,21 @@ pub async fn register_agent(
     // Store in database
     if let Err(e) = state.api_key_store.store(&api_key_record).await {
         warn!("Failed to store API key: {:?}", e);
+        record_registration_metric(&state, "error", "INTERNAL_ERROR").await;
         log_registration_audit(
             &state,
+            &request,
             Some(tenant_id),
             Some(agent_id),
             client_ip.as_deref(),
             user_agent.as_deref(),
             request_id.as_deref(),
-            false,
             Some("failed to store api key".to_string()),
         )
         .await;
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
+            HeaderMap::new(),
             Json(serde_json::json!({
                 "success": false,
                 "error": "Failed to create API key",
@@ -200,17 +354,22 @@ pub async fn register_agent(
 
     log_registration_audit(
         &state,
+        &request,
         Some(tenant_id),
         Some(agent_id),
         client_ip.as_deref(),
         user_agent.as_deref(),
         request_id.as_deref(),
-        true,
         None,
     )
     .await;
 
-    Ok(Json(AgentRegistrationResponse {
+    record_registration_metric(&state, "success", "REGISTERED").await;
+
+    let mut response_headers = rate_limit_headers;
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+
+    Ok((response_headers, Json(AgentRegistrationResponse {
         success: true,
         agent_id,
         tenant_id,
@@ -221,72 +380,18 @@ pub async fn register_agent(
             "read_write".to_string()
         },
         message: "Agent registered successfully. Store your API key securely - it cannot be retrieved later.".to_string(),
-    }))
+    })))
 }
 
-fn extract_client_ip(
-    headers: &HeaderMap,
-    remote_addr: SocketAddr,
-    trust_proxy_headers: bool,
-) -> Option<String> {
-    if trust_proxy_headers {
-        if let Some(ip) = extract_forwarded_ip(headers) {
-            return Some(ip);
-        }
-    }
-
-    Some(remote_addr.ip().to_string())
-}
-
-fn extract_forwarded_ip(headers: &HeaderMap) -> Option<String> {
-    if let Some(forwarded) = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Some(first) = forwarded.split(',').next() {
-            let ip = first.trim();
-            if !ip.is_empty() {
-                return Some(ip.to_string());
-            }
-        }
-    }
-
-    if let Some(real_ip) = headers
-        .get("x-real-ip")
-        .and_then(|v| v.to_str().ok())
-    {
-        let ip = real_ip.trim();
-        if !ip.is_empty() {
-            return Some(ip.to_string());
-        }
-    }
-
-    if let Some(forwarded) = headers
-        .get("forwarded")
-        .and_then(|v| v.to_str().ok())
-    {
-        for part in forwarded.split(';') {
-            let part = part.trim();
-            if let Some(value) = part.strip_prefix("for=") {
-                let value = value.trim_matches('"').trim_matches('[').trim_matches(']');
-                if !value.is_empty() {
-                    return Some(value.to_string());
-                }
-            }
-        }
-    }
-
-    None
-}
-
+#[allow(clippy::too_many_arguments)]
 async fn log_registration_audit(
     state: &AppState,
+    request: &AgentRegistrationRequest,
     tenant_id: Option<Uuid>,
     agent_id: Option<Uuid>,
     ip_address: Option<&str>,
     user_agent: Option<&str>,
     request_id: Option<&str>,
-    success: bool,
     error_message: Option<String>,
 ) {
     let Some(logger) = &state.audit_logger else {
@@ -314,11 +419,68 @@ async fn log_registration_audit(
     if let Some(req_id) = request_id {
         builder = builder.request_id(req_id.to_string());
     }
+    let store_ids: Vec<String> = request
+        .store_ids
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|id| id.to_string())
+        .collect();
+    builder = builder.details(serde_json::json!({
+        "name": request.name,
+        "description": request.description,
+        "requested_tenant_id": request.tenant_id.map(|id| id.to_string()),
+        "store_ids": store_ids,
+        "read_only": request.read_only.unwrap_or(false),
+        "admin": request.admin.unwrap_or(false),
+        "rate_limit": request.rate_limit,
+    }));
     if let Some(error) = error_message {
         builder = builder.failed(error);
     }
+    if logger.log(builder.build()).await.is_ok() {
+        state
+            .metrics
+            .inc_counter(crate::metrics::metric_names::AUDIT_EVENTS_LOGGED)
+            .await;
+    }
+}
 
-    let _ = logger.log(builder.build()).await;
+async fn record_registration_metric(state: &AppState, outcome: &str, reason: &str) {
+    state
+        .metrics
+        .inc_counter_labeled(
+            crate::metrics::metric_names::AGENT_REGISTRATION_TOTAL,
+            crate::metrics::Labels::new()
+                .with("outcome", outcome)
+                .with("reason", reason),
+        )
+        .await;
+}
+
+fn rate_limit_headers_snapshot(limiter: &crate::auth::RateLimiter, key: &str) -> (HeaderMap, u64) {
+    let metrics = limiter.metrics();
+    let remaining = limiter.remaining(key);
+    let reset_after = limiter.reset_after(key);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "ratelimit-limit",
+        HeaderValue::from_str(&metrics.requests_per_minute.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        "ratelimit-remaining",
+        HeaderValue::from_str(&remaining.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    headers.insert(
+        "ratelimit-reset",
+        HeaderValue::from_str(&reset_after.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+
+    (headers, reset_after)
 }
 
 /// GET /api/v1/agents/:agent_id - Get agent details.
@@ -347,11 +509,12 @@ pub async fn get_agent(
             .list_for_agent(&agent_id)
             .await
             .map_err(|e| {
+                error!(error = ?e, "Internal error in agent handler");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "success": false,
-                        "error": format!("Failed to fetch agent: {:?}", e),
+                        "error": "Internal error",
                         "code": "INTERNAL_ERROR"
                     })),
                 )
@@ -362,11 +525,12 @@ pub async fn get_agent(
             .list_for_tenant(&auth.tenant_id)
             .await
             .map_err(|e| {
+                error!(error = ?e, "Internal error in agent handler");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "success": false,
-                        "error": format!("Failed to fetch agent: {:?}", e),
+                        "error": "Internal error",
                         "code": "INTERNAL_ERROR"
                     })),
                 )
@@ -429,11 +593,12 @@ pub async fn create_agent_api_key(
             .list_for_agent(&agent_id)
             .await
             .map_err(|e| {
+                error!(error = ?e, "Internal error in agent handler");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "success": false,
-                        "error": format!("Failed to fetch agent: {:?}", e),
+                        "error": "Internal error",
                         "code": "INTERNAL_ERROR"
                     })),
                 )
@@ -456,11 +621,12 @@ pub async fn create_agent_api_key(
                 .list_for_tenant(&auth.tenant_id)
                 .await
                 .map_err(|e| {
+                    error!(error = ?e, "Internal error in agent handler");
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({
                             "success": false,
-                            "error": format!("Failed to fetch agent: {:?}", e),
+                            "error": "Internal error",
                             "code": "INTERNAL_ERROR"
                         })),
                     )
@@ -501,11 +667,12 @@ pub async fn create_agent_api_key(
     };
 
     if let Err(e) = state.api_key_store.store(&api_key_record).await {
+        error!(error = ?e, "Failed to store API key");
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "success": false,
-                "error": format!("Failed to create API key: {:?}", e),
+                "error": "Internal error",
                 "code": "INTERNAL_ERROR"
             })),
         ));
@@ -553,11 +720,12 @@ pub async fn list_agent_api_keys(
             .list_for_agent(&agent_id)
             .await
             .map_err(|e| {
+                error!(error = ?e, "Internal error in agent handler");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "success": false,
-                        "error": format!("Failed to list keys: {:?}", e),
+                        "error": "Internal error",
                         "code": "INTERNAL_ERROR"
                     })),
                 )
@@ -568,11 +736,12 @@ pub async fn list_agent_api_keys(
             .list_for_tenant(&auth.tenant_id)
             .await
             .map_err(|e| {
+                error!(error = ?e, "Internal error in agent handler");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "success": false,
-                        "error": format!("Failed to list keys: {:?}", e),
+                        "error": "Internal error",
                         "code": "INTERNAL_ERROR"
                     })),
                 )
@@ -632,11 +801,12 @@ pub async fn revoke_agent_api_key(
             .list_for_agent(&agent_id)
             .await
             .map_err(|e| {
+                error!(error = ?e, "Internal error in agent handler");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "success": false,
-                        "error": format!("Failed to list keys: {:?}", e),
+                        "error": "Internal error",
                         "code": "INTERNAL_ERROR"
                     })),
                 )
@@ -647,11 +817,12 @@ pub async fn revoke_agent_api_key(
             .list_for_tenant(&auth.tenant_id)
             .await
             .map_err(|e| {
+                error!(error = ?e, "Internal error in agent handler");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "success": false,
-                        "error": format!("Failed to list keys: {:?}", e),
+                        "error": "Internal error",
                         "code": "INTERNAL_ERROR"
                     })),
                 )
@@ -678,11 +849,12 @@ pub async fn revoke_agent_api_key(
         .revoke(&key_to_revoke.key_hash)
         .await
         .map_err(|e| {
+            error!(error = ?e, "Internal error in agent handler");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "success": false,
-                    "error": format!("Failed to revoke key: {:?}", e),
+                    "error": "Internal error",
                     "code": "INTERNAL_ERROR"
                 })),
             )

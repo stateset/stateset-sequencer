@@ -19,9 +19,8 @@ use stateset_sequencer::domain::{
 };
 use stateset_sequencer::infra::{
     CommitmentEngine, EventStore, IngestService, PayloadEncryption, PgCommitmentEngine,
-    PgEventStore, PgSequencer, Sequencer,
+    PgEventStore, PgSequencer, Sequencer, SequencerError,
 };
-
 
 // ============================================================================
 // Test Helpers
@@ -412,6 +411,73 @@ async fn test_event_store_read_range() {
 
 #[tokio::test]
 #[ignore]
+async fn test_event_store_read_range_reports_gap_when_range_is_empty() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption.clone());
+    let event_store = PgEventStore::new(pool.clone(), payload_encryption);
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+
+    let events: Vec<EventEnvelope> = (0..3)
+        .map(|i| {
+            create_test_event(
+                tenant_id.clone(),
+                store_id.clone(),
+                agent_id.clone(),
+                &format!("ord-{}", i),
+            )
+        })
+        .collect();
+    sequencer
+        .ingest(EventBatch::new(agent_id, events))
+        .await
+        .unwrap();
+
+    let head = sequencer.head(&tenant_id, &store_id).await.unwrap();
+    assert_eq!(head, 3);
+
+    sqlx::query(
+        "DELETE FROM events WHERE tenant_id = $1 AND store_id = $2 AND sequence_number = $3",
+    )
+    .bind(tenant_id.0)
+    .bind(store_id.0)
+    .bind(2_i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = event_store
+        .read_range(&tenant_id, &store_id, 2, 2)
+        .await
+        .unwrap_err();
+    match err {
+        SequencerError::InvariantViolation { invariant, message } => {
+            assert_eq!(invariant, "sequence_range");
+            assert!(message.contains("sequence gap in range 2..=2"));
+        }
+        other => panic!("expected sequence_range invariant, got {other:?}"),
+    }
+
+    let empty = event_store
+        .read_range(&tenant_id, &store_id, 10, 10)
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_event_store_read_entity() {
     let Some(pool) = connect_db().await else {
         eprintln!("DATABASE_URL not set; skipping");
@@ -537,7 +603,12 @@ async fn test_event_store_event_exists() {
     let store_id = StoreId::new();
     let agent_id = AgentId::new();
 
-    let event = create_test_event(tenant_id.clone(), store_id.clone(), agent_id.clone(), "ord-exists");
+    let event = create_test_event(
+        tenant_id.clone(),
+        store_id.clone(),
+        agent_id.clone(),
+        "ord-exists",
+    );
     let event_id = event.event_id;
 
     sequencer
@@ -648,7 +719,10 @@ async fn test_commitment_engine_store_and_retrieve() {
         .await
         .unwrap();
 
-    commitment_engine.store_commitment(&commitment).await.unwrap();
+    commitment_engine
+        .store_commitment(&commitment)
+        .await
+        .unwrap();
 
     // Retrieve by ID
     let retrieved = commitment_engine
@@ -738,7 +812,10 @@ async fn test_commitment_engine_update_chain_tx() {
         .await
         .unwrap();
 
-    commitment_engine.store_commitment(&commitment).await.unwrap();
+    commitment_engine
+        .store_commitment(&commitment)
+        .await
+        .unwrap();
 
     // Update with chain tx hash
     let tx_hash: Hash256 = [0xAB; 32];
@@ -801,7 +878,10 @@ async fn test_commitment_engine_list_unanchored() {
             .create_commitment(&tenant_id, &store_id, (start, end))
             .await
             .unwrap();
-        commitment_engine.store_commitment(&commitment).await.unwrap();
+        commitment_engine
+            .store_commitment(&commitment)
+            .await
+            .unwrap();
     }
 
     // List unanchored

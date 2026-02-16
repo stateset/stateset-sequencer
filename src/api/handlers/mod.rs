@@ -1,5 +1,6 @@
 //! REST API handlers organized by domain.
 
+pub mod admin;
 pub mod agent_keys;
 pub mod agents;
 pub mod anchoring;
@@ -12,6 +13,7 @@ pub mod schemas;
 pub mod ves;
 pub mod x402;
 
+pub use admin::*;
 pub use agent_keys::*;
 pub use agents::*;
 pub use anchoring::*;

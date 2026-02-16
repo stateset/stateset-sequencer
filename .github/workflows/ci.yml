@@ -18,6 +18,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch local STARK dependency source
+        run: |
+          if [ ! -d ../stateset-stark ]; then
+            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -54,6 +60,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch local STARK dependency source
+        run: |
+          if [ ! -d ../stateset-stark ]; then
+            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -92,6 +104,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch local STARK dependency source
+        run: |
+          if [ ! -d ../stateset-stark ]; then
+            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -166,6 +184,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch local STARK dependency source
+        run: |
+          if [ ! -d ../stateset-stark ]; then
+            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install cargo-audit
@@ -179,6 +203,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch local STARK dependency source
+        run: |
+          if [ ! -d ../stateset-stark ]; then
+            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -202,6 +232,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Fetch local STARK dependency source
+        run: |
+          if [ ! -d ../stateset-stark ]; then
+            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -214,6 +250,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch local STARK dependency source
+        run: |
+          if [ ! -d ../stateset-stark ]; then
+            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+          fi
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -243,6 +285,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Ensure local STARK dependency source for Docker build
+        run: |
+          if [ ! -d ../stateset-stark ]; then
+            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -266,7 +314,8 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: ..
+          file: stateset-sequencer/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

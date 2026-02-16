@@ -7,12 +7,11 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPool;
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 
 use crate::auth::{AgentKeyEntry, AgentKeyError, AgentKeyLookup, AgentKeyRegistry, KeyStatus};
 use crate::crypto::PublicKey32;
-use crate::infra::AgentKeyCache;
+use crate::infra::{AgentKeyCache, CACHE_STAMPEDE_DELAY};
 
 /// PostgreSQL-backed agent key registry
 pub struct PgAgentKeyRegistry {
@@ -23,10 +22,7 @@ pub struct PgAgentKeyRegistry {
 impl PgAgentKeyRegistry {
     /// Create a new PostgreSQL agent key registry
     pub fn new(pool: PgPool) -> Self {
-        Self {
-            pool,
-            cache: None,
-        }
+        Self { pool, cache: None }
     }
 
     /// Enable caching for agent key lookups.
@@ -128,7 +124,7 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
             }
             lock_acquired = lock;
             if !lock_acquired {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
                 if let Some(entry) = cache
                     .get(&lookup.tenant_id, &lookup.agent_id, lookup.key_id)
                     .await
@@ -346,6 +342,7 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
             FROM agent_signing_keys
             WHERE tenant_id = $1 AND agent_id = $2
             ORDER BY key_id ASC
+            LIMIT 1000
             "#,
         )
         .bind(tenant_id)

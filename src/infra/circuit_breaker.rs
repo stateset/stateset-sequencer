@@ -120,7 +120,8 @@ impl CircuitBreakerStats {
 
     /// Record call duration
     pub fn record_duration(&self, duration: Duration) {
-        self.total_duration_ms.fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
+        self.total_duration_ms
+            .fetch_add(duration.as_millis() as u64, Ordering::Relaxed);
         self.calls_with_duration.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -425,7 +426,10 @@ impl CircuitBreaker {
 
         // Calculate exponential backoff with jitter
         let base_backoff = self.config.open_timeout.as_secs_f64();
-        let multiplier = self.config.backoff_multiplier.powi(state.consecutive_opens.saturating_sub(1) as i32);
+        let multiplier = self
+            .config
+            .backoff_multiplier
+            .powi(state.consecutive_opens.saturating_sub(1) as i32);
         let backoff_secs = base_backoff * multiplier;
 
         // Cap at max backoff

@@ -108,6 +108,20 @@ services:
 
 ## Kubernetes Deployment
 
+### Repo Manifests (Recommended)
+
+This repo includes a Kustomize deployment in `k8s/` (namespace: `sequencer`).
+
+```bash
+kubectl apply -k k8s
+kubectl -n sequencer rollout status deployment/stateset-sequencer --timeout=10m
+```
+
+**Secrets:** create the `sequencer-secrets` secret out-of-band (or via External Secrets). Use
+`k8s/secret.example.yaml` as a template, but do not commit real credentials.
+
+**Images:** use immutable tags or digests (avoid `:latest` in production).
+
 ### Namespace and ConfigMap
 
 ```yaml
@@ -138,6 +152,8 @@ data:
   MAX_EVENT_PAYLOAD_SIZE: "1048576"     # 1MB
   # Schema validation
   SCHEMA_VALIDATION_MODE: "enforce"      # disabled|warn|enforce|required
+  # Proxy headers (set true when behind a trusted ingress/load balancer)
+  TRUST_PROXY_HEADERS: "true"
 ```
 
 ### Secrets
@@ -258,6 +274,49 @@ spec:
             name: sequencer-service
             port:
               number: 80
+```
+
+### Autoscaling (HPA)
+
+```yaml
+# hpa.yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sequencer
+  namespace: stateset
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sequencer
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+```
+
+**Note:** HPA requires the Kubernetes metrics-server to be installed and reporting CPU metrics.
+
+### Pod Disruption Budget
+
+```yaml
+# pdb.yaml
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: sequencer
+  namespace: stateset
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: sequencer
 ```
 
 ### PostgreSQL StatefulSet

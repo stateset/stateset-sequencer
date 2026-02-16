@@ -68,6 +68,7 @@ fn test_event_envelope_creation() {
     let payload_hash = compute_payload_hash(&payload);
 
     let envelope = EventEnvelope {
+        envelope_version: 1,
         event_id: Uuid::new_v4(),
         command_id: Some(Uuid::new_v4()),
         tenant_id: TenantId::from_uuid(test_tenant_id()),
@@ -99,6 +100,7 @@ fn test_sequenced_event_creation() {
     let payload_hash = compute_payload_hash(&payload);
 
     let envelope = EventEnvelope {
+        envelope_version: 1,
         event_id: Uuid::new_v4(),
         command_id: None,
         tenant_id: TenantId::from_uuid(test_tenant_id()),
@@ -136,6 +138,7 @@ fn test_event_batch_creation() {
             let payload_hash = compute_payload_hash(&payload);
 
             EventEnvelope {
+                envelope_version: 1,
                 event_id: Uuid::new_v4(),
                 command_id: None,
                 tenant_id: TenantId::from_uuid(test_tenant_id()),

@@ -10,9 +10,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use std::sync::Arc;
-use uuid::Uuid;
 
-use super::{ApiKeyStore, ApiKeyValidator, AuthContext, AuthError, JwtValidator, Permissions, API_KEY_PREFIX};
+use super::{
+    ApiKeyStore, ApiKeyValidator, AuthContext, AuthError, JwtValidator, API_KEY_PREFIX,
+};
 
 /// Combined authenticator supporting both API keys and JWT
 pub struct Authenticator {
@@ -112,10 +113,13 @@ pub struct AuthContextExt(pub AuthContext);
 #[derive(Clone)]
 pub struct AuthMiddlewareState {
     pub authenticator: Arc<Authenticator>,
-    /// If false, requests are treated as fully authorized (dev mode).
+    /// If false, requests are treated as bootstrap-admin (explicitly allowed by
+    /// `AUTH_MODE=disabled` + `ALLOW_AUTH_DISABLED=true`).
     pub require_auth: bool,
     /// Optional global rate limiter.
     pub rate_limiter: Option<Arc<RateLimiter>>,
+    /// Optional connection pool health monitor for load-shedding.
+    pub pool_monitor: Option<Arc<crate::infra::PoolMonitor>>,
 }
 
 /// Authentication middleware
@@ -124,21 +128,44 @@ pub async fn auth_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    // Reject early if connection pool is critically exhausted (load-shedding)
+    if let Some(ref monitor) = state.pool_monitor {
+        if !monitor.is_healthy().await {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": "Service temporarily unavailable",
+                    "code": "pool_exhausted"
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Extract auth header
     let auth_header = request
         .headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
+    let api_key_header = request
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok());
 
-    let context = match state.authenticator.authenticate(auth_header).await {
+    let context = match state
+        .authenticator
+        .authenticate(auth_header.or(api_key_header))
+        .await
+    {
         Ok(context) => context,
-        Err(e) if state.require_auth => return auth_error_response(e),
-        Err(_) => AuthContext {
-            tenant_id: Uuid::nil(),
-            store_ids: Vec::new(),
-            agent_id: None,
-            permissions: Permissions::admin(),
-        },
+        Err(error) if state.require_auth => return auth_error_response(error),
+        Err(error) => {
+            tracing::debug!(
+                error = %error,
+                "Authentication disabled; injecting bootstrap admin context",
+            );
+            AuthContext::bootstrap_admin()
+        }
     };
 
     if let Some(ref limiter) = state.rate_limiter {
@@ -170,14 +197,23 @@ fn auth_error_response(error: AuthError) -> Response {
         AuthError::StoreAccessDenied => (StatusCode::FORBIDDEN, "Store access denied"),
     };
 
-    (
+    let mut response = (
         status,
         axum::Json(serde_json::json!({
             "error": message,
             "code": format!("{:?}", error).to_lowercase()
         })),
     )
-        .into_response()
+        .into_response();
+
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static("60"),
+        );
+    }
+
+    response
 }
 
 /// Rate limiter configuration
@@ -274,7 +310,7 @@ impl RateLimiter {
 
     /// Check if request is allowed
     pub fn check(&self, key: &str) -> Result<(), AuthError> {
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let window_duration = std::time::Duration::from_secs(self.config.window_seconds);
 
@@ -351,13 +387,15 @@ impl RateLimiter {
             entries.remove(key);
         }
 
-        self.entries_evicted
-            .fetch_add(keys_to_remove.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.entries_evicted.fetch_add(
+            keys_to_remove.len() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Get remaining requests for a key
     pub fn remaining(&self, key: &str) -> u32 {
-        let entries = self.entries.read().unwrap();
+        let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let window_duration = std::time::Duration::from_secs(self.config.window_seconds);
 
@@ -375,7 +413,7 @@ impl RateLimiter {
 
     /// Get time until rate limit resets for a key (in seconds)
     pub fn reset_after(&self, key: &str) -> u64 {
-        let entries = self.entries.read().unwrap();
+        let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let window_duration = std::time::Duration::from_secs(self.config.window_seconds);
 
@@ -404,7 +442,7 @@ impl RateLimiter {
             entries_evicted: self
                 .entries_evicted
                 .load(std::sync::atomic::Ordering::Relaxed),
-            current_entries: self.entries.read().unwrap().len(),
+            current_entries: self.entries.read().unwrap_or_else(|e| e.into_inner()).len(),
             max_entries: self.config.max_entries,
             requests_per_minute: self.config.requests_per_minute,
         }
@@ -412,7 +450,7 @@ impl RateLimiter {
 
     /// Get current number of tracked keys
     pub fn entry_count(&self) -> usize {
-        self.entries.read().unwrap().len()
+        self.entries.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 
@@ -447,9 +485,9 @@ pub struct RequestLimits {
 impl Default for RequestLimits {
     fn default() -> Self {
         Self {
-            max_body_size: 10 * 1024 * 1024,       // 10MB
-            max_events_per_batch: 1000,            // 1000 events
-            max_event_payload_size: 1024 * 1024,   // 1MB
+            max_body_size: 10 * 1024 * 1024,     // 10MB
+            max_events_per_batch: 1000,          // 1000 events
+            max_event_payload_size: 1024 * 1024, // 1MB
         }
     }
 }

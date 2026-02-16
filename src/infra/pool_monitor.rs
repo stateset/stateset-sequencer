@@ -57,8 +57,8 @@ pub struct PoolMonitorConfig {
 impl Default for PoolMonitorConfig {
     fn default() -> Self {
         Self {
-            moderate_threshold: 0.5, // 50% utilization
-            stressed_threshold: 0.8, // 80% utilization
+            moderate_threshold: 0.5,  // 50% utilization
+            stressed_threshold: 0.8,  // 80% utilization
             critical_threshold: 0.95, // 95% utilization
             slow_acquisition_ms: 100,
             slow_acquisition_threshold: 10,
@@ -105,7 +105,10 @@ impl PoolStats {
 
     /// Check if pool is under stress
     pub fn is_stressed(&self) -> bool {
-        matches!(self.status, PoolHealthStatus::Stressed | PoolHealthStatus::Critical)
+        matches!(
+            self.status,
+            PoolHealthStatus::Stressed | PoolHealthStatus::Critical
+        )
     }
 
     /// Check if pool is critical
@@ -189,8 +192,12 @@ impl PoolMonitor {
     pub fn record_acquisition(&self, latency: Duration, success: bool) {
         let latency_us = latency.as_micros() as u64;
 
-        self.metrics.total_acquisitions.fetch_add(1, Ordering::Relaxed);
-        self.metrics.total_latency_us.fetch_add(latency_us, Ordering::Relaxed);
+        self.metrics
+            .total_acquisitions
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .total_latency_us
+            .fetch_add(latency_us, Ordering::Relaxed);
 
         // Update max latency
         let mut current_max = self.metrics.max_latency_us.load(Ordering::Relaxed);
@@ -208,11 +215,15 @@ impl PoolMonitor {
 
         // Track slow acquisitions
         if latency.as_millis() as u64 > self.config.slow_acquisition_ms {
-            self.metrics.slow_acquisitions.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .slow_acquisitions
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         if !success {
-            self.metrics.timed_out_acquisitions.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .timed_out_acquisitions
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -332,7 +343,9 @@ impl PoolMonitor {
     pub fn reset_metrics(&self) {
         self.metrics.total_acquisitions.store(0, Ordering::Relaxed);
         self.metrics.slow_acquisitions.store(0, Ordering::Relaxed);
-        self.metrics.timed_out_acquisitions.store(0, Ordering::Relaxed);
+        self.metrics
+            .timed_out_acquisitions
+            .store(0, Ordering::Relaxed);
         self.metrics.total_latency_us.store(0, Ordering::Relaxed);
         self.metrics.max_latency_us.store(0, Ordering::Relaxed);
     }
@@ -340,7 +353,10 @@ impl PoolMonitor {
 
 impl PoolHealthStatus {
     fn is_stressed(&self) -> bool {
-        matches!(self, PoolHealthStatus::Stressed | PoolHealthStatus::Critical)
+        matches!(
+            self,
+            PoolHealthStatus::Stressed | PoolHealthStatus::Critical
+        )
     }
 }
 
@@ -400,8 +416,10 @@ mod tests {
 
     #[test]
     fn test_pool_stats_is_stressed() {
-        let mut stats = PoolStats::default();
-        stats.status = PoolHealthStatus::Healthy;
+        let mut stats = PoolStats {
+            status: PoolHealthStatus::Healthy,
+            ..Default::default()
+        };
         assert!(!stats.is_stressed());
 
         stats.status = PoolHealthStatus::Stressed;
@@ -449,10 +467,16 @@ mod tests {
         let monitor = PoolMonitor::new(100);
         monitor.record_acquisition(Duration::from_millis(50), true);
 
-        assert_eq!(monitor.metrics.total_acquisitions.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            monitor.metrics.total_acquisitions.load(Ordering::Relaxed),
+            1
+        );
 
         monitor.reset_metrics();
-        assert_eq!(monitor.metrics.total_acquisitions.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            monitor.metrics.total_acquisitions.load(Ordering::Relaxed),
+            0
+        );
     }
 
     #[test]

@@ -5,10 +5,10 @@
 
 use super::{AuthContext, AuthError, Permissions};
 use sha2::{Digest, Sha256};
+use sqlx::postgres::PgPool;
 use std::collections::HashMap;
 use std::sync::RwLock;
 use uuid::Uuid;
-use sqlx::postgres::PgPool;
 
 /// API key prefix
 pub const API_KEY_PREFIX: &str = "ss_";
@@ -96,7 +96,7 @@ impl ApiKeyValidator {
 
     /// Register a new API key
     pub fn register_key(&self, record: ApiKeyRecord) {
-        let mut keys = self.keys.write().unwrap();
+        let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
         keys.insert(record.key_hash.clone(), record);
     }
 
@@ -111,7 +111,7 @@ impl ApiKeyValidator {
         let key_hash = Self::hash_key(key);
 
         // Look up the key
-        let keys = self.keys.read().unwrap();
+        let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
         let record = keys.get(&key_hash).ok_or(AuthError::InvalidApiKey)?;
 
         // Check if key is active
@@ -124,7 +124,7 @@ impl ApiKeyValidator {
 
     /// Revoke an API key
     pub fn revoke(&self, key_hash: &str) {
-        let mut keys = self.keys.write().unwrap();
+        let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
         if let Some(record) = keys.get_mut(key_hash) {
             record.active = false;
         }
@@ -316,12 +316,11 @@ impl ApiKeyStore for PgApiKeyStore {
     }
 
     async fn has_any_active(&self) -> Result<bool, AuthError> {
-        let row: Option<(i64,)> = sqlx::query_as(
-            "SELECT 1 FROM api_keys WHERE active = TRUE LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|_| AuthError::InvalidApiKey)?;
+        let row: Option<(i64,)> =
+            sqlx::query_as("SELECT 1 FROM api_keys WHERE active = TRUE LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| AuthError::InvalidApiKey)?;
 
         Ok(row.is_some())
     }

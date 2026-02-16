@@ -270,7 +270,7 @@ impl InMemoryAgentKeyRegistry {
     pub fn with_keys(keys: Vec<(AgentKeyLookup, AgentKeyEntry)>) -> Self {
         let registry = Self::new();
         {
-            let mut map = registry.keys.write().unwrap();
+            let mut map = registry.keys.write().unwrap_or_else(|e| e.into_inner());
             for (lookup, entry) in keys {
                 map.insert(lookup, entry);
             }
@@ -288,14 +288,12 @@ impl Default for InMemoryAgentKeyRegistry {
 #[async_trait::async_trait]
 impl AgentKeyRegistry for InMemoryAgentKeyRegistry {
     async fn get_key(&self, lookup: &AgentKeyLookup) -> Result<AgentKeyEntry, AgentKeyError> {
-        let keys = self.keys.read().unwrap();
-        keys.get(lookup)
-            .cloned()
-            .ok_or(AgentKeyError::KeyNotFound {
-                tenant_id: lookup.tenant_id,
-                agent_id: lookup.agent_id,
-                key_id: lookup.key_id,
-            })
+        let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
+        keys.get(lookup).cloned().ok_or(AgentKeyError::KeyNotFound {
+            tenant_id: lookup.tenant_id,
+            agent_id: lookup.agent_id,
+            key_id: lookup.key_id,
+        })
     }
 
     async fn get_valid_key_at(
@@ -318,7 +316,7 @@ impl AgentKeyRegistry for InMemoryAgentKeyRegistry {
         lookup: &AgentKeyLookup,
         entry: AgentKeyEntry,
     ) -> Result<(), AgentKeyError> {
-        let mut keys = self.keys.write().unwrap();
+        let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
         if keys.contains_key(lookup) {
             return Err(AgentKeyError::KeyAlreadyExists);
         }
@@ -327,14 +325,12 @@ impl AgentKeyRegistry for InMemoryAgentKeyRegistry {
     }
 
     async fn revoke_key(&self, lookup: &AgentKeyLookup) -> Result<(), AgentKeyError> {
-        let mut keys = self.keys.write().unwrap();
-        let entry = keys
-            .get_mut(lookup)
-            .ok_or(AgentKeyError::KeyNotFound {
-                tenant_id: lookup.tenant_id,
-                agent_id: lookup.agent_id,
-                key_id: lookup.key_id,
-            })?;
+        let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
+        let entry = keys.get_mut(lookup).ok_or(AgentKeyError::KeyNotFound {
+            tenant_id: lookup.tenant_id,
+            agent_id: lookup.agent_id,
+            key_id: lookup.key_id,
+        })?;
 
         entry.status = KeyStatus::Revoked;
         entry.revoked_at = Some(Utc::now());
@@ -346,7 +342,7 @@ impl AgentKeyRegistry for InMemoryAgentKeyRegistry {
         tenant_id: &Uuid,
         agent_id: &Uuid,
     ) -> Result<Vec<(u32, AgentKeyEntry)>, AgentKeyError> {
-        let keys = self.keys.read().unwrap();
+        let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
         let result: Vec<_> = keys
             .iter()
             .filter(|(lookup, _)| lookup.tenant_id == *tenant_id && lookup.agent_id == *agent_id)

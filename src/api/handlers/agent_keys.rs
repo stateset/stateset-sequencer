@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::api::auth_helpers::ensure_admin;
 use crate::api::types::RegisterAgentKeyRequest;
+use crate::api::utils::internal_error;
 use crate::auth::{AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, AuthContextExt};
 use crate::server::AppState;
 
@@ -95,7 +96,7 @@ pub async fn register_agent_key(
         .agent_key_registry
         .register_key(&lookup, entry)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     Ok(Json(serde_json::json!({
         "success": true,

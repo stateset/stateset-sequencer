@@ -217,17 +217,23 @@ impl Default for ShutdownCoordinator {
 /// Install signal handlers and return a future that completes on shutdown signal
 pub async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
+        if let Err(e) = signal::ctrl_c().await {
+            tracing::error!("Failed to listen for Ctrl+C: {e} — shutdown via signal will not work");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM handler")
-            .recv()
-            .await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -244,10 +250,7 @@ pub async fn shutdown_signal() {
 }
 
 /// Create a shutdown-aware task that stops when shutdown is signaled
-pub fn spawn_until_shutdown<F>(
-    signal: ShutdownSignal,
-    task: F,
-) -> tokio::task::JoinHandle<()>
+pub fn spawn_until_shutdown<F>(signal: ShutdownSignal, task: F) -> tokio::task::JoinHandle<()>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -372,9 +375,8 @@ mod tests {
         let guards: Vec<_> = (0..3).map(|_| tracker.request_start()).collect();
 
         // Spawn drain task
-        let drain_task = tokio::spawn(async move {
-            tracker2.wait_for_drain(Duration::from_secs(5)).await
-        });
+        let drain_task =
+            tokio::spawn(async move { tracker2.wait_for_drain(Duration::from_secs(5)).await });
 
         // Let drain run for a bit
         tokio::time::sleep(Duration::from_millis(50)).await;

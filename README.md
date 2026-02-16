@@ -264,7 +264,7 @@ GET /metrics    # Prometheus metrics
 | `READ_DB_APPLICATION_NAME` | `${DB_APPLICATION_NAME}-read` | PostgreSQL `application_name` for read pool |
 | `DB_MIGRATE_ON_STARTUP` | `true` | Auto-run SQL migrations on startup |
 | `PUBLIC_AGENT_REGISTRATION_ENABLED` | `true` | Enable public agent self-registration |
-| `TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `Forwarded` / `X-Real-IP` when extracting client IPs |
+| `TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `Forwarded` / `X-Real-IP` when extracting client IPs (only enable behind a trusted proxy/LB) |
 
 ### Database Pool Tuning
 
@@ -307,10 +307,12 @@ GET /metrics    # Prometheus metrics
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AUTH_MODE` | `required` | `required` or `disabled` |
+| `ALLOW_AUTH_DISABLED` | `false` | Set to `true` to explicitly allow `AUTH_MODE=disabled` |
 | `BOOTSTRAP_ADMIN_API_KEY` | (unset) | Admin API key for bootstrap/dev |
 | `JWT_SECRET` | (unset) | HMAC secret for JWT validation |
 | `JWT_ISSUER` | `stateset-sequencer` | Expected JWT issuer claim |
 | `JWT_AUDIENCE` | `stateset-api` | Expected JWT audience claim |
+| `ADMIN_IP_ALLOWLIST` | (unset) | Comma-separated IPs/CIDRs allowed to access admin + metrics (e.g. `203.0.113.10,10.0.0.0/8`) |
 
 ### Rate Limiting
 

@@ -91,10 +91,7 @@ pub fn router() -> Router<AppState> {
             post(handlers::ves::verify_ves_proof),
         )
         // VES anchoring
-        .route(
-            "/v1/ves/anchor",
-            post(handlers::ves::anchor_ves_commitment),
-        )
+        .route("/v1/ves/anchor", post(handlers::ves::anchor_ves_commitment))
         .route(
             "/v1/ves/anchor/:batch_id/verify",
             get(handlers::ves::verify_ves_anchor_onchain),
@@ -163,6 +160,15 @@ pub fn router() -> Router<AppState> {
         )
         // x402 payment protocol
         .nest("/v1/x402", handlers::x402_router())
+}
+
+/// Router for admin-only endpoints.
+pub fn admin_router() -> Router<AppState> {
+    Router::new()
+        .route("/v1/admin/overview", get(handlers::admin_overview))
+        .route("/v1/admin/tenants", get(handlers::admin_tenants))
+        .route("/v1/admin/stores", get(handlers::admin_stores))
+        .route("/v1/admin/agents", get(handlers::admin_agents))
 }
 
 /// Public router for self-service endpoints (no auth middleware).

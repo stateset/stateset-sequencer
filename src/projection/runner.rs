@@ -15,9 +15,7 @@ use super::{
     RejectionEvent, RejectionReason,
 };
 use crate::domain::{SequencedEvent, StoreId, TenantId};
-use crate::infra::{
-    DeadLetterReason, EnqueueParams, PgDeadLetterQueue, SequencerError,
-};
+use crate::infra::{DeadLetterReason, EnqueueParams, PgDeadLetterQueue, SequencerError};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -61,6 +59,9 @@ pub struct ProjectionRunnerConfig {
 
     /// Delay between retries (milliseconds)
     pub retry_delay_ms: u64,
+
+    /// Poll interval when no events are available (milliseconds)
+    pub poll_interval_ms: u64,
 }
 
 impl Default for ProjectionRunnerConfig {
@@ -71,6 +72,7 @@ impl Default for ProjectionRunnerConfig {
             continue_on_error: true,
             max_retries: 3,
             retry_delay_ms: 100,
+            poll_interval_ms: 100,
         }
     }
 }
@@ -203,7 +205,9 @@ impl ProjectionRunner {
         match reason {
             RejectionReason::VersionConflict { .. } => DeadLetterReason::VersionConflict,
             RejectionReason::InvariantViolation { .. } => DeadLetterReason::InvariantViolation,
-            RejectionReason::InvalidStateTransition { .. } => DeadLetterReason::InvalidStateTransition,
+            RejectionReason::InvalidStateTransition { .. } => {
+                DeadLetterReason::InvalidStateTransition
+            }
             RejectionReason::PayloadInvalid { .. } => DeadLetterReason::SchemaValidation,
             RejectionReason::EntityNotFound => DeadLetterReason::HandlerError,
         }
@@ -256,8 +260,11 @@ impl ProjectionRunner {
                 .await?;
 
             if events.is_empty() {
-                // No more events, wait a bit before polling again
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                // No more events, wait before polling again
+                tokio::time::sleep(tokio::time::Duration::from_millis(
+                    self.config.poll_interval_ms,
+                ))
+                .await;
                 continue;
             }
 
@@ -302,7 +309,8 @@ impl ProjectionRunner {
                             DeadLetterReason::HandlerError,
                             &e.to_string(),
                             event.payload().clone(),
-                        ).await;
+                        )
+                        .await;
 
                         {
                             let mut stats = self.stats.write().await;
@@ -397,9 +405,13 @@ impl ProjectionRunner {
                     store_id,
                     event,
                     DeadLetterReason::VersionConflict,
-                    &format!("Version conflict: expected {}, got {}", expected_version, actual_version),
+                    &format!(
+                        "Version conflict: expected {}, got {}",
+                        expected_version, actual_version
+                    ),
                     event.payload().clone(),
-                ).await;
+                )
+                .await;
 
                 warn!(
                     event_id = %event.event_id(),
@@ -470,7 +482,8 @@ impl ProjectionRunner {
                     dlq_reason,
                     &message,
                     event.payload().clone(),
-                ).await;
+                )
+                .await;
 
                 warn!(
                     event_id = %event.event_id(),

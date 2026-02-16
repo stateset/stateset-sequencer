@@ -1,17 +1,19 @@
 //! VES inclusion proof handlers.
 
+use crate::api::auth_helpers::ensure_read;
+use crate::api::types::{ProofQuery, VerifyVesProofRequest};
+use crate::api::utils::internal_error;
+use crate::auth::AuthContextExt;
+use crate::domain::{MerkleProof, StoreId, TenantId};
+use crate::infra::CACHE_STAMPEDE_DELAY;
+use crate::server::AppState;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use std::time::Duration;
-
-use crate::api::auth_helpers::ensure_read;
-use crate::api::types::{ProofQuery, VerifyVesProofRequest};
-use crate::auth::AuthContextExt;
-use crate::domain::{MerkleProof, StoreId, TenantId};
-use crate::server::AppState;
+use tracing::instrument;
 
 /// GET /api/v1/ves/proofs/:sequence_number - Get VES inclusion proof.
+#[instrument(skip(state, auth, query), fields(sequence_number = %sequence_number))]
 pub async fn get_ves_inclusion_proof(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -50,10 +52,11 @@ pub async fn get_ves_inclusion_proof(
         .get(&tenant_id.0, &store_id.0, sequence_number)
         .await
     {
-        if state
-            .ves_commitment_reader
-            .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
-        {
+        if state.ves_commitment_reader.verify_inclusion(
+            proof.leaf_hash,
+            &proof,
+            commitment.merkle_root,
+        ) {
             return Ok(Json(serde_json::json!({
                 "sequence_number": sequence_number,
                 "batch_id": commitment.batch_id,
@@ -70,10 +73,11 @@ pub async fn get_ves_inclusion_proof(
         .get_with_lock(&tenant_id.0, &store_id.0, sequence_number)
         .await;
     if let Some(proof) = cached {
-        if state
-            .ves_commitment_reader
-            .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
-        {
+        if state.ves_commitment_reader.verify_inclusion(
+            proof.leaf_hash,
+            &proof,
+            commitment.merkle_root,
+        ) {
             return Ok(Json(serde_json::json!({
                 "sequence_number": sequence_number,
                 "batch_id": commitment.batch_id,
@@ -87,15 +91,16 @@ pub async fn get_ves_inclusion_proof(
     }
 
     if !lock_acquired {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
         if let Some(proof) = proof_cache
             .get(&tenant_id.0, &store_id.0, sequence_number)
             .await
         {
-            if state
-                .ves_commitment_reader
-                .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
-            {
+            if state.ves_commitment_reader.verify_inclusion(
+                proof.leaf_hash,
+                &proof,
+                commitment.merkle_root,
+            ) {
                 return Ok(Json(serde_json::json!({
                     "sequence_number": sequence_number,
                     "batch_id": commitment.batch_id,
@@ -121,7 +126,7 @@ pub async fn get_ves_inclusion_proof(
                     .release_lock(&tenant_id.0, &store_id.0, sequence_number)
                     .await;
             }
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            return Err(internal_error(e));
         }
     };
 
@@ -140,7 +145,7 @@ pub async fn get_ves_inclusion_proof(
                         .release_lock(&tenant_id.0, &store_id.0, sequence_number)
                         .await;
                 }
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                return Err(internal_error(e));
             }
         };
         let computed_root_primary = state.ves_commitment_engine.compute_merkle_root(&leaves);
@@ -180,7 +185,7 @@ pub async fn get_ves_inclusion_proof(
                     .release_lock(&tenant_id.0, &store_id.0, sequence_number)
                     .await;
             }
-            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+            return Err(internal_error(e));
         }
     };
 
@@ -205,6 +210,7 @@ pub async fn get_ves_inclusion_proof(
 }
 
 /// POST /api/v1/ves/proofs/verify - Verify a VES Merkle proof.
+#[instrument(skip(state, auth, request))]
 pub async fn verify_ves_proof(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -218,7 +224,12 @@ pub async fn verify_ves_proof(
     }
 
     let leaf_hash: [u8; 32] = hex::decode(&request.leaf_hash)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid leaf_hash: {}", e)))?
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Invalid leaf_hash format".to_string(),
+            )
+        })?
         .try_into()
         .map_err(|_| {
             (

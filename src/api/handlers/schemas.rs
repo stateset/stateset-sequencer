@@ -6,17 +6,24 @@ use axum::Json;
 use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
+/// Maximum length for event type strings.
+const MAX_EVENT_TYPE_LEN: usize = 256;
+/// Maximum size for schema JSON in bytes.
+const MAX_SCHEMA_JSON_SIZE: usize = 102_400; // 100 KB
+/// Maximum length for schema description.
+const MAX_SCHEMA_DESCRIPTION_LEN: usize = 2048;
+
 use crate::api::auth_helpers::{ensure_admin, ensure_read, ensure_write};
 use crate::api::types::{
     RegisterSchemaRequest, RegisterSchemaResponse, SchemaByEventTypeQuery, SchemaListResponse,
     SchemaQuery, SchemaResponse, SchemaVersionQuery, UpdateSchemaStatusRequest,
     ValidatePayloadRequest, ValidationErrorResponse, ValidationResponse,
 };
+use crate::api::utils::internal_error;
 use crate::auth::AuthContextExt;
-use crate::domain::{
-    EventType, Schema, SchemaCompatibility, SchemaId, SchemaStatus, TenantId,
-};
+use crate::domain::{EventType, Schema, SchemaCompatibility, SchemaId, SchemaStatus, TenantId};
 use crate::infra::SchemaStore;
+use crate::infra::{AuditAction, AuditLogBuilder};
 use crate::server::AppState;
 
 /// Convert a Schema domain object to API response.
@@ -59,6 +66,44 @@ pub async fn register_schema(
     // Require write access to the tenant
     ensure_write(&auth, request.tenant_id, Uuid::nil())?;
 
+    // Validate event type length
+    if request.event_type.is_empty() || request.event_type.len() > MAX_EVENT_TYPE_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "event_type must be between 1 and {} characters",
+                MAX_EVENT_TYPE_LEN
+            ),
+        ));
+    }
+
+    // Validate schema JSON size
+    let schema_size = serde_json::to_vec(&request.schema_json)
+        .map(|v| v.len())
+        .unwrap_or(0);
+    if schema_size > MAX_SCHEMA_JSON_SIZE {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "schema_json exceeds maximum size of {} bytes",
+                MAX_SCHEMA_JSON_SIZE
+            ),
+        ));
+    }
+
+    // Validate description length
+    if let Some(ref desc) = request.description {
+        if desc.len() > MAX_SCHEMA_DESCRIPTION_LEN {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "description must be at most {} characters",
+                    MAX_SCHEMA_DESCRIPTION_LEN
+                ),
+            ));
+        }
+    }
+
     let tenant_id = TenantId::from_uuid(request.tenant_id);
     let event_type = EventType::from(request.event_type.as_str());
 
@@ -88,12 +133,31 @@ pub async fn register_schema(
 
     // Register it
     match state.schema_store.register(schema).await {
-        Ok(registered) => Ok(Json(RegisterSchemaResponse {
-            id: registered.id.0,
-            event_type: registered.event_type.to_string(),
-            version: registered.version,
-            created_at: registered.created_at.to_rfc3339(),
-        })),
+        Ok(registered) => {
+            if let Some(ref logger) = state.audit_logger {
+                let actor = auth
+                    .agent_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                let entry = AuditLogBuilder::new(AuditAction::SchemaRegistered, &actor, "api_key")
+                    .tenant_id(request.tenant_id)
+                    .resource("schema", registered.id.0.to_string())
+                    .details(serde_json::json!({
+                        "event_type": registered.event_type.to_string(),
+                        "version": registered.version,
+                    }))
+                    .build();
+                if let Err(e) = logger.log(entry).await {
+                    warn!(error = %e, "Failed to write audit log");
+                }
+            }
+            Ok(Json(RegisterSchemaResponse {
+                id: registered.id.0,
+                event_type: registered.event_type.to_string(),
+                version: registered.version,
+                created_at: registered.created_at.to_rfc3339(),
+            }))
+        }
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
     }
 }
@@ -120,7 +184,7 @@ pub async fn list_schemas(
                 count,
             }))
         }
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err(internal_error(e)),
     }
 }
 
@@ -142,7 +206,7 @@ pub async fn get_schema(
             Ok(Json(schema_to_response(&schema)))
         }
         Ok(None) => Err((StatusCode::NOT_FOUND, "Schema not found".to_string())),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err(internal_error(e)),
     }
 }
 
@@ -179,7 +243,7 @@ pub async fn get_schemas_by_event_type(
                 StatusCode::NOT_FOUND,
                 format!("Schema version {} not found", version),
             )),
-            Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            Err(e) => Err(internal_error(e)),
         }
     } else {
         // List all versions
@@ -197,7 +261,7 @@ pub async fn get_schemas_by_event_type(
                     "count": count
                 })))
             }
-            Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+            Err(e) => Err(internal_error(e)),
         }
     }
 }
@@ -226,7 +290,7 @@ pub async fn get_latest_schema(
             StatusCode::NOT_FOUND,
             format!("No schema found for event type: {}", event_type),
         )),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err(internal_error(e)),
     }
 }
 
@@ -248,7 +312,7 @@ pub async fn update_schema_status(
     let schema = match state.schema_store.get_by_id(schema_id).await {
         Ok(Some(s)) => s,
         Ok(None) => return Err((StatusCode::NOT_FOUND, "Schema not found".to_string())),
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => return Err(internal_error(e)),
     };
 
     // Verify caller has write access to this schema's tenant
@@ -267,12 +331,30 @@ pub async fn update_schema_status(
     };
 
     match state.schema_store.update_status(schema_id, status).await {
-        Ok(()) => Ok(Json(serde_json::json!({
-            "success": true,
-            "schema_id": schema_id.0,
-            "new_status": request.status
-        }))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Ok(()) => {
+            if let Some(ref logger) = state.audit_logger {
+                let actor = auth
+                    .agent_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                let entry = AuditLogBuilder::new(AuditAction::SchemaUpdated, &actor, "api_key")
+                    .tenant_id(schema.tenant_id.0)
+                    .resource("schema", schema_id.0.to_string())
+                    .details(serde_json::json!({
+                        "new_status": request.status,
+                    }))
+                    .build();
+                if let Err(e) = logger.log(entry).await {
+                    warn!(error = %e, "Failed to write audit log");
+                }
+            }
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "schema_id": schema_id.0,
+                "new_status": request.status
+            })))
+        }
+        Err(e) => Err(internal_error(e)),
     }
 }
 
@@ -290,18 +372,37 @@ pub async fn delete_schema(
     let schema = match state.schema_store.get_by_id(schema_id).await {
         Ok(Some(s)) => s,
         Ok(None) => return Err((StatusCode::NOT_FOUND, "Schema not found".to_string())),
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => return Err(internal_error(e)),
     };
 
     // Verify caller has admin access to this schema's tenant
     ensure_admin(&auth, schema.tenant_id.0, Uuid::nil())?;
 
     match state.schema_store.delete(schema_id).await {
-        Ok(()) => Ok(Json(serde_json::json!({
-            "success": true,
-            "deleted_schema_id": schema_id.0
-        }))),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Ok(()) => {
+            if let Some(ref logger) = state.audit_logger {
+                let actor = auth
+                    .agent_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                let entry = AuditLogBuilder::new(AuditAction::SchemaDeleted, &actor, "api_key")
+                    .tenant_id(schema.tenant_id.0)
+                    .resource("schema", schema_id.0.to_string())
+                    .details(serde_json::json!({
+                        "event_type": schema.event_type.to_string(),
+                        "version": schema.version,
+                    }))
+                    .build();
+                if let Err(e) = logger.log(entry).await {
+                    warn!(error = %e, "Failed to write audit log");
+                }
+            }
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "deleted_schema_id": schema_id.0
+            })))
+        }
+        Err(e) => Err(internal_error(e)),
     }
 }
 
@@ -350,6 +451,6 @@ pub async fn validate_payload(
                 })
                 .collect(),
         })),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => Err(internal_error(e)),
     }
 }

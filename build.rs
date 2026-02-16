@@ -6,8 +6,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .out_dir("src/proto")
         .compile_protos(
             &[
-                "proto/sequencer.proto",      // v1 - existing protocol
-                "proto/sequencer_v2.proto",   // v2 - VES v1.0 with streaming
+                "proto/sequencer.proto",    // v1 - existing protocol
+                "proto/sequencer_v2.proto", // v2 - VES v1.0 with streaming
             ],
             &["proto"],
         )?;

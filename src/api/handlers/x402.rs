@@ -8,7 +8,7 @@
 //! - `GET /api/v1/x402/payments/:intent_id` - Get payment status
 //! - `GET /api/v1/x402/payments/:intent_id/receipt` - Get payment receipt
 //! - `GET /api/v1/x402/batches/:batch_id` - Get batch status
-//! - `POST /api/v1/x402/batches/settle` - Trigger batch settlement
+//! - `POST /api/v1/x402/batches/settle` - Submit or confirm batch settlement
 //!
 //! # Flow
 //!
@@ -19,6 +19,8 @@
 //! 5. Batch is committed (Merkle root computed)
 //! 6. Batch is settled on Set Chain L2 via SetPaymentBatch contract
 //! 7. Agent can fetch receipt with inclusion proof
+
+use std::collections::HashSet;
 
 use axum::extract::{Extension, Path, Query, State};
 use axum::Json;
@@ -32,11 +34,20 @@ use crate::auth::{AgentKeyRegistry, AuthContextExt};
 use crate::domain::{
     AgentId, AgentKeyId, GetX402BatchResponse, GetX402ReceiptResponse, Hash256, Signature64,
     StoreId, SubmitX402PaymentRequest, SubmitX402PaymentResponse, TenantId, X402BatchStatus,
-    X402IntentStatus, X402Network, X402PaymentBatch, X402PaymentIntent, X402PaymentIntentFilter,
-    X402_MAX_VALIDITY_SECS,
+    X402_DEFAULT_BATCH_SIZE, X402IntentStatus, X402Network, X402_MAX_BATCH_SIZE,
+    X402PaymentBatch, X402PaymentIntent, X402PaymentIntentFilter, X402_MAX_VALIDITY_SECS,
 };
 use crate::infra::PgX402Repository;
 use crate::server::AppState;
+
+const X402_DEFAULT_LIST_LIMIT: u32 = X402_DEFAULT_BATCH_SIZE as u32;
+const X402_MAX_LIST_LIMIT: u32 = X402_MAX_BATCH_SIZE as u32;
+const X402_MAX_LIST_OFFSET: u32 = 10_000;
+const X402_MAX_ADDRESS_LEN: usize = 66;
+const X402_MAX_STRING_FIELD_LEN: usize = 1024;
+const X402_MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
+const X402_MAX_URI_LEN: usize = 4096;
+const X402_MAX_DESCRIPTION_LEN: usize = 8192;
 
 // =============================================================================
 // Submit Payment Intent
@@ -90,7 +101,75 @@ pub async fn submit_payment_intent(
 
     let tenant_id = TenantId::from_uuid(payload.tenant_id);
     let store_id = StoreId::from_uuid(payload.store_id);
+    let amount = payload.amount;
     let now_unix = Utc::now().timestamp() as u64;
+
+    if payload.tenant_id.is_nil() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "tenant_id cannot be nil",
+        ));
+    }
+
+    if payload.store_id.is_nil() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "store_id cannot be nil",
+        ));
+    }
+
+    if payload.agent_id.is_nil() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "agent_id cannot be nil",
+        ));
+    }
+
+    if amount == 0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "amount must be greater than 0",
+        ));
+    }
+
+    validate_hex_string(&payload.payer_address, "payer_address", X402_MAX_ADDRESS_LEN)?;
+    validate_hex_string(&payload.payee_address, "payee_address", X402_MAX_ADDRESS_LEN)?;
+
+    if payload.payer_address == payload.payee_address {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "payer_address and payee_address cannot be the same",
+        ));
+    }
+
+    if let Some(agent_key_id) = payload.agent_key_id {
+        if agent_key_id == 0 {
+            return Err(ApiError::new(
+                ErrorCode::InvalidFieldValue,
+                "agent_key_id must be greater than 0",
+            ));
+        }
+    }
+
+    if let Some(ref idempotency_key) = payload.idempotency_key {
+        validate_length(
+            idempotency_key,
+            "idempotency_key",
+            X402_MAX_IDEMPOTENCY_KEY_LEN,
+        )?;
+    }
+
+    if let Some(ref resource_uri) = payload.resource_uri {
+        validate_length(resource_uri, "resource_uri", X402_MAX_URI_LEN)?;
+    }
+
+    if let Some(ref description) = payload.description {
+        validate_length(description, "description", X402_MAX_DESCRIPTION_LEN)?;
+    }
+
+    if let Some(ref merchant_id) = payload.merchant_id {
+        validate_length(merchant_id, "merchant_id", X402_MAX_STRING_FIELD_LEN)?;
+    }
 
     ensure_write(&auth, tenant_id.0, store_id.0)
         .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
@@ -163,7 +242,7 @@ pub async fn submit_payment_intent(
     let expected_hash = PgX402Repository::compute_signing_hash(
         &payload.payer_address,
         &payload.payee_address,
-        payload.amount,
+        amount,
         &payload.asset,
         &payload.network,
         payload.network.chain_id(),
@@ -238,11 +317,14 @@ pub async fn submit_payment_intent(
         agent_key_id: AgentKeyId::new(payload.agent_key_id.unwrap_or(1)),
         payer_address: payload.payer_address,
         payee_address: payload.payee_address,
-        amount: payload.amount,
+        amount,
         asset: payload.asset,
         network: payload.network,
         chain_id: payload.network.chain_id(),
-        token_address: payload.asset.token_address(payload.network).map(String::from),
+        token_address: payload
+            .asset
+            .token_address(payload.network)
+            .map(String::from),
         created_at_unix: now_unix,
         valid_until: payload.valid_until,
         nonce: payload.nonce,
@@ -266,17 +348,12 @@ pub async fn submit_payment_intent(
     };
 
     // Persist intent and reserve nonce atomically
-    let mut tx = state
-        .x402_repository
-        .pool()
-        .begin()
-        .await
-        .map_err(|e| {
-            ApiError::new(
-                ErrorCode::InternalError,
-                format!("Failed to start transaction: {}", e),
-            )
-        })?;
+    let mut tx = state.x402_repository.pool().begin().await.map_err(|e| {
+        ApiError::new(
+            ErrorCode::InternalError,
+            format!("Failed to start transaction: {}", e),
+        )
+    })?;
 
     state
         .x402_repository
@@ -460,9 +537,11 @@ pub async fn list_payment_intents(
 ) -> Result<Json<Vec<X402PaymentIntent>>, ApiError> {
     debug!(?filter, "Listing payment intents");
 
-    let tenant_id = filter.tenant_id.ok_or_else(|| {
-        ApiError::new(ErrorCode::MissingRequiredField, "tenant_id is required")
-    })?;
+    let mut filter = filter;
+
+    let tenant_id = filter
+        .tenant_id
+        .ok_or_else(|| ApiError::new(ErrorCode::MissingRequiredField, "tenant_id is required"))?;
     if filter.store_id.is_none() && !auth.store_ids.is_empty() {
         return Err(ApiError::new(
             ErrorCode::MissingRequiredField,
@@ -470,6 +549,42 @@ pub async fn list_payment_intents(
         ));
     }
     let store_id = filter.store_id.unwrap_or_else(Uuid::nil);
+
+    if let (Some(from_date), Some(to_date)) = (filter.from_date.as_ref(), filter.to_date.as_ref()) {
+        if from_date > to_date {
+            return Err(ApiError::new(
+                ErrorCode::InvalidFieldValue,
+                "from_date must be <= to_date",
+            ));
+        }
+    }
+
+    let requested_limit = filter.limit.unwrap_or(X402_DEFAULT_LIST_LIMIT);
+    if requested_limit == 0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "limit must be greater than 0",
+        ));
+    }
+    if requested_limit > X402_MAX_LIST_LIMIT {
+        return Err(ApiError::new(
+            ErrorCode::BatchTooLarge,
+            format!("limit exceeds maximum of {}", X402_MAX_LIST_LIMIT),
+        ));
+    }
+    filter.limit = Some(requested_limit);
+
+    let requested_offset = filter.offset.unwrap_or(0);
+    if requested_offset > X402_MAX_LIST_OFFSET {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            format!(
+                "offset exceeds platform maximum of {}",
+                X402_MAX_LIST_OFFSET
+            ),
+        ));
+    }
+    filter.offset = Some(requested_offset);
 
     ensure_read(&auth, tenant_id, store_id)
         .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
@@ -529,10 +644,13 @@ pub async fn get_batch(
 // Trigger Batch Settlement
 // =============================================================================
 
-/// Trigger settlement of a committed batch
+/// Trigger batch submission/settlement
 #[derive(Debug, serde::Deserialize)]
 pub struct SettleBatchRequest {
     pub batch_id: Uuid,
+    pub tx_hash: Option<String>,
+    pub block_number: Option<u64>,
+    pub gas_used: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -540,6 +658,8 @@ pub struct SettleBatchResponse {
     pub batch_id: Uuid,
     pub status: X402BatchStatus,
     pub tx_hash: Option<String>,
+    pub block_number: Option<u64>,
+    pub gas_used: Option<u64>,
     pub message: String,
 }
 
@@ -549,49 +669,175 @@ pub async fn settle_batch(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(payload): Json<SettleBatchRequest>,
 ) -> Result<Json<SettleBatchResponse>, ApiError> {
-    info!(batch_id = %payload.batch_id, "Triggering batch settlement");
+    let batch_id = payload.batch_id;
+    let tx_hash = payload
+        .tx_hash
+        .as_ref()
+        .map(|hash| {
+            parse_hash256(hash).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidFieldValue,
+                    format!("Invalid tx_hash: {}", e),
+                )
+            })?;
+            Ok::<_, ApiError>(hash.clone())
+        })
+        .transpose()?;
+
+    info!(
+        batch_id = %batch_id,
+        has_tx_hash = payload.tx_hash.is_some(),
+        "Triggering batch settlement"
+    );
 
     // Fetch batch from database
-    let batch = state
-        .x402_repository
-        .get_batch(payload.batch_id)
-        .await
-        .map_err(|e| {
-            ApiError::new(
-                ErrorCode::InternalError,
-                format!("Failed to fetch batch: {}", e),
-            )
-        })?;
+    let batch = state.x402_repository.get_batch(batch_id).await.map_err(|e| {
+        ApiError::new(
+            ErrorCode::InternalError,
+            format!("Failed to fetch batch: {}", e),
+        )
+    })?;
 
     let batch = batch.ok_or_else(|| {
-        ApiError::new(
-            ErrorCode::BatchNotFound,
-            format!("Batch {} not found", payload.batch_id),
-        )
+        ApiError::new(ErrorCode::BatchNotFound, format!("Batch {} not found", batch_id))
     })?;
 
     ensure_admin(&auth, batch.tenant_id.0, batch.store_id.0)
         .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
 
-    // Verify batch is in Committed status
-    if batch.status != X402BatchStatus::Committed {
-        return Err(ApiError::new(
-            ErrorCode::InvalidFieldValue,
+    match batch.status {
+        X402BatchStatus::Committed => {
+            let tx_hash = tx_hash.ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidFieldValue,
+                    "tx_hash is required when batch is 'committed'",
+                )
+            })?;
+
+            state
+                .x402_repository
+                .submit_batch(batch_id, &tx_hash)
+                .await
+                .map_err(|e| ApiError::from(e))?;
+
+            if let Some(block_number) = payload.block_number {
+                state
+                    .x402_repository
+                    .settle_batch(batch_id, &tx_hash, block_number, payload.gas_used)
+                    .await
+                    .map_err(|e| ApiError::from(e))?;
+
+                Ok(Json(SettleBatchResponse {
+                    batch_id,
+                    status: X402BatchStatus::Settled,
+                    tx_hash: Some(tx_hash),
+                    block_number: payload.block_number,
+                    gas_used: payload.gas_used,
+                    message: "Batch submitted and settled".to_string(),
+                }))
+            } else {
+                Ok(Json(SettleBatchResponse {
+                    batch_id,
+                    status: X402BatchStatus::Submitted,
+                    tx_hash: Some(tx_hash),
+                    block_number: None,
+                    gas_used: None,
+                    message: "Batch submission recorded".to_string(),
+                }))
+            }
+        }
+        X402BatchStatus::Submitted => {
+            let tx_hash = match (tx_hash.clone(), batch.tx_hash.clone()) {
+                (Some(provided), Some(stored)) => {
+                    if provided != stored {
+                        return Err(ApiError::new(
+                            ErrorCode::InvalidFieldValue,
+                            "tx_hash does not match already submitted batch",
+                        ));
+                    }
+                    provided
+                }
+                (Some(provided), None) => provided,
+                (None, Some(stored)) => stored,
+                (None, None) => {
+                    return Err(ApiError::new(
+                        ErrorCode::InvalidFieldValue,
+                        "tx_hash is required when batch is 'submitted'",
+                    ))
+                }
+            };
+
+            let block_number = payload.block_number.ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::InvalidFieldValue,
+                    "block_number is required when batch is 'submitted'",
+                )
+            })?;
+
+            state
+                .x402_repository
+                .settle_batch(batch_id, &tx_hash, block_number, payload.gas_used)
+                .await
+                .map_err(|e| ApiError::from(e))?;
+
+            Ok(Json(SettleBatchResponse {
+                batch_id,
+                status: X402BatchStatus::Settled,
+                tx_hash: Some(tx_hash),
+                block_number: Some(block_number),
+                gas_used: payload.gas_used,
+                message: "Batch settlement confirmed".to_string(),
+            }))
+        }
+        X402BatchStatus::Settled => {
+            if let Some(provided_tx_hash) = tx_hash {
+                if let Some(stored_tx_hash) = batch.tx_hash.as_ref() {
+                    if provided_tx_hash != *stored_tx_hash {
+                        return Err(ApiError::new(
+                            ErrorCode::InvalidFieldValue,
+                            "tx_hash does not match existing settled batch",
+                        ));
+                    }
+                }
+            }
+            if let Some(provided_block_number) = payload.block_number {
+                if let Some(stored_block_number) = batch.block_number {
+                    if provided_block_number != stored_block_number {
+                        return Err(ApiError::new(
+                            ErrorCode::InvalidFieldValue,
+                            "block_number does not match existing settled batch",
+                        ));
+                    }
+                }
+            }
+            if let Some(provided_gas_used) = payload.gas_used {
+                if let Some(stored_gas_used) = batch.gas_used {
+                    if provided_gas_used != stored_gas_used {
+                        return Err(ApiError::new(
+                            ErrorCode::InvalidFieldValue,
+                            "gas_used does not match existing settled batch",
+                        ));
+                    }
+                }
+            }
+
+            Ok(Json(SettleBatchResponse {
+                batch_id,
+                status: X402BatchStatus::Settled,
+                tx_hash: batch.tx_hash,
+                block_number: batch.block_number,
+                gas_used: batch.gas_used,
+                message: "Batch already settled".to_string(),
+            }))
+        }
+        _ => Err(ApiError::new(
+            ErrorCode::InvalidStateTransition,
             format!(
-                "Batch must be in 'committed' status to settle, current status: {:?}",
+                "Batch settlement is only valid for committed, submitted, or settled batches, current status: {:?}",
                 batch.status
             ),
-        ));
+        )),
     }
-
-    // TODO: Submit to Set Chain L2 via SetPaymentBatch contract
-    // For now, return pending status
-    Ok(Json(SettleBatchResponse {
-        batch_id: payload.batch_id,
-        status: X402BatchStatus::Submitted,
-        tx_hash: None,
-        message: "Batch settlement initiated".to_string(),
-    }))
 }
 
 // =============================================================================
@@ -634,21 +880,47 @@ pub async fn create_batch(
 
     let tenant_id = TenantId::from_uuid(payload.tenant_id);
     let store_id = StoreId::from_uuid(payload.store_id);
-    let max_size = payload.max_size.unwrap_or(100);
+    let max_size = payload.max_size.unwrap_or(X402_DEFAULT_BATCH_SIZE);
+    if max_size == 0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "max_size must be greater than 0",
+        ));
+    }
+    if max_size > X402_MAX_BATCH_SIZE {
+        return Err(ApiError::new(
+            ErrorCode::BatchTooLarge,
+            format!("max_size exceeds maximum of {}", X402_MAX_BATCH_SIZE),
+        ));
+    }
 
     ensure_admin(&auth, tenant_id.0, store_id.0)
         .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
 
-    let intents = if let Some(intent_ids) = payload.intent_ids.as_ref().filter(|ids| !ids.is_empty())
+    let intents = if let Some(payload_intent_ids) =
+        payload.intent_ids.as_ref().filter(|ids| !ids.is_empty())
     {
-        if intent_ids.len() > max_size {
+        if payload_intent_ids.len() > max_size {
             return Err(ApiError::new(
                 ErrorCode::BatchTooLarge,
                 "Requested intent_ids exceed batch size limit",
             ));
         }
+
+        let mut seen = HashSet::with_capacity(payload_intent_ids.len());
+        let mut intent_ids = Vec::with_capacity(payload_intent_ids.len());
+        for intent_id in payload_intent_ids {
+            if !seen.insert(*intent_id) {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidFieldValue,
+                    "Duplicate intent_id in intent_ids",
+                ));
+            }
+            intent_ids.push(*intent_id);
+        }
+
         let mut intents = Vec::with_capacity(intent_ids.len());
-        for intent_id in intent_ids {
+        for intent_id in &intent_ids {
             let intent = state
                 .x402_repository
                 .get_intent(*intent_id)
@@ -730,32 +1002,24 @@ pub async fn create_batch(
             )
         })?;
 
-    // Update intents to batched status and attach batch id
-    let intent_ids: Vec<Uuid> = intents.iter().map(|i| i.intent_id).collect();
-    for intent_id in &intent_ids {
-        state
-            .x402_repository
-            .update_intent_batch(*intent_id, batch.batch_id)
-            .await
-            .map_err(|e| {
-                ApiError::new(
-                    ErrorCode::InternalError,
-                    format!("Failed to update intent batch: {}", e),
-                )
-            })?;
-    }
-
     // Compute Merkle root + commit batch
-    let (merkle_root, _state_root) = state
+    let (merkle_root, _state_root) = match state
         .x402_repository
         .commit_batch_with_merkle(batch.batch_id, &tenant_id, &store_id)
         .await
-        .map_err(|e| {
-            ApiError::new(
+    {
+        Ok(result) => result,
+        Err(e) => {
+            let _ = state
+                .x402_repository
+                .mark_batch_failed_if_pending(batch.batch_id)
+                .await;
+            return Err(ApiError::new(
                 ErrorCode::InternalError,
                 format!("Failed to commit batch: {}", e),
-            )
-        })?;
+            ));
+        }
+    };
 
     Ok(Json(CreateBatchResponse {
         batch_id: batch.batch_id,
@@ -779,6 +1043,75 @@ fn parse_hash256(s: &str) -> Result<Hash256, String> {
         .map_err(|_| "Expected 32 bytes for hash".to_string())
 }
 
+fn validate_length(value: &str, field_name: &str, max_len: usize) -> Result<(), ApiError> {
+    if value.len() > max_len {
+        return Err(ApiError::new(
+            ErrorCode::PayloadTooLarge,
+            format!("{} must be at most {} characters", field_name, max_len),
+        ));
+    }
+
+    if value.trim().is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            format!("{} cannot be empty", field_name),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_hex_string(
+    value: &str,
+    field_name: &str,
+    max_len: usize,
+) -> Result<(), ApiError> {
+    if value.len() > max_len {
+        return Err(ApiError::new(
+            ErrorCode::PayloadTooLarge,
+            format!(
+                "{} exceeds maximum length of {} characters",
+                field_name, max_len
+            ),
+        ));
+    }
+
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            format!("{} cannot be empty", field_name),
+        ));
+    }
+
+    let hex_part = value.strip_prefix("0x").unwrap_or(value);
+    if hex_part.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            format!(
+                "{} must be a hexadecimal string",
+                field_name
+            ),
+        ));
+    }
+
+    if !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            format!("{} must be a valid hex string", field_name),
+        ));
+    }
+
+    if hex_part.len() % 2 != 0 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            format!("{} hex length must be even", field_name),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Parse a hex string into a 64-byte signature
 /// Supports both Ed25519 (64 bytes) and Ethereum ECDSA (65 bytes with recovery byte)
 fn parse_signature64(s: &str) -> Result<Signature64, String> {
@@ -797,10 +1130,7 @@ fn parse_signature64(s: &str) -> Result<Signature64, String> {
                 .map_err(|_| "Failed to extract 64 bytes from ECDSA signature".to_string())?;
             Ok(sig_bytes)
         }
-        n => Err(format!(
-            "Expected 64 or 65 bytes for signature, got {}",
-            n
-        )),
+        n => Err(format!("Expected 64 or 65 bytes for signature, got {}", n)),
     }
 }
 
@@ -858,5 +1188,25 @@ mod tests {
     fn test_parse_hash256_invalid() {
         assert!(parse_hash256("invalid").is_err());
         assert!(parse_hash256("0x0102").is_err()); // too short
+    }
+
+    #[test]
+    fn test_validate_length() {
+        assert!(validate_length("abc", "field", 4).is_ok());
+        assert!(validate_length("", "field", 4).is_err());
+        assert!(validate_length("abcde", "field", 4).is_err());
+    }
+
+    #[test]
+    fn test_validate_hex_string() {
+        assert!(
+            validate_hex_string("0xabcdef", "address", X402_MAX_ADDRESS_LEN).is_ok()
+        );
+        assert!(
+            validate_hex_string("abcdef", "address", X402_MAX_ADDRESS_LEN).is_ok()
+        );
+        assert!(validate_hex_string("0x", "address", X402_MAX_ADDRESS_LEN).is_err());
+        assert!(validate_hex_string("0xxyz", "address", X402_MAX_ADDRESS_LEN).is_err());
+        assert!(validate_hex_string("abc", "address", X402_MAX_ADDRESS_LEN).is_err());
     }
 }

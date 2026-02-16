@@ -8,6 +8,22 @@ contracts/broadcast/
 
 # Node.js
 node_modules/
+.cache/
+.npm/
+.pnpm-store/
+.yarn/
+.yarnrc
+.yarnrc.yml
+
+# Python tooling/build
+venv/
+.venv/
+.mypy_cache/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.tox/
+.python-version
 
 # Environment files
 .env
@@ -28,6 +44,7 @@ Thumbs.db
 # Log files
 *.log
 logs/
+coverage/
 
 # Database files
 *.db
@@ -40,8 +57,22 @@ logs/
 # Secrets and credentials
 *.pem
 *.key
+*.p12
+*.pfx
+*.jks
 secrets/
 target_alt/
+target-local/
+coverage-integration/
 
 # Kubernetes manifests
-k8s/
+k8s/*.local.yaml
+k8s/*.local.yml
+k8s/sequencer-secrets.yaml
+k8s/secret.local.yaml
+
+# Local build/cache dirs
+.tmp/
+.tmp
+load/results/
+target-clippy/

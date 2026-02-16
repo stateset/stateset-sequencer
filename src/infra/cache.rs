@@ -19,11 +19,16 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+use crate::auth::AgentKeyEntry;
 use crate::crypto::Hash256;
 use crate::domain::{BatchCommitment, MerkleProof, Schema, VesBatchCommitment};
-use crate::auth::AgentKeyEntry;
 #[cfg(test)]
 use crate::domain::{StoreId, TenantId};
+
+/// Delay used to mitigate cache stampedes when a miss triggers a concurrent
+/// recomputation.  All handlers should use this constant instead of inlining
+/// a `Duration::from_millis(25)` literal.
+pub const CACHE_STAMPEDE_DELAY: Duration = Duration::from_millis(25);
 
 // ============================================================================
 // LRU Cache Implementation
@@ -341,11 +346,12 @@ where
         let cached = self.get(key).await;
 
         // Check if we need to trigger background refresh
-        let needs_refresh =
-            self.needs_refresh(key).await && self.try_acquire_refresh(key).await;
+        let needs_refresh = self.needs_refresh(key).await && self.try_acquire_refresh(key).await;
 
         if needs_refresh {
-            self.stats.background_refreshes.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .background_refreshes
+                .fetch_add(1, Ordering::Relaxed);
         }
 
         (cached, needs_refresh)
@@ -376,7 +382,6 @@ where
         }
     }
 }
-
 
 // ============================================================================
 // Commitment Cache
@@ -679,12 +684,7 @@ impl ProofCache {
     }
 
     /// Release a previously acquired proof lock.
-    pub async fn release_lock(
-        &self,
-        tenant_id: &Uuid,
-        store_id: &Uuid,
-        sequence_number: u64,
-    ) {
+    pub async fn release_lock(&self, tenant_id: &Uuid, store_id: &Uuid, sequence_number: u64) {
         let key = ProofCacheKey {
             tenant_id: *tenant_id,
             store_id: *store_id,
@@ -1014,6 +1014,7 @@ impl CacheManager {
     }
 
     /// Create with custom settings
+    #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         commitment_max: usize,
         commitment_ttl: Duration,
@@ -1057,7 +1058,10 @@ impl CacheManager {
         self.commitments.by_batch_id.cleanup_expired().await;
         self.commitments.latest_by_stream.cleanup_expired().await;
         self.ves_commitments.by_batch_id.cleanup_expired().await;
-        self.ves_commitments.latest_by_stream.cleanup_expired().await;
+        self.ves_commitments
+            .latest_by_stream
+            .cleanup_expired()
+            .await;
         self.proofs.proofs.cleanup_expired().await;
         self.ves_proofs.proofs.cleanup_expired().await;
         self.agent_keys.keys.cleanup_expired().await;

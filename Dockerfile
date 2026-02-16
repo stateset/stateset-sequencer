@@ -4,18 +4,21 @@
 # Build stage
 FROM rust:latest AS builder
 
-WORKDIR /app
+WORKDIR /workspace
 
 # Install dependencies for building
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests first for better caching
-COPY Cargo.toml Cargo.lock* ./
+# Copy manifests and local path dependencies for build caching
+COPY stateset-sequencer/Cargo.toml stateset-sequencer/Cargo.lock* ./stateset-sequencer/
+COPY stateset-stark ./stateset-stark
 
 # Create dummy source files to build dependencies (lib + bin + bench targets)
+WORKDIR /workspace/stateset-sequencer
 RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs && \
     echo "fn main() {}" > src/bin/admin.rs && \
     mkdir benches && echo "fn main() {}" > benches/sequencer_bench.rs
@@ -24,15 +27,16 @@ RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && echo "" > src/lib.r
 RUN cargo build --release && rm -rf src benches
 
 # Copy actual source code
-COPY src ./src
-COPY migrations ./migrations
-COPY benches ./benches
 
-# Touch source files to rebuild with actual source
-RUN touch src/main.rs src/lib.rs src/bin/admin.rs
+# Copy build script and application sources for real build
+COPY stateset-sequencer/build.rs ./build.rs
+COPY stateset-sequencer/src ./src
+COPY stateset-sequencer/migrations ./migrations
+COPY stateset-sequencer/benches ./benches
+COPY stateset-sequencer/proto ./proto
 
 # Build the actual application
-RUN cargo build --release
+RUN cargo build --release --manifest-path /workspace/stateset-sequencer/Cargo.toml
 
 # Runtime stage
 FROM debian:bookworm-slim AS runtime
@@ -50,10 +54,10 @@ RUN useradd -r -s /bin/false sequencer
 WORKDIR /app
 
 # Copy the binary from builder
-COPY --from=builder /app/target/release/stateset-sequencer /app/stateset-sequencer
+COPY --from=builder /workspace/stateset-sequencer/target/release/stateset-sequencer /app/stateset-sequencer
 
 # Copy migrations for reference
-COPY --from=builder /app/migrations /app/migrations
+COPY --from=builder /workspace/stateset-sequencer/migrations /app/migrations
 
 # Set ownership
 RUN chown -R sequencer:sequencer /app

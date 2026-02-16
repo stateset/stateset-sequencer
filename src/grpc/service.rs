@@ -1,16 +1,16 @@
 //! gRPC Sequencer service implementation
 //!
 //! Implements the Sequencer gRPC service trait.
+#![allow(clippy::result_large_err)]
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
 
 use crate::auth::{AuthContext, Permissions};
@@ -54,7 +54,7 @@ use crate::domain::{
 };
 use crate::infra::{
     CacheManager, CommitmentEngine, EventStore, IngestService, PgCommitmentEngine, PgEventStore,
-    PgSequencer, Sequencer,
+    PgSequencer, Sequencer, CACHE_STAMPEDE_DELAY,
 };
 use crate::proto::{
     sequencer_server::Sequencer as SequencerTrait, BatchCommitment, EventEnvelope,
@@ -63,6 +63,9 @@ use crate::proto::{
     InclusionProof, PullRequest, PullResponse, PushRequest, PushResponse, RejectedEvent,
     SequencedEvent,
 };
+
+/// Maximum events allowed in a single gRPC push request.
+const MAX_GRPC_BATCH_SIZE: usize = 1000;
 
 /// gRPC Sequencer service implementation
 pub struct SequencerService {
@@ -166,10 +169,7 @@ impl SequencerService {
         }
     }
 
-    async fn get_commitment_cached(
-        &self,
-        batch_id: Uuid,
-    ) -> Result<DomainBatchCommitment, Status> {
+    async fn get_commitment_cached(&self, batch_id: Uuid) -> Result<DomainBatchCommitment, Status> {
         let cache = &self.cache_manager.commitments;
 
         if let Some(cached) = cache.get_by_batch_id(&batch_id).await {
@@ -182,7 +182,7 @@ impl SequencerService {
         }
 
         if !lock_acquired {
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
             if let Some(cached) = cache.get_by_batch_id(&batch_id).await {
                 return Ok(cached.commitment);
             }
@@ -196,7 +196,7 @@ impl SequencerService {
                     if lock_acquired {
                         cache.release_batch_id_lock(&batch_id).await;
                     }
-                    return Err(Status::internal(e.to_string()));
+                    return Err(super::grpc_internal_error(e));
                 }
             },
             Err(_) => match self.commitment_engine_writer.get_commitment(batch_id).await {
@@ -205,7 +205,7 @@ impl SequencerService {
                     if lock_acquired {
                         cache.release_batch_id_lock(&batch_id).await;
                     }
-                    return Err(Status::internal(e.to_string()));
+                    return Err(super::grpc_internal_error(e));
                 }
             },
         };
@@ -239,11 +239,15 @@ impl SequencerService {
         let sequence_number = event.sequence_number();
         let proof_cache = &self.cache_manager.proofs;
 
-        if let Some(proof) = proof_cache.get(&tenant_id, &store_id, sequence_number).await {
-            if self
-                .commitment_engine
-                .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
-            {
+        if let Some(proof) = proof_cache
+            .get(&tenant_id, &store_id, sequence_number)
+            .await
+        {
+            if self.commitment_engine.verify_inclusion(
+                proof.leaf_hash,
+                &proof,
+                commitment.events_root,
+            ) {
                 let proof_hashes: Vec<Vec<u8>> =
                     proof.proof_path.iter().map(|h| h.to_vec()).collect();
                 let proof_response = GetInclusionProofResponse {
@@ -264,10 +268,11 @@ impl SequencerService {
             .get_with_lock(&tenant_id, &store_id, sequence_number)
             .await;
         if let Some(proof) = cached {
-            if self
-                .commitment_engine
-                .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
-            {
+            if self.commitment_engine.verify_inclusion(
+                proof.leaf_hash,
+                &proof,
+                commitment.events_root,
+            ) {
                 let proof_hashes: Vec<Vec<u8>> =
                     proof.proof_path.iter().map(|h| h.to_vec()).collect();
                 let proof_response = GetInclusionProofResponse {
@@ -285,12 +290,16 @@ impl SequencerService {
         }
 
         if !lock_acquired {
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            if let Some(proof) = proof_cache.get(&tenant_id, &store_id, sequence_number).await {
-                if self
-                    .commitment_engine
-                    .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
-                {
+            tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
+            if let Some(proof) = proof_cache
+                .get(&tenant_id, &store_id, sequence_number)
+                .await
+            {
+                if self.commitment_engine.verify_inclusion(
+                    proof.leaf_hash,
+                    &proof,
+                    commitment.events_root,
+                ) {
                     let proof_hashes: Vec<Vec<u8>> =
                         proof.proof_path.iter().map(|h| h.to_vec()).collect();
                     let proof_response = GetInclusionProofResponse {
@@ -308,9 +317,7 @@ impl SequencerService {
             }
         }
 
-        let proof = self
-            .commitment_engine
-            .prove_inclusion(leaf_index, leaves);
+        let proof = self.commitment_engine.prove_inclusion(leaf_index, leaves);
         proof_cache
             .insert(tenant_id, store_id, sequence_number, proof.clone())
             .await;
@@ -380,7 +387,25 @@ impl SequencerService {
             _ => return Err(Status::invalid_argument("payload_hash must be 32 bytes")),
         };
 
+        // Validate string field lengths (matching HTTP-side limits)
+        if proto.entity_type.is_empty() || proto.entity_type.len() > 128 {
+            return Err(Status::invalid_argument(
+                "entity_type must be between 1 and 128 characters",
+            ));
+        }
+        if proto.entity_id.is_empty() || proto.entity_id.len() > 512 {
+            return Err(Status::invalid_argument(
+                "entity_id must be between 1 and 512 characters",
+            ));
+        }
+        if proto.event_type.is_empty() || proto.event_type.len() > 256 {
+            return Err(Status::invalid_argument(
+                "event_type must be between 1 and 256 characters",
+            ));
+        }
+
         Ok(crate::domain::EventEnvelope {
+            envelope_version: 1,
             event_id,
             command_id,
             tenant_id: TenantId(tenant_id),
@@ -425,6 +450,7 @@ impl SequencerService {
 #[tonic::async_trait]
 impl SequencerTrait for SequencerService {
     /// Push a batch of events for sequencing
+    #[instrument(skip(self, request))]
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushResponse>, Status> {
         let auth_ctx = Self::auth_context(&request);
         let req = request.into_inner();
@@ -436,6 +462,17 @@ impl SequencerTrait for SequencerService {
         );
 
         Self::require_write(&auth_ctx)?;
+
+        if req.events.is_empty() {
+            return Err(Status::invalid_argument("events must not be empty"));
+        }
+        if req.events.len() > MAX_GRPC_BATCH_SIZE {
+            return Err(Status::resource_exhausted(format!(
+                "batch size {} exceeds maximum of {}",
+                req.events.len(),
+                MAX_GRPC_BATCH_SIZE,
+            )));
+        }
 
         // Parse agent ID
         let agent_id = Uuid::parse_str(&req.agent_id)
@@ -466,47 +503,47 @@ impl SequencerTrait for SequencerService {
                     .collect();
 
                 // Get commitment if available
-        let commitment = match self
-            .commitment_engine
-            .get_commitment(receipt.batch_id)
-            .await
-        {
-            Ok(Some(c)) => {
-                self.cache_manager
-                    .commitments
-                    .insert(c.clone(), c.events_root)
-                    .await;
-                Some(Self::to_proto_commitment(&c))
-            }
-            Ok(None) => match self
-                .commitment_engine_writer
-                .get_commitment(receipt.batch_id)
-                .await
-            {
-                Ok(Some(c)) => {
-                    self.cache_manager
-                        .commitments
-                        .insert(c.clone(), c.events_root)
-                        .await;
-                    Some(Self::to_proto_commitment(&c))
-                }
-                _ => None,
-            },
-            Err(_) => match self
-                .commitment_engine_writer
-                .get_commitment(receipt.batch_id)
-                .await
-            {
-                Ok(Some(c)) => {
-                    self.cache_manager
-                        .commitments
-                        .insert(c.clone(), c.events_root)
-                        .await;
-                    Some(Self::to_proto_commitment(&c))
-                }
-                _ => None,
-            },
-        };
+                let commitment = match self
+                    .commitment_engine
+                    .get_commitment(receipt.batch_id)
+                    .await
+                {
+                    Ok(Some(c)) => {
+                        self.cache_manager
+                            .commitments
+                            .insert(c.clone(), c.events_root)
+                            .await;
+                        Some(Self::to_proto_commitment(&c))
+                    }
+                    Ok(None) => match self
+                        .commitment_engine_writer
+                        .get_commitment(receipt.batch_id)
+                        .await
+                    {
+                        Ok(Some(c)) => {
+                            self.cache_manager
+                                .commitments
+                                .insert(c.clone(), c.events_root)
+                                .await;
+                            Some(Self::to_proto_commitment(&c))
+                        }
+                        _ => None,
+                    },
+                    Err(_) => match self
+                        .commitment_engine_writer
+                        .get_commitment(receipt.batch_id)
+                        .await
+                    {
+                        Ok(Some(c)) => {
+                            self.cache_manager
+                                .commitments
+                                .insert(c.clone(), c.events_root)
+                                .await;
+                            Some(Self::to_proto_commitment(&c))
+                        }
+                        _ => None,
+                    },
+                };
 
                 Ok(Response::new(PushResponse {
                     batch_id: receipt.batch_id.to_string(),
@@ -520,7 +557,7 @@ impl SequencerTrait for SequencerService {
             }
             Err(e) => {
                 error!(error = %e, "Push failed");
-                Err(Status::internal(e.to_string()))
+                Err(super::grpc_internal_error(e))
             }
         }
     }
@@ -529,6 +566,7 @@ impl SequencerTrait for SequencerService {
     type PullStream = Pin<Box<dyn Stream<Item = Result<PullResponse, Status>> + Send>>;
 
     /// Pull events starting from a cursor (streaming)
+    #[instrument(skip(self, request))]
     async fn pull(
         &self,
         request: Request<PullRequest>,
@@ -572,7 +610,7 @@ impl SequencerTrait for SequencerService {
                 let head = match sequencer.head(&tenant_id, &store_id).await {
                     Ok(h) => h,
                     Err(e) => {
-                        let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                        let _ = tx.send(Err(super::grpc_internal_error(e))).await;
                         break;
                     }
                 };
@@ -584,10 +622,11 @@ impl SequencerTrait for SequencerService {
                 let mut events = match event_store
                     .read_range(&tenant_id, &store_id, from_sequence, end_sequence)
                     .await
+                    .map_err(super::grpc_sequencer_error)
                 {
                     Ok(e) => e,
                     Err(e) => {
-                        let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                        let _ = tx.send(Err(e)).await;
                         break;
                     }
                 };
@@ -600,10 +639,11 @@ impl SequencerTrait for SequencerService {
                             .event_store()
                             .read_range(&tenant_id, &store_id, from_sequence, end_sequence)
                             .await
+                            .map_err(super::grpc_sequencer_error)
                         {
                             Ok(e) => events = e,
                             Err(e) => {
-                                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                                let _ = tx.send(Err(e)).await;
                                 break;
                             }
                         }
@@ -647,6 +687,7 @@ impl SequencerTrait for SequencerService {
     }
 
     /// Get the current head sequence number
+    #[instrument(skip(self, request))]
     async fn get_head(
         &self,
         request: Request<GetHeadRequest>,
@@ -669,7 +710,7 @@ impl SequencerTrait for SequencerService {
             .sequencer
             .head(&tenant_id, &store_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(super::grpc_internal_error)?;
 
         let cache = &self.cache_manager.commitments;
         let mut lock_acquired = false;
@@ -679,14 +720,12 @@ impl SequencerTrait for SequencerService {
             .map(|cached| cached.commitment);
 
         if latest_commitment.is_none() {
-            let (cached, lock) = cache
-                .get_latest_with_lock(&tenant_id.0, &store_id.0)
-                .await;
+            let (cached, lock) = cache.get_latest_with_lock(&tenant_id.0, &store_id.0).await;
             lock_acquired = lock;
             latest_commitment = cached.map(|c| c.commitment);
 
             if latest_commitment.is_none() && !lock_acquired {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
                 latest_commitment = cache
                     .get_latest(&tenant_id.0, &store_id.0)
                     .await
@@ -708,11 +747,9 @@ impl SequencerTrait for SequencerService {
                         Ok(commitment) => commitment,
                         Err(e) => {
                             if lock_acquired {
-                                cache
-                                    .release_latest_lock(&tenant_id.0, &store_id.0)
-                                    .await;
+                                cache.release_latest_lock(&tenant_id.0, &store_id.0).await;
                             }
-                            return Err(Status::internal(e.to_string()));
+                            return Err(super::grpc_internal_error(e));
                         }
                     },
                     Err(_) => match self
@@ -723,11 +760,9 @@ impl SequencerTrait for SequencerService {
                         Ok(commitment) => commitment,
                         Err(e) => {
                             if lock_acquired {
-                                cache
-                                    .release_latest_lock(&tenant_id.0, &store_id.0)
-                                    .await;
+                                cache.release_latest_lock(&tenant_id.0, &store_id.0).await;
                             }
-                            return Err(Status::internal(e.to_string()));
+                            return Err(super::grpc_internal_error(e));
                         }
                     },
                 };
@@ -742,9 +777,7 @@ impl SequencerTrait for SequencerService {
         }
 
         if lock_acquired {
-            cache
-                .release_latest_lock(&tenant_id.0, &store_id.0)
-                .await;
+            cache.release_latest_lock(&tenant_id.0, &store_id.0).await;
         }
 
         let latest_commitment = latest_commitment.map(|c| Self::to_proto_commitment(&c));
@@ -756,6 +789,7 @@ impl SequencerTrait for SequencerService {
     }
 
     /// Get Merkle inclusion proof for an event
+    #[instrument(skip(self, request))]
     async fn get_inclusion_proof(
         &self,
         request: Request<GetInclusionProofRequest>,
@@ -784,14 +818,14 @@ impl SequencerTrait for SequencerService {
                 .event_store()
                 .read_by_id(event_id)
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(super::grpc_internal_error)?
                 .ok_or_else(|| Status::not_found("event not found"))?,
             Err(_) => self
                 .sequencer
                 .event_store()
                 .read_by_id(event_id)
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(super::grpc_internal_error)?
                 .ok_or_else(|| Status::not_found("event not found"))?,
         };
 
@@ -820,10 +854,11 @@ impl SequencerTrait for SequencerService {
             .event_store
             .get_leaf_inputs(tenant_id, store_id, start, end)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(super::grpc_internal_error)?;
 
         if leaf_inputs.is_empty() {
-            return Err(Status::internal("commitment range contains no events"));
+            error!(start, end, "commitment range contains no events");
+            return Err(Status::internal("internal error"));
         }
 
         let expected_len = end
@@ -838,17 +873,18 @@ impl SequencerTrait for SequencerService {
                 .event_store()
                 .get_leaf_inputs(tenant_id, store_id, start, end)
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(super::grpc_internal_error)?;
         }
 
         if leaf_inputs.len() as u64 != expected_len {
-            return Err(Status::internal(format!(
-                "commitment range {}..={} contains {} events but expected {}",
+            error!(
                 start,
                 end,
-                leaf_inputs.len(),
-                expected_len
-            )));
+                actual = leaf_inputs.len(),
+                expected = expected_len,
+                "commitment range event count mismatch"
+            );
+            return Err(Status::internal("internal error"));
         }
 
         if leaf_index >= leaf_inputs.len() {
@@ -856,9 +892,11 @@ impl SequencerTrait for SequencerService {
         }
 
         if leaf_inputs[leaf_index].sequence_number != seq {
-            return Err(Status::internal(
-                "non-contiguous sequence numbers in commitment range",
-            ));
+            error!(
+                seq,
+                leaf_index, "non-contiguous sequence numbers in commitment range"
+            );
+            return Err(Status::internal("internal error"));
         }
 
         let leaves_v0: Vec<[u8; 32]> = leaf_inputs.iter().map(|i| i.payload_hash).collect();
@@ -890,7 +928,7 @@ impl SequencerTrait for SequencerService {
                 .event_store()
                 .get_leaf_inputs(tenant_id, store_id, start, end)
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?;
+                .map_err(super::grpc_internal_error)?;
             let leaves_v0_primary: Vec<[u8; 32]> =
                 leaf_inputs_primary.iter().map(|i| i.payload_hash).collect();
             let leaves_v1_primary: Vec<[u8; 32]> = leaf_inputs_primary
@@ -907,21 +945,34 @@ impl SequencerTrait for SequencerService {
                 })
                 .collect();
 
-            let root_v0_primary = self.commitment_engine.compute_events_root(&leaves_v0_primary);
-            let root_v1_primary = self.commitment_engine.compute_events_root(&leaves_v1_primary);
+            let root_v0_primary = self
+                .commitment_engine
+                .compute_events_root(&leaves_v0_primary);
+            let root_v1_primary = self
+                .commitment_engine
+                .compute_events_root(&leaves_v1_primary);
 
             if root_v1_primary == commitment.events_root {
                 return self
-                    .build_cached_proof_response(&commitment, &event, leaf_index, &leaves_v1_primary)
+                    .build_cached_proof_response(
+                        &commitment,
+                        &event,
+                        leaf_index,
+                        &leaves_v1_primary,
+                    )
                     .await;
             } else if root_v0_primary == commitment.events_root {
                 return self
-                    .build_cached_proof_response(&commitment, &event, leaf_index, &leaves_v0_primary)
+                    .build_cached_proof_response(
+                        &commitment,
+                        &event,
+                        leaf_index,
+                        &leaves_v0_primary,
+                    )
                     .await;
             } else {
-                return Err(Status::internal(
-                    "commitment events_root does not match events table",
-                ));
+                error!("commitment events_root does not match events table");
+                return Err(Status::internal("internal error"));
             }
         };
 
@@ -930,6 +981,7 @@ impl SequencerTrait for SequencerService {
     }
 
     /// Get a batch commitment by ID
+    #[instrument(skip(self, request))]
     async fn get_commitment(
         &self,
         request: Request<GetCommitmentRequest>,
@@ -952,6 +1004,7 @@ impl SequencerTrait for SequencerService {
     }
 
     /// Get entity event history
+    #[instrument(skip(self, request))]
     async fn get_entity_history(
         &self,
         request: Request<GetEntityHistoryRequest>,
@@ -966,6 +1019,18 @@ impl SequencerTrait for SequencerService {
 
         let tenant_id = TenantId(tenant_id);
         let store_id = StoreId(store_id);
+
+        if req.entity_type.is_empty() || req.entity_type.len() > 128 {
+            return Err(Status::invalid_argument(
+                "entity_type must be between 1 and 128 characters",
+            ));
+        }
+        if req.entity_id.is_empty() || req.entity_id.len() > 512 {
+            return Err(Status::invalid_argument(
+                "entity_id must be between 1 and 512 characters",
+            ));
+        }
+
         let entity_type = EntityType::from(req.entity_type.as_str());
 
         Self::require_read(&auth_ctx)?;
@@ -975,10 +1040,42 @@ impl SequencerTrait for SequencerService {
             .event_store
             .read_entity(&tenant_id, &store_id, &entity_type, &req.entity_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(super::grpc_internal_error)?;
 
         let current_version = events.len() as u64;
-        let proto_events: Vec<SequencedEvent> = events.iter().map(Self::to_proto_event).collect();
+        let requested_from_version = if req.from_version == 0 { 1 } else { req.from_version };
+        let requested_to_version = if req.to_version == 0 {
+            current_version
+        } else {
+            req.to_version
+        };
+
+        if current_version == 0 || requested_from_version > current_version {
+            return Ok(Response::new(GetEntityHistoryResponse {
+                events: Vec::new(),
+                current_version,
+            }));
+        }
+
+        let to_version = requested_to_version.min(current_version);
+        if req.to_version != 0 && requested_from_version > req.to_version {
+            return Err(Status::invalid_argument(
+                "from_version must be less than or equal to to_version",
+            ));
+        }
+
+        let take_count = to_version
+            .saturating_sub(requested_from_version)
+            .saturating_add(1) as usize;
+        let start_index = usize::try_from(requested_from_version - 1)
+            .map_err(|_| Status::invalid_argument("from_version is out of range"))?;
+
+        let proto_events: Vec<SequencedEvent> = events
+            .into_iter()
+            .skip(start_index)
+            .take(take_count)
+            .map(|event| Self::to_proto_event(&event))
+            .collect();
 
         Ok(Response::new(GetEntityHistoryResponse {
             events: proto_events,

@@ -171,9 +171,9 @@ impl PgCommitmentEngine {
 
     fn stream_lock_key(tenant_id: &TenantId, store_id: &StoreId) -> i64 {
         let stream_id = compute_stream_id(&tenant_id.0, &store_id.0);
-        let bytes: [u8; 8] = stream_id[..8]
-            .try_into()
-            .expect("stream_id is always 32 bytes");
+        // Safety: stream_id is Hash256 = [u8; 32], so first 8 bytes always exist
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&stream_id[..8]);
         i64::from_be_bytes(bytes)
     }
 
@@ -253,11 +253,14 @@ impl PgCommitmentEngine {
 
         let prev_state_root = if let Some(row) = last_row {
             let last_commitment = BatchCommitment::try_from(row)?;
-            let expected_start = last_commitment
-                .sequence_range
-                .1
-                .checked_add(1)
-                .ok_or_else(|| SequencerError::Internal("commitment sequence overflow".to_string()))?;
+            let expected_start =
+                last_commitment
+                    .sequence_range
+                    .1
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        SequencerError::Internal("commitment sequence overflow".to_string())
+                    })?;
             if start != expected_start {
                 return Err(SequencerError::Internal(format!(
                     "Commitment range must start at {} (next after last committed sequence {})",
@@ -428,11 +431,9 @@ impl CommitmentEngine for PgCommitmentEngine {
         // Get the previous state root
         let prev_commitment = self.get_last_commitment(tenant_id, store_id).await?;
         if let Some(prev) = &prev_commitment {
-            let expected_start = prev
-                .sequence_range
-                .1
-                .checked_add(1)
-                .ok_or_else(|| SequencerError::Internal("commitment sequence overflow".to_string()))?;
+            let expected_start = prev.sequence_range.1.checked_add(1).ok_or_else(|| {
+                SequencerError::Internal("commitment sequence overflow".to_string())
+            })?;
             if start != expected_start {
                 return Err(SequencerError::Internal(format!(
                     "Commitment range must start at {} (next after last committed sequence {})",
@@ -535,11 +536,9 @@ impl CommitmentEngine for PgCommitmentEngine {
             .get_last_commitment(&commitment.tenant_id, &commitment.store_id)
             .await?
         {
-            let expected_start = last
-                .sequence_range
-                .1
-                .checked_add(1)
-                .ok_or_else(|| SequencerError::Internal("commitment sequence overflow".to_string()))?;
+            let expected_start = last.sequence_range.1.checked_add(1).ok_or_else(|| {
+                SequencerError::Internal("commitment sequence overflow".to_string())
+            })?;
             if start != expected_start {
                 return Err(SequencerError::Internal(format!(
                     "Commitment range must start at {} (next after last committed sequence {})",

@@ -611,12 +611,10 @@ impl PgDeadLetterQueue {
     pub async fn count(&self, tenant_id: Option<&TenantId>) -> Result<i64> {
         let count: (i64,) = match tenant_id {
             Some(tid) => {
-                sqlx::query_as(
-                    "SELECT COUNT(*) FROM dead_letter_events WHERE tenant_id = $1",
-                )
-                .bind(tid.0)
-                .fetch_one(&self.pool)
-                .await?
+                sqlx::query_as("SELECT COUNT(*) FROM dead_letter_events WHERE tenant_id = $1")
+                    .bind(tid.0)
+                    .fetch_one(&self.pool)
+                    .await?
             }
             None => {
                 sqlx::query_as("SELECT COUNT(*) FROM dead_letter_events")
@@ -664,17 +662,15 @@ impl PgDeadLetterQueue {
             .fetch_one(&self.pool)
             .await?;
 
-        let pending: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM dead_letter_events WHERE status = 'pending'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let pending: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM dead_letter_events WHERE status = 'pending'")
+                .fetch_one(&self.pool)
+                .await?;
 
-        let failed: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM dead_letter_events WHERE status = 'failed'",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let failed: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM dead_letter_events WHERE status = 'failed'")
+                .fetch_one(&self.pool)
+                .await?;
 
         let by_reason: Vec<(String, i64)> = sqlx::query_as(
             r#"
@@ -696,17 +692,15 @@ impl PgDeadLetterQueue {
         .fetch_all(&self.pool)
         .await?;
 
-        let oldest: Option<(DateTime<Utc>,)> = sqlx::query_as(
-            "SELECT MIN(created_at) FROM dead_letter_events",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let oldest: Option<(DateTime<Utc>,)> =
+            sqlx::query_as("SELECT MIN(created_at) FROM dead_letter_events")
+                .fetch_optional(&self.pool)
+                .await?;
 
-        let highest_retry: (i32,) = sqlx::query_as(
-            "SELECT COALESCE(MAX(retry_count), 0) FROM dead_letter_events",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let highest_retry: (i32,) =
+            sqlx::query_as("SELECT COALESCE(MAX(retry_count), 0) FROM dead_letter_events")
+                .fetch_one(&self.pool)
+                .await?;
 
         let due_for_retry: (i64,) = sqlx::query_as(
             r#"
@@ -807,6 +801,32 @@ impl From<DeadLetterRow> for DeadLetterEvent {
             metadata: row.metadata,
         }
     }
+}
+
+/// Spawn a background task that periodically cleans up old dead letter events.
+///
+/// Events older than `retention_days` are deleted every `interval`.
+/// Returns a `JoinHandle` that can be used to abort the task on shutdown.
+pub fn spawn_dlq_cleanup(
+    dlq: std::sync::Arc<PgDeadLetterQueue>,
+    interval: Duration,
+    retention_days: i32,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            match dlq.cleanup_old(retention_days).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(deleted, retention_days, "DLQ cleanup completed");
+                }
+                Ok(_) => {} // nothing to clean
+                Err(e) => {
+                    tracing::warn!("DLQ cleanup failed: {}", e);
+                }
+            }
+        }
+    })
 }
 
 #[cfg(test)]

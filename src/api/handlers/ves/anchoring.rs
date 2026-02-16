@@ -3,14 +3,17 @@
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use tracing::instrument;
 use uuid::Uuid;
 
 use crate::api::auth_helpers::{ensure_admin, ensure_read};
 use crate::api::types::AnchorRequest;
+use crate::api::utils::internal_error;
 use crate::auth::AuthContextExt;
 use crate::server::AppState;
 
 /// POST /api/v1/ves/anchor - Anchor a VES commitment on-chain.
+#[instrument(skip(state, auth, request), fields(batch_id = %request.batch_id))]
 pub async fn anchor_ves_commitment(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -36,7 +39,7 @@ pub async fn anchor_ves_commitment(
     let (tx_hash, chain_block_number) = anchor_service
         .anchor_ves_commitment(&commitment)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     state
         .ves_commitment_engine
@@ -47,7 +50,7 @@ pub async fn anchor_ves_commitment(
             chain_block_number,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     state
         .cache_manager
@@ -67,6 +70,7 @@ pub async fn anchor_ves_commitment(
 }
 
 /// GET /api/v1/ves/anchor/:batch_id/verify - Verify VES commitment is anchored on-chain.
+#[instrument(skip(state, auth), fields(batch_id = %batch_id))]
 pub async fn verify_ves_anchor_onchain(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -80,7 +84,7 @@ pub async fn verify_ves_anchor_onchain(
     let is_anchored = anchor_service
         .verify_anchored(batch_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     if let Ok(commitment) = super::get_ves_commitment_cached(&state, batch_id).await {
         ensure_read(&auth, commitment.tenant_id.0, commitment.store_id.0)?;

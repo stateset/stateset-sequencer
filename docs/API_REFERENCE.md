@@ -5,7 +5,7 @@ Complete REST API documentation for the StateSet Sequencer.
 ## Base URL
 
 ```
-https://sequencer.stateset.com/api/v1
+https://api.sequencer.stateset.app/api
 ```
 
 ## Authentication
@@ -15,6 +15,20 @@ All API requests require authentication via Bearer token:
 ```bash
 Authorization: Bearer <your-api-key>
 ```
+
+**Public endpoints:** `/v1/agents/register`, `/health`, `/ready`
+
+**Metrics:** `/metrics` requires an admin API key.
+
+## Admin Dashboard
+
+The admin dashboard UI is available at:
+
+```http
+GET /admin
+```
+
+It uses the admin APIs below and requires a bootstrap admin API key to load data.
 
 ## Common Headers
 
@@ -705,7 +719,7 @@ POST /v1/ves/compliance/{event_id}/inputs
 **Request Body:**
 ```json
 {
-  "policyId": "aml.amount_lt",
+  "policyId": "aml.threshold",
   "policyParams": { "threshold": 10000 }
 }
 ```
@@ -723,7 +737,7 @@ POST /v1/ves/compliance/{event_id}/inputs
     "payloadPlainHash": "hex-32-bytes",
     "payloadCipherHash": "hex-32-bytes",
     "eventSigningHash": "hex-32-bytes",
-    "policyId": "aml.amount_lt",
+    "policyId": "aml.threshold",
     "policyParams": { "threshold": 10000 },
     "policyHash": "hex-32-bytes"
   },
@@ -735,6 +749,11 @@ POST /v1/ves/compliance/{event_id}/inputs
 
 Submit a compliance proof for an event + policy. `publicInputs` (if provided) must match the canonical inputs returned by `/inputs`.
 
+For STARK compliance proofs:
+- `proofType` should start with `stark` (recommended: `stark`)
+- `proofVersion` must match the verifier's expected version (currently `2`)
+- `witnessCommitment` is required (32 bytes, hex-encoded as 64 lowercase hex chars; `0x` prefix accepted)
+
 ```http
 POST /v1/ves/compliance/{event_id}/proofs
 ```
@@ -743,10 +762,11 @@ POST /v1/ves/compliance/{event_id}/proofs
 ```json
 {
   "proofType": "stark",
-  "proofVersion": 1,
-  "policyId": "aml.amount_lt",
+  "proofVersion": 2,
+  "policyId": "aml.threshold",
   "policyParams": { "threshold": 10000 },
   "proofB64": "base64",
+  "witnessCommitment": "64-lowercase-hex-chars",
   "publicInputs": { "..." : "..." }
 }
 ```
@@ -759,11 +779,13 @@ POST /v1/ves/compliance/{event_id}/proofs
   "tenant_id": "uuid",
   "store_id": "uuid",
   "proof_type": "stark",
-  "proof_version": 1,
-  "policy_id": "aml.amount_lt",
+  "proof_version": 2,
+  "policy_id": "aml.threshold",
   "policy_params": { "threshold": 10000 },
   "policy_hash": "hex-32-bytes",
   "proof_hash": "hex-32-bytes",
+  "witness_commitment": [123, 456, 789, 101112],
+  "witness_commitment_hex": "64-lowercase-hex-chars",
   "public_inputs": { "..." : "..." },
   "submitted_at": "2024-01-15T12:00:00Z"
 }
@@ -786,11 +808,13 @@ GET /v1/ves/compliance/{event_id}/proofs
       "tenant_id": "uuid",
       "store_id": "uuid",
       "proof_type": "stark",
-      "proof_version": 1,
-      "policy_id": "aml.amount_lt",
+      "proof_version": 2,
+      "policy_id": "aml.threshold",
       "policy_params": { "threshold": 10000 },
       "policy_hash": "hex-32-bytes",
       "proof_hash": "hex-32-bytes",
+      "witness_commitment": [123, 456, 789, 101112],
+      "witness_commitment_hex": "64-lowercase-hex-chars",
       "public_inputs": { "..." : "..." },
       "submitted_at": "2024-01-15T12:00:00Z"
     }
@@ -813,11 +837,13 @@ GET /v1/ves/compliance/proofs/{proof_id}
   "tenant_id": "uuid",
   "store_id": "uuid",
   "proof_type": "stark",
-  "proof_version": 1,
-  "policy_id": "aml.amount_lt",
+  "proof_version": 2,
+  "policy_id": "aml.threshold",
   "policy_params": { "threshold": 10000 },
   "policy_hash": "hex-32-bytes",
   "proof_hash": "hex-32-bytes",
+  "witness_commitment": [123, 456, 789, 101112],
+  "witness_commitment_hex": "64-lowercase-hex-chars",
   "proof_b64": "base64",
   "public_inputs": { "..." : "..." },
   "submitted_at": "2024-01-15T12:00:00Z"
@@ -827,7 +853,8 @@ GET /v1/ves/compliance/proofs/{proof_id}
 ### Verify VES Compliance Proof
 
 Verify that a stored proof is internally consistent with the sequencer’s canonical public inputs for the referenced event + policy, and that the stored proof bytes match the recorded proof hash.
-This does not perform cryptographic proof verification.
+
+For STARK compliance proofs, this endpoint also performs cryptographic proof verification (using `stateset-stark` verifier) and returns STARK-specific fields.
 
 ```http
 GET /v1/ves/compliance/proofs/{proof_id}/verify
@@ -841,14 +868,19 @@ GET /v1/ves/compliance/proofs/{proof_id}/verify
   "tenant_id": "uuid",
   "store_id": "uuid",
   "proof_type": "stark",
-  "proof_version": 1,
-  "policy_id": "aml.amount_lt",
+  "proof_version": 2,
+  "policy_id": "aml.threshold",
   "policy_hash": "hex-32-bytes",
   "proof_hash": "hex-32-bytes",
   "proof_hash_match": true,
   "public_inputs_hash": "hex-32-bytes",
   "canonical_public_inputs_hash": "hex-32-bytes",
   "public_inputs_match": true,
+  "witness_commitment": [123, 456, 789, 101112],
+  "witness_commitment_hex": "64-lowercase-hex-chars",
+  "stark_valid": true,
+  "stark_error": null,
+  "stark_verification_time_ms": 1234,
   "valid": true,
   "reason": null
 }
@@ -1166,6 +1198,70 @@ GET /v1/ves/anchor/{batch_id}/verify
 
 ---
 
+## Agent Registration (Public)
+
+Register a new agent and receive an API key for self-service onboarding. This endpoint is
+unauthenticated when public registration is enabled.
+
+```http
+POST /v1/agents/register
+```
+
+**Compatibility Note:** This endpoint is also exposed at `/v1/agents/register` without the `/api`
+prefix for legacy clients.
+
+**Request Body:**
+```json
+{
+  "name": "agent-name",
+  "description": "Optional agent description",
+  "storeIds": ["uuid"],
+  "readOnly": false,
+  "rateLimit": 120
+}
+```
+
+**Fields:**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `name` | string | Yes | Human-readable agent name |
+| `description` | string | No | Optional description of the agent (max 1024 chars) |
+| `storeIds` | array[uuid] | No | Store IDs this agent can access (max 50) |
+| `readOnly` | boolean | No | Register as read-only (default false) |
+| `rateLimit` | integer | No | Optional requests per minute (1-10000) |
+
+**Constraints:**
+- `name` is required and must be 1-128 characters.
+- `description` (if provided) must be at most 1024 characters.
+- `storeIds` (if provided) must include at most 50 store IDs.
+- `rateLimit` (if provided) must be between 1 and 10000.
+
+**Response Headers:**
+- `Cache-Control: no-store`
+- `RateLimit-Limit`: Requests per minute for this client (when rate limiting enabled)
+- `RateLimit-Remaining`: Remaining requests in the current window
+- `RateLimit-Reset`: Seconds until the window resets
+- `Retry-After`: Present on `429` responses
+
+**Response:**
+```json
+{
+  "success": true,
+  "agentId": "uuid",
+  "tenantId": "uuid",
+  "apiKey": "sk_live_...",
+  "permissions": "read_write",
+  "message": "Agent registered successfully. Store your API key securely - it cannot be retrieved later."
+}
+```
+
+**Error Codes:**
+- `INVALID_NAME`, `NAME_TOO_LONG`, `DESCRIPTION_TOO_LONG`, `STORE_IDS_TOO_MANY`, `RATE_LIMIT_INVALID`
+- `REGISTRATION_DISABLED`, `ADMIN_NOT_ALLOWED`, `RATE_LIMIT_EXCEEDED`, `INTERNAL_ERROR`
+
+---
+
 ## Agent Keys
 
 ### Register Agent Key
@@ -1208,6 +1304,105 @@ POST /v1/agents/keys
   "keyId": 1,
   "message": "Agent key registered successfully"
 }
+```
+
+---
+
+## Admin
+
+All admin endpoints require a bootstrap admin API key.
+
+### Overview
+
+```http
+GET /v1/admin/overview
+```
+
+**Response:**
+```json
+{
+  "tenants": 12,
+  "stores": 42,
+  "agents": 18,
+  "apiKeys": 25,
+  "activeApiKeys": 24,
+  "totalHeadSequence": 12890,
+  "activeStores24h": 7,
+  "maxProjectionLag": 12,
+  "lastActivityAt": "2026-02-04T16:58:12Z"
+}
+```
+
+### Tenants
+
+```http
+GET /v1/admin/tenants
+```
+
+**Response:**
+```json
+[
+  {
+    "tenantId": "uuid",
+    "agentCount": 3,
+    "apiKeyCount": 5,
+    "activeApiKeys": 4,
+    "storeCount": 2,
+    "totalHeadSequence": 640,
+    "activeStores24h": 2,
+    "maxProjectionLag": 8,
+    "lastKeyAt": "2026-02-04T16:58:12Z",
+    "lastActivityAt": "2026-02-04T16:57:31Z"
+  }
+]
+```
+
+### Stores
+
+```http
+GET /v1/admin/stores
+```
+
+**Response:**
+```json
+[
+  {
+    "tenantId": "uuid",
+    "storeId": "uuid",
+    "headSequence": 1289,
+    "lastProjectedSequence": 1275,
+    "projectionLag": 14,
+    "agentCount": 3,
+    "lastAgentSyncAt": "2026-02-04T16:57:31Z",
+    "updatedAt": "2026-02-04T16:57:31Z"
+  }
+]
+```
+
+### Agents
+
+```http
+GET /v1/admin/agents
+```
+
+**Response:**
+```json
+[
+  {
+    "tenantId": "uuid",
+    "agentId": "uuid",
+    "permissions": "read_write",
+    "storeScope": "scoped",
+    "apiKeyCount": 2,
+    "activeApiKeys": 2,
+    "firstKeyAt": "2026-02-04T16:50:02Z",
+    "lastKeyAt": "2026-02-04T16:58:12Z",
+    "storeId": "uuid",
+    "lastSyncAt": "2026-02-04T16:59:01Z",
+    "lastPulledSequence": 1282,
+    "lastPushedSequence": 1290
+  }
+]
 ```
 
 ---

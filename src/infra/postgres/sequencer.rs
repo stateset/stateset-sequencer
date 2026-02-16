@@ -57,6 +57,52 @@ pub struct PgSequencer {
 }
 
 impl PgSequencer {
+    const MAX_SEQUENCE: u64 = i64::MAX as u64;
+
+    fn decode_sequence(value: i64) -> Result<u64> {
+        u64::try_from(value).map_err(|_| SequencerError::InvariantViolation {
+            invariant: "sequence_counter".to_string(),
+            message: "sequence counter must be a non-negative BIGINT".to_string(),
+        })
+    }
+
+    fn encode_sequence(value: u64) -> Result<i64> {
+        i64::try_from(value).map_err(|_| SequencerError::InvariantViolation {
+            invariant: "sequence_counter".to_string(),
+            message: format!("sequence counter must be <= {}", Self::MAX_SEQUENCE),
+        })
+    }
+
+    fn ensure_sequence_capacity(head: u64, count: usize) -> Result<()> {
+        let count = u64::try_from(count).map_err(|_| SequencerError::InvariantViolation {
+            invariant: "sequence_counter".to_string(),
+            message: "sequence counter increment overflow".to_string(),
+        })?;
+
+        if head > Self::MAX_SEQUENCE {
+            return Err(SequencerError::InvariantViolation {
+                invariant: "sequence_counter".to_string(),
+                message: format!("sequence counter must be <= {}", Self::MAX_SEQUENCE),
+            });
+        }
+
+        let limit = head
+            .checked_add(count)
+            .ok_or_else(|| SequencerError::InvariantViolation {
+                invariant: "sequence_counter".to_string(),
+                message: "sequence counter overflow".to_string(),
+            })?;
+
+        if limit > Self::MAX_SEQUENCE {
+            return Err(SequencerError::InvariantViolation {
+                invariant: "sequence_counter".to_string(),
+                message: format!("sequence counter must be <= {}", Self::MAX_SEQUENCE),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Create a new PostgreSQL sequencer
     pub fn new(pool: PgPool, payload_encryption: Arc<PayloadEncryption>) -> Self {
         let event_store = PgEventStore::new(pool.clone(), payload_encryption.clone());
@@ -99,7 +145,7 @@ impl PgSequencer {
         .fetch_one(&mut **tx)
         .await?;
 
-        Ok(row.0 as u64)
+        Self::decode_sequence(row.0)
     }
 
     async fn set_sequence_counter(
@@ -108,6 +154,7 @@ impl PgSequencer {
         store_id: &StoreId,
         head: u64,
     ) -> Result<()> {
+        let head = Self::encode_sequence(head)?;
         sqlx::query(
             r#"
             UPDATE sequence_counters
@@ -118,7 +165,7 @@ impl PgSequencer {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(head as i64)
+        .bind(head)
         .execute(&mut **tx)
         .await?;
 
@@ -137,6 +184,14 @@ impl PgSequencer {
             return Ok((head, head));
         }
 
+        let head = self.head(tenant_id, store_id).await?;
+        Self::ensure_sequence_capacity(head, usize::try_from(count).map_err(|_| {
+            SequencerError::InvariantViolation {
+                invariant: "sequence_counter".to_string(),
+                message: "sequence request count too large".to_string(),
+            }
+        })?)?;
+
         let row: (i64,) = sqlx::query_as(
             r#"
             INSERT INTO sequence_counters (tenant_id, store_id, current_sequence, updated_at)
@@ -150,12 +205,21 @@ impl PgSequencer {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(count as i64)
+        .bind(i64::try_from(count).map_err(|_| SequencerError::InvariantViolation {
+            invariant: "sequence_counter".to_string(),
+            message: format!("sequence request count must be <= {}", Self::MAX_SEQUENCE),
+        })?)
         .fetch_one(&self.pool)
         .await?;
 
-        let end = row.0 as u64;
-        let start = end - count as u64 + 1;
+        let end = Self::decode_sequence(row.0)?;
+        let count = count as u64;
+        let start = end.checked_sub(count).and_then(|value| value.checked_add(1)).ok_or_else(
+            || SequencerError::InvariantViolation {
+                invariant: "sequence_counter".to_string(),
+                message: "sequence range calculation overflow".to_string(),
+            },
+        )?;
         Ok((start, end))
     }
 
@@ -223,6 +287,11 @@ impl PgSequencer {
         event: &SequencedEvent,
     ) -> Result<bool> {
         let env = &event.envelope;
+        let sequence_number = Self::encode_sequence(env.sequence_number.unwrap_or(0))?;
+        let base_version = env
+            .base_version
+            .map(Self::encode_sequence)
+            .transpose()?;
 
         let payload_bytes = serde_json::to_vec(&env.payload)
             .map_err(|e| SequencerError::Internal(e.to_string()))?;
@@ -248,18 +317,18 @@ impl PgSequencer {
         )
         .bind(env.event_id)
         .bind(env.command_id)
-        .bind(env.sequence_number.unwrap_or(0) as i64)
+            .bind(sequence_number)
         .bind(env.tenant_id.0)
         .bind(env.store_id.0)
         .bind(env.entity_type.as_str())
         .bind(&env.entity_id)
         .bind(env.event_type.as_str())
-        .bind(&payload_encrypted)
-        .bind(&env.payload_hash[..])
-        .bind(env.base_version.map(|v| v as i64))
-        .bind(env.source_agent.0)
-        .bind(env.signature.as_ref())
-        .bind(env.created_at)
+            .bind(&payload_encrypted)
+            .bind(&env.payload_hash[..])
+            .bind(base_version)
+            .bind(env.source_agent.0)
+            .bind(env.signature.as_ref())
+            .bind(env.created_at)
         .bind(event.sequenced_at)
         .execute(&mut **tx)
         .await?;
@@ -293,7 +362,11 @@ impl PgSequencer {
         Ok(())
     }
 
-    /// Get the current entity version within a transaction (for OCC at ingest time)
+    /// Get the current entity version within a transaction (for OCC at ingest time).
+    ///
+    /// Uses `FOR UPDATE` to prevent concurrent transactions from reading stale
+    /// version values for the same entity, closing the TOCTOU race window between
+    /// the version check and the version bump.
     async fn get_entity_version_tx(
         tx: &mut Transaction<'_, Postgres>,
         tenant_id: &TenantId,
@@ -306,6 +379,7 @@ impl PgSequencer {
             SELECT version
             FROM entity_versions
             WHERE tenant_id = $1 AND store_id = $2 AND entity_type = $3 AND entity_id = $4
+            FOR UPDATE
             "#,
         )
         .bind(tenant_id.0)
@@ -315,7 +389,7 @@ impl PgSequencer {
         .fetch_optional(&mut **tx)
         .await?;
 
-        Ok(row.map(|(v,)| v as u64))
+        Ok(row.map(|(v,)| Self::decode_sequence(v)).transpose()?)
     }
 
     async fn fetch_existing_command_id_tx(
@@ -388,7 +462,10 @@ impl Sequencer for PgSequencer {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(row.map(|r| r.0 as u64).unwrap_or(0))
+        Ok(row
+            .map(|r| Self::decode_sequence(r.0))
+            .transpose()?
+            .unwrap_or(0))
     }
 }
 
@@ -515,6 +592,8 @@ impl IngestService for PgSequencer {
             });
         }
 
+        Self::ensure_sequence_capacity(head, valid_events.len())?;
+
         let mut assigned_sequence_start: Option<u64> = None;
         let mut assigned_sequence_end: Option<u64> = None;
         let mut events_accepted: u32 = 0;
@@ -553,7 +632,10 @@ impl IngestService for PgSequencer {
                 }
             }
 
-            let next_seq = head.saturating_add(1);
+            let next_seq = head.checked_add(1).ok_or_else(|| SequencerError::InvariantViolation {
+                invariant: "sequence_counter".to_string(),
+                message: "sequence counter overflow".to_string(),
+            })?;
             let sequenced = SequencedEvent::new(event, next_seq);
 
             // Insert; if we raced a duplicate event_id (global), reject without advancing.
@@ -565,13 +647,8 @@ impl IngestService for PgSequencer {
                             Self::fetch_existing_command_id_tx(&mut tx, sequenced.event_id())
                                 .await?;
                         if existing_cmd_id != Some(cmd_id) {
-                            Self::release_command_id_tx(
-                                &mut tx,
-                                &tenant_id,
-                                &store_id,
-                                cmd_id,
-                            )
-                            .await?;
+                            Self::release_command_id_tx(&mut tx, &tenant_id, &store_id, cmd_id)
+                                .await?;
                         }
                     }
                 }
@@ -620,6 +697,8 @@ impl IngestService for PgSequencer {
 
         match row {
             Some((tenant_id, store_id, pushed, pulled, last_sync)) => {
+                let last_pushed_sequence = Self::decode_sequence(pushed)?;
+                let last_pulled_sequence = Self::decode_sequence(pulled)?;
                 let head = self
                     .head(
                         &TenantId::from_uuid(tenant_id),
@@ -630,8 +709,8 @@ impl IngestService for PgSequencer {
                     agent_id: agent_id.clone(),
                     tenant_id: TenantId::from_uuid(tenant_id),
                     store_id: StoreId::from_uuid(store_id),
-                    last_pushed_sequence: pushed as u64,
-                    last_pulled_sequence: pulled as u64,
+                    last_pushed_sequence,
+                    last_pulled_sequence,
                     head_sequence: head,
                     last_sync_at: last_sync,
                 })
@@ -651,6 +730,9 @@ impl IngestService for PgSequencer {
             ));
         }
 
+        let last_pushed_sequence = Self::encode_sequence(state.last_pushed_sequence)?;
+        let last_pulled_sequence = Self::encode_sequence(state.last_pulled_sequence)?;
+
         sqlx::query(
             r#"
             INSERT INTO agent_sync_state (
@@ -668,8 +750,8 @@ impl IngestService for PgSequencer {
         .bind(state.agent_id.0)
         .bind(state.tenant_id.0)
         .bind(state.store_id.0)
-        .bind(state.last_pushed_sequence as i64)
-        .bind(state.last_pulled_sequence as i64)
+        .bind(last_pushed_sequence)
+        .bind(last_pulled_sequence)
         .bind(state.last_sync_at)
         .execute(&self.pool)
         .await?;
@@ -836,5 +918,32 @@ impl PgSequencer {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_sequence_rejects_negative() {
+        assert!(PgSequencer::decode_sequence(-1).is_err());
+    }
+
+    #[test]
+    fn encode_sequence_rejects_too_large() {
+        let too_large = PgSequencer::MAX_SEQUENCE + 1;
+        assert!(PgSequencer::encode_sequence(too_large).is_err());
+    }
+
+    #[test]
+    fn ensure_sequence_capacity_allows_max_boundary() {
+        let head = PgSequencer::MAX_SEQUENCE - 1;
+        assert!(PgSequencer::ensure_sequence_capacity(head, 1).is_ok());
+    }
+
+    #[test]
+    fn ensure_sequence_capacity_rejects_overflow() {
+        assert!(PgSequencer::ensure_sequence_capacity(PgSequencer::MAX_SEQUENCE, 1).is_err());
     }
 }

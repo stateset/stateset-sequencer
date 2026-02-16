@@ -1,0 +1,86 @@
+apiVersion: monitoring.googleapis.com/v1
+kind: Rules
+metadata:
+  name: stateset-sequencer
+  namespace: sequencer
+  labels:
+    app.kubernetes.io/name: stateset-sequencer
+    app.kubernetes.io/part-of: stateset
+spec:
+  groups:
+    - name: stateset-sequencer.slo
+      interval: 30s
+      rules:
+        - alert: SequencerHighErrorRate
+          expr: |
+            (
+              sum(rate(sequencer_http_requests_total{status=~"5.."}[5m]))
+              /
+              clamp_min(sum(rate(sequencer_http_requests_total[5m])), 0.001)
+            ) > 0.001
+          for: 10m
+          labels:
+            severity: page
+          annotations:
+            summary: "Sequencer 5xx error rate > 0.1% (10m)"
+            description: "Investigate upstream dependencies, DB health, or deployment regressions."
+
+        - alert: SequencerHighLatencyP95Ingest
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (
+                rate(sequencer_http_request_latency_seconds_bucket{status=~"2..",path=~"^/(api/)?v1/(ves/)?events/ingest$"}[5m])
+              )
+            ) > 0.75
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sequencer ingest p95 latency > 750ms (10m)"
+            description: "Check DB saturation, payload sizes, or hot tenants."
+
+        - alert: SequencerHighLatencyP95Read
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (
+                rate(sequencer_http_request_latency_seconds_bucket{status=~"2..",path=~"^/(api/)?v1/(head|events)$"}[5m])
+              )
+            ) > 0.2
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sequencer read p95 latency > 200ms (10m)"
+            description: "Check DB indexes, connection pool pressure, or cache hit rates."
+
+    - name: stateset-sequencer.resources
+      interval: 30s
+      rules:
+        - alert: SequencerDbPoolSaturation
+          expr: sequencer_pool_utilization > 0.9
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sequencer DB pool utilization > 90% (5m)"
+            description: "Consider increasing pool size or optimizing queries."
+
+        - alert: SequencerDbAcquireTimeouts
+          expr: rate(sequencer_pool_timed_out_acquisitions[5m]) > 0
+          for: 5m
+          labels:
+            severity: page
+          annotations:
+            summary: "Sequencer DB acquisition timeouts detected"
+            description: "Pool contention or database saturation is causing timeouts."
+
+        - alert: SequencerDbSlowAcquires
+          expr: rate(sequencer_pool_slow_acquisitions[5m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sequencer DB slow acquires detected"
+            description: "Connection acquires are frequently exceeding the slow threshold; check DB or pool sizing."

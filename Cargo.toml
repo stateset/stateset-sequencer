@@ -29,6 +29,9 @@ sqlite = []
 # Enable payload encryption at rest
 encryption = []
 
+# Integration-only toggles for test modules
+integration = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -67,6 +70,7 @@ base64 = "0.22"
 # UUID and time
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+ipnet = "2"
 
 # Error handling
 thiserror = "2"
@@ -91,10 +95,14 @@ config = "0.14"
 # HTTP/REST (optional, alongside gRPC)
 axum = "0.7"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "cors", "timeout", "trace"] }
 
 # Hex encoding for hashes
 hex = "0.4"
+
+# StateSet STARK (Winterfell) verification
+ves-stark-verifier = { path = "../stateset-stark/crates/ves-stark-verifier" }
+ves-stark-primitives = { path = "../stateset-stark/crates/ves-stark-primitives" }
 
 # Ethereum/EVM interaction
 alloy = { version = "0.8", features = ["full", "signer-local"] }
@@ -103,6 +111,7 @@ alloy = { version = "0.8", features = ["full", "signer-local"] }
 tonic-build = "0.12"
 
 [dev-dependencies]
+ves-stark-prover = { path = "../stateset-stark/crates/ves-stark-prover" }
 tokio-test = "0.4"
 tempfile = "3"
 serial_test = "3"

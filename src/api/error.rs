@@ -384,6 +384,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status();
         let code_str = self.error.code.to_string();
+        let retry_after = self.error.retry_after;
         let mut response = (status, Json(self)).into_response();
 
         // Add error code header for easier debugging
@@ -392,6 +393,15 @@ impl IntoResponse for ApiError {
                 axum::http::header::HeaderName::from_static("x-error-code"),
                 code_value,
             );
+        }
+
+        // Add Retry-After header for rate-limited responses (RFC 7231 §7.1.3)
+        if let Some(seconds) = retry_after {
+            if let Ok(val) = axum::http::HeaderValue::from_str(&seconds.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, val);
+            }
         }
 
         response
@@ -418,48 +428,61 @@ impl From<crate::infra::SequencerError> for ApiError {
                 ApiError::new(ErrorCode::BatchNotFound, format!("Batch not found: {}", id))
                     .with_resource_id(id.to_string())
             }
-            SequencerError::EntityNotFound { entity_type, entity_id } => {
-                ApiError::new(
-                    ErrorCode::EntityNotFound,
-                    format!("Entity not found: {}/{}", entity_type, entity_id)
-                ).with_details(serde_json::json!({
-                    "entity_type": entity_type,
-                    "entity_id": entity_id
-                }))
-            }
-            SequencerError::VersionConflict { entity_type, entity_id, expected, actual } => {
-                ApiError::new(
-                    ErrorCode::VersionConflict,
-                    format!("Version conflict for {}/{}: expected {}, got {}",
-                        entity_type, entity_id, expected, actual)
-                ).with_details(serde_json::json!({
-                    "entity_type": entity_type,
-                    "entity_id": entity_id,
-                    "expected_version": expected,
-                    "actual_version": actual
-                }))
-            }
-            SequencerError::InvariantViolation { invariant, message } => {
-                ApiError::new(
-                    ErrorCode::InvariantViolation,
-                    format!("Invariant violation: {} - {}", invariant, message)
-                ).with_details(serde_json::json!({
-                    "invariant": invariant,
-                    "details": message
-                }))
-            }
-            SequencerError::InvalidStateTransition { entity_type, entity_id, from, to } => {
-                ApiError::new(
-                    ErrorCode::InvalidStateTransition,
-                    format!("Invalid state transition for {}/{}: {} -> {}",
-                        entity_type, entity_id, from, to)
-                ).with_details(serde_json::json!({
-                    "entity_type": entity_type,
-                    "entity_id": entity_id,
-                    "from_state": from,
-                    "to_state": to
-                }))
-            }
+            SequencerError::EntityNotFound {
+                entity_type,
+                entity_id,
+            } => ApiError::new(
+                ErrorCode::EntityNotFound,
+                format!("Entity not found: {}/{}", entity_type, entity_id),
+            )
+            .with_details(serde_json::json!({
+                "entity_type": entity_type,
+                "entity_id": entity_id
+            })),
+            SequencerError::VersionConflict {
+                entity_type,
+                entity_id,
+                expected,
+                actual,
+            } => ApiError::new(
+                ErrorCode::VersionConflict,
+                format!(
+                    "Version conflict for {}/{}: expected {}, got {}",
+                    entity_type, entity_id, expected, actual
+                ),
+            )
+            .with_details(serde_json::json!({
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "expected_version": expected,
+                "actual_version": actual
+            })),
+            SequencerError::InvariantViolation { invariant, message } => ApiError::new(
+                ErrorCode::InvariantViolation,
+                format!("Invariant violation: {} - {}", invariant, message),
+            )
+            .with_details(serde_json::json!({
+                "invariant": invariant,
+                "details": message
+            })),
+            SequencerError::InvalidStateTransition {
+                entity_type,
+                entity_id,
+                from,
+                to,
+            } => ApiError::new(
+                ErrorCode::InvalidStateTransition,
+                format!(
+                    "Invalid state transition for {}/{}: {} -> {}",
+                    entity_type, entity_id, from, to
+                ),
+            )
+            .with_details(serde_json::json!({
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "from_state": from,
+                "to_state": to
+            })),
             SequencerError::SchemaValidation(msg) => {
                 ApiError::new(ErrorCode::SchemaValidationFailed, msg)
             }
@@ -470,59 +493,67 @@ impl From<crate::infra::SequencerError> for ApiError {
                 ApiError::new(ErrorCode::RateLimitExceeded, "Rate limit exceeded")
                     .with_retry_after(60)
             }
-            SequencerError::DuplicateEvent(id) => {
-                ApiError::new(ErrorCode::DuplicateEvent, format!("Duplicate event: {}", id))
-                    .with_resource_id(id.to_string())
-            }
-            SequencerError::DuplicateCommand(id) => {
-                ApiError::new(ErrorCode::DuplicateCommand, format!("Duplicate command: {}", id))
-                    .with_resource_id(id.to_string())
-            }
-            SequencerError::InvalidPayloadHash(id) => {
-                ApiError::new(ErrorCode::InvalidPayloadHash, format!("Invalid payload hash for event: {}", id))
-                    .with_resource_id(id.to_string())
-            }
-            SequencerError::Encryption(msg) => {
-                ApiError::new(ErrorCode::EncryptionError, msg)
-            }
-            SequencerError::MerkleTree(msg) => {
-                ApiError::new(ErrorCode::InternalError, format!("Merkle tree error: {}", msg))
-            }
-            SequencerError::Configuration(msg) => {
-                ApiError::new(ErrorCode::InternalError, format!("Configuration error: {}", msg))
-            }
-            SequencerError::Internal(msg) => {
-                ApiError::new(ErrorCode::InternalError, msg)
-            }
-            SequencerError::InvalidEntityType(t) => {
-                ApiError::new(ErrorCode::InvalidFieldValue, format!("Invalid entity type: {}", t))
-            }
-            SequencerError::SchemaNotFound(event_type) => {
-                ApiError::new(
-                    ErrorCode::SchemaNotFound,
-                    format!("No schema registered for event type: {}", event_type)
-                ).with_details(serde_json::json!({
-                    "event_type": event_type
-                }))
-            }
-            SequencerError::SchemaVersionNotFound { event_type, version } => {
-                ApiError::new(
-                    ErrorCode::SchemaNotFound,
-                    format!("Schema version {} not found for event type: {}", version, event_type)
-                ).with_details(serde_json::json!({
-                    "event_type": event_type,
-                    "version": version
-                }))
-            }
+            SequencerError::DuplicateEvent(id) => ApiError::new(
+                ErrorCode::DuplicateEvent,
+                format!("Duplicate event: {}", id),
+            )
+            .with_resource_id(id.to_string()),
+            SequencerError::DuplicateCommand(id) => ApiError::new(
+                ErrorCode::DuplicateCommand,
+                format!("Duplicate command: {}", id),
+            )
+            .with_resource_id(id.to_string()),
+            SequencerError::InvalidPayloadHash(id) => ApiError::new(
+                ErrorCode::InvalidPayloadHash,
+                format!("Invalid payload hash for event: {}", id),
+            )
+            .with_resource_id(id.to_string()),
+            SequencerError::Encryption(msg) => ApiError::new(ErrorCode::EncryptionError, msg),
+            SequencerError::MerkleTree(msg) => ApiError::new(
+                ErrorCode::InternalError,
+                format!("Merkle tree error: {}", msg),
+            ),
+            SequencerError::Configuration(msg) => ApiError::new(
+                ErrorCode::InternalError,
+                format!("Configuration error: {}", msg),
+            ),
+            SequencerError::Internal(msg) => ApiError::new(ErrorCode::InternalError, msg),
+            SequencerError::InvalidEntityType(t) => ApiError::new(
+                ErrorCode::InvalidFieldValue,
+                format!("Invalid entity type: {}", t),
+            ),
+            SequencerError::SchemaNotFound(event_type) => ApiError::new(
+                ErrorCode::SchemaNotFound,
+                format!("No schema registered for event type: {}", event_type),
+            )
+            .with_details(serde_json::json!({
+                "event_type": event_type
+            })),
+            SequencerError::SchemaVersionNotFound {
+                event_type,
+                version,
+            } => ApiError::new(
+                ErrorCode::SchemaNotFound,
+                format!(
+                    "Schema version {} not found for event type: {}",
+                    version, event_type
+                ),
+            )
+            .with_details(serde_json::json!({
+                "event_type": event_type,
+                "version": version
+            })),
             SequencerError::SchemaValidationFailed(msg) => {
                 ApiError::new(ErrorCode::SchemaValidationFailed, msg)
             }
-            SequencerError::InvalidJsonSchema(msg) => {
-                ApiError::new(ErrorCode::InvalidFieldValue, format!("Invalid JSON schema: {}", msg))
-            }
-            SequencerError::SchemaCompatibilityViolation(msg) => {
-                ApiError::new(ErrorCode::InvalidFieldValue, format!("Schema compatibility violation: {}", msg))
-            }
+            SequencerError::InvalidJsonSchema(msg) => ApiError::new(
+                ErrorCode::InvalidFieldValue,
+                format!("Invalid JSON schema: {}", msg),
+            ),
+            SequencerError::SchemaCompatibilityViolation(msg) => ApiError::new(
+                ErrorCode::InvalidFieldValue,
+                format!("Schema compatibility violation: {}", msg),
+            ),
         }
     }
 }
@@ -535,16 +566,14 @@ impl From<crate::infra::SequencerError> for ApiError {
 pub fn not_found(resource_type: &str, id: impl std::fmt::Display) -> ApiError {
     ApiError::new(
         ErrorCode::ResourceNotFound,
-        format!("{} not found: {}", resource_type, id)
-    ).with_resource_id(id.to_string())
+        format!("{} not found: {}", resource_type, id),
+    )
+    .with_resource_id(id.to_string())
 }
 
 /// Create a validation error with field details
 pub fn validation_error(field: &str, message: impl Into<String>) -> ApiError {
-    ApiError::new(
-        ErrorCode::InvalidFieldValue,
-        message.into()
-    ).with_details(serde_json::json!({
+    ApiError::new(ErrorCode::InvalidFieldValue, message.into()).with_details(serde_json::json!({
         "field": field
     }))
 }
@@ -593,13 +622,34 @@ mod tests {
 
     #[test]
     fn test_error_code_http_status() {
-        assert_eq!(ErrorCode::AuthRequired.http_status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(ErrorCode::InsufficientPermissions.http_status(), StatusCode::FORBIDDEN);
-        assert_eq!(ErrorCode::RateLimitExceeded.http_status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(ErrorCode::InvalidRequestBody.http_status(), StatusCode::BAD_REQUEST);
-        assert_eq!(ErrorCode::EventNotFound.http_status(), StatusCode::NOT_FOUND);
-        assert_eq!(ErrorCode::DuplicateEvent.http_status(), StatusCode::CONFLICT);
-        assert_eq!(ErrorCode::InternalError.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            ErrorCode::AuthRequired.http_status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            ErrorCode::InsufficientPermissions.http_status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            ErrorCode::RateLimitExceeded.http_status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            ErrorCode::InvalidRequestBody.http_status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ErrorCode::EventNotFound.http_status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            ErrorCode::DuplicateEvent.http_status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ErrorCode::InternalError.http_status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
@@ -642,6 +692,9 @@ mod tests {
     #[test]
     fn test_error_display() {
         assert_eq!(ErrorCode::EventNotFound.to_string(), "EVENT_NOT_FOUND");
-        assert_eq!(ErrorCode::RateLimitExceeded.to_string(), "RATE_LIMIT_EXCEEDED");
+        assert_eq!(
+            ErrorCode::RateLimitExceeded.to_string(),
+            "RATE_LIMIT_EXCEEDED"
+        );
     }
 }

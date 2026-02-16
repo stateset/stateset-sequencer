@@ -397,7 +397,9 @@ pub fn encrypt_payload_ves(
     // Split ciphertext and tag
     let tag_start = ciphertext_with_tag.len() - TAG_SIZE;
     let ciphertext = &ciphertext_with_tag[..tag_start];
-    let tag: [u8; TAG_SIZE] = ciphertext_with_tag[tag_start..].try_into().unwrap();
+    let tag: [u8; TAG_SIZE] = ciphertext_with_tag[tag_start..]
+        .try_into()
+        .map_err(|_| EncryptionError::EncryptionFailed("tag extraction failed".into()))?;
 
     // Wrap DEK for each recipient using HPKE (X25519/HKDF-SHA256/AES-256-GCM)
     let mut recipients = Vec::with_capacity(recipient_keys.len());
@@ -498,7 +500,9 @@ pub fn decrypt_payload_ves(
     if plaintext.len() < SALT_SIZE {
         return Err(EncryptionError::InvalidPayloadFormat);
     }
-    let salt: [u8; SALT_SIZE] = plaintext[..SALT_SIZE].try_into().unwrap();
+    let salt: [u8; SALT_SIZE] = plaintext[..SALT_SIZE]
+        .try_into()
+        .map_err(|_| EncryptionError::DecryptionFailed("salt extraction failed".into()))?;
     let json_bytes = &plaintext[SALT_SIZE..];
 
     // Parse JSON
@@ -930,7 +934,7 @@ impl KeyManager for InMemoryKeyManager {
         &self,
         tenant_id: &Uuid,
     ) -> Result<Vec<EncryptionKey>, EncryptionError> {
-        let keys = self.keys.read().unwrap();
+        let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
         Ok(keys
             .get(tenant_id)
             .cloned()
@@ -939,7 +943,7 @@ impl KeyManager for InMemoryKeyManager {
 
     async fn rotate_tenant_key(&self, tenant_id: &Uuid) -> Result<EncryptionKey, EncryptionError> {
         let new_key = generate_key();
-        let mut keys = self.keys.write().unwrap();
+        let mut keys = self.keys.write().unwrap_or_else(|e| e.into_inner());
         let entry = keys.entry(*tenant_id).or_default();
         entry.insert(0, new_key);
         Ok(new_key)

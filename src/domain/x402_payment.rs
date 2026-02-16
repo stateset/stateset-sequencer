@@ -104,10 +104,7 @@ impl X402Network {
     pub fn is_testnet(&self) -> bool {
         matches!(
             self,
-            Self::SetChainTestnet
-                | Self::ArcTestnet
-                | Self::BaseSepolia
-                | Self::EthereumSepolia
+            Self::SetChainTestnet | Self::ArcTestnet | Self::BaseSepolia | Self::EthereumSepolia
         )
     }
 }
@@ -174,9 +171,7 @@ impl X402Asset {
                 Some("0x3600000000000000000000000000000000000000")
             }
             // Base
-            (Self::Usdc, X402Network::Base) => {
-                Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
-            }
+            (Self::Usdc, X402Network::Base) => Some("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),
             // Ethereum
             (Self::Usdc, X402Network::Ethereum) => {
                 Some("0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48")
@@ -184,9 +179,7 @@ impl X402Asset {
             (Self::Usdt, X402Network::Ethereum) => {
                 Some("0xdAC17F958D2ee523a2206206994597C13D831ec7")
             }
-            (Self::Dai, X402Network::Ethereum) => {
-                Some("0x6B175474E89094C44Da98b954Ee4606eB48")
-            }
+            (Self::Dai, X402Network::Ethereum) => Some("0x6B175474E89094C44Da98b954Ee4606eB48"),
             // Native ETH has no contract
             (Self::Eth, _) => None,
             _ => None,
@@ -821,11 +814,7 @@ mod tests {
 
     #[test]
     fn test_x402_batch_creation() {
-        let batch = X402PaymentBatch::new(
-            TenantId::new(),
-            StoreId::new(),
-            X402Network::SetChain,
-        );
+        let batch = X402PaymentBatch::new(TenantId::new(), StoreId::new(), X402Network::SetChain);
 
         assert_eq!(batch.status, X402BatchStatus::Pending);
         assert_eq!(batch.payment_count, 0);

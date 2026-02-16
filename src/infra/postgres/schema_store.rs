@@ -8,14 +8,13 @@ use chrono::{DateTime, Utc};
 use jsonschema::Validator;
 use sqlx::postgres::PgPool;
 use std::sync::Arc;
-use std::time::Duration;
 use uuid::Uuid;
 
 use crate::domain::{
     EventType, Schema, SchemaCompatibility, SchemaId, SchemaStatus, SchemaValidationError,
     SchemaValidationResult, TenantId,
 };
-use crate::infra::{Result, SchemaCache, SchemaStore, SequencerError};
+use crate::infra::{Result, SchemaCache, SchemaStore, SequencerError, CACHE_STAMPEDE_DELAY};
 
 /// PostgreSQL-backed schema registry
 pub struct PgSchemaStore {
@@ -151,10 +150,7 @@ impl PgSchemaStore {
         .await
         .map_err(SequencerError::Database)?;
 
-        Ok(row
-            .and_then(|r| r.0)
-            .map(|v| v as u32 + 1)
-            .unwrap_or(1))
+        Ok(row.and_then(|r| r.0).map(|v| v as u32 + 1).unwrap_or(1))
     }
 
     /// Validate a JSON Schema definition
@@ -175,7 +171,9 @@ impl SchemaStore for PgSchemaStore {
 
         // Auto-assign version if not set or set to 0
         if schema.version == 0 {
-            schema.version = self.next_version(&schema.tenant_id, &schema.event_type).await?;
+            schema.version = self
+                .next_version(&schema.tenant_id, &schema.event_type)
+                .await?;
         }
 
         let status = match schema.status {
@@ -225,13 +223,13 @@ impl SchemaStore for PgSchemaStore {
                 }
                 Ok(schema)
             }
-            Err(e) if e.to_string().contains("duplicate key") => Err(
-                SequencerError::SchemaCompatibilityViolation(format!(
+            Err(e) if e.to_string().contains("duplicate key") => {
+                Err(SequencerError::SchemaCompatibilityViolation(format!(
                     "Schema version {} already exists for event type {}",
                     schema.version,
                     schema.event_type.as_str()
-                )),
-            ),
+                )))
+            }
             Err(e) => Err(SequencerError::Database(e)),
         }
     }
@@ -251,11 +249,8 @@ impl SchemaStore for PgSchemaStore {
             }
             lock_acquired = lock;
             if !lock_acquired {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                if let Some(schema) = cache
-                    .get_latest(&tenant_id.0, event_type.as_str())
-                    .await
-                {
+                tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
+                if let Some(schema) = cache.get_latest(&tenant_id.0, event_type.as_str()).await {
                     return Ok(Some(schema));
                 }
             }
@@ -301,7 +296,19 @@ impl SchemaStore for PgSchemaStore {
         };
 
         let schema = row.map(
-            |(id, tenant_id, event_type, version, schema_json, status, compatibility, description, created_at, updated_at, created_by)| {
+            |(
+                id,
+                tenant_id,
+                event_type,
+                version,
+                schema_json,
+                status,
+                compatibility,
+                description,
+                created_at,
+                updated_at,
+                created_by,
+            )| {
                 Self::row_to_schema(
                     id,
                     tenant_id,
@@ -365,7 +372,19 @@ impl SchemaStore for PgSchemaStore {
         .map_err(SequencerError::Database)?;
 
         Ok(row.map(
-            |(id, tenant_id, event_type, version, schema_json, status, compatibility, description, created_at, updated_at, created_by)| {
+            |(
+                id,
+                tenant_id,
+                event_type,
+                version,
+                schema_json,
+                status,
+                compatibility,
+                description,
+                created_at,
+                updated_at,
+                created_by,
+            )| {
                 Self::row_to_schema(
                     id,
                     tenant_id,
@@ -409,7 +428,19 @@ impl SchemaStore for PgSchemaStore {
         .map_err(SequencerError::Database)?;
 
         Ok(row.map(
-            |(id, tenant_id, event_type, version, schema_json, status, compatibility, description, created_at, updated_at, created_by)| {
+            |(
+                id,
+                tenant_id,
+                event_type,
+                version,
+                schema_json,
+                status,
+                compatibility,
+                description,
+                created_at,
+                updated_at,
+                created_by,
+            )| {
                 Self::row_to_schema(
                     id,
                     tenant_id,
@@ -450,6 +481,7 @@ impl SchemaStore for PgSchemaStore {
             FROM event_schemas
             WHERE tenant_id = $1 AND event_type = $2
             ORDER BY version DESC
+            LIMIT 1000
             "#,
         )
         .bind(tenant_id.0)
@@ -461,7 +493,19 @@ impl SchemaStore for PgSchemaStore {
         Ok(rows
             .into_iter()
             .map(
-                |(id, tenant_id, event_type, version, schema_json, status, compatibility, description, created_at, updated_at, created_by)| {
+                |(
+                    id,
+                    tenant_id,
+                    event_type,
+                    version,
+                    schema_json,
+                    status,
+                    compatibility,
+                    description,
+                    created_at,
+                    updated_at,
+                    created_by,
+                )| {
                     Self::row_to_schema(
                         id,
                         tenant_id,
@@ -499,6 +543,7 @@ impl SchemaStore for PgSchemaStore {
             FROM event_schemas
             WHERE tenant_id = $1
             ORDER BY event_type ASC, version DESC
+            LIMIT 1000
             "#,
         )
         .bind(tenant_id.0)
@@ -509,7 +554,19 @@ impl SchemaStore for PgSchemaStore {
         Ok(rows
             .into_iter()
             .map(
-                |(id, tenant_id, event_type, version, schema_json, status, compatibility, description, created_at, updated_at, created_by)| {
+                |(
+                    id,
+                    tenant_id,
+                    event_type,
+                    version,
+                    schema_json,
+                    status,
+                    compatibility,
+                    description,
+                    created_at,
+                    updated_at,
+                    created_by,
+                )| {
                     Self::row_to_schema(
                         id,
                         tenant_id,
@@ -584,9 +641,7 @@ impl SchemaStore for PgSchemaStore {
         // Use iter_errors to collect all validation errors
         let errors: Vec<SchemaValidationError> = validator
             .iter_errors(payload)
-            .map(|e| {
-                SchemaValidationError::new(e.instance_path.to_string(), e.to_string())
-            })
+            .map(|e| SchemaValidationError::new(e.instance_path.to_string(), e.to_string()))
             .collect();
 
         if errors.is_empty() {
@@ -656,9 +711,7 @@ impl PgSchemaStore {
         // Use iter_errors to collect all validation errors
         let errors: Vec<SchemaValidationError> = validator
             .iter_errors(payload)
-            .map(|e| {
-                SchemaValidationError::new(e.instance_path.to_string(), e.to_string())
-            })
+            .map(|e| SchemaValidationError::new(e.instance_path.to_string(), e.to_string()))
             .collect();
 
         if errors.is_empty() {
@@ -680,6 +733,7 @@ impl PgSchemaStore {
             FROM event_schemas
             WHERE tenant_id = $1
             ORDER BY event_type ASC
+            LIMIT 1000
             "#,
         )
         .bind(tenant_id.0)

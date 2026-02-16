@@ -14,8 +14,11 @@
 //! - `X402_BATCH_MIN_SIZE` - Minimum intents before batching (default: 1)
 //! - `X402_BATCH_MAX_SIZE` - Maximum intents per batch (default: 100)
 //! - `X402_BATCH_MAX_WAIT_SECS` - Max time to wait before batching (default: 300)
+//! - `X402_BATCH_NETWORKS` - Comma-separated networks to process (default: set_chain)
+//! - `X402_BATCH_AUTO_COMMIT` - Set to true/1/on/yes to auto-commit (default: true)
 
 use std::sync::Arc;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -24,8 +27,16 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::domain::{StoreId, TenantId, X402Network, X402PaymentBatch};
+use crate::domain::{StoreId, TenantId, X402Network, X402PaymentBatch, X402_MAX_BATCH_SIZE};
 use crate::infra::PgX402Repository;
+
+const X402_BATCH_DEFAULT_INTERVAL_SECS: u64 = 30;
+const X402_BATCH_DEFAULT_MIN_SIZE: usize = 1;
+const X402_BATCH_DEFAULT_MAX_SIZE: usize = 100;
+const X402_BATCH_MIN_INTERVAL_SECS: u64 = 1;
+const X402_BATCH_MIN_SIZE: usize = 1;
+const X402_BATCH_MIN_WAIT_SECS: u64 = 1;
+const X402_BATCH_DEFAULT_MAX_WAIT_SECS: u64 = 300;
 
 /// Configuration for the x402 batch worker
 #[derive(Debug, Clone)]
@@ -60,39 +71,87 @@ impl Default for X402BatchWorkerConfig {
 impl X402BatchWorkerConfig {
     /// Load configuration from environment
     pub fn from_env() -> Self {
+        fn parse_bool_var(value: &str) -> Option<bool> {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" | "y" => Some(true),
+                "0" | "false" | "off" | "no" | "n" => Some(false),
+                _ => None,
+            }
+        }
+
+        fn parse_batch_networks(raw: String) -> Vec<X402Network> {
+            let parsed: Vec<X402Network> = raw
+                .split(',')
+                .filter_map(|network| match network.trim().to_ascii_lowercase().as_str() {
+                    "set_chain" => Some(X402Network::SetChain),
+                    "set_chain_testnet" => Some(X402Network::SetChainTestnet),
+                    "arc" => Some(X402Network::Arc),
+                    "arc_testnet" => Some(X402Network::ArcTestnet),
+                    "base" => Some(X402Network::Base),
+                    "base_sepolia" => Some(X402Network::BaseSepolia),
+                    "ethereum" => Some(X402Network::Ethereum),
+                    "ethereum_sepolia" => Some(X402Network::EthereumSepolia),
+                    "arbitrum" => Some(X402Network::Arbitrum),
+                    "optimism" => Some(X402Network::Optimism),
+                    _ => None,
+                })
+                .collect();
+
+            if parsed.is_empty() {
+                vec![X402Network::SetChain]
+            } else {
+                parsed
+            }
+        }
+
+        let networks = std::env::var("X402_BATCH_NETWORKS")
+            .ok()
+            .map(parse_batch_networks)
+            .unwrap_or_else(|| vec![X402Network::SetChain]);
+
         let batch_interval = std::env::var("X402_BATCH_INTERVAL_SECS")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|secs| secs.max(X402_BATCH_MIN_INTERVAL_SECS))
             .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(30));
+            .unwrap_or(Duration::from_secs(X402_BATCH_DEFAULT_INTERVAL_SECS));
 
         let min_batch_size = std::env::var("X402_BATCH_MIN_SIZE")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&size| size >= X402_BATCH_MIN_SIZE)
+            .unwrap_or(X402_BATCH_DEFAULT_MIN_SIZE);
 
         let max_batch_size = std::env::var("X402_BATCH_MAX_SIZE")
             .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100);
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&size| size >= X402_BATCH_MIN_SIZE)
+            .unwrap_or(X402_BATCH_DEFAULT_MAX_SIZE)
+            .min(X402_MAX_BATCH_SIZE);
 
         let max_wait_time = std::env::var("X402_BATCH_MAX_WAIT_SECS")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|secs| secs.max(X402_BATCH_MIN_WAIT_SECS))
             .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(300));
+            .unwrap_or(Duration::from_secs(X402_BATCH_DEFAULT_MAX_WAIT_SECS));
 
         let auto_commit = std::env::var("X402_BATCH_AUTO_COMMIT")
             .ok()
-            .map(|s| s == "true" || s == "1")
+            .and_then(|s| parse_bool_var(&s))
             .unwrap_or(true);
+
+        let mut max_batch_size = max_batch_size.max(min_batch_size);
+        if max_batch_size > X402_MAX_BATCH_SIZE {
+            max_batch_size = X402_MAX_BATCH_SIZE;
+        }
 
         Self {
             batch_interval,
             min_batch_size,
             max_batch_size,
             max_wait_time,
-            networks: vec![X402Network::SetChain],
+            networks,
             auto_commit,
         }
     }
@@ -213,9 +272,9 @@ impl X402BatchWorker {
     }
 
     /// Get list of tenant/store combinations with pending intents
-    async fn get_pending_streams(
-        &self,
-    ) -> Result<Vec<(TenantId, StoreId, X402Network)>, String> {
+    async fn get_pending_streams(&self) -> Result<Vec<(TenantId, StoreId, X402Network)>, String> {
+        let allowed_networks: HashSet<X402Network> = self.config.networks.iter().copied().collect();
+
         // Query database for distinct tenant/store/network with pending intents
         // For now, we'll need to query this from the database
         // This is a simplified version - in production you'd want a more efficient query
@@ -247,6 +306,9 @@ impl X402BatchWorker {
                     "optimism" => X402Network::Optimism,
                     _ => return None,
                 };
+                if !allowed_networks.is_empty() && !allowed_networks.contains(&network) {
+                    return None;
+                }
                 Some((
                     TenantId::from_uuid(tenant_id),
                     StoreId::from_uuid(store_id),
@@ -288,10 +350,7 @@ impl X402BatchWorker {
         // Check minimum batch size (unless we've waited too long)
         if intents.len() < self.config.min_batch_size {
             // Check if oldest intent has waited too long
-            let oldest_created = intents
-                .iter()
-                .filter_map(|i| i.sequenced_at)
-                .min();
+            let oldest_created = intents.iter().filter_map(|i| i.sequenced_at).min();
 
             if let Some(oldest) = oldest_created {
                 let wait_time = Utc::now().signed_duration_since(oldest);
@@ -327,16 +386,7 @@ impl X402BatchWorker {
             .insert_batch(&batch)
             .await
             .map_err(|e| e.to_string())?;
-
-        // Update intents to batched status
         let intent_ids: Vec<Uuid> = intents.iter().map(|i| i.intent_id).collect();
-        for intent_id in &intent_ids {
-            self.repository
-                .update_intent_batch(*intent_id, batch.batch_id)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-
         let mut result = BatchResult {
             batch_id: batch.batch_id,
             payment_count: batch.payment_count,
@@ -356,7 +406,7 @@ impl X402BatchWorker {
                     result.committed = true;
                     info!(
                         batch_id = %batch.batch_id,
-                        merkle_root = %result.merkle_root.as_ref().unwrap(),
+                        merkle_root = hex::encode(merkle_root),
                         "Batch committed with Merkle root"
                     );
                 }
@@ -366,14 +416,51 @@ impl X402BatchWorker {
                         error = ?e,
                         "Failed to commit batch"
                     );
+                    if let Err(mark_err) = self
+                        .repository
+                        .mark_batch_failed_if_pending(batch.batch_id)
+                        .await
+                    {
+                        warn!(
+                            batch_id = %batch.batch_id,
+                            error = ?mark_err,
+                            "Failed to mark batch as failed"
+                        );
+                    }
                 }
             }
+        } else {
+            if let Err(e) = self
+                .repository
+                .assign_intents_to_batch(batch.batch_id, &intent_ids)
+                .await
+            {
+                if let Err(mark_err) = self
+                    .repository
+                    .mark_batch_failed_if_pending(batch.batch_id)
+                    .await
+                {
+                    warn!(
+                        batch_id = %batch.batch_id,
+                        error = ?mark_err,
+                        "Failed to mark batch as failed"
+                    );
+                }
+                return Err(e.to_string());
+            }
         }
+
+        info!(
+            batch_id = %result.batch_id,
+            payment_count = result.payment_count,
+            committed = result.committed,
+            merkle_root = ?result.merkle_root,
+            "Batch created"
+        );
 
         Ok(Some(result))
     }
 }
-
 
 /// Spawn the batch worker as a background task
 pub fn spawn_batch_worker(

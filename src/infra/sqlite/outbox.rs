@@ -578,6 +578,7 @@ impl TryFrom<OutboxEventRow> for OutboxEvent {
         Ok(OutboxEvent {
             local_id: row.id,
             envelope: EventEnvelope {
+                envelope_version: 1,
                 event_id,
                 command_id,
                 tenant_id: TenantId::from_uuid(tenant_id),

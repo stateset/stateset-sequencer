@@ -40,6 +40,36 @@ The StateSet Sequencer provides AI agents with:
 
 ## Agent Lifecycle
 
+### 0. (Optional) Self-Service Registration
+
+If public registration is enabled, an agent can self-register to receive an API key:
+
+```bash
+curl -X POST https://sequencer.example.com/api/v1/agents/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "agent-name",
+    "description": "Optional description",
+    "storeIds": ["550e8400-e29b-41d4-a716-446655440000"],
+    "readOnly": false
+  }'
+```
+
+**Compatibility note:** The same endpoint is also available at `/v1/agents/register` without the
+`/api` prefix.
+
+Constraints:
+- `name` must be 1-128 characters.
+- `description` is optional, max 1024 characters.
+- `storeIds` is optional, max 50 entries.
+- `rateLimit` is optional, 1-10000 requests per minute.
+
+Rate limit headers (`RateLimit-Limit`, `RateLimit-Remaining`, `RateLimit-Reset`) are included when
+public registration rate limiting is enabled. `Retry-After` is included on `429` responses.
+
+The response includes an `apiKey`, `tenantId`, and `agentId`. Store the API key securely; it is
+only returned once.
+
 ### 1. Key Registration (One-Time Setup)
 
 Before an agent can submit events, it must register its Ed25519 public key:

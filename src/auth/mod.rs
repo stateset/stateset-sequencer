@@ -25,7 +25,8 @@
 //!
 //! # Configuration
 //!
-//! - `AUTH_MODE`: `required` (default) or `disabled` for development
+//! - `AUTH_MODE`: `required` (default) or `disabled` (requires explicit opt-in)
+//! - `ALLOW_AUTH_DISABLED`: `true` to explicitly allow `AUTH_MODE=disabled` in a non-production flow
 //! - `BOOTSTRAP_ADMIN_API_KEY`: Initial admin key for setup
 //! - `JWT_SECRET`: HMAC secret for JWT validation
 
@@ -97,6 +98,16 @@ impl Permissions {
 }
 
 impl AuthContext {
+    /// Create the canonical bootstrap admin context used in intentionally disabled auth mode.
+    pub fn bootstrap_admin() -> Self {
+        Self {
+            tenant_id: Uuid::nil(),
+            store_ids: Vec::new(),
+            agent_id: None,
+            permissions: Permissions::admin(),
+        }
+    }
+
     /// Check if this auth context allows access to a specific store
     pub fn can_access_store(&self, store_id: &Uuid) -> bool {
         self.store_ids.is_empty() || self.store_ids.contains(store_id)

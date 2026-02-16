@@ -1,18 +1,19 @@
 //! gRPC authentication interceptor
 //!
 //! Validates API keys and JWT tokens from gRPC metadata.
+#![allow(clippy::result_large_err)]
 
 use std::sync::Arc;
 
 use tonic::{Request, Status};
 use tracing::{debug, warn};
 
-use crate::auth::{AuthContext, AuthError, Authenticator, Permissions};
-use uuid::Uuid;
+use crate::auth::{AuthContext, AuthError, Authenticator, RateLimiter};
 
-/// gRPC authentication interceptor
+/// gRPC authentication interceptor with optional rate limiting
 ///
-/// Extracts and validates credentials from gRPC request metadata.
+/// Extracts and validates credentials from gRPC request metadata,
+/// then applies rate limiting per tenant if configured.
 ///
 /// Supported metadata keys:
 /// - `authorization`: Bearer token (JWT) or API key
@@ -22,49 +23,87 @@ use uuid::Uuid;
 pub struct GrpcAuthInterceptor {
     authenticator: Arc<Authenticator>,
     require_auth: bool,
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 impl GrpcAuthInterceptor {
-    pub fn new(authenticator: Arc<Authenticator>, require_auth: bool) -> Self {
+    pub fn new(
+        authenticator: Arc<Authenticator>,
+        require_auth: bool,
+        rate_limiter: Option<Arc<RateLimiter>>,
+    ) -> Self {
         Self {
             authenticator,
             require_auth,
+            rate_limiter,
         }
     }
 
-    /// Validate request and extract auth context
+    /// Validate request, extract auth context, and enforce rate limits
     pub fn authenticate<T>(&self, request: &Request<T>) -> Result<Option<AuthContext>, Status> {
         let metadata = request.metadata();
+        let bootstrap_ctx = AuthContext::bootstrap_admin();
 
         // Try Authorization header first (Bearer token or raw API key)
-        if let Some(auth_value) = metadata.get("authorization") {
-            let auth_str = auth_value
-                .to_str()
-                .map_err(|_| Status::unauthenticated("invalid authorization header encoding"))?;
+        let auth_ctx = if let Some(auth_value) = metadata.get("authorization") {
+            let auth_str = match auth_value.to_str() {
+                Ok(value) => value,
+                Err(_) if self.require_auth => {
+                    return Err(Status::unauthenticated("invalid authorization header encoding"));
+                }
+                Err(_) => {
+                    debug!("Invalid authorization metadata encoding, auth not required; injecting bootstrap context");
+                    return Ok(Some(bootstrap_ctx));
+                }
+            };
 
-            return self.authenticate_header(auth_str);
-        }
+            match self.authenticate_header(auth_str) {
+                Ok(ctx) => ctx,
+                Err(_) if !self.require_auth => {
+                    debug!("Invalid authorization metadata, auth not required; injecting bootstrap context");
+                    Some(bootstrap_ctx.clone())
+                }
+                Err(error) => return Err(error),
+            }
+        } else if let Some(api_key) = metadata.get("x-api-key") {
+            // Try x-api-key header
+            let key_str = match api_key.to_str() {
+                Ok(value) => value,
+                Err(_) if self.require_auth => {
+                    return Err(Status::unauthenticated("invalid api key header encoding"));
+                }
+                Err(_) => {
+                    debug!("Invalid x-api-key metadata encoding, auth not required; injecting bootstrap context");
+                    return Ok(Some(bootstrap_ctx));
+                }
+            };
 
-        // Try x-api-key header
-        if let Some(api_key) = metadata.get("x-api-key") {
-            let key_str = api_key
-                .to_str()
-                .map_err(|_| Status::unauthenticated("invalid api key header encoding"))?;
-            return self.authenticate_header(key_str);
-        }
-
-        // No credentials found
-        if self.require_auth {
-            Err(Status::unauthenticated("authentication required"))
+            match self.authenticate_header(key_str) {
+                Ok(ctx) => ctx,
+                Err(_) if !self.require_auth => {
+                    debug!("Invalid x-api-key metadata, auth not required; injecting bootstrap context");
+                    Some(bootstrap_ctx.clone())
+                }
+                Err(error) => return Err(error),
+            }
+        } else if self.require_auth {
+            // No credentials found
+            return Err(Status::unauthenticated("authentication required"));
         } else {
-            debug!("No auth credentials, auth not required - proceeding");
-            Ok(Some(AuthContext {
-                tenant_id: Uuid::nil(),
-                store_ids: Vec::new(),
-                agent_id: None,
-                permissions: Permissions::admin(),
-            }))
+            debug!("No auth credentials, auth not required - injecting bootstrap context");
+            Some(bootstrap_ctx)
+        };
+
+        // Apply rate limiting after successful authentication
+        if let (Some(limiter), Some(ref ctx)) = (&self.rate_limiter, &auth_ctx) {
+            let key = format!("grpc:tenant:{}", ctx.tenant_id);
+            if let Err(AuthError::RateLimited) = limiter.check(&key) {
+                warn!(tenant_id = %ctx.tenant_id, "gRPC rate limit exceeded");
+                return Err(Status::resource_exhausted("rate limit exceeded"));
+            }
         }
+
+        Ok(auth_ctx)
     }
 
     fn authenticate_header(&self, header: &str) -> Result<Option<AuthContext>, Status> {

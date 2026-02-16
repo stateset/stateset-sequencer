@@ -30,6 +30,22 @@ k6 run load/sequencer_ingest.js
 k6 run load/sequencer_ingest.js --opts load/runner.json
 ```
 
+### Standard Profiles (Recommended)
+
+We ship ready-to-use profiles in `load/profiles`:
+
+- `smoke.json` — quick validation (1m, 5 VUs)
+- `sustained.json` — steady-state (14m total, up to 50 VUs)
+- `stress.json` — ramp to 200 VUs
+
+Run via helper script:
+
+```bash
+./scripts/run_load_test.sh load/sequencer_ingest.js smoke
+./scripts/run_load_test.sh load/mixed_workload.js sustained
+./scripts/run_load_test.sh load/sequencer_query.js stress
+```
+
 ### Environment Variables
 
 Set environment variables before running:
@@ -52,6 +68,9 @@ Tests the `/api/v1/ves/events/ingest` endpoint with:
 - Concurrent users: 10, 50, 100 VUs
 - Duration: 30s - 5m
 
+Note: The provided `sequencer_ingest.js` script targets the legacy `/api/v1/events/ingest` endpoint
+to avoid signature requirements. Use VES ingest only when you can generate valid signatures.
+
 ### 2. Query Performance (sequencer_query.js)
 
 Tests read endpoints:
@@ -66,6 +85,14 @@ Tests realistic production traffic patterns:
 - 70% event ingestion
 - 20% queries
 - 10% commitments/proof generation
+
+### 4. Public Registration (agents_register.js)
+
+Tests `/api/v1/agents/register` (staging only). Requires:
+
+```bash
+export ALLOW_PUBLIC_REGISTRATION_LOAD=true
+```
 
 ## Interpreting Results
 
@@ -110,6 +137,13 @@ For production readiness:
 | Error rate | 0% | No failed requests |
 | TPS | 1000+ | Transactions per second |
 | Batch size | 100 events | Optimal batch size |
+
+## Output Artifacts
+
+The helper script writes JSON output to `load/results/`:
+
+- `*-summary.json` — k6 summary export
+- `*.json` — raw timeseries output
 
 ## CI/CD Integration
 

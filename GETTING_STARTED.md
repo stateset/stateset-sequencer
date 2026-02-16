@@ -65,6 +65,7 @@ cargo run --bin stateset-sequencer-admin -- backfill-ves-state-roots
 # Auth (pick one)
 export BOOTSTRAP_ADMIN_API_KEY="dev_admin_key"   # recommended for local dev
 # export AUTH_MODE="disabled"                    # disables auth middleware entirely
+# export ALLOW_AUTH_DISABLED="true"              # required when AUTH_MODE=disabled
 
 # Payload encryption-at-rest (legacy `events` table)
 export PAYLOAD_ENCRYPTION_MODE="required"        # disabled|optional|required
@@ -75,6 +76,14 @@ export PAYLOAD_ENCRYPTION_KEYS="0x...,0x..."     # keyring (current first), 32-b
 
 # Start the sequencer
 cargo run
+```
+
+If you encounter `Invalid cross-device link (os error 18)` during local builds, use:
+
+```bash
+./scripts/cargo-local.sh build
+./scripts/cargo-local.sh clippy --all-targets -- -D warnings
+./scripts/cargo-local.sh test
 ```
 
 ## Configuration
@@ -88,7 +97,8 @@ Configure via environment variables:
 | `PORT` | `8080` | HTTP server port |
 | `MAX_DB_CONNECTIONS` | `10` | Connection pool size |
 | `RUST_LOG` | `info` | Log level (debug, info, warn, error) |
-| `AUTH_MODE` | `required` | `required` (default) or `disabled` (local dev) |
+| `AUTH_MODE` | `required` | `required` (default) or `disabled` |
+| `ALLOW_AUTH_DISABLED` | `false` | Set to `true` to run with `AUTH_MODE=disabled` |
 | `BOOTSTRAP_ADMIN_API_KEY` | (unset) | Admin API key for bootstrap / local dev |
 | `JWT_SECRET` | (unset) | HMAC secret for JWT validation (enables `Bearer` auth) |
 | `JWT_ISSUER` | `stateset-sequencer` | Expected JWT issuer |
@@ -96,7 +106,7 @@ Configure via environment variables:
 | `RATE_LIMIT_PER_MINUTE` | (unset) | Optional global per-tenant rate limit |
 | `RATE_LIMIT_MAX_ENTRIES` | `10000` | Max tracked rate limit entries |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window duration |
-| `PUBLIC_AGENT_REGISTRATION_ENABLED` | `true` | Enable public agent self-registration |
+| `PUBLIC_AGENT_REGISTRATION_ENABLED` | `true` | Enable public agent self-registration (set `false` in production by default) |
 | `PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE` | (unset) | Per-IP rate limit for public agent registration |
 | `PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES` | `10000` | Max tracked public registration rate limit entries |
 | `PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS` | `60` | Public registration rate limit window duration |

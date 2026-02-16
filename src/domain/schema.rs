@@ -50,7 +50,6 @@ pub enum SchemaCompatibility {
     None,
 }
 
-
 /// Schema status
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,7 +63,6 @@ pub enum SchemaStatus {
     /// Schema is archived and should not be used
     Archived,
 }
-
 
 /// A registered schema for an event type
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,7 +195,11 @@ impl SchemaValidationResult {
     }
 
     /// Create a failed validation result
-    pub fn invalid(schema_id: SchemaId, schema_version: u32, errors: Vec<SchemaValidationError>) -> Self {
+    pub fn invalid(
+        schema_id: SchemaId,
+        schema_version: u32,
+        errors: Vec<SchemaValidationError>,
+    ) -> Self {
         Self {
             valid: false,
             schema_id: Some(schema_id),
@@ -247,12 +249,18 @@ mod tests {
     fn test_schema_id_display() {
         let uuid = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
         let schema_id = SchemaId::from_uuid(uuid);
-        assert_eq!(format!("{}", schema_id), "12345678-1234-1234-1234-123456789abc");
+        assert_eq!(
+            format!("{}", schema_id),
+            "12345678-1234-1234-1234-123456789abc"
+        );
     }
 
     #[test]
     fn test_schema_compatibility_default() {
-        assert_eq!(SchemaCompatibility::default(), SchemaCompatibility::Backward);
+        assert_eq!(
+            SchemaCompatibility::default(),
+            SchemaCompatibility::Backward
+        );
     }
 
     #[test]
@@ -318,7 +326,10 @@ mod tests {
             .with_compatibility(SchemaCompatibility::Full)
             .with_created_by("admin@example.com");
 
-        assert_eq!(schema.description, Some("Order creation schema".to_string()));
+        assert_eq!(
+            schema.description,
+            Some("Order creation schema".to_string())
+        );
         assert_eq!(schema.compatibility, SchemaCompatibility::Full);
         assert_eq!(schema.created_by, Some("admin@example.com".to_string()));
     }

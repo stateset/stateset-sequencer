@@ -10,6 +10,7 @@ use axum::extract::{Extension, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use tracing::{error, instrument};
 
 use crate::auth::AuthContextExt;
 use crate::domain::{StoreId, TenantId};
@@ -148,6 +149,7 @@ pub struct SystemInfo {
 ///
 /// Returns a simple health response without performing deep checks.
 /// Use this for Kubernetes liveness probes.
+#[instrument]
 pub async fn health_check() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: HealthStatus::Healthy,
@@ -160,6 +162,7 @@ pub async fn health_check() -> Json<HealthResponse> {
 /// Readiness check endpoint.
 ///
 /// Checks database connectivity. Use this for Kubernetes readiness probes.
+#[instrument(skip(state))]
 pub async fn readiness_check(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
@@ -198,10 +201,13 @@ pub async fn readiness_check(
                 "pool": pool_status,
             })))
         }
-        Err(e) => Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("Database unavailable: {}", e),
-        )),
+        Err(e) => {
+            error!(error = %e, "Readiness check failed: database unavailable");
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service unavailable".to_string(),
+            ))
+        }
     }
 }
 
@@ -209,6 +215,7 @@ pub async fn readiness_check(
 ///
 /// Performs comprehensive health checks on all components.
 /// Returns detailed status information for observability.
+#[instrument(skip(state, auth))]
 pub async fn detailed_health_check(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -250,12 +257,15 @@ pub async fn detailed_health_check(
             message: None,
             response_time_ms: Some(db_response_time),
         },
-        Err(e) => ComponentStatus {
-            name: "postgresql".to_string(),
-            status: HealthStatus::Unhealthy,
-            message: Some(format!("Connection failed: {}", e)),
-            response_time_ms: Some(db_response_time),
-        },
+        Err(e) => {
+            error!(error = %e, "Detailed health check: database connection failed");
+            ComponentStatus {
+                name: "postgresql".to_string(),
+                status: HealthStatus::Unhealthy,
+                message: Some("Connection failed".to_string()),
+                response_time_ms: Some(db_response_time),
+            }
+        }
     };
 
     // Check pool health
@@ -319,16 +329,20 @@ pub async fn detailed_health_check(
         Vec::new()
     };
 
-    // Check anchor service
-    let anchor_status = state.anchor_service.as_ref().map(|_| ComponentStatus {
-        name: "anchor_service".to_string(),
-        status: HealthStatus::Healthy, // Basic check - service is configured
-        message: Some("Configured".to_string()),
-        response_time_ms: None,
+    // Check anchor service — derive health from its circuit breaker state
+    let anchor_status = state.anchor_service.as_ref().map(|_| {
+        let (status, message) = anchor_health_from_circuit_breakers(&circuit_breakers);
+        ComponentStatus {
+            name: "anchor_service".to_string(),
+            status,
+            message: Some(message),
+            response_time_ms: None,
+        }
     });
 
     // Determine overall health status
-    let overall_status = determine_overall_status(&database_status, &pool_status, &circuit_breakers);
+    let overall_status =
+        determine_overall_status(&database_status, &pool_status, &circuit_breakers);
 
     let response = DetailedHealthResponse {
         status: overall_status,
@@ -408,6 +422,31 @@ fn pool_health_to_string(status: PoolHealthStatus) -> &'static str {
         PoolHealthStatus::Moderate => "moderate",
         PoolHealthStatus::Stressed => "stressed",
         PoolHealthStatus::Critical => "critical",
+    }
+}
+
+/// Derive anchor service health from the circuit breaker states.
+fn anchor_health_from_circuit_breakers(
+    circuit_breakers: &[CircuitBreakerStatus],
+) -> (HealthStatus, String) {
+    let anchor_cb = circuit_breakers
+        .iter()
+        .find(|cb| cb.name.contains("anchor"));
+
+    match anchor_cb {
+        Some(cb) if cb.state == "open" => (
+            HealthStatus::Unhealthy,
+            format!("Circuit breaker open ({} failures)", cb.failures),
+        ),
+        Some(cb) if cb.state == "half_open" => (
+            HealthStatus::Degraded,
+            "Circuit breaker half-open (recovering)".to_string(),
+        ),
+        Some(cb) => (
+            HealthStatus::Healthy,
+            format!("Operational ({} successes)", cb.successes),
+        ),
+        None => (HealthStatus::Healthy, "Configured".to_string()),
     }
 }
 

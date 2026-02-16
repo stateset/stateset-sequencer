@@ -209,6 +209,15 @@ pub struct HeadQuery {
     pub store_id: Uuid,
 }
 
+/// Query parameters for entity history.
+#[derive(Debug, Deserialize)]
+pub struct EntityHistoryQuery {
+    pub tenant_id: Uuid,
+    pub store_id: Uuid,
+    pub from: Option<u64>,
+    pub limit: Option<u32>,
+}
+
 /// Query parameters for proof requests.
 #[derive(Debug, Deserialize)]
 pub struct ProofQuery {
@@ -288,6 +297,18 @@ pub struct VesComplianceInputsRequest {
     pub policy_params: serde_json::Value,
 }
 
+/// Witness commitment for STARK compliance proofs.
+///
+/// We accept either:
+/// - a 64-char lowercase hex string (32 bytes), or
+/// - an array of 4 u64 limbs (Rust-friendly, but NOT JavaScript-safe for large values).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum WitnessCommitment {
+    Hex(String),
+    U64([u64; 4]),
+}
+
 /// Request body for submitting a VES compliance proof.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -299,6 +320,8 @@ pub struct SubmitVesComplianceProofRequest {
     #[serde(default = "default_policy_params")]
     pub policy_params: serde_json::Value,
     pub proof_b64: String,
+    #[serde(default)]
+    pub witness_commitment: Option<WitnessCommitment>,
     pub public_inputs: Option<serde_json::Value>,
 }
 
@@ -425,6 +448,73 @@ pub struct ValidationResponse {
 pub struct ValidationErrorResponse {
     pub path: String,
     pub message: String,
+}
+
+// ============================================================================
+// Admin dashboard types
+// ============================================================================
+
+/// Summary counts for the admin dashboard.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminOverviewResponse {
+    pub tenants: u64,
+    pub stores: u64,
+    pub agents: u64,
+    pub api_keys: u64,
+    pub active_api_keys: u64,
+    pub total_head_sequence: u64,
+    pub active_stores_24h: u64,
+    pub max_projection_lag: u64,
+    pub last_activity_at: Option<String>,
+}
+
+/// Tenant summary entry for the admin dashboard.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminTenantSummary {
+    pub tenant_id: Uuid,
+    pub agent_count: u64,
+    pub api_key_count: u64,
+    pub active_api_keys: u64,
+    pub store_count: u64,
+    pub total_head_sequence: u64,
+    pub active_stores_24h: u64,
+    pub max_projection_lag: u64,
+    pub last_key_at: Option<String>,
+    pub last_activity_at: Option<String>,
+}
+
+/// Store summary entry for the admin dashboard.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminStoreSummary {
+    pub tenant_id: Uuid,
+    pub store_id: Uuid,
+    pub head_sequence: u64,
+    pub last_projected_sequence: u64,
+    pub projection_lag: u64,
+    pub agent_count: u64,
+    pub last_agent_sync_at: Option<String>,
+    pub updated_at: String,
+}
+
+/// Agent summary entry for the admin dashboard.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminAgentSummary {
+    pub tenant_id: Uuid,
+    pub agent_id: Uuid,
+    pub permissions: String,
+    pub store_scope: String,
+    pub api_key_count: u64,
+    pub active_api_keys: u64,
+    pub first_key_at: Option<String>,
+    pub last_key_at: Option<String>,
+    pub store_id: Option<Uuid>,
+    pub last_sync_at: Option<String>,
+    pub last_pushed_sequence: Option<u64>,
+    pub last_pulled_sequence: Option<u64>,
 }
 
 // ============================================================================

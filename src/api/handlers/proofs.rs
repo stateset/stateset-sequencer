@@ -3,15 +3,15 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use std::time::Duration;
 use tracing::{debug, instrument};
 
 use crate::api::auth_helpers::ensure_read;
 use crate::api::types::{ProofQuery, VerifyProofRequest};
+use crate::api::utils::internal_error;
 use crate::auth::AuthContextExt;
 use crate::crypto::legacy_commitment_leaf_hash;
 use crate::domain::{BatchCommitment, MerkleProof, StoreId, TenantId};
-use crate::infra::CommitmentEngine;
+use crate::infra::{CommitmentEngine, CACHE_STAMPEDE_DELAY};
 use crate::server::AppState;
 
 /// GET /api/v1/proofs/:sequence_number - Get inclusion proof for an event.
@@ -39,30 +39,27 @@ pub async fn get_inclusion_proof(
     let commitment = if let Some(cached) = commitment_cache.get_by_batch_id(&query.batch_id).await {
         cached.commitment
     } else {
-        let (cached, lock_acquired) =
-            commitment_cache.get_by_batch_id_with_lock(&query.batch_id).await;
+        let (cached, lock_acquired) = commitment_cache
+            .get_by_batch_id_with_lock(&query.batch_id)
+            .await;
         commitment_lock_acquired = lock_acquired;
         if let Some(cached) = cached {
             cached.commitment
-        } else {
-            if !lock_acquired {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-                if let Some(cached) = commitment_cache.get_by_batch_id(&query.batch_id).await {
-                    cached.commitment
-                } else {
-                    match state.commitment_reader.get_commitment(query.batch_id).await {
-                        Ok(Some(commitment)) => {
-                            commitment_cache
-                                .insert(commitment.clone(), commitment.events_root)
-                                .await;
-                            commitment
-                        }
-                        Ok(None) => {
-                            let fallback = match state
-                                .commitment_engine
-                                .get_commitment(query.batch_id)
-                                .await
-                            {
+        } else if !lock_acquired {
+            tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
+            if let Some(cached) = commitment_cache.get_by_batch_id(&query.batch_id).await {
+                cached.commitment
+            } else {
+                match state.commitment_reader.get_commitment(query.batch_id).await {
+                    Ok(Some(commitment)) => {
+                        commitment_cache
+                            .insert(commitment.clone(), commitment.events_root)
+                            .await;
+                        commitment
+                    }
+                    Ok(None) => {
+                        let fallback =
+                            match state.commitment_engine.get_commitment(query.batch_id).await {
                                 Ok(Some(commitment)) => commitment,
                                 Ok(None) => {
                                     if lock_acquired {
@@ -81,39 +78,35 @@ pub async fn get_inclusion_proof(
                                             .release_batch_id_lock(&query.batch_id)
                                             .await;
                                     }
-                                    return Err((
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        e.to_string(),
-                                    ));
+                                    return Err(internal_error(e));
                                 }
                             };
+                        commitment_cache
+                            .insert(fallback.clone(), fallback.events_root)
+                            .await;
+                        fallback
+                    }
+                    Err(e) => {
+                        if lock_acquired {
                             commitment_cache
-                                .insert(fallback.clone(), fallback.events_root)
+                                .release_batch_id_lock(&query.batch_id)
                                 .await;
-                            fallback
                         }
-                        Err(e) => {
-                            if lock_acquired {
-                                commitment_cache.release_batch_id_lock(&query.batch_id).await;
-                            }
-                            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-                        }
+                        return Err(internal_error(e));
                     }
                 }
-            } else {
-                match state.commitment_reader.get_commitment(query.batch_id).await {
-                    Ok(Some(commitment)) => {
-                        commitment_cache
-                            .insert(commitment.clone(), commitment.events_root)
-                            .await;
-                        commitment
-                    }
-                    Ok(None) => {
-                        let fallback = match state
-                            .commitment_engine
-                            .get_commitment(query.batch_id)
-                            .await
-                        {
+            }
+        } else {
+            match state.commitment_reader.get_commitment(query.batch_id).await {
+                Ok(Some(commitment)) => {
+                    commitment_cache
+                        .insert(commitment.clone(), commitment.events_root)
+                        .await;
+                    commitment
+                }
+                Ok(None) => {
+                    let fallback =
+                        match state.commitment_engine.get_commitment(query.batch_id).await {
                             Ok(Some(commitment)) => commitment,
                             Ok(None) => {
                                 if lock_acquired {
@@ -132,30 +125,30 @@ pub async fn get_inclusion_proof(
                                         .release_batch_id_lock(&query.batch_id)
                                         .await;
                                 }
-                                return Err((
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    e.to_string(),
-                                ));
+                                return Err(internal_error(e));
                             }
                         };
+                    commitment_cache
+                        .insert(fallback.clone(), fallback.events_root)
+                        .await;
+                    fallback
+                }
+                Err(e) => {
+                    if lock_acquired {
                         commitment_cache
-                            .insert(fallback.clone(), fallback.events_root)
+                            .release_batch_id_lock(&query.batch_id)
                             .await;
-                        fallback
                     }
-                    Err(e) => {
-                        if lock_acquired {
-                            commitment_cache.release_batch_id_lock(&query.batch_id).await;
-                        }
-                        return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-                    }
+                    return Err(internal_error(e));
                 }
             }
         }
     };
 
     if commitment_lock_acquired {
-        commitment_cache.release_batch_id_lock(&query.batch_id).await;
+        commitment_cache
+            .release_batch_id_lock(&query.batch_id)
+            .await;
     }
 
     if commitment.tenant_id.0 != tenant_id.0 || commitment.store_id.0 != store_id.0 {
@@ -183,7 +176,7 @@ pub async fn get_inclusion_proof(
         .event_store
         .get_leaf_inputs(&tenant_id, &store_id, start, end)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     if leaf_inputs.is_empty() {
         return Err((
@@ -207,7 +200,7 @@ pub async fn get_inclusion_proof(
             .event_store()
             .get_leaf_inputs(&tenant_id, &store_id, start, end)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(internal_error)?;
     }
 
     if leaf_inputs.len() as u64 != expected_len {
@@ -269,7 +262,7 @@ pub async fn get_inclusion_proof(
             .event_store()
             .get_leaf_inputs(&tenant_id, &store_id, start, end)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            .map_err(internal_error)?;
 
         let leaves_v0_primary: Vec<[u8; 32]> =
             leaf_inputs_primary.iter().map(|i| i.payload_hash).collect();
@@ -287,8 +280,12 @@ pub async fn get_inclusion_proof(
             })
             .collect();
 
-        let root_v0_primary = state.commitment_reader.compute_events_root(&leaves_v0_primary);
-        let root_v1_primary = state.commitment_reader.compute_events_root(&leaves_v1_primary);
+        let root_v0_primary = state
+            .commitment_reader
+            .compute_events_root(&leaves_v0_primary);
+        let root_v1_primary = state
+            .commitment_reader
+            .compute_events_root(&leaves_v1_primary);
 
         if root_v1_primary == commitment.events_root {
             return generate_cached_proof(
@@ -385,15 +382,16 @@ async fn generate_cached_proof(
     }
 
     if !lock_acquired {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
         if let Some(proof) = proof_cache
             .get(&tenant_id.0, &store_id.0, sequence_number)
             .await
         {
-            if state
-                .commitment_reader
-                .verify_inclusion(proof.leaf_hash, &proof, commitment.events_root)
-            {
+            if state.commitment_reader.verify_inclusion(
+                proof.leaf_hash,
+                &proof,
+                commitment.events_root,
+            ) {
                 return Ok(Json(serde_json::json!({
                     "sequence_number": sequence_number,
                     "batch_id": commitment.batch_id,
@@ -445,7 +443,12 @@ pub async fn verify_proof(
 
     // Parse hex strings
     let leaf_hash: [u8; 32] = hex::decode(&request.leaf_hash)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid leaf_hash: {}", e)))?
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Invalid leaf_hash format".to_string(),
+            )
+        })?
         .try_into()
         .map_err(|_| {
             (

@@ -14,7 +14,9 @@ use base64::Engine;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use stateset_sequencer::auth::{ApiKeyValidator, AuthMiddlewareState, Authenticator, RequestLimits};
+use stateset_sequencer::auth::{
+    ApiKeyValidator, AuthMiddlewareState, Authenticator, RequestLimits,
+};
 use stateset_sequencer::crypto::{is_payload_at_rest_encrypted, StaticKeyManager};
 use stateset_sequencer::domain::{
     AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
@@ -23,6 +25,7 @@ use stateset_sequencer::infra::{
     EventStore, IngestService, PayloadEncryption, PayloadEncryptionMode, PgAgentKeyRegistry,
     PgCommitmentEngine, PgEventStore, PgSequencer, PgVesCommitmentEngine,
     PgVesComplianceProofStore, PgVesValidityProofStore, SchemaValidationMode, Sequencer,
+    SequencerError,
     VesSequencer,
 };
 use stateset_sequencer::server::AppState;
@@ -241,6 +244,211 @@ async fn postgres_sequencer_rejects_duplicate_command_id() {
 
 #[tokio::test]
 #[ignore]
+async fn postgres_ves_read_range_reports_gap_when_window_is_empty() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let source_agent_id = Uuid::new_v4();
+    let payload = json!({ "kind": "ves-gap" });
+    let created_at = chrono::Utc::now();
+    let created_at_str = created_at.to_rfc3339();
+
+    for seq in [1_i64, 3_i64] {
+        let payload_plain_hash = vec![seq as u8; 32];
+        let payload_cipher_hash = vec![0u8; 32];
+        let event_signing_hash = vec![seq as u8; 32];
+        let agent_signature = vec![seq as u8; 64];
+
+        sqlx::query(
+            r#"
+            INSERT INTO ves_events (
+                event_id,
+                command_id,
+                ves_version,
+                tenant_id,
+                store_id,
+                source_agent_id,
+                agent_key_id,
+                entity_type,
+                entity_id,
+                event_type,
+                created_at,
+                created_at_str,
+                payload_kind,
+                payload,
+                payload_encrypted,
+                payload_plain_hash,
+                payload_cipher_hash,
+                event_signing_hash,
+                agent_signature,
+                sequence_number,
+                base_version
+            ) VALUES (
+                $1,NULL,1,$2,$3,$4,1,'order',$5,'order.created',$6,$7,0,$8,NULL,$9,$10,$11,$12,$13,NULL
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(source_agent_id)
+        .bind(format!("ord-{seq}"))
+        .bind(created_at)
+        .bind(&created_at_str)
+        .bind(&payload)
+        .bind(&payload_plain_hash)
+        .bind(&payload_cipher_hash)
+        .bind(&event_signing_hash)
+        .bind(&agent_signature)
+        .bind(seq)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    let ves_sequencer = VesSequencer::new(pool.clone(), registry);
+    let err = ves_sequencer
+        .read_range(&tenant_id, &store_id, 2, 2)
+        .await
+        .unwrap_err();
+
+    match err {
+        SequencerError::InvariantViolation { invariant, message } => {
+            assert_eq!(invariant, "sequence_range");
+            assert!(message.contains("sequence gap in range 2..=2"));
+        }
+        other => panic!("expected sequence_range invariant, got {other:?}"),
+    }
+
+    let empty = ves_sequencer
+        .read_range(&tenant_id, &store_id, 10, 10)
+        .await
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[tokio::test]
+#[ignore]
+async fn postgres_sequencer_scopes_sequences_by_tenant_and_store() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption.clone());
+    let store = PgEventStore::new(pool, payload_encryption);
+
+    let tenant_a = TenantId::new();
+    let tenant_b = TenantId::new();
+    let store_one = StoreId::new();
+    let store_two = StoreId::new();
+
+    let agent_a = AgentId::new();
+    let agent_b = AgentId::new();
+
+    let events_a1: Vec<EventEnvelope> = (0..2)
+        .map(|i| {
+            EventEnvelope::new(
+                tenant_a.clone(),
+                store_one.clone(),
+                EntityType::order(),
+                format!("a1-ord-{i}"),
+                EventType::new("order.created"),
+                json!({ "tenant": "a", "store": "one", "i": i }),
+                agent_a.clone(),
+            )
+        })
+        .collect();
+    sequencer
+        .ingest(EventBatch::new(agent_a.clone(), events_a1))
+        .await
+        .unwrap();
+
+    let events_a2: Vec<EventEnvelope> = (0..1)
+        .map(|i| {
+            EventEnvelope::new(
+                tenant_a.clone(),
+                store_two.clone(),
+                EntityType::order(),
+                format!("a2-ord-{i}"),
+                EventType::new("order.created"),
+                json!({ "tenant": "a", "store": "two", "i": i }),
+                agent_a.clone(),
+            )
+        })
+        .collect();
+    sequencer
+        .ingest(EventBatch::new(agent_a, events_a2))
+        .await
+        .unwrap();
+
+    let events_b1: Vec<EventEnvelope> = (0..3)
+        .map(|i| {
+            EventEnvelope::new(
+                tenant_b.clone(),
+                store_one.clone(),
+                EntityType::order(),
+                format!("b1-ord-{i}"),
+                EventType::new("order.created"),
+                json!({ "tenant": "b", "store": "one", "i": i }),
+                agent_b.clone(),
+            )
+        })
+        .collect();
+    sequencer
+        .ingest(EventBatch::new(agent_b, events_b1))
+        .await
+        .unwrap();
+
+    let head_a_one = sequencer.head(&tenant_a, &store_one).await.unwrap();
+    let head_a_two = sequencer.head(&tenant_a, &store_two).await.unwrap();
+    let head_b_one = sequencer.head(&tenant_b, &store_one).await.unwrap();
+
+    assert_eq!(head_a_one, 2);
+    assert_eq!(head_a_two, 1);
+    assert_eq!(head_b_one, 3);
+
+    let events_a_one = store
+        .read_range(&tenant_a, &store_one, 1, head_a_one)
+        .await
+        .unwrap();
+    for (idx, event) in events_a_one.iter().enumerate() {
+        assert_eq!(event.sequence_number(), (idx as u64) + 1);
+    }
+
+    let events_a_two = store
+        .read_range(&tenant_a, &store_two, 1, head_a_two)
+        .await
+        .unwrap();
+    for (idx, event) in events_a_two.iter().enumerate() {
+        assert_eq!(event.sequence_number(), (idx as u64) + 1);
+    }
+
+    let events_b_one = store
+        .read_range(&tenant_b, &store_one, 1, head_b_one)
+        .await
+        .unwrap();
+    for (idx, event) in events_b_one.iter().enumerate() {
+        assert_eq!(event.sequence_number(), (idx as u64) + 1);
+    }
+}
+
+#[tokio::test]
+#[ignore]
 async fn postgres_ves_validity_proofs_rest_flow() {
     let Some(pool) = connect_db().await else {
         eprintln!("DATABASE_URL not set; skipping");
@@ -340,15 +548,19 @@ async fn postgres_ves_validity_proofs_rest_flow() {
     let cache_manager = Arc::new(stateset_sequencer::infra::CacheManager::new());
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
-    let ves_sequencer_reader = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+    let ves_sequencer_reader =
+        Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
     let schema_store = Arc::new(stateset_sequencer::infra::PgSchemaStore::new(pool.clone()));
-    let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(pool.clone()));
+    let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(
+        pool.clone(),
+    ));
 
     let metrics = Arc::new(stateset_sequencer::metrics::MetricsRegistry::new());
     let api_key_validator = Arc::new(ApiKeyValidator::new());
     let api_key_store = Arc::new(stateset_sequencer::auth::PgApiKeyStore::new(pool.clone()));
 
     let state = AppState {
+        read_pool: pool.clone(),
         sequencer,
         event_store,
         commitment_engine,
@@ -382,6 +594,7 @@ async fn postgres_ves_validity_proofs_rest_flow() {
         authenticator,
         require_auth: false,
         rate_limiter: None,
+        pool_monitor: None,
     };
 
     let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
@@ -650,15 +863,19 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
     let cache_manager = Arc::new(stateset_sequencer::infra::CacheManager::new());
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
     let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
-    let ves_sequencer_reader = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
+    let ves_sequencer_reader =
+        Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
     let schema_store = Arc::new(stateset_sequencer::infra::PgSchemaStore::new(pool.clone()));
-    let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(pool.clone()));
+    let x402_repository = Arc::new(stateset_sequencer::infra::PgX402Repository::new(
+        pool.clone(),
+    ));
 
     let metrics = Arc::new(stateset_sequencer::metrics::MetricsRegistry::new());
     let api_key_validator = Arc::new(ApiKeyValidator::new());
     let api_key_store = Arc::new(stateset_sequencer::auth::PgApiKeyStore::new(pool.clone()));
 
     let state = AppState {
+        read_pool: pool.clone(),
         sequencer,
         event_store,
         commitment_engine,
@@ -692,6 +909,7 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
         authenticator,
         require_auth: false,
         rate_limiter: None,
+        pool_monitor: None,
     };
 
     let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
@@ -745,15 +963,25 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
     let inputs_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(inputs_json["public_inputs_hash"].as_str().is_some());
 
-    let proof_bytes = b"stark-proof-bytes-1".to_vec();
+    let public_inputs: ves_stark_primitives::public_inputs::CompliancePublicInputs =
+        serde_json::from_value(inputs_json["public_inputs"].clone()).unwrap();
+    let witness = ves_stark_prover::ComplianceWitness::new(5000, public_inputs);
+
+    let prover = ves_stark_prover::ComplianceProver::with_policy(
+        ves_stark_prover::Policy::aml_threshold(10000),
+    );
+    let proof = prover.prove(&witness).unwrap();
+
+    let proof_bytes = proof.proof_bytes.clone();
     let proof_b64 = base64::engine::general_purpose::STANDARD.encode(&proof_bytes);
 
     let submit_body = json!({
         "proofType": "stark",
-        "proofVersion": 1,
+        "proofVersion": ves_stark_verifier::PROOF_VERSION,
         "policyId": "aml.threshold",
         "policyParams": { "threshold": 10000 },
-        "proofB64": proof_b64
+        "proofB64": proof_b64,
+        "witnessCommitment": proof.witness_commitment,
     });
 
     let (status, body) = send(
@@ -844,10 +1072,18 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
 
     let conflict_body = json!({
         "proofType": "stark",
-        "proofVersion": 1,
+        "proofVersion": ves_stark_verifier::PROOF_VERSION,
         "policyId": "aml.threshold",
         "policyParams": { "threshold": 10000 },
-        "proofB64": base64::engine::general_purpose::STANDARD.encode(b"different")
+        "witnessCommitment": proof.witness_commitment,
+        "proofB64": ({
+            // Generate a second valid proof for the same event+policy (different witness amount)
+            // to force an idempotency conflict (proof_hash mismatch under same key).
+            let witness2 = ves_stark_prover::ComplianceWitness::new(4000, witness.public_inputs.clone());
+            let prover2 = ves_stark_prover::ComplianceProver::with_policy(ves_stark_prover::Policy::aml_threshold(10000));
+            let proof2 = prover2.prove(&witness2).unwrap();
+            base64::engine::general_purpose::STANDARD.encode(&proof2.proof_bytes)
+        })
     });
 
     let (status, body) = send(

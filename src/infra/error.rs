@@ -309,15 +309,11 @@ impl<T> ResultExt<T> for Result<T> {
     }
 
     fn in_component(self, component: &'static str) -> std::result::Result<T, ContextualError> {
-        self.map_err(|e| {
-            ContextualError::new(e, ErrorContext::new().component(component))
-        })
+        self.map_err(|e| ContextualError::new(e, ErrorContext::new().component(component)))
     }
 
     fn during(self, operation: &'static str) -> std::result::Result<T, ContextualError> {
-        self.map_err(|e| {
-            ContextualError::new(e, ErrorContext::new().operation(operation))
-        })
+        self.map_err(|e| ContextualError::new(e, ErrorContext::new().operation(operation)))
     }
 }
 
@@ -412,7 +408,9 @@ mod tests {
         let event_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
         let err = SequencerError::EventNotFound(event_id);
         assert!(err.to_string().contains("event not found"));
-        assert!(err.to_string().contains("12345678-1234-1234-1234-123456789abc"));
+        assert!(err
+            .to_string()
+            .contains("12345678-1234-1234-1234-123456789abc"));
     }
 
     #[test]
@@ -575,7 +573,8 @@ mod tests {
 
     #[test]
     fn test_schema_validation_failed_error() {
-        let err = SequencerError::SchemaValidationFailed("missing required field: order_id".to_string());
+        let err =
+            SequencerError::SchemaValidationFailed("missing required field: order_id".to_string());
         assert!(err.to_string().contains("schema validation failed"));
         assert!(err.to_string().contains("order_id"));
     }
@@ -589,7 +588,8 @@ mod tests {
 
     #[test]
     fn test_schema_compatibility_violation_error() {
-        let err = SequencerError::SchemaCompatibilityViolation("removed required field".to_string());
+        let err =
+            SequencerError::SchemaCompatibilityViolation("removed required field".to_string());
         assert!(err.to_string().contains("schema compatibility violation"));
         assert!(err.to_string().contains("removed required field"));
     }
@@ -639,9 +639,7 @@ mod tests {
     fn test_error_context_to_json() {
         let tenant_id = Uuid::new_v4();
 
-        let ctx = ErrorContext::new()
-            .component("sequencer")
-            .tenant(tenant_id);
+        let ctx = ErrorContext::new().component("sequencer").tenant(tenant_id);
 
         let json = ctx.to_json();
         assert!(json.get("component").is_some());
@@ -668,9 +666,7 @@ mod tests {
         let store_id = Uuid::new_v4();
 
         let result: Result<()> = Err(SequencerError::RateLimited);
-        let ctx_result = result.with_context(
-            ErrorContext::new().tenant(tenant_id).store(store_id),
-        );
+        let ctx_result = result.with_context(ErrorContext::new().tenant(tenant_id).store(store_id));
 
         assert!(ctx_result.is_err());
         let ctx_err = ctx_result.unwrap_err();
@@ -695,7 +691,10 @@ mod tests {
 
         assert!(ctx_result.is_err());
         let ctx_err = ctx_result.unwrap_err();
-        assert_eq!(ctx_err.context.operation.as_deref(), Some("event_processing"));
+        assert_eq!(
+            ctx_err.context.operation.as_deref(),
+            Some("event_processing")
+        );
     }
 
     #[test]

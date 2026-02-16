@@ -4,7 +4,9 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
-use stateset_sequencer::domain::{AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId};
+use stateset_sequencer::domain::{
+    AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
+};
 
 /// Create a batch of test events
 fn create_event_batch(count: usize) -> EventBatch {
@@ -42,11 +44,15 @@ fn bench_event_creation(c: &mut Criterion) {
 
     for count in [1, 10, 100, 1000].iter() {
         group.throughput(Throughput::Elements(*count as u64));
-        group.bench_with_input(BenchmarkId::new("create_batch", count), count, |b, &count| {
-            b.iter(|| {
-                black_box(create_event_batch(count));
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("create_batch", count),
+            count,
+            |b, &count| {
+                b.iter(|| {
+                    black_box(create_event_batch(count));
+                });
+            },
+        );
     }
 
     group.finish();

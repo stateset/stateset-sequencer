@@ -8,10 +8,12 @@ use alloy::primitives::{Address, FixedBytes};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
-use tracing::info;
+use tracing::{info, warn};
 
-use crate::domain::{BatchCommitment, Hash256, TenantId, StoreId, VesBatchCommitment};
-use crate::infra::{Result, SequencerError};
+use crate::domain::{BatchCommitment, Hash256, StoreId, TenantId, VesBatchCommitment};
+use crate::infra::{
+    CircuitBreaker, CircuitBreakerConfig, Result, Retry, RetryConfig, SequencerError,
+};
 
 /// STARK batch proof commitment for on-chain anchoring
 #[derive(Debug, Clone)]
@@ -130,7 +132,7 @@ impl AnchorConfig {
         let chain_id = std::env::var("L2_CHAIN_ID")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(84532001);
+            .unwrap_or(84532001); // Default: Set Chain testnet
 
         Some(Self {
             rpc_url,
@@ -141,19 +143,65 @@ impl AnchorConfig {
     }
 }
 
-/// On-chain anchor service
+/// Determine if an anchor error is transient and worth retrying.
+/// Retries on transport/timeout errors; does NOT retry on reverts or nonce errors.
+fn is_retryable_anchor_error(err: &SequencerError) -> bool {
+    match err {
+        SequencerError::Internal(msg) => {
+            let lower = msg.to_lowercase();
+            // Transport / network / timeout errors are retryable
+            lower.contains("timeout")
+                || lower.contains("connection")
+                || lower.contains("transport")
+                || lower.contains("eof")
+                || lower.contains("reset by peer")
+                || lower.contains("broken pipe")
+                || lower.contains("failed to send")
+                || lower.contains("failed to get receipt")
+        }
+        _ => false,
+    }
+}
+
+/// On-chain anchor service with retry and circuit breaker protection
 pub struct AnchorService {
     config: AnchorConfig,
+    circuit_breaker: CircuitBreaker,
+    retry_config: RetryConfig,
 }
 
 impl AnchorService {
-    /// Create a new anchor service
+    /// Create a new anchor service with default retry and circuit breaker settings
     pub fn new(config: AnchorConfig) -> Self {
-        Self { config }
+        let circuit_breaker = CircuitBreaker::with_config(
+            "anchor",
+            CircuitBreakerConfig {
+                failure_threshold: 5,
+                success_threshold: 2,
+                open_timeout: std::time::Duration::from_secs(60),
+                failure_window: std::time::Duration::from_secs(120),
+                half_open_max_requests: 1,
+                backoff_multiplier: 2.0,
+                max_backoff: std::time::Duration::from_secs(300),
+                jitter_factor: 0.1,
+                slow_call_threshold: Some(std::time::Duration::from_secs(30)),
+                slow_call_rate_threshold: None,
+            },
+        );
+        Self {
+            config,
+            circuit_breaker,
+            retry_config: RetryConfig::blockchain(),
+        }
     }
 
     pub fn chain_id(&self) -> u64 {
         self.config.chain_id
+    }
+
+    /// Get a reference to the circuit breaker for status monitoring
+    pub fn circuit_breaker(&self) -> &CircuitBreaker {
+        &self.circuit_breaker
     }
 
     /// Convert Hash256 to FixedBytes<32>
@@ -168,79 +216,74 @@ impl AnchorService {
         FixedBytes::from_slice(&bytes)
     }
 
-    /// Anchor a commitment on-chain
+    /// Anchor a commitment on-chain with retry and circuit breaker protection
     pub async fn anchor_commitment(&self, commitment: &BatchCommitment) -> Result<Hash256> {
         info!(
             "Anchoring commitment {} to chain (sequences {}-{})",
             commitment.batch_id, commitment.sequence_range.0, commitment.sequence_range.1
         );
 
-        // Parse private key and create signer
-        let signer: PrivateKeySigner = self
-            .config
-            .private_key
-            .parse()
-            .map_err(|e| SequencerError::Internal(format!("Invalid private key: {}", e)))?;
+        let config = &self.config;
+        let registry_address = config.registry_address;
+        let batch_id_uuid = commitment.batch_id;
+        let retry_config = self.retry_config.clone();
 
-        // Create provider with signer and recommended fillers
-        let provider = ProviderBuilder::new()
-            .with_recommended_fillers()
-            .wallet(alloy::network::EthereumWallet::from(signer))
-            .on_http(
-                self.config
-                    .rpc_url
-                    .parse()
-                    .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {}", e)))?,
-            );
+        let (tx_hash, block_number) = self
+            .circuit_breaker
+            .call(async {
+                let retry = Retry::new(retry_config);
+                let result = retry.run_with_predicate(
+                    || {
+                        let private_key = config.private_key.clone();
+                        let rpc_url = config.rpc_url.clone();
+                        let batch_id = Self::uuid_to_bytes32(commitment.batch_id);
+                        let tenant_id = Self::uuid_to_bytes32(commitment.tenant_id.0);
+                        let store_id = Self::uuid_to_bytes32(commitment.store_id.0);
+                        let events_root = Self::to_bytes32(&commitment.events_root);
+                        let state_root = Self::to_bytes32(&commitment.new_state_root);
+                        let seq_start = commitment.sequence_range.0;
+                        let seq_end = commitment.sequence_range.1;
+                        let event_count = commitment.event_count;
 
-        // Create contract instance
-        let contract = IStateSetAnchor::new(self.config.registry_address, &provider);
+                        async move {
+                            let signer: PrivateKeySigner = private_key.parse()
+                                .map_err(|e| SequencerError::Internal(format!("Invalid private key: {e}")))?;
+                            let provider = ProviderBuilder::new()
+                                .with_recommended_fillers()
+                                .wallet(alloy::network::EthereumWallet::from(signer))
+                                .on_http(rpc_url.parse()
+                                    .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?);
+                            let contract = IStateSetAnchor::new(registry_address, &provider);
+                            let tx = contract.anchor(batch_id, tenant_id, store_id, events_root, state_root, seq_start, seq_end, event_count);
+                            let pending = tx.send().await
+                                .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {e}")))?;
+                            let receipt = pending.get_receipt().await
+                                .map_err(|e| SequencerError::Internal(format!("Failed to get receipt: {e}")))?;
+                            Ok::<_, SequencerError>((receipt.transaction_hash.0, receipt.block_number))
+                        }
+                    },
+                    is_retryable_anchor_error,
+                ).await;
 
-        // Convert commitment fields to contract types
-        let batch_id = Self::uuid_to_bytes32(commitment.batch_id);
-        let tenant_id = Self::uuid_to_bytes32(commitment.tenant_id.0);
-        let store_id = Self::uuid_to_bytes32(commitment.store_id.0);
-        let events_root = Self::to_bytes32(&commitment.events_root);
-        let state_root = Self::to_bytes32(&commitment.new_state_root);
-
-        // Build and send transaction
-        let tx = contract.anchor(
-            batch_id,
-            tenant_id,
-            store_id,
-            events_root,
-            state_root,
-            commitment.sequence_range.0,
-            commitment.sequence_range.1,
-            commitment.event_count,
-        );
-
-        let pending = tx
-            .send()
+                if result.attempts > 1 {
+                    warn!(batch_id = %batch_id_uuid, attempts = result.attempts, "Anchor commitment succeeded after retries");
+                }
+                result.into_result()
+            })
             .await
-            .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {}", e)))?;
-
-        info!("Transaction sent: {:?}", pending.tx_hash());
-
-        // Wait for confirmation
-        let receipt = pending
-            .get_receipt()
-            .await
-            .map_err(|e| SequencerError::Internal(format!("Failed to get receipt: {}", e)))?;
-
-        let tx_hash: Hash256 = receipt.transaction_hash.0;
+            .map_err(|_| SequencerError::Internal("Anchor circuit breaker is open — RPC endpoint unavailable".into()))?;
 
         info!(
             "Commitment {} anchored in tx {} (block {})",
-            commitment.batch_id,
+            batch_id_uuid,
             hex::encode(tx_hash),
-            receipt.block_number.unwrap_or(0)
+            block_number.unwrap_or(0)
         );
 
         Ok(tx_hash)
     }
 
-    /// Anchor a VES commitment on-chain.
+    /// Anchor a VES commitment on-chain with retry and circuit breaker protection.
     pub async fn anchor_ves_commitment(
         &self,
         commitment: &VesBatchCommitment,
@@ -250,59 +293,59 @@ impl AnchorService {
             commitment.batch_id, commitment.sequence_range.0, commitment.sequence_range.1
         );
 
-        let signer: PrivateKeySigner = self
-            .config
-            .private_key
-            .parse()
-            .map_err(|e| SequencerError::Internal(format!("Invalid private key: {}", e)))?;
+        let config = &self.config;
+        let registry_address = config.registry_address;
+        let batch_id_uuid = commitment.batch_id;
+        let retry_config = self.retry_config.clone();
 
-        let provider = ProviderBuilder::new()
-            .with_recommended_fillers()
-            .wallet(alloy::network::EthereumWallet::from(signer))
-            .on_http(
-                self.config
-                    .rpc_url
-                    .parse()
-                    .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {}", e)))?,
-            );
+        let (tx_hash, block_number) = self
+            .circuit_breaker
+            .call(async {
+                let retry = Retry::new(retry_config);
+                let result = retry.run_with_predicate(
+                    || {
+                        let private_key = config.private_key.clone();
+                        let rpc_url = config.rpc_url.clone();
+                        let batch_id = Self::uuid_to_bytes32(commitment.batch_id);
+                        let tenant_id = Self::uuid_to_bytes32(commitment.tenant_id.0);
+                        let store_id = Self::uuid_to_bytes32(commitment.store_id.0);
+                        let events_root = Self::to_bytes32(&commitment.merkle_root);
+                        let state_root = Self::to_bytes32(&commitment.new_state_root);
+                        let seq_start = commitment.sequence_range.0;
+                        let seq_end = commitment.sequence_range.1;
+                        let leaf_count = commitment.leaf_count;
 
-        let contract = IStateSetAnchor::new(self.config.registry_address, &provider);
+                        async move {
+                            let signer: PrivateKeySigner = private_key.parse()
+                                .map_err(|e| SequencerError::Internal(format!("Invalid private key: {e}")))?;
+                            let provider = ProviderBuilder::new()
+                                .with_recommended_fillers()
+                                .wallet(alloy::network::EthereumWallet::from(signer))
+                                .on_http(rpc_url.parse()
+                                    .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?);
+                            let contract = IStateSetAnchor::new(registry_address, &provider);
+                            let tx = contract.anchor(batch_id, tenant_id, store_id, events_root, state_root, seq_start, seq_end, leaf_count);
+                            let pending = tx.send().await
+                                .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {e}")))?;
+                            let receipt = pending.get_receipt().await
+                                .map_err(|e| SequencerError::Internal(format!("Failed to get receipt: {e}")))?;
+                            Ok::<_, SequencerError>((receipt.transaction_hash.0, receipt.block_number))
+                        }
+                    },
+                    is_retryable_anchor_error,
+                ).await;
 
-        let batch_id = Self::uuid_to_bytes32(commitment.batch_id);
-        let tenant_id = Self::uuid_to_bytes32(commitment.tenant_id.0);
-        let store_id = Self::uuid_to_bytes32(commitment.store_id.0);
-        let events_root = Self::to_bytes32(&commitment.merkle_root);
-        let state_root = Self::to_bytes32(&commitment.new_state_root);
-
-        let tx = contract.anchor(
-            batch_id,
-            tenant_id,
-            store_id,
-            events_root,
-            state_root,
-            commitment.sequence_range.0,
-            commitment.sequence_range.1,
-            commitment.leaf_count,
-        );
-
-        let pending = tx
-            .send()
+                if result.attempts > 1 {
+                    warn!(batch_id = %batch_id_uuid, attempts = result.attempts, "VES anchor succeeded after retries");
+                }
+                result.into_result()
+            })
             .await
-            .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {}", e)))?;
-
-        info!("Transaction sent: {:?}", pending.tx_hash());
-
-        let receipt = pending
-            .get_receipt()
-            .await
-            .map_err(|e| SequencerError::Internal(format!("Failed to get receipt: {}", e)))?;
-
-        let tx_hash: Hash256 = receipt.transaction_hash.0;
-        let block_number = receipt.block_number;
+            .map_err(|_| SequencerError::Internal("Anchor circuit breaker is open — RPC endpoint unavailable".into()))?;
 
         info!(
             "VES commitment {} anchored in tx {} (block {})",
-            commitment.batch_id,
+            batch_id_uuid,
             hex::encode(tx_hash),
             block_number.unwrap_or(0)
         );
@@ -381,85 +424,82 @@ impl AnchorService {
         Ok(valid._0)
     }
 
-    /// Anchor a STARK batch proof on-chain (batch + proof in single transaction)
+    /// Anchor a STARK batch proof on-chain with retry and circuit breaker protection
     pub async fn anchor_stark_batch_proof(
         &self,
         proof: &StarkBatchProof,
     ) -> Result<(Hash256, Option<u64>)> {
         info!(
             "Anchoring STARK batch proof {} to chain (sequences {}-{}, {} events, all_compliant={})",
-            proof.batch_id,
-            proof.sequence_start,
-            proof.sequence_end,
-            proof.event_count,
-            proof.all_compliant
+            proof.batch_id, proof.sequence_start, proof.sequence_end, proof.event_count, proof.all_compliant
         );
 
-        let signer: PrivateKeySigner = self
-            .config
-            .private_key
-            .parse()
-            .map_err(|e| SequencerError::Internal(format!("Invalid private key: {}", e)))?;
+        let config = &self.config;
+        let registry_address = config.registry_address;
+        let batch_id_uuid = proof.batch_id;
+        let retry_config = self.retry_config.clone();
 
-        let provider = ProviderBuilder::new()
-            .with_recommended_fillers()
-            .wallet(alloy::network::EthereumWallet::from(signer))
-            .on_http(
-                self.config
-                    .rpc_url
-                    .parse()
-                    .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {}", e)))?,
-            );
+        let (tx_hash, block_number) = self
+            .circuit_breaker
+            .call(async {
+                let retry = Retry::new(retry_config);
+                let result = retry.run_with_predicate(
+                    || {
+                        let private_key = config.private_key.clone();
+                        let rpc_url = config.rpc_url.clone();
+                        let batch_id = Self::uuid_to_bytes32(proof.batch_id);
+                        let tenant_id = Self::uuid_to_bytes32(proof.tenant_id.0);
+                        let store_id = Self::uuid_to_bytes32(proof.store_id.0);
+                        let events_root = Self::to_bytes32(&proof.events_root);
+                        let prev_state_root = Self::to_bytes32(&proof.prev_state_root);
+                        let new_state_root = Self::to_bytes32(&proof.new_state_root);
+                        let proof_hash = Self::to_bytes32(&proof.proof_hash);
+                        let policy_hash = Self::to_bytes32(&proof.policy_hash);
+                        let seq_start = proof.sequence_start;
+                        let seq_end = proof.sequence_end;
+                        let event_count = proof.event_count;
+                        let policy_limit = proof.policy_limit;
+                        let all_compliant = proof.all_compliant;
+                        let proof_size = proof.proof_size;
+                        let proving_time_ms = proof.proving_time_ms;
 
-        let contract = IStateSetAnchor::new(self.config.registry_address, &provider);
+                        async move {
+                            let signer: PrivateKeySigner = private_key.parse()
+                                .map_err(|e| SequencerError::Internal(format!("Invalid private key: {e}")))?;
+                            let provider = ProviderBuilder::new()
+                                .with_recommended_fillers()
+                                .wallet(alloy::network::EthereumWallet::from(signer))
+                                .on_http(rpc_url.parse()
+                                    .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?);
+                            let contract = IStateSetAnchor::new(registry_address, &provider);
+                            let tx = contract.commitBatchWithStarkProof(
+                                batch_id, tenant_id, store_id, events_root,
+                                prev_state_root, new_state_root,
+                                seq_start, seq_end, event_count,
+                                proof_hash, policy_hash, policy_limit,
+                                all_compliant, proof_size, proving_time_ms,
+                            );
+                            let pending = tx.send().await
+                                .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {e}")))?;
+                            let receipt = pending.get_receipt().await
+                                .map_err(|e| SequencerError::Internal(format!("Failed to get receipt: {e}")))?;
+                            Ok::<_, SequencerError>((receipt.transaction_hash.0, receipt.block_number))
+                        }
+                    },
+                    is_retryable_anchor_error,
+                ).await;
 
-        // Convert all fields to contract types
-        let batch_id = Self::uuid_to_bytes32(proof.batch_id);
-        let tenant_id = Self::uuid_to_bytes32(proof.tenant_id.0);
-        let store_id = Self::uuid_to_bytes32(proof.store_id.0);
-        let events_root = Self::to_bytes32(&proof.events_root);
-        let prev_state_root = Self::to_bytes32(&proof.prev_state_root);
-        let new_state_root = Self::to_bytes32(&proof.new_state_root);
-        let proof_hash = Self::to_bytes32(&proof.proof_hash);
-        let policy_hash = Self::to_bytes32(&proof.policy_hash);
-
-        // Call commitBatchWithStarkProof - single transaction for both batch and proof
-        let tx = contract.commitBatchWithStarkProof(
-            batch_id,
-            tenant_id,
-            store_id,
-            events_root,
-            prev_state_root,
-            new_state_root,
-            proof.sequence_start,
-            proof.sequence_end,
-            proof.event_count,
-            proof_hash,
-            policy_hash,
-            proof.policy_limit,
-            proof.all_compliant,
-            proof.proof_size,
-            proof.proving_time_ms,
-        );
-
-        let pending = tx
-            .send()
+                if result.attempts > 1 {
+                    warn!(batch_id = %batch_id_uuid, attempts = result.attempts, "STARK anchor succeeded after retries");
+                }
+                result.into_result()
+            })
             .await
-            .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {}", e)))?;
-
-        info!("STARK proof transaction sent: {:?}", pending.tx_hash());
-
-        let receipt = pending
-            .get_receipt()
-            .await
-            .map_err(|e| SequencerError::Internal(format!("Failed to get receipt: {}", e)))?;
-
-        let tx_hash: Hash256 = receipt.transaction_hash.0;
-        let block_number = receipt.block_number;
+            .map_err(|_| SequencerError::Internal("Anchor circuit breaker is open — RPC endpoint unavailable".into()))?;
 
         info!(
             "STARK batch proof {} anchored in tx {} (block {})",
-            proof.batch_id,
+            batch_id_uuid,
             hex::encode(tx_hash),
             block_number.unwrap_or(0)
         );

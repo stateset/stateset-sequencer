@@ -10,21 +10,26 @@ use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use stateset_sequencer::auth::{AgentKeyEntry, AgentKeyLookup};
 use stateset_sequencer::domain::{
-    AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
+    AgentId, AgentKeyId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
+    VesEventEnvelope,
 };
-use stateset_sequencer::grpc::SequencerService;
+use stateset_sequencer::crypto::AgentSigningKey;
+use stateset_sequencer::grpc::{SequencerService, SequencerServiceV2};
 use stateset_sequencer::infra::{
     CommitmentEngine, IngestService, PayloadEncryption, PgCommitmentEngine, PgEventStore,
-    PgSequencer,
+    PgAgentKeyRegistry, PgSequencer, PgVesCommitmentEngine, VesSequencer,
 };
 use stateset_sequencer::proto::sequencer_server::Sequencer as SequencerTrait;
 use stateset_sequencer::proto::{
     GetCommitmentRequest, GetEntityHistoryRequest, GetHeadRequest, GetInclusionProofRequest,
     PushRequest,
 };
+use stateset_sequencer::proto::v2::GetEntityHistoryRequest as V2GetEntityHistoryRequest;
 
 use tonic::Request;
+use tonic::Code;
 
 // Note: common module provides test helpers but not all are used here
 #[allow(unused_imports)]
@@ -60,6 +65,26 @@ async fn create_grpc_service(pool: sqlx::PgPool) -> SequencerService {
     )
 }
 
+async fn create_grpc_service_v2(pool: sqlx::PgPool) -> SequencerServiceV2 {
+    let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    let ves_sequencer = Arc::new(VesSequencer::new(
+        pool.clone(),
+        agent_key_registry.clone(),
+    ));
+    let ves_commitment_engine = Arc::new(PgVesCommitmentEngine::new(pool.clone()));
+
+    SequencerServiceV2::new(
+        ves_sequencer,
+        ves_commitment_engine.clone(),
+        Arc::new(VesSequencer::new(
+            pool.clone(),
+            agent_key_registry,
+        )),
+        ves_commitment_engine,
+        Arc::new(stateset_sequencer::infra::CacheManager::new()),
+    )
+}
+
 fn create_test_event(
     tenant_id: &TenantId,
     store_id: &StoreId,
@@ -71,10 +96,55 @@ fn create_test_event(
         store_id.clone(),
         EntityType::order(),
         entity_id.to_string(),
-        EventType::new("order.created"),
-        json!({ "test": true, "entity_id": entity_id }),
+    EventType::new("order.created"),
+    json!({ "test": true, "entity_id": entity_id }),
+    agent_id.clone(),
+)
+}
+
+fn create_v2_test_event(
+    tenant_id: &TenantId,
+    store_id: &StoreId,
+    agent_id: &AgentId,
+    signing_key: &AgentSigningKey,
+    entity_id: &str,
+    idx: usize,
+) -> VesEventEnvelope {
+    VesEventEnvelope::new_plaintext(
+        tenant_id.clone(),
+        store_id.clone(),
         agent_id.clone(),
+        AgentKeyId::default(),
+        EntityType::new("order"),
+        entity_id.to_string(),
+        EventType::new("order.updated"),
+        json!({ "index": idx, "entity_id": entity_id }),
+        signing_key,
     )
+}
+
+async fn seed_v2_events_for_test(
+    pool: &sqlx::PgPool,
+    tenant_id: &TenantId,
+    store_id: &StoreId,
+    agent_id: &AgentId,
+    signing_key: &AgentSigningKey,
+    entity_id: &str,
+    count: usize,
+) {
+    let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    let lookup = AgentKeyLookup::new(tenant_id, agent_id, AgentKeyId::default());
+    agent_key_registry
+        .register_key(&lookup, AgentKeyEntry::new(signing_key.public_key_bytes()))
+        .await
+        .unwrap();
+
+    let ves_sequencer = VesSequencer::new(pool.clone(), agent_key_registry);
+    let events: Vec<VesEventEnvelope> = (0..count)
+        .map(|i| create_v2_test_event(tenant_id, store_id, agent_id, signing_key, entity_id, i))
+        .collect();
+
+    ves_sequencer.ingest(events).await.unwrap();
 }
 
 async fn seed_events_for_test(
@@ -343,7 +413,6 @@ async fn test_grpc_get_head_empty_store() {
 // ============================================================================
 
 #[tokio::test]
-#[ignore]
 async fn test_grpc_get_entity_history_success() {
     let Some(pool) = connect_db().await else {
         eprintln!("DATABASE_URL not set; skipping");
@@ -409,13 +478,476 @@ async fn test_grpc_get_entity_history_success() {
         to_version: 0, // 0 means no upper limit
     });
 
-    let response = service.get_entity_history(request).await.unwrap().into_inner();
+    let response = service
+        .get_entity_history(request)
+        .await
+        .unwrap()
+        .into_inner();
 
     assert_eq!(response.events.len(), 2);
     for event in &response.events {
         let envelope = event.envelope.as_ref().unwrap();
         assert_eq!(envelope.entity_id, target_entity);
     }
+}
+
+#[tokio::test]
+async fn test_grpc_get_entity_history_from_zero_equals_one() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption);
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let target_entity = "ord-history-grpc-from-zero-v1";
+
+    let events = vec![
+        EventEnvelope::new(
+            tenant_id.clone(),
+            store_id.clone(),
+            EntityType::order(),
+            target_entity.to_string(),
+            EventType::new("order.created"),
+            json!({ "status": "created" }),
+            agent_id.clone(),
+        ),
+        EventEnvelope::new(
+            tenant_id.clone(),
+            store_id.clone(),
+            EntityType::order(),
+            target_entity.to_string(),
+            EventType::new("order.confirmed"),
+            json!({ "status": "confirmed" }),
+            agent_id.clone(),
+        ),
+    ];
+
+    sequencer
+        .ingest(EventBatch::new(agent_id, events))
+        .await
+        .unwrap();
+
+    let service = create_grpc_service(pool).await;
+
+    let request_zero = Request::new(GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 0,
+        to_version: 0,
+    });
+    let request_one = Request::new(GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 1,
+        to_version: 0,
+    });
+
+    let response_zero = service
+        .get_entity_history(request_zero)
+        .await
+        .unwrap()
+        .into_inner();
+    let response_one = service
+        .get_entity_history(request_one)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let ids_zero: Vec<_> = response_zero
+        .events
+        .iter()
+        .map(|e| e.envelope.as_ref().unwrap().event_id.clone())
+        .collect();
+    let ids_one: Vec<_> = response_one
+        .events
+        .iter()
+        .map(|e| e.envelope.as_ref().unwrap().event_id.clone())
+        .collect();
+
+    assert_eq!(ids_zero, ids_one);
+}
+
+#[tokio::test]
+async fn test_grpc_get_entity_history_invalid_version_range() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption);
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let target_entity = "ord-history-grpc-range";
+
+    let event = EventEnvelope::new(
+        tenant_id.clone(),
+        store_id.clone(),
+        EntityType::order(),
+        target_entity.to_string(),
+        EventType::new("order.created"),
+        json!({ "status": "created" }),
+        agent_id.clone(),
+    );
+    sequencer
+        .ingest(EventBatch::new(agent_id, vec![event]))
+        .await
+        .unwrap();
+
+    let service = create_grpc_service(pool).await;
+
+    let request = Request::new(GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 2,
+        to_version: 1,
+    });
+
+    let error = service.get_entity_history(request).await.unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn test_grpc_v2_get_entity_history_limit_zero_defaults() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let signing_key = AgentSigningKey::generate();
+    let target_entity = "ord-history-v2-grpc-default-limit";
+
+    seed_v2_events_for_test(
+        &pool,
+        &tenant_id,
+        &store_id,
+        &agent_id,
+        &signing_key,
+        target_entity,
+        150,
+    )
+    .await;
+
+    let service = create_grpc_service_v2(pool).await;
+    let request = Request::new(V2GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 0,
+        to_version: 0,
+        limit: 0,
+    });
+
+    let response = service
+        .get_entity_history(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.events.len(), 100);
+    assert_eq!(response.current_version, 150);
+    for event in &response.events {
+        let envelope = event.envelope.as_ref().unwrap();
+        assert_eq!(envelope.entity_id, target_entity);
+    }
+}
+
+#[tokio::test]
+async fn test_grpc_v2_get_entity_history_invalid_version_range() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let signing_key = AgentSigningKey::generate();
+    let target_entity = "ord-history-v2-grpc-range";
+
+    seed_v2_events_for_test(
+        &pool,
+        &tenant_id,
+        &store_id,
+        &agent_id,
+        &signing_key,
+        target_entity,
+        1,
+    )
+    .await;
+
+    let service = create_grpc_service_v2(pool).await;
+    let request = Request::new(V2GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 2,
+        to_version: 1,
+        limit: 10,
+    });
+
+    let error = service.get_entity_history(request).await.unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
+async fn test_grpc_v2_get_entity_history_limit_is_capped() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let signing_key = AgentSigningKey::generate();
+    let target_entity = "ord-history-v2-grpc-limit-cap";
+
+    seed_v2_events_for_test(
+        &pool,
+        &tenant_id,
+        &store_id,
+        &agent_id,
+        &signing_key,
+        target_entity,
+        150,
+    )
+    .await;
+
+    let service = create_grpc_service_v2(pool).await;
+    let request = Request::new(V2GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 1,
+        to_version: 0,
+        limit: 250,
+    });
+
+    let response = service
+        .get_entity_history(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.events.len(), 100);
+    assert_eq!(response.current_version, 150);
+}
+
+#[tokio::test]
+async fn test_grpc_get_entity_history_from_version_beyond_current_returns_empty() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption);
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let target_entity = "ord-history-grpc-beyond-current";
+
+    let event = EventEnvelope::new(
+        tenant_id.clone(),
+        store_id.clone(),
+        EntityType::order(),
+        target_entity.to_string(),
+        EventType::new("order.created"),
+        json!({ "status": "created" }),
+        agent_id.clone(),
+    );
+    sequencer
+        .ingest(EventBatch::new(agent_id, vec![event]))
+        .await
+        .unwrap();
+
+    let service = create_grpc_service(pool).await;
+
+    let request = Request::new(GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 10,
+        to_version: 0,
+    });
+
+    let response = service
+        .get_entity_history(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.events.len(), 0);
+    assert_eq!(response.current_version, 1);
+}
+
+#[tokio::test]
+async fn test_grpc_v2_get_entity_history_from_version_beyond_current_returns_empty() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let signing_key = AgentSigningKey::generate();
+    let target_entity = "ord-history-v2-grpc-beyond-current";
+
+    seed_v2_events_for_test(
+        &pool,
+        &tenant_id,
+        &store_id,
+        &agent_id,
+        &signing_key,
+        target_entity,
+        4,
+    )
+    .await;
+
+    let service = create_grpc_service_v2(pool).await;
+    let request = Request::new(V2GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 10,
+        to_version: 0,
+        limit: 10,
+    });
+
+    let response = service
+        .get_entity_history(request)
+        .await
+        .unwrap()
+        .into_inner();
+
+    assert_eq!(response.events.len(), 0);
+    assert_eq!(response.current_version, 4);
+}
+
+#[tokio::test]
+async fn test_grpc_v2_get_entity_history_from_zero_equals_one() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let signing_key = AgentSigningKey::generate();
+    let target_entity = "ord-history-v2-grpc-from-zero";
+
+    seed_v2_events_for_test(
+        &pool,
+        &tenant_id,
+        &store_id,
+        &agent_id,
+        &signing_key,
+        target_entity,
+        3,
+    )
+    .await;
+
+    let service = create_grpc_service_v2(pool).await;
+
+    let request_zero = Request::new(V2GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 0,
+        to_version: 0,
+        limit: 0,
+    });
+    let request_one = Request::new(V2GetEntityHistoryRequest {
+        tenant_id: tenant_id.0.to_string(),
+        store_id: store_id.0.to_string(),
+        entity_type: "order".to_string(),
+        entity_id: target_entity.to_string(),
+        from_version: 1,
+        to_version: 0,
+        limit: 0,
+    });
+
+    let response_zero = service
+        .get_entity_history(request_zero)
+        .await
+        .unwrap()
+        .into_inner();
+    let response_one = service
+        .get_entity_history(request_one)
+        .await
+        .unwrap()
+        .into_inner();
+
+    let ids_zero: Vec<_> = response_zero
+        .events
+        .iter()
+        .map(|e| e.envelope.as_ref().unwrap().event_id.clone())
+        .collect();
+    let ids_one: Vec<_> = response_one
+        .events
+        .iter()
+        .map(|e| e.envelope.as_ref().unwrap().event_id.clone())
+        .collect();
+
+    assert_eq!(ids_zero, ids_one);
 }
 
 // ============================================================================
@@ -444,7 +976,14 @@ async fn test_grpc_get_commitment_success() {
 
     // Seed events
     let events: Vec<EventEnvelope> = (0..5)
-        .map(|i| create_test_event(&tenant_id, &store_id, &agent_id, &format!("ord-commit-{}", i)))
+        .map(|i| {
+            create_test_event(
+                &tenant_id,
+                &store_id,
+                &agent_id,
+                &format!("ord-commit-{}", i),
+            )
+        })
         .collect();
 
     sequencer
@@ -458,7 +997,10 @@ async fn test_grpc_get_commitment_success() {
         .await
         .unwrap();
 
-    commitment_engine.store_commitment(&commitment).await.unwrap();
+    commitment_engine
+        .store_commitment(&commitment)
+        .await
+        .unwrap();
 
     let service = create_grpc_service(pool).await;
 
@@ -524,7 +1066,14 @@ async fn test_grpc_get_inclusion_proof_success() {
 
     // Seed events and capture event IDs
     let events: Vec<EventEnvelope> = (0..8)
-        .map(|i| create_test_event(&tenant_id, &store_id, &agent_id, &format!("ord-proof-{}", i)))
+        .map(|i| {
+            create_test_event(
+                &tenant_id,
+                &store_id,
+                &agent_id,
+                &format!("ord-proof-{}", i),
+            )
+        })
         .collect();
 
     let event_id = events[3].event_id; // Get the 4th event's ID
@@ -540,7 +1089,10 @@ async fn test_grpc_get_inclusion_proof_success() {
         .await
         .unwrap();
 
-    commitment_engine.store_commitment(&commitment).await.unwrap();
+    commitment_engine
+        .store_commitment(&commitment)
+        .await
+        .unwrap();
 
     let service = create_grpc_service(pool).await;
 
@@ -550,7 +1102,11 @@ async fn test_grpc_get_inclusion_proof_success() {
         event_id: event_id.to_string(),
     });
 
-    let response = service.get_inclusion_proof(request).await.unwrap().into_inner();
+    let response = service
+        .get_inclusion_proof(request)
+        .await
+        .unwrap()
+        .into_inner();
     let proof = response.proof.unwrap();
 
     assert!(!proof.merkle_root.is_empty());

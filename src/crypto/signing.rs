@@ -496,7 +496,9 @@ mod tests {
             payload_cipher_hash: &cipher_hash,
         };
 
-        assert!(verifying_key.verify_event(&modified_params, &signature).is_err());
+        assert!(verifying_key
+            .verify_event(&modified_params, &signature)
+            .is_err());
     }
 
     #[test]

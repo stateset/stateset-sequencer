@@ -140,17 +140,60 @@ impl PgX402Repository {
 
     /// Update intent's batch_id
     pub async fn update_intent_batch(&self, intent_id: Uuid, batch_id: Uuid) -> Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE x402_payment_intents
-            SET batch_id = $2, status = 'batched', updated_at = NOW()
-            WHERE intent_id = $1
-            "#,
-        )
-        .bind(intent_id)
-        .bind(batch_id)
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        self.assign_intents_to_batch_tx(&mut tx, batch_id, std::slice::from_ref(&intent_id))
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Update multiple intent batch assignments atomically
+    pub async fn assign_intents_to_batch(
+        &self,
+        batch_id: Uuid,
+        intent_ids: &[Uuid],
+    ) -> Result<()> {
+        if intent_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut tx = self.pool.begin().await?;
+        self.assign_intents_to_batch_tx(&mut tx, batch_id, intent_ids)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn assign_intents_to_batch_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        batch_id: Uuid,
+        intent_ids: &[Uuid],
+    ) -> Result<()> {
+        for intent_id in intent_ids {
+            let result = sqlx::query(
+                r#"
+                UPDATE x402_payment_intents
+                SET batch_id = $2, status = 'batched', updated_at = NOW()
+                WHERE intent_id = $1
+                  AND status = 'sequenced'
+                "#,
+            )
+            .bind(intent_id)
+            .bind(batch_id)
+            .execute(&mut *tx)
+            .await?;
+
+            if result.rows_affected() == 0 {
+                return Err(SequencerError::InvariantViolation {
+                    invariant: "x402 intent batch assignment".into(),
+                    message: format!(
+                        "intent {} was not found or was not in sequenced state",
+                        intent_id
+                    ),
+                });
+            }
+        }
 
         Ok(())
     }
@@ -509,6 +552,7 @@ impl PgX402Repository {
             SELECT * FROM x402_payment_intents
             WHERE batch_id = $1
             ORDER BY sequence_number ASC
+            LIMIT 10000
             "#,
         )
         .bind(batch_id)
@@ -523,51 +567,37 @@ impl PgX402Repository {
         &self,
         filter: &X402PaymentIntentFilter,
     ) -> Result<Vec<X402PaymentIntent>> {
-        // Build dynamic query based on filter
-        let rows: Vec<X402IntentRow> = if let Some(tenant_id) = filter.tenant_id {
-            if let Some(store_id) = filter.store_id {
-                sqlx::query_as(
-                    r#"
-                    SELECT * FROM x402_payment_intents
-                    WHERE tenant_id = $1 AND store_id = $2
-                    ORDER BY created_at DESC
-                    LIMIT $3 OFFSET $4
-                    "#,
-                )
-                .bind(tenant_id)
-                .bind(store_id)
-                .bind(filter.limit.unwrap_or(100) as i64)
-                .bind(filter.offset.unwrap_or(0) as i64)
-                .fetch_all(&self.pool)
-                .await?
-            } else {
-                sqlx::query_as(
-                    r#"
-                    SELECT * FROM x402_payment_intents
-                    WHERE tenant_id = $1
-                    ORDER BY created_at DESC
-                    LIMIT $2 OFFSET $3
-                    "#,
-                )
-                .bind(tenant_id)
-                .bind(filter.limit.unwrap_or(100) as i64)
-                .bind(filter.offset.unwrap_or(0) as i64)
-                .fetch_all(&self.pool)
-                .await?
-            }
-        } else {
-            sqlx::query_as(
-                r#"
-                SELECT * FROM x402_payment_intents
-                ORDER BY created_at DESC
-                LIMIT $1 OFFSET $2
-                "#,
-            )
-            .bind(filter.limit.unwrap_or(100) as i64)
-            .bind(filter.offset.unwrap_or(0) as i64)
-            .fetch_all(&self.pool)
-            .await?
-        };
+        let rows: Vec<X402IntentRow> = sqlx::query_as(
+            r#"
+            SELECT * FROM x402_payment_intents
+            WHERE ($1::uuid IS NULL OR tenant_id = $1)
+              AND ($2::uuid IS NULL OR store_id = $2)
+              AND ($3::text IS NULL OR payer_address = $3)
+              AND ($4::text IS NULL OR payee_address = $4)
+              AND ($5::text IS NULL OR status = $5)
+              AND ($6::text IS NULL OR network = $6)
+              AND ($7::text IS NULL OR asset = $7)
+              AND ($8::uuid IS NULL OR batch_id = $8)
+              AND ($9::timestamptz IS NULL OR created_at >= $9)
+              AND ($10::timestamptz IS NULL OR created_at <= $10)
+            ORDER BY created_at DESC
+            LIMIT $11 OFFSET $12
+            "#,
+        )
+        .bind(filter.tenant_id)
+        .bind(filter.store_id)
+        .bind(filter.payer_address.as_deref())
+        .bind(filter.payee_address.as_deref())
+        .bind(filter.status.map(|s| s.to_string()))
+        .bind(filter.network.map(|network| network.to_string()))
+        .bind(filter.asset.map(|asset| format!("{:?}", asset).to_lowercase()))
+        .bind(filter.batch_id)
+        .bind(filter.from_date)
+        .bind(filter.to_date)
+        .bind(filter.limit.unwrap_or(100) as i64)
+        .bind(filter.offset.unwrap_or(0) as i64)
+        .fetch_all(&self.pool)
+        .await?;
 
         rows.into_iter().map(Self::row_to_intent).collect()
     }
@@ -639,6 +669,27 @@ impl PgX402Repository {
         row.map(Self::row_to_batch).transpose()
     }
 
+    /// Mark a pending batch as failed
+    pub async fn mark_batch_failed_if_pending(&self, batch_id: Uuid) -> Result<()> {
+        let result = sqlx::query(
+            r#"
+            UPDATE x402_payment_batches
+            SET status = 'failed'
+            WHERE batch_id = $1
+              AND status = 'pending'
+            "#,
+        )
+        .bind(batch_id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
     /// Update batch with Merkle root and commit
     pub async fn commit_batch(
         &self,
@@ -650,7 +701,7 @@ impl PgX402Repository {
         let mut tx = self.pool.begin().await?;
 
         // Update batch
-        sqlx::query(
+        let batch_result = sqlx::query(
             r#"
             UPDATE x402_payment_batches
             SET status = 'committed',
@@ -658,6 +709,7 @@ impl PgX402Repository {
                 new_state_root = $3,
                 committed_at = NOW()
             WHERE batch_id = $1
+              AND status = 'pending'
             "#,
         )
         .bind(batch_id)
@@ -666,20 +718,20 @@ impl PgX402Repository {
         .execute(&mut *tx)
         .await?;
 
-        // Update intents
-        for intent_id in intent_ids {
-            sqlx::query(
-                r#"
-                UPDATE x402_payment_intents
-                SET status = 'batched', batch_id = $2, updated_at = NOW()
-                WHERE intent_id = $1
-                "#,
-            )
-            .bind(intent_id)
-            .bind(batch_id)
-            .execute(&mut *tx)
-            .await?;
+        if batch_result.rows_affected() == 0 {
+            return Err(SequencerError::InvalidStateTransition {
+                entity_type: "x402_payment_batch".into(),
+                entity_id: batch_id.to_string(),
+                from: "not pending".into(),
+                to: "committed".into(),
+            });
         }
+
+        self.assign_intents_to_batch_tx(&mut tx, batch_id, intent_ids)
+            .await?;
+
+        // If any intents were not updated because they were missing or no longer sequenced,
+        // assign_intents_to_batch_tx returns an invariant violation.
 
         tx.commit().await?;
         Ok(())
@@ -695,8 +747,7 @@ impl PgX402Repository {
     ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
-        // Update batch
-        sqlx::query(
+        let settled = sqlx::query(
             r#"
             UPDATE x402_payment_batches
             SET status = 'settled',
@@ -705,6 +756,7 @@ impl PgX402Repository {
                 gas_used = $4,
                 settled_at = NOW()
             WHERE batch_id = $1
+              AND status IN ('committed', 'submitted')
             "#,
         )
         .bind(batch_id)
@@ -714,8 +766,16 @@ impl PgX402Repository {
         .execute(&mut *tx)
         .await?;
 
-        // Update all intents in batch
-        sqlx::query(
+        if settled.rows_affected() == 0 {
+            return Err(SequencerError::InvalidStateTransition {
+                entity_type: "x402_payment_batch".into(),
+                entity_id: batch_id.to_string(),
+                from: "not committed/submitted".into(),
+                to: "settled".into(),
+            });
+        }
+
+        let updated_intents = sqlx::query(
             r#"
             UPDATE x402_payment_intents
             SET status = 'settled',
@@ -732,6 +792,49 @@ impl PgX402Repository {
         .execute(&mut *tx)
         .await?;
 
+        if updated_intents.rows_affected() == 0 {
+            return Err(SequencerError::InvariantViolation {
+                invariant: "batch_settlement".into(),
+                message: format!(
+                    "batch {} was marked settled but had no associated payment intents",
+                    batch_id
+                ),
+            });
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Update batch with submission info
+    pub async fn submit_batch(&self, batch_id: Uuid, tx_hash: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // Update batch
+        let result = sqlx::query(
+            r#"
+            UPDATE x402_payment_batches
+            SET status = 'submitted',
+                tx_hash = $2,
+                submitted_at = NOW()
+            WHERE batch_id = $1
+              AND status = 'committed'
+            "#,
+        )
+        .bind(batch_id)
+        .bind(tx_hash)
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(SequencerError::InvalidStateTransition {
+                entity_type: "x402_payment_batch".into(),
+                entity_id: batch_id.to_string(),
+                from: "not committed".into(),
+                to: "submitted".into(),
+            });
+        }
+
         tx.commit().await?;
         Ok(())
     }
@@ -741,6 +844,7 @@ impl PgX402Repository {
     // =========================================================================
 
     /// Compute the expected signing hash for payment parameters
+    #[allow(clippy::too_many_arguments)]
     pub fn compute_signing_hash(
         payer: &str,
         payee: &str,
@@ -759,12 +863,12 @@ impl PgX402Repository {
         // Payment parameters
         hasher.update(payer.as_bytes());
         hasher.update(payee.as_bytes());
-        hasher.update(&amount.to_be_bytes());
+        hasher.update(amount.to_be_bytes());
         hasher.update(format!("{:?}", asset).to_lowercase().as_bytes());
         hasher.update(network.to_string().as_bytes());
-        hasher.update(&chain_id.to_be_bytes());
-        hasher.update(&valid_until.to_be_bytes());
-        hasher.update(&nonce.to_be_bytes());
+        hasher.update(chain_id.to_be_bytes());
+        hasher.update(valid_until.to_be_bytes());
+        hasher.update(nonce.to_be_bytes());
 
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
@@ -796,23 +900,23 @@ impl PgX402Repository {
 
         // Intent identity
         hasher.update(intent.intent_id.as_bytes());
-        hasher.update(&intent.sequence_number.unwrap_or(0).to_be_bytes());
+        hasher.update(intent.sequence_number.unwrap_or(0).to_be_bytes());
 
         // Payment parameters
         hasher.update(intent.payer_address.as_bytes());
         hasher.update(intent.payee_address.as_bytes());
-        hasher.update(&intent.amount.to_be_bytes());
+        hasher.update(intent.amount.to_be_bytes());
         hasher.update(format!("{:?}", intent.asset).to_lowercase().as_bytes());
         hasher.update(intent.network.to_string().as_bytes());
-        hasher.update(&intent.chain_id.to_be_bytes());
+        hasher.update(intent.chain_id.to_be_bytes());
 
         // Validity
-        hasher.update(&intent.nonce.to_be_bytes());
-        hasher.update(&intent.valid_until.to_be_bytes());
+        hasher.update(intent.nonce.to_be_bytes());
+        hasher.update(intent.valid_until.to_be_bytes());
 
         // Signature
-        hasher.update(&intent.signing_hash);
-        hasher.update(&intent.payer_signature);
+        hasher.update(intent.signing_hash);
+        hasher.update(intent.payer_signature);
 
         let result = hasher.finalize();
         let mut hash = [0u8; 32];
@@ -822,10 +926,7 @@ impl PgX402Repository {
 
     /// Build Merkle tree from payment intents
     pub fn build_merkle_tree(intents: &[X402PaymentIntent]) -> MerkleTree<MerkleSha256> {
-        let leaves: Vec<Hash256> = intents
-            .iter()
-            .map(Self::compute_intent_leaf)
-            .collect();
+        let leaves: Vec<Hash256> = intents.iter().map(Self::compute_intent_leaf).collect();
         MerkleTree::<MerkleSha256>::from_leaves(&leaves)
     }
 
@@ -896,6 +997,7 @@ impl PgX402Repository {
             SELECT intent_id FROM x402_payment_intents
             WHERE batch_id = $1
             ORDER BY sequence_number ASC
+            LIMIT 10000
             "#,
         )
         .bind(batch_id)
@@ -919,7 +1021,7 @@ impl PgX402Repository {
             hasher.update(tenant_id.0.as_bytes());
             hasher.update(store_id.0.as_bytes());
             hasher.update(batch_id.as_bytes());
-            hasher.update(&merkle_root);
+            hasher.update(merkle_root);
             let result = hasher.finalize();
             let mut hash = [0u8; 32];
             hash.copy_from_slice(&result);
@@ -967,9 +1069,7 @@ impl PgX402Repository {
         };
 
         // Fetch all intents in batch to generate proof
-        let batch_intents = self
-            .get_intents_by_batch(batch_id)
-            .await?;
+        let batch_intents = self.get_intents_by_batch(batch_id).await?;
 
         let total_leaves = batch_intents.len() as u32;
 
@@ -1034,39 +1134,9 @@ impl PgX402Repository {
             })
             .transpose()?;
 
-        let status = match row.status.as_str() {
-            "pending" => X402IntentStatus::Pending,
-            "sequenced" => X402IntentStatus::Sequenced,
-            "batched" => X402IntentStatus::Batched,
-            "settled" => X402IntentStatus::Settled,
-            "expired" => X402IntentStatus::Expired,
-            "failed" => X402IntentStatus::Failed,
-            _ => X402IntentStatus::Pending,
-        };
-
-        let asset = match row.asset.as_str() {
-            "usdc" => X402Asset::Usdc,
-            "usdt" => X402Asset::Usdt,
-            "ssusd" => X402Asset::SsUsd,
-            "wssusd" => X402Asset::WssUsd,
-            "dai" => X402Asset::Dai,
-            "eth" => X402Asset::Eth,
-            _ => X402Asset::Usdc,
-        };
-
-        let network = match row.network.as_str() {
-            "set_chain" => X402Network::SetChain,
-            "set_chain_testnet" => X402Network::SetChainTestnet,
-            "arc" => X402Network::Arc,
-            "arc_testnet" => X402Network::ArcTestnet,
-            "base" => X402Network::Base,
-            "base_sepolia" => X402Network::BaseSepolia,
-            "ethereum" => X402Network::Ethereum,
-            "ethereum_sepolia" => X402Network::EthereumSepolia,
-            "arbitrum" => X402Network::Arbitrum,
-            "optimism" => X402Network::Optimism,
-            _ => X402Network::SetChain,
-        };
+        let status = Self::parse_x402_intent_status(&row.status)?;
+        let asset = Self::parse_x402_asset(&row.asset)?;
+        let network = Self::parse_x402_network(&row.network)?;
 
         Ok(X402PaymentIntent {
             intent_id: row.intent_id,
@@ -1106,6 +1176,55 @@ impl PgX402Repository {
         })
     }
 
+    fn parse_x402_intent_status(raw: &str) -> Result<X402IntentStatus> {
+        match raw {
+            "pending" => Ok(X402IntentStatus::Pending),
+            "sequenced" => Ok(X402IntentStatus::Sequenced),
+            "batched" => Ok(X402IntentStatus::Batched),
+            "settled" => Ok(X402IntentStatus::Settled),
+            "expired" => Ok(X402IntentStatus::Expired),
+            "failed" => Ok(X402IntentStatus::Failed),
+            _ => Err(SequencerError::Internal(format!(
+                "invalid x402 payment intent status in database: {}",
+                raw
+            ))),
+        }
+    }
+
+    fn parse_x402_asset(raw: &str) -> Result<X402Asset> {
+        match raw {
+            "usdc" => Ok(X402Asset::Usdc),
+            "usdt" => Ok(X402Asset::Usdt),
+            "ssusd" => Ok(X402Asset::SsUsd),
+            "wssusd" => Ok(X402Asset::WssUsd),
+            "dai" => Ok(X402Asset::Dai),
+            "eth" => Ok(X402Asset::Eth),
+            _ => Err(SequencerError::Internal(format!(
+                "invalid x402 asset in database: {}",
+                raw
+            ))),
+        }
+    }
+
+    fn parse_x402_network(raw: &str) -> Result<X402Network> {
+        match raw {
+            "set_chain" => Ok(X402Network::SetChain),
+            "set_chain_testnet" => Ok(X402Network::SetChainTestnet),
+            "arc" => Ok(X402Network::Arc),
+            "arc_testnet" => Ok(X402Network::ArcTestnet),
+            "base" => Ok(X402Network::Base),
+            "base_sepolia" => Ok(X402Network::BaseSepolia),
+            "ethereum" => Ok(X402Network::Ethereum),
+            "ethereum_sepolia" => Ok(X402Network::EthereumSepolia),
+            "arbitrum" => Ok(X402Network::Arbitrum),
+            "optimism" => Ok(X402Network::Optimism),
+            _ => Err(SequencerError::Internal(format!(
+                "invalid x402 network in database: {}",
+                raw
+            ))),
+        }
+    }
+
     fn row_to_batch(row: X402BatchRow) -> Result<X402PaymentBatch> {
         let merkle_root: Option<Hash256> = row
             .merkle_root
@@ -1131,28 +1250,8 @@ impl PgX402Repository {
             })
             .transpose()?;
 
-        let status = match row.status.as_str() {
-            "pending" => X402BatchStatus::Pending,
-            "committed" => X402BatchStatus::Committed,
-            "submitted" => X402BatchStatus::Submitted,
-            "settled" => X402BatchStatus::Settled,
-            "failed" => X402BatchStatus::Failed,
-            _ => X402BatchStatus::Pending,
-        };
-
-        let network = match row.network.as_str() {
-            "set_chain" => X402Network::SetChain,
-            "set_chain_testnet" => X402Network::SetChainTestnet,
-            "arc" => X402Network::Arc,
-            "arc_testnet" => X402Network::ArcTestnet,
-            "base" => X402Network::Base,
-            "base_sepolia" => X402Network::BaseSepolia,
-            "ethereum" => X402Network::Ethereum,
-            "ethereum_sepolia" => X402Network::EthereumSepolia,
-            "arbitrum" => X402Network::Arbitrum,
-            "optimism" => X402Network::Optimism,
-            _ => X402Network::SetChain,
-        };
+        let status = Self::parse_x402_batch_status(&row.status)?;
+        let network = Self::parse_x402_network(&row.network)?;
 
         let total_amounts: Vec<X402BatchTotal> =
             serde_json::from_value(row.total_amounts).unwrap_or_default();
@@ -1179,6 +1278,20 @@ impl PgX402Repository {
             submitted_at: row.submitted_at,
             settled_at: row.settled_at,
         })
+    }
+
+    fn parse_x402_batch_status(raw: &str) -> Result<X402BatchStatus> {
+        match raw {
+            "pending" => Ok(X402BatchStatus::Pending),
+            "committed" => Ok(X402BatchStatus::Committed),
+            "submitted" => Ok(X402BatchStatus::Submitted),
+            "settled" => Ok(X402BatchStatus::Settled),
+            "failed" => Ok(X402BatchStatus::Failed),
+            _ => Err(SequencerError::Internal(format!(
+                "invalid x402 batch status in database: {}",
+                raw
+            ))),
+        }
     }
 }
 

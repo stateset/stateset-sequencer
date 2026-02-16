@@ -11,12 +11,21 @@ use crate::crypto::canonical_json_hash;
 
 use super::{hash256_hex, AgentId, EntityType, EventType, Hash256, StoreId, TenantId};
 
+/// Default envelope version for backward-compatible deserialization
+fn default_envelope_version() -> u32 {
+    1
+}
+
 /// Canonical event envelope for all StateSet operations.
 ///
 /// This structure is Phase 2-compatible, meaning it includes fields
 /// that will be used for ZK proof generation in later phases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventEnvelope {
+    /// Envelope format version (allows future schema evolution without migration)
+    #[serde(default = "default_envelope_version")]
+    pub envelope_version: u32,
+
     /// Globally unique event identifier (idempotency at event level)
     pub event_id: Uuid,
 
@@ -82,6 +91,7 @@ impl EventEnvelope {
         let payload_hash = Self::compute_payload_hash(&payload);
 
         Self {
+            envelope_version: 1,
             event_id: Uuid::new_v4(),
             command_id: None,
             tenant_id,
@@ -117,10 +127,11 @@ impl EventEnvelope {
     }
 
     /// Get bytes to sign for authenticity verification
-    /// Signature covers: event_id | command_id | tenant_id | store_id |
+    /// Signature covers: envelope_version | event_id | command_id | tenant_id | store_id |
     /// entity_type | entity_id | event_type | payload_hash | base_version | created_at
     pub fn signing_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+        bytes.extend(&self.envelope_version.to_be_bytes());
         bytes.extend(self.event_id.as_bytes());
         if let Some(cmd_id) = &self.command_id {
             bytes.extend(cmd_id.as_bytes());
@@ -446,12 +457,16 @@ mod tests {
 
     #[test]
     fn test_signing_bytes_deterministic() {
-        let tenant_id = TenantId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
-        let store_id = StoreId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
+        let tenant_id =
+            TenantId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+        let store_id =
+            StoreId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap());
         let event_id = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
-        let agent_id = AgentId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap());
+        let agent_id =
+            AgentId::from_uuid(Uuid::parse_str("00000000-0000-0000-0000-000000000004").unwrap());
 
         let envelope = EventEnvelope {
+            envelope_version: 1,
             event_id,
             command_id: None,
             tenant_id,
@@ -462,7 +477,9 @@ mod tests {
             payload: serde_json::json!({}),
             payload_hash: [0u8; 32],
             base_version: None,
-            created_at: chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z").unwrap().with_timezone(&Utc),
+            created_at: chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
             sequence_number: None,
             source_agent: agent_id,
             signature: None,
@@ -492,7 +509,10 @@ mod tests {
         };
 
         // Signing bytes should be different with command_id
-        assert_ne!(envelope_without_cmd.signing_bytes(), envelope_with_cmd.signing_bytes());
+        assert_ne!(
+            envelope_without_cmd.signing_bytes(),
+            envelope_with_cmd.signing_bytes()
+        );
     }
 
     #[test]
@@ -637,13 +657,11 @@ mod tests {
         let receipt = IngestReceipt {
             batch_id: Uuid::new_v4(),
             events_accepted: 5,
-            events_rejected: vec![
-                RejectedEvent {
-                    event_id: Uuid::new_v4(),
-                    reason: RejectionReason::DuplicateEventId,
-                    message: "Event already exists".to_string(),
-                },
-            ],
+            events_rejected: vec![RejectedEvent {
+                event_id: Uuid::new_v4(),
+                reason: RejectionReason::DuplicateEventId,
+                message: "Event already exists".to_string(),
+            }],
             assigned_sequence_start: Some(1),
             assigned_sequence_end: Some(5),
             head_sequence: 10,

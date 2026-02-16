@@ -14,11 +14,12 @@ pub use inclusion_proofs::*;
 pub use validity_proofs::*;
 
 use axum::http::StatusCode;
-use std::time::Duration;
+use tracing::instrument;
 use uuid::Uuid;
 
+use crate::api::utils::internal_error;
 use crate::domain::{Hash256, VesBatchCommitment};
-use crate::infra::VesComplianceEventInputs;
+use crate::infra::{VesComplianceEventInputs, CACHE_STAMPEDE_DELAY};
 use crate::server::AppState;
 
 /// Generate canonical public inputs for VES validity proofs.
@@ -62,6 +63,7 @@ pub fn ves_compliance_public_inputs(
 }
 
 /// Fetch a VES commitment with cache and replica fallback.
+#[instrument(skip(state), fields(batch_id = %batch_id))]
 pub async fn get_ves_commitment_cached(
     state: &AppState,
     batch_id: Uuid,
@@ -77,7 +79,7 @@ pub async fn get_ves_commitment_cached(
     }
 
     if !lock_acquired {
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
         if let Some(commitment) = cache.get_by_batch_id(&batch_id).await {
             return Ok(commitment);
         }
@@ -91,7 +93,7 @@ pub async fn get_ves_commitment_cached(
                 if lock_acquired {
                     cache.release_batch_id_lock(&batch_id).await;
                 }
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                return Err(internal_error(e));
             }
         },
         Err(_) => match state.ves_commitment_engine.get_commitment(batch_id).await {
@@ -100,7 +102,7 @@ pub async fn get_ves_commitment_cached(
                 if lock_acquired {
                     cache.release_batch_id_lock(&batch_id).await;
                 }
-                return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+                return Err(internal_error(e));
             }
         },
     };

@@ -14,6 +14,22 @@ use stateset_sequencer::crypto::{
 use stateset_sequencer::infra::{PayloadEncryption, PayloadEncryptionMode};
 use stateset_sequencer::{StoreId, TenantId};
 
+const ADMIN_COMMANDS: [&str; 13] = [
+    "migrate",
+    "verify-proof",
+    "export-events",
+    "rotate-keys",
+    "list-agent-keys",
+    "reencrypt-events",
+    "reencrypt-ves-validity-proofs",
+    "reencrypt-ves-compliance-proofs",
+    "backfill-ves-state-roots",
+    "ves-commit-and-anchor",
+    "commands",
+    "version",
+    "help",
+];
+
 fn print_help() {
     eprintln!(
         "\
@@ -21,6 +37,10 @@ stateset-sequencer-admin
 
 USAGE:
   stateset-sequencer-admin <command> [options]
+
+OPTIONS:
+  -V, -v, --version              Print version
+  -h, --help                     Print help
 
 COMMANDS:
   migrate                         Run database migrations
@@ -33,6 +53,9 @@ COMMANDS:
   reencrypt-ves-compliance-proofs Re-encrypt compliance proofs
   backfill-ves-state-roots        Backfill VES state roots
   ves-commit-and-anchor           Create and anchor a VES commitment
+  commands                       List available commands
+  help                           Show command help (`help <command>`)
+  version                        Print version
 
 COMMON OPTIONS:
   --database-url <postgres_url>    (defaults to env DATABASE_URL)
@@ -105,6 +128,146 @@ ENV (encryption at rest):
     );
 }
 
+fn command_synopsis(command: &str) -> Option<&'static str> {
+    match command {
+        "migrate" => Some("Run database migrations"),
+        "verify-proof" => Some("Verify an inclusion proof"),
+        "export-events" => Some("Export events to JSON/NDJSON file"),
+        "rotate-keys" => Some("Rotate agent signing keys"),
+        "list-agent-keys" => Some("List agent keys for a tenant"),
+        "reencrypt-events" => Some("Re-encrypt event payloads with new key"),
+        "reencrypt-ves-validity-proofs" => Some("Re-encrypt validity proofs"),
+        "reencrypt-ves-compliance-proofs" => Some("Re-encrypt compliance proofs"),
+        "backfill-ves-state-roots" => Some("Backfill VES state roots"),
+        "ves-commit-and-anchor" => Some("Create and anchor a VES commitment"),
+        "commands" => Some("List available commands"),
+        "version" => Some("Print version"),
+        "help" => Some("Show command help (`help <command>`)"),
+        _ => None,
+    }
+}
+
+fn command_usage_hint(command: &str) -> Option<&'static str> {
+    match command {
+        "migrate" => Some("migrate [--database-url <postgres_url>]"),
+        "verify-proof" => Some(
+            "verify-proof --leaf-hash <hex> --merkle-root <hex> --proof-path <hex,hex,...> --leaf-index <n>",
+        ),
+        "export-events" => Some(
+            "export-events --tenant-id <uuid> --store-id <uuid> [--from <n>] [--to <n>] [--output <path>] [--format <json|ndjson>] [--database-url <postgres_url>]",
+        ),
+        "rotate-keys" => Some(
+            "rotate-keys --tenant-id <uuid> --agent-id <uuid> --new-key-id <n> --public-key <hex> [--revoke-old] [--database-url <postgres_url>]",
+        ),
+        "list-agent-keys" => Some(
+            "list-agent-keys --tenant-id <uuid> [--agent-id <uuid>] [--database-url <postgres_url>]",
+        ),
+        "reencrypt-events" => Some(
+            "reencrypt-events [--tenant-id <uuid>] [--store-id <uuid>] [--batch-size <n>] [--limit <n>] [--dry-run] [--force] [--database-url <postgres_url>]",
+        ),
+        "reencrypt-ves-validity-proofs" => Some(
+            "reencrypt-ves-validity-proofs [--tenant-id <uuid>] [--store-id <uuid>] [--batch-size <n>] [--limit <n>] [--dry-run] [--force] [--database-url <postgres_url>]",
+        ),
+        "reencrypt-ves-compliance-proofs" => Some(
+            "reencrypt-ves-compliance-proofs [--tenant-id <uuid>] [--store-id <uuid>] [--batch-size <n>] [--limit <n>] [--dry-run] [--force] [--database-url <postgres_url>]",
+        ),
+        "backfill-ves-state-roots" => Some(
+            "backfill-ves-state-roots [--tenant-id <uuid>] [--store-id <uuid>] [--dry-run] [--force] [--database-url <postgres_url>]",
+        ),
+        "ves-commit-and-anchor" => Some(
+            "ves-commit-and-anchor --tenant-id <uuid> --store-id <uuid> [--sequence-start <n>] [--sequence-end <n>] [--max-events <n>] [--database-url <postgres_url>]",
+        ),
+        "help" => Some("help [command]"),
+        "commands" => Some("commands"),
+        "version" => Some("version"),
+        _ => None,
+    }
+}
+
+fn suggest_command(input: &str) -> Option<&'static str> {
+    if let Some(command) = ADMIN_COMMANDS
+        .iter()
+        .find(|command| command.starts_with(input))
+        .copied()
+    {
+        return Some(command);
+    }
+
+    let mut best: Option<(&str, usize)> = None;
+    for &command in ADMIN_COMMANDS.iter() {
+        let distance = levenshtein_distance(input, command);
+        if distance <= 2 {
+            match best {
+                Some((_, best_distance)) if best_distance <= distance => {}
+                _ => best = Some((command, distance)),
+            }
+        }
+    }
+
+    best.map(|(command, _)| command)
+}
+
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut previous: Vec<usize> = (0..=b_bytes.len()).collect();
+    let mut current = vec![0usize; b_bytes.len() + 1];
+
+    for (i, &ca) in a_bytes.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, &cb) in b_bytes.iter().enumerate() {
+            let cost = if ca == cb { 0 } else { 1 };
+            let insertion = current[j] + 1;
+            let deletion = previous[j + 1] + 1;
+            let substitution = previous[j] + cost;
+            current[j + 1] = insertion.min(deletion).min(substitution);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+
+    previous[b_bytes.len()]
+}
+
+fn print_command_help_hint(command: &str) {
+    match (command_usage_hint(command), command_synopsis(command)) {
+        (Some(usage), Some(synopsis)) => {
+            eprintln!("Usage:");
+            eprintln!("  stateset-sequencer-admin {usage}");
+            eprintln!("Description:");
+            eprintln!("  {synopsis}");
+            eprintln!();
+            eprintln!("Options:");
+            eprintln!("  Use `stateset-sequencer-admin {command} --help` for full option list.");
+        }
+        (None, Some(synopsis)) => {
+            eprintln!("Usage:");
+            eprintln!("  stateset-sequencer-admin {command}");
+            eprintln!("Description:");
+            eprintln!("  {synopsis}");
+            eprintln!();
+            eprintln!("Options:");
+            eprintln!("  Use `stateset-sequencer-admin {command} --help` for full option list.");
+        }
+        None => {
+            eprintln!("unknown command: {command}");
+            if let Some(suggestion) = suggest_command(command) {
+                eprintln!("Did you mean: {suggestion}?");
+            }
+            eprintln!("Run `stateset-sequencer-admin --help` for usage.");
+        }
+    }
+}
+
+fn print_available_commands() {
+    for command in ADMIN_COMMANDS {
+        if let Some(description) = command_synopsis(command) {
+            println!("{:<24} {description}", command);
+        } else {
+            println!("{command}");
+        }
+    }
+}
+
 fn require_database_url(database_url: Option<String>) -> anyhow::Result<String> {
     database_url
         .or_else(|| std::env::var("DATABASE_URL").ok())
@@ -113,9 +276,9 @@ fn require_database_url(database_url: Option<String>) -> anyhow::Result<String> 
 
 fn stream_lock_key(tenant_id: &Uuid, store_id: &Uuid) -> i64 {
     let stream_id = compute_stream_id(tenant_id, store_id);
-    let bytes: [u8; 8] = stream_id[..8]
-        .try_into()
-        .expect("stream_id is always 32 bytes");
+    // Safety: stream_id is Hash256 = [u8; 32], so first 8 bytes always exist
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&stream_id[..8]);
     i64::from_be_bytes(bytes)
 }
 
@@ -199,12 +362,37 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    if matches!(command.as_str(), "-h" | "--help" | "help") {
+    if matches!(command.as_str(), "-h" | "--help") {
         print_help();
         return Ok(());
     }
 
+    if command == "help" {
+        if let Some(arg) = args.pop_front() {
+            print_command_help_hint(&arg);
+        } else {
+            print_help();
+        }
+        return Ok(());
+    }
+
+    if matches!(command.as_str(), "-V" | "-v" | "--version" | "version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    if command.starts_with('-') {
+        eprintln!("unknown global option: {command}");
+        eprintln!("Run `stateset-sequencer-admin --help` to see available global options.");
+        anyhow::bail!("unknown global option: {command}");
+    }
+
     match command.as_str() {
+        "commands" => {
+            println!("COMMANDS:");
+            print_available_commands();
+            Ok(())
+        }
         "migrate" => {
             let mut database_url: Option<String> = None;
             while let Some(arg) = args.pop_front() {
@@ -364,7 +552,8 @@ async fn main() -> anyhow::Result<()> {
 
                     let is_encrypted = is_payload_at_rest_encrypted(&row.payload_encrypted);
 
-                    if is_encrypted && !force
+                    if is_encrypted
+                        && !force
                         && payload_encryption
                             .decrypt_payload_with_current_key(
                                 &row.tenant_id,
@@ -373,10 +562,10 @@ async fn main() -> anyhow::Result<()> {
                             )
                             .await
                             .is_ok()
-                        {
-                            skipped_current_key += 1;
-                            continue;
-                        }
+                    {
+                        skipped_current_key += 1;
+                        continue;
+                    }
 
                     let plaintext = if is_encrypted {
                         payload_encryption
@@ -552,15 +741,16 @@ async fn main() -> anyhow::Result<()> {
 
                     let is_encrypted = is_payload_at_rest_encrypted(&row.proof);
 
-                    if is_encrypted && !force
+                    if is_encrypted
+                        && !force
                         && payload_encryption
                             .decrypt_payload_with_current_key(&row.tenant_id, &aad, &row.proof)
                             .await
                             .is_ok()
-                        {
-                            skipped_current_key += 1;
-                            continue;
-                        }
+                    {
+                        skipped_current_key += 1;
+                        continue;
+                    }
 
                     let plaintext = if is_encrypted {
                         payload_encryption
@@ -763,15 +953,16 @@ async fn main() -> anyhow::Result<()> {
 
                     let is_encrypted = is_payload_at_rest_encrypted(&row.proof);
 
-                    if is_encrypted && !force
+                    if is_encrypted
+                        && !force
                         && payload_encryption
                             .decrypt_payload_with_current_key(&row.tenant_id, &aad, &row.proof)
                             .await
                             .is_ok()
-                        {
-                            skipped_current_key += 1;
-                            continue;
-                        }
+                    {
+                        skipped_current_key += 1;
+                        continue;
+                    }
 
                     let plaintext = if is_encrypted {
                         payload_encryption
@@ -1097,16 +1288,16 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     "--merkle-root" => {
-                        merkle_root = Some(
-                            args.pop_front()
-                                .ok_or_else(|| anyhow::anyhow!("missing value for --merkle-root"))?,
-                        );
+                        merkle_root =
+                            Some(args.pop_front().ok_or_else(|| {
+                                anyhow::anyhow!("missing value for --merkle-root")
+                            })?);
                     }
                     "--proof-path" => {
-                        proof_path = Some(
-                            args.pop_front()
-                                .ok_or_else(|| anyhow::anyhow!("missing value for --proof-path"))?,
-                        );
+                        proof_path =
+                            Some(args.pop_front().ok_or_else(|| {
+                                anyhow::anyhow!("missing value for --proof-path")
+                            })?);
                     }
                     "--leaf-index" => {
                         let raw = args
@@ -1164,12 +1355,7 @@ async fn main() -> anyhow::Result<()> {
             let tree_depth = proof_hashes.len();
             let total_leaves = 1usize << tree_depth;
 
-            let is_valid = proof.verify(
-                root,
-                &indices,
-                &leaves,
-                total_leaves,
-            );
+            let is_valid = proof.verify(root, &indices, &leaves, total_leaves);
 
             if is_valid {
                 println!("ok: proof is VALID");
@@ -1197,10 +1383,10 @@ async fn main() -> anyhow::Result<()> {
             while let Some(arg) = args.pop_front() {
                 match arg.as_str() {
                     "--database-url" => {
-                        database_url = Some(
-                            args.pop_front()
-                                .ok_or_else(|| anyhow::anyhow!("missing value for --database-url"))?,
-                        );
+                        database_url =
+                            Some(args.pop_front().ok_or_else(|| {
+                                anyhow::anyhow!("missing value for --database-url")
+                            })?);
                     }
                     "--tenant-id" => {
                         let raw = args
@@ -1324,10 +1510,10 @@ async fn main() -> anyhow::Result<()> {
             while let Some(arg) = args.pop_front() {
                 match arg.as_str() {
                     "--database-url" => {
-                        database_url = Some(
-                            args.pop_front()
-                                .ok_or_else(|| anyhow::anyhow!("missing value for --database-url"))?,
-                        );
+                        database_url =
+                            Some(args.pop_front().ok_or_else(|| {
+                                anyhow::anyhow!("missing value for --database-url")
+                            })?);
                     }
                     "--tenant-id" => {
                         let raw = args
@@ -1429,10 +1615,10 @@ async fn main() -> anyhow::Result<()> {
             while let Some(arg) = args.pop_front() {
                 match arg.as_str() {
                     "--database-url" => {
-                        database_url = Some(
-                            args.pop_front()
-                                .ok_or_else(|| anyhow::anyhow!("missing value for --database-url"))?,
-                        );
+                        database_url =
+                            Some(args.pop_front().ok_or_else(|| {
+                                anyhow::anyhow!("missing value for --database-url")
+                            })?);
                     }
                     "--tenant-id" => {
                         let raw = args
@@ -1453,10 +1639,10 @@ async fn main() -> anyhow::Result<()> {
                         new_key_id = Some(raw.parse()?);
                     }
                     "--public-key" => {
-                        public_key = Some(
-                            args.pop_front()
-                                .ok_or_else(|| anyhow::anyhow!("missing value for --public-key"))?,
-                        );
+                        public_key =
+                            Some(args.pop_front().ok_or_else(|| {
+                                anyhow::anyhow!("missing value for --public-key")
+                            })?);
                     }
                     "--revoke-old" => revoke_old = true,
                     "-h" | "--help" => {
@@ -1469,8 +1655,10 @@ async fn main() -> anyhow::Result<()> {
 
             let tenant_id = tenant_id.ok_or_else(|| anyhow::anyhow!("--tenant-id is required"))?;
             let agent_id = agent_id.ok_or_else(|| anyhow::anyhow!("--agent-id is required"))?;
-            let new_key_id = new_key_id.ok_or_else(|| anyhow::anyhow!("--new-key-id is required"))?;
-            let public_key = public_key.ok_or_else(|| anyhow::anyhow!("--public-key is required"))?;
+            let new_key_id =
+                new_key_id.ok_or_else(|| anyhow::anyhow!("--new-key-id is required"))?;
+            let public_key =
+                public_key.ok_or_else(|| anyhow::anyhow!("--public-key is required"))?;
 
             let public_key_bytes = hex::decode(&public_key)
                 .map_err(|_| anyhow::anyhow!("invalid hex for --public-key"))?;
@@ -1623,8 +1811,7 @@ async fn main() -> anyhow::Result<()> {
                     anyhow::bail!("no new events to commit (head_sequence={head})");
                 }
                 let max_events = max_events.max(1);
-                let end = start.saturating_add(max_events.saturating_sub(1))
-                    .min(head);
+                let end = start.saturating_add(max_events.saturating_sub(1)).min(head);
                 (start, end)
             };
 
@@ -1671,7 +1858,12 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         other => {
-            eprintln!("unknown command: {other}\n");
+            eprintln!("unknown command: {other}");
+            eprintln!("Run with --help for usage. Available commands:");
+            print_available_commands();
+            if let Some(suggestion) = suggest_command(other) {
+                eprintln!("Did you mean: {suggestion}?");
+            }
             print_help();
             anyhow::bail!("unknown command: {other}");
         }

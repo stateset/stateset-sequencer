@@ -12,6 +12,7 @@ help: ## Show this help message
 .PHONY: test test-unit test-integration test-coverage
 .PHONY: lint fmt clippy check
 .PHONY: clean
+.PHONY: load-smoke load-sustained load-stress
 
 dev: ## Quick setup for local development (install deps, build, start services)
 	@echo "Setting up development environment..."
@@ -76,7 +77,11 @@ check: fmt check ## Check code quality (format + clippy)
 
 ## Docker
 docker-build: ## Build Docker image
-	docker build -t stateset-sequencer:latest .
+	@if [ ! -d ../stateset-stark ]; then \
+		echo "Missing sibling stateset-stark checkout at ../stateset-stark"; \
+		exit 1; \
+	fi
+	docker build -f Dockerfile -t stateset-sequencer:latest ..
 
 docker-up: ## Start services with docker-compose
 	docker-compose up -d
@@ -130,6 +135,16 @@ bench: ## Run benchmarks
 
 bench-criterion: ## Run benchmarks with Criterion output
 	cargo bench -- --output-format bencher
+
+## Load Testing
+load-smoke: ## Run smoke load test (k6)
+	./scripts/run_load_test.sh load/sequencer_ingest.js smoke
+
+load-sustained: ## Run sustained load test (k6)
+	./scripts/run_load_test.sh load/sequencer_ingest.js sustained
+
+load-stress: ## Run stress load test (k6)
+	./scripts/run_load_test.sh load/sequencer_ingest.js stress
 
 ## Security
 audit: ## Run security audit

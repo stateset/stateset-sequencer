@@ -3,6 +3,7 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use tracing::instrument;
 use uuid::Uuid;
 
 use crate::api::auth_helpers::{ensure_admin, ensure_read, ensure_write, is_bootstrap_admin};
@@ -10,11 +11,13 @@ use crate::api::types::{
     AnchorNotificationRequest, CommitAndAnchorVesRequest, CreateCommitmentRequest, HeadQuery,
     PendingCommitmentsQuery,
 };
+use crate::api::utils::internal_error;
 use crate::auth::AuthContextExt;
 use crate::domain::{Hash256, StoreId, TenantId};
 use crate::server::AppState;
 
 /// GET /api/v1/ves/commitments - List VES commitments.
+#[instrument(skip(state, auth, query))]
 pub async fn list_ves_commitments(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -29,7 +32,7 @@ pub async fn list_ves_commitments(
         .ves_commitment_reader
         .list_unanchored(&tenant_id, &store_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     let response: Vec<serde_json::Value> = commitments
         .iter()
@@ -60,6 +63,7 @@ pub async fn list_ves_commitments(
 }
 
 /// GET /api/v1/ves/commitments/:batch_id - Get a VES commitment.
+#[instrument(skip(state, auth), fields(batch_id = %batch_id))]
 pub async fn get_ves_commitment(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -90,6 +94,7 @@ pub async fn get_ves_commitment(
 }
 
 /// POST /api/v1/ves/commitments - Create a VES commitment.
+#[instrument(skip(state, auth, request))]
 pub async fn create_ves_commitment(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -109,9 +114,7 @@ pub async fn create_ves_commitment(
         )
         .await
         .map_err(|e| match e {
-            crate::infra::SequencerError::Database(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            }
+            crate::infra::SequencerError::Database(_) => internal_error(e),
             _ => (StatusCode::BAD_REQUEST, e.to_string()),
         })?;
 
@@ -139,6 +142,7 @@ pub async fn create_ves_commitment(
 }
 
 /// POST /api/v1/ves/commitments/anchor - Create and anchor a VES commitment in one call.
+#[instrument(skip(state, auth, request))]
 pub async fn commit_and_anchor_ves_commitment(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -161,7 +165,7 @@ pub async fn commit_and_anchor_ves_commitment(
                 .ves_sequencer
                 .head(&tenant_id, &store_id)
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                .map_err(internal_error)?;
 
             if head == 0 {
                 return Err((StatusCode::BAD_REQUEST, "no events to commit".to_string()));
@@ -171,7 +175,7 @@ pub async fn commit_and_anchor_ves_commitment(
                 .ves_commitment_engine
                 .last_sequence_end(&tenant_id, &store_id)
                 .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+                .map_err(internal_error)?;
             let start = last_end.map(|v| v.saturating_add(1)).unwrap_or(1);
             if start > head {
                 return Err((
@@ -181,8 +185,7 @@ pub async fn commit_and_anchor_ves_commitment(
             }
 
             let max_events = request.max_events.unwrap_or(1024).max(1);
-            let end = start.saturating_add(max_events.saturating_sub(1))
-                .min(head);
+            let end = start.saturating_add(max_events.saturating_sub(1)).min(head);
             (start, end)
         }
         _ => {
@@ -198,9 +201,7 @@ pub async fn commit_and_anchor_ves_commitment(
         .create_and_store_commitment(&tenant_id, &store_id, (start, end))
         .await
         .map_err(|e| match e {
-            crate::infra::SequencerError::Database(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            }
+            crate::infra::SequencerError::Database(_) => internal_error(e),
             _ => (StatusCode::BAD_REQUEST, e.to_string()),
         })?;
 
@@ -228,7 +229,7 @@ pub async fn commit_and_anchor_ves_commitment(
     let (tx_hash, chain_block_number) = anchor_service
         .anchor_ves_commitment(&commitment)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     state
         .ves_commitment_engine
@@ -239,7 +240,7 @@ pub async fn commit_and_anchor_ves_commitment(
             chain_block_number,
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     state
         .cache_manager
@@ -262,6 +263,7 @@ pub async fn commit_and_anchor_ves_commitment(
 }
 
 /// GET /v1/commitments/pending - List pending (unanchored) VES commitments (anchor compat).
+#[instrument(skip(state, auth, query))]
 pub async fn list_pending_ves_commitments(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -279,7 +281,7 @@ pub async fn list_pending_ves_commitments(
         .ves_commitment_reader
         .list_unanchored_global(limit)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     let commitments: Vec<serde_json::Value> = commitments
         .into_iter()
@@ -307,6 +309,7 @@ pub async fn list_pending_ves_commitments(
 }
 
 /// POST /v1/commitments/:batch_id/anchored - Notify anchor completion (anchor compat).
+#[instrument(skip(state, auth, request), fields(batch_id = %batch_id))]
 pub async fn notify_ves_commitment_anchored(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -351,9 +354,10 @@ pub async fn notify_ves_commitment_anchored(
     })?;
 
     if commitment.is_anchored() {
-        let existing = commitment
-            .chain_tx_hash
-            .expect("is_anchored implies tx hash");
+        let existing = commitment.chain_tx_hash.ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Commitment marked as anchored but missing tx hash".to_string(),
+        ))?;
         if existing == tx_hash {
             return Ok(Json(serde_json::json!({
                 "batch_id": batch_id,
@@ -371,7 +375,7 @@ pub async fn notify_ves_commitment_anchored(
         .ves_commitment_engine
         .update_chain_tx(batch_id, chain_id, tx_hash, request.block_number)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     state
         .cache_manager

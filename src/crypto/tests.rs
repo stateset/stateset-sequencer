@@ -535,14 +535,10 @@ mod edge_case_tests {
         let prev_root = [0u8; 32];
         let merkle_root = sha256(b"events");
 
-        let root1 = compute_ves_state_root(
-            &tenant, &store, &prev_root, &merkle_root, 1, 10, 10
-        );
+        let root1 = compute_ves_state_root(&tenant, &store, &prev_root, &merkle_root, 1, 10, 10);
 
         // Chaining: use root1 as prev_root
-        let root2 = compute_ves_state_root(
-            &tenant, &store, &root1, &merkle_root, 11, 20, 10
-        );
+        let root2 = compute_ves_state_root(&tenant, &store, &root1, &merkle_root, 11, 20, 10);
 
         assert_ne!(root1, root2);
         assert_ne!(root1, prev_root);
@@ -648,10 +644,8 @@ mod signing_edge_cases {
     fn test_secret_key_from_base64() {
         let key = AgentSigningKey::generate();
         let secret_bytes = key.to_bytes();
-        let base64_str = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            secret_bytes
-        );
+        let base64_str =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, secret_bytes);
 
         let parsed = secret_key_from_str(&base64_str).unwrap();
         assert_eq!(parsed, secret_bytes);
@@ -663,7 +657,7 @@ mod signing_edge_cases {
         let secret_bytes = key.to_bytes();
         let base64_str = base64::Engine::encode(
             &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-            secret_bytes
+            secret_bytes,
         );
 
         let parsed = secret_key_from_str(&base64_str).unwrap();
@@ -765,7 +759,10 @@ mod compatibility_tests {
         // Canonical form should be:
         // {"amount":100,"currency":"USD","orderId":"ORD-001"}
         let canonical = canonicalize_json(&json);
-        assert_eq!(canonical, r#"{"amount":100,"currency":"USD","orderId":"ORD-001"}"#);
+        assert_eq!(
+            canonical,
+            r#"{"amount":100,"currency":"USD","orderId":"ORD-001"}"#
+        );
 
         // The hash should be deterministic
         let hash = payload_plain_hash(&json);

@@ -154,8 +154,10 @@ fn init_tracer_provider(
     let resource = Resource::new(vec![
         KeyValue::new("service.name", config.service_name.clone()),
         KeyValue::new("service.version", config.service_version.clone()),
-        KeyValue::new("deployment.environment",
-            std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string())),
+        KeyValue::new(
+            "deployment.environment",
+            std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()),
+        ),
     ]);
 
     let sampler = if config.sample_rate >= 1.0 {
@@ -254,9 +256,7 @@ pub mod spans {
 }
 
 /// Extract trace context from HTTP headers for propagation
-pub fn extract_context_from_headers(
-    headers: &axum::http::HeaderMap,
-) -> opentelemetry::Context {
+pub fn extract_context_from_headers(headers: &axum::http::HeaderMap) -> opentelemetry::Context {
     use opentelemetry::propagation::TextMapPropagator;
 
     struct HeaderExtractor<'a>(&'a axum::http::HeaderMap);

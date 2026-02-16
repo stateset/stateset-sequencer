@@ -22,7 +22,12 @@ curl http://localhost:8080/health
 
 Expected response:
 ```json
-{"status": "healthy", "service": "stateset-sequencer", "version": "0.1.1"}
+{
+  "status": "healthy",
+  "service": "stateset-sequencer",
+  "version": "<version>",
+  "timestamp": "2026-02-04T00:00:00Z"
+}
 ```
 
 ### Readiness Check (Database Connectivity)
@@ -33,7 +38,19 @@ curl http://localhost:8080/ready
 
 Expected response:
 ```json
-{"status": "ready", "database": "connected"}
+{
+  "status": "ready",
+  "database": {
+    "connected": true,
+    "response_time_ms": 30
+  },
+  "pool": {
+    "status": "healthy",
+    "utilization": "0.0%",
+    "active": 0,
+    "idle": 10
+  }
+}
 ```
 
 ### Metrics Endpoint
@@ -43,6 +60,24 @@ curl http://localhost:8080/metrics
 ```
 
 Returns Prometheus-format metrics.
+
+---
+
+## Kubernetes (GKE) Operations
+
+### Restart / Redeploy
+
+```bash
+# Restart pods (keeps the same image)
+kubectl -n sequencer rollout restart deployment/stateset-sequencer
+kubectl -n sequencer rollout status deployment/stateset-sequencer --timeout=5m
+```
+
+```bash
+# Apply manifests (Kustomize)
+kubectl apply -k k8s
+kubectl -n sequencer rollout status deployment/stateset-sequencer --timeout=10m
+```
 
 ---
 
@@ -166,6 +201,25 @@ This should NEVER happen in normal operation. If it does:
 1. Stop event ingestion for the affected stream
 2. Investigate database logs for failed transactions
 3. Contact engineering - this may indicate a bug
+
+---
+
+## SLO Validation
+
+Run load tests against a staging environment before major releases:
+
+```bash
+export SEQUENCER_BASE_URL=https://api.sequencer.stateset.app
+export API_KEY=<admin-or-test-key>
+export TENANT_ID=<tenant-uuid>
+export STORE_ID=<store-uuid>
+export AGENT_ID=<agent-uuid>
+
+k6 run load/sequencer_ingest.js
+k6 run load/sequencer_query.js
+```
+
+Compare p95 latency and error rates against `docs/SLO.md`.
 
 ---
 

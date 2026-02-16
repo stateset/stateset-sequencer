@@ -34,17 +34,19 @@ use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use base64::Engine;
+use tracing::instrument;
 use uuid::Uuid;
 
 use crate::api::auth_helpers::{ensure_admin, ensure_read};
 use crate::api::handlers::ves::ves_validity_public_inputs;
 use crate::api::types::SubmitVesValidityProofRequest;
-use crate::api::utils::decode_base64_any;
+use crate::api::utils::{decode_base64_any, internal_error};
 use crate::auth::AuthContextExt;
 use crate::crypto::{canonical_json_hash, compute_ves_validity_proof_hash};
 use crate::server::AppState;
 
 /// GET /api/v1/ves/validity/:batch_id/inputs - Get validity public inputs.
+#[instrument(skip(state, auth), fields(batch_id = %batch_id))]
 pub async fn get_ves_validity_public_inputs(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -65,6 +67,7 @@ pub async fn get_ves_validity_public_inputs(
 }
 
 /// POST /api/v1/ves/validity/:batch_id/proofs - Submit a validity proof.
+#[instrument(skip(state, auth, request), fields(batch_id = %batch_id))]
 pub async fn submit_ves_validity_proof(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -136,12 +139,8 @@ pub async fn submit_ves_validity_proof(
             crate::infra::SequencerError::InvariantViolation { .. } => {
                 (StatusCode::CONFLICT, e.to_string())
             }
-            crate::infra::SequencerError::Encryption(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            }
-            crate::infra::SequencerError::Database(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-            }
+            crate::infra::SequencerError::Encryption(_) => internal_error(e),
+            crate::infra::SequencerError::Database(_) => internal_error(e),
             _ => (StatusCode::BAD_REQUEST, e.to_string()),
         })?;
 
@@ -159,6 +158,7 @@ pub async fn submit_ves_validity_proof(
 }
 
 /// GET /api/v1/ves/validity/:batch_id/proofs - List validity proofs for a batch.
+#[instrument(skip(state, auth), fields(batch_id = %batch_id))]
 pub async fn list_ves_validity_proofs(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -172,7 +172,7 @@ pub async fn list_ves_validity_proofs(
         .ves_validity_proof_store
         .list_proofs_for_batch(batch_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(internal_error)?;
 
     let proofs: Vec<serde_json::Value> = proofs
         .into_iter()
@@ -199,6 +199,7 @@ pub async fn list_ves_validity_proofs(
 }
 
 /// GET /api/v1/ves/validity/proofs/:proof_id - Get a validity proof by ID.
+#[instrument(skip(state, auth), fields(proof_id = %proof_id))]
 pub async fn get_ves_validity_proof(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -208,7 +209,7 @@ pub async fn get_ves_validity_proof(
         .ves_validity_proof_store
         .get_proof(proof_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(internal_error)?
         .ok_or((
             StatusCode::NOT_FOUND,
             "Validity proof not found".to_string(),
@@ -231,6 +232,7 @@ pub async fn get_ves_validity_proof(
 }
 
 /// GET /api/v1/ves/validity/proofs/:proof_id/verify - Verify a validity proof.
+#[instrument(skip(state, auth), fields(proof_id = %proof_id))]
 pub async fn verify_ves_validity_proof(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
@@ -240,7 +242,7 @@ pub async fn verify_ves_validity_proof(
         .ves_validity_proof_store
         .get_proof(proof_id)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(internal_error)?
         .ok_or((
             StatusCode::NOT_FOUND,
             "Validity proof not found".to_string(),
@@ -248,15 +250,19 @@ pub async fn verify_ves_validity_proof(
 
     ensure_read(&auth, proof.tenant_id.0, proof.store_id.0)?;
 
-    let commitment = match state.ves_commitment_reader.get_commitment(proof.batch_id).await {
+    let commitment = match state
+        .ves_commitment_reader
+        .get_commitment(proof.batch_id)
+        .await
+    {
         Ok(Some(commitment)) => commitment,
         Ok(None) => state
             .ves_commitment_engine
             .get_commitment(proof.batch_id)
             .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+            .map_err(internal_error)?
             .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))?,
-        Err(e) => return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        Err(e) => return Err(internal_error(e)),
     };
 
     if commitment.tenant_id.0 != proof.tenant_id.0 || commitment.store_id.0 != proof.store_id.0 {
@@ -269,8 +275,7 @@ pub async fn verify_ves_validity_proof(
     let canonical_public_inputs = ves_validity_public_inputs(&commitment);
     let canonical_public_inputs_hash = canonical_json_hash(&canonical_public_inputs);
 
-    let proof_hash_match =
-        compute_ves_validity_proof_hash(&proof.proof) == proof.proof_hash;
+    let proof_hash_match = compute_ves_validity_proof_hash(&proof.proof) == proof.proof_hash;
 
     let stored_public_inputs_hash = proof.public_inputs.as_ref().map(canonical_json_hash);
     let public_inputs_match = stored_public_inputs_hash

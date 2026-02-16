@@ -1,0 +1,22 @@
+apiVersion: v2
+name: stateset-sequencer
+description: A Helm chart for StateSet Sequencer - Verifiable Event Sync (VES) service
+type: application
+version: 0.2.4
+appVersion: "0.2.4"
+keywords:
+  - sequencer
+  - event-sourcing
+  - cryptocurrency
+  - blockchain
+home: https://github.com/stateset/stateset-sequencer
+sources:
+  - https://github.com/stateset/stateset-sequencer
+maintainers:
+  - name: StateSet
+    email: infrastructure@stateset.com
+icon: https://stateset.com/logo.png
+annotations:
+  artifacthub.io/category: infrastructure
+  artifacthub.io/changes: |
+    - Add Helm chart support

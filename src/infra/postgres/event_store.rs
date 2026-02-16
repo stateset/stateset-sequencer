@@ -20,6 +20,78 @@ pub struct PgEventStore {
 }
 
 impl PgEventStore {
+    const MAX_SEQUENCE: u64 = i64::MAX as u64;
+    const FIRST_SEQUENCE: u64 = 1;
+
+    fn decode_sequence(value: i64) -> Result<u64> {
+        u64::try_from(value).map_err(|_| SequencerError::InvariantViolation {
+            invariant: "sequence_counter".to_string(),
+            message: "sequence number must be a non-negative BIGINT".to_string(),
+        })
+    }
+
+    fn encode_sequence(value: u64) -> Result<i64> {
+        i64::try_from(value).map_err(|_| SequencerError::InvariantViolation {
+            invariant: "sequence_counter".to_string(),
+            message: format!("sequence number must be <= {}", Self::MAX_SEQUENCE),
+        })
+    }
+
+    fn normalize_range_start(start: u64) -> u64 {
+        if start == 0 {
+            Self::FIRST_SEQUENCE
+        } else {
+            start
+        }
+    }
+
+    fn ensure_sequence_contiguity(start: u64, events: &[SequencedEvent]) -> Result<u64> {
+        let mut expected = start;
+        let mut last = 0u64;
+
+        for event in events {
+            let sequence = event.sequence_number();
+            if sequence != expected {
+                return Err(SequencerError::InvariantViolation {
+                    invariant: "sequence_range".to_string(),
+                    message: format!(
+                        "non-contiguous event sequence: expected {expected}, got {sequence}"
+                    ),
+                });
+            }
+
+            expected = sequence.checked_add(1).ok_or_else(|| {
+                SequencerError::InvariantViolation {
+                    invariant: "sequence_range".to_string(),
+                    message: "sequence number overflow while validating range".to_string(),
+                }
+            })?;
+            last = sequence;
+        }
+
+        Ok(last)
+    }
+
+    async fn head_sequence(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+    ) -> Result<u64> {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COALESCE(MAX(sequence_number), 0)
+            FROM events
+            WHERE tenant_id = $1 AND store_id = $2
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Self::decode_sequence(row.0)
+    }
+
     /// Create a new PostgreSQL event store
     pub fn new(pool: PgPool, payload_encryption: Arc<PayloadEncryption>) -> Self {
         Self {
@@ -49,11 +121,12 @@ impl PgEventStore {
     }
 
     async fn decode_row(&self, row: EventRow) -> Result<SequencedEvent> {
+        let sequence_number = Self::decode_sequence(row.sequence_number)?;
         let aad = PayloadEncryption::aad_for_row(
             &row.tenant_id,
             &row.store_id,
             &row.event_id,
-            row.sequence_number as u64,
+            sequence_number,
             &row.entity_type,
             &row.entity_id,
             &row.event_type,
@@ -74,6 +147,7 @@ impl PgEventStore {
 
         Ok(SequencedEvent {
             envelope: EventEnvelope {
+                envelope_version: 1,
                 event_id: row.event_id,
                 command_id: row.command_id,
                 tenant_id: TenantId::from_uuid(row.tenant_id),
@@ -83,9 +157,9 @@ impl PgEventStore {
                 event_type: EventType::from(row.event_type.as_str()),
                 payload,
                 payload_hash,
-                base_version: row.base_version.map(|v| v as u64),
+                base_version: row.base_version.map(Self::decode_sequence).transpose()?,
                 created_at: row.created_at,
-                sequence_number: Some(row.sequence_number as u64),
+                sequence_number: Some(sequence_number),
                 source_agent: AgentId::from_uuid(row.source_agent),
                 signature: row.signature,
             },
@@ -105,6 +179,11 @@ impl EventStore for PgEventStore {
 
         for event in events {
             let env = &event.envelope;
+            let sequence_number = Self::encode_sequence(env.sequence_number.unwrap_or(0))?;
+            let base_version = env
+                .base_version
+                .map(Self::encode_sequence)
+                .transpose()?;
 
             let payload_bytes = serde_json::to_vec(&env.payload)
                 .map_err(|e| SequencerError::Internal(e.to_string()))?;
@@ -129,7 +208,7 @@ impl EventStore for PgEventStore {
             )
             .bind(env.event_id)
             .bind(env.command_id)
-            .bind(env.sequence_number.unwrap_or(0) as i64)
+            .bind(sequence_number)
             .bind(env.tenant_id.0)
             .bind(env.store_id.0)
             .bind(env.entity_type.as_str())
@@ -137,7 +216,7 @@ impl EventStore for PgEventStore {
             .bind(env.event_type.as_str())
             .bind(&payload_encrypted)
             .bind(&env.payload_hash[..])
-            .bind(env.base_version.map(|v| v as i64))
+            .bind(base_version)
             .bind(env.source_agent.0)
             .bind(env.signature.as_ref())
             .bind(env.created_at)
@@ -157,6 +236,15 @@ impl EventStore for PgEventStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<SequencedEvent>> {
+        if end < start {
+            return Ok(Vec::new());
+        }
+
+        let start = Self::normalize_range_start(start);
+        if start > end || end == 0 {
+            return Ok(Vec::new());
+        }
+
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT event_id, command_id, sequence_number,
@@ -173,8 +261,8 @@ impl EventStore for PgEventStore {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(start as i64)
-        .bind(end as i64)
+        .bind(Self::encode_sequence(start)?)
+        .bind(Self::encode_sequence(end)?)
         .fetch_all(&self.pool)
         .await?;
 
@@ -182,6 +270,30 @@ impl EventStore for PgEventStore {
         for row in rows {
             events.push(self.decode_row(row).await?);
         }
+
+        let head_sequence = self.head_sequence(tenant_id, store_id).await?;
+        if events.is_empty() {
+            if head_sequence >= start {
+                return Err(SequencerError::InvariantViolation {
+                    invariant: "sequence_range".to_string(),
+                    message: format!(
+                        "sequence gap in range {start}..={end}: head {head_sequence}"
+                    ),
+                });
+            }
+            return Ok(events);
+        }
+
+        let last_sequence = Self::ensure_sequence_contiguity(start, &events)?;
+        if last_sequence < end && head_sequence > last_sequence {
+            return Err(SequencerError::InvariantViolation {
+                invariant: "sequence_range".to_string(),
+                message: format!(
+                    "sequence gap in range {start}..={end}: last event {last_sequence}, head {head_sequence}"
+                ),
+            });
+        }
+
         Ok(events)
     }
 
@@ -204,6 +316,7 @@ impl EventStore for PgEventStore {
             WHERE tenant_id = $1 AND store_id = $2
               AND entity_type = $3 AND entity_id = $4
             ORDER BY sequence_number ASC
+            LIMIT 10000
             "#,
         )
         .bind(tenant_id.0)
@@ -291,8 +404,8 @@ impl PgEventStore {
         .bind(tenant_id.0)
         .bind(store_id.0)
         .bind(event_type.as_str())
-        .bind(start as i64)
-        .bind(end as i64)
+        .bind(Self::encode_sequence(start)?)
+        .bind(Self::encode_sequence(end)?)
         .fetch_all(&self.pool)
         .await?;
 
@@ -322,8 +435,8 @@ impl PgEventStore {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(start as i64)
-        .bind(end as i64)
+        .bind(Self::encode_sequence(start)?)
+        .bind(Self::encode_sequence(end)?)
         .fetch_all(&self.pool)
         .await?;
 
@@ -332,7 +445,7 @@ impl PgEventStore {
                 let hash_arr: Hash256 = hash
                     .try_into()
                     .map_err(|_| SequencerError::Internal("Invalid hash length".to_string()))?;
-                Ok((seq as u64, hash_arr))
+                Ok((Self::decode_sequence(seq)?, hash_arr))
             })
             .collect()
     }
@@ -355,12 +468,12 @@ impl PgEventStore {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(start as i64)
-        .bind(end as i64)
+        .bind(Self::encode_sequence(start)?)
+        .bind(Self::encode_sequence(end)?)
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(row.0 as u64)
+        Ok(Self::decode_sequence(row.0)?)
     }
 
     /// Get leaf inputs for a sequence range (for Merkle tree construction).
@@ -382,8 +495,8 @@ impl PgEventStore {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(start as i64)
-        .bind(end as i64)
+        .bind(Self::encode_sequence(start)?)
+        .bind(Self::encode_sequence(end)?)
         .fetch_all(&self.pool)
         .await?;
 
@@ -393,7 +506,7 @@ impl PgEventStore {
                     .try_into()
                     .map_err(|_| SequencerError::Internal("Invalid hash length".to_string()))?;
                 Ok(LeafInput {
-                    sequence_number: seq as u64,
+                    sequence_number: Self::decode_sequence(seq)?,
                     payload_hash: hash_arr,
                     entity_type,
                     entity_id,
@@ -430,4 +543,84 @@ struct EventRow {
     signature: Option<Vec<u8>>,
     created_at: DateTime<Utc>,
     sequenced_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn decode_sequence_rejects_negative() {
+        assert!(PgEventStore::decode_sequence(-1).is_err());
+    }
+
+    #[test]
+    fn encode_sequence_rejects_too_large() {
+        let too_large = PgEventStore::MAX_SEQUENCE + 1;
+        assert!(PgEventStore::encode_sequence(too_large).is_err());
+    }
+
+    #[test]
+    fn normalize_range_start_maps_zero_to_one() {
+        assert_eq!(PgEventStore::normalize_range_start(0), 1);
+    }
+
+    #[test]
+    fn ensure_sequence_contiguity_succeeds_for_consecutive_sequence() {
+        let envelope_one = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-1",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({}),
+            AgentId::new(),
+        );
+        let envelope_two = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-2",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({}),
+            AgentId::new(),
+        );
+
+        let events = vec![
+            SequencedEvent::new(envelope_one, 10),
+            SequencedEvent::new(envelope_two, 11),
+        ];
+
+        assert!(PgEventStore::ensure_sequence_contiguity(10, &events).is_ok());
+    }
+
+    #[test]
+    fn ensure_sequence_contiguity_detects_gap() {
+        let envelope_one = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-1",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({}),
+            AgentId::new(),
+        );
+        let envelope_two = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-2",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({}),
+            AgentId::new(),
+        );
+
+        let events = vec![
+            SequencedEvent::new(envelope_one, 10),
+            SequencedEvent::new(envelope_two, 12),
+        ];
+
+        assert!(PgEventStore::ensure_sequence_contiguity(10, &events).is_err());
+    }
 }

@@ -1,18 +1,17 @@
 //! gRPC Sequencer v2 service implementation
 //!
 //! Implements the VES v1.0 Protocol with bidirectional streaming support.
+#![allow(clippy::result_large_err)]
 
+use chrono::{DateTime, Utc};
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-
-use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::auth::{
@@ -20,9 +19,9 @@ use crate::auth::{
     KeyStatus as DomainKeyStatus, Permissions,
 };
 use crate::crypto::{
-    base64_url_decode, base64_url_encode, compute_cipher_hash_from_encrypted,
-    compute_payload_aad, compute_receipt_hash, payload_plain_hash, HpkeParams, PayloadAadParams,
-    PayloadEncrypted, Recipient, NONCE_SIZE, TAG_SIZE,
+    base64_url_decode, base64_url_encode, compute_cipher_hash_from_encrypted, compute_payload_aad,
+    compute_receipt_hash, payload_plain_hash, HpkeParams, PayloadAadParams, PayloadEncrypted,
+    Recipient, NONCE_SIZE, TAG_SIZE,
 };
 use crate::domain::{
     AgentId, AgentKeyId, EntityType, EventType, PayloadKind, SequencedVesEvent, StoreId, TenantId,
@@ -30,21 +29,47 @@ use crate::domain::{
 };
 use crate::infra::{
     postgres::VesRejectionReason, CacheManager, PgAgentKeyRegistry, PgVesCommitmentEngine,
-    VesSequencer,
+    VesSequencer, CACHE_STAMPEDE_DELAY,
 };
 use crate::proto::v2::{
     self,
-    sequencer_server::Sequencer as SequencerTrait,
     key_management_server::KeyManagement as KeyManagementTrait,
-    BatchCommitment, EventEnvelope, GetCommitmentRequest, GetEntityHistoryRequest,
-    GetEntityHistoryResponse, GetInclusionProofRequest, GetInclusionProofResponse,
-    GetSyncStateRequest, HealthResponse, InclusionProof, PullEventsRequest, PullEventsResponse,
-    PushRequest, PushResponse, RejectedEvent, RejectionReason, SequencedEvent, StreamEventsRequest,
-    SubscribeEntityRequest, SyncMessage, SyncState,
+    sequencer_server::Sequencer as SequencerTrait,
+    BatchCommitment,
+    EventEnvelope,
     // Key management types
-    GetAgentKeysRequest, GetAgentKeysResponse, KeyType,
-    RegisterKeyRequest, RegisterKeyResponse, RevokeKeyRequest, RevokeKeyResponse,
+    GetAgentKeysRequest,
+    GetAgentKeysResponse,
+    GetCommitmentRequest,
+    GetEntityHistoryRequest,
+    GetEntityHistoryResponse,
+    GetInclusionProofRequest,
+    GetInclusionProofResponse,
+    GetSyncStateRequest,
+    HealthResponse,
+    InclusionProof,
+    KeyType,
+    PullEventsRequest,
+    PullEventsResponse,
+    PushRequest,
+    PushResponse,
+    RegisterKeyRequest,
+    RegisterKeyResponse,
+    RejectedEvent,
+    RejectionReason,
+    RevokeKeyRequest,
+    RevokeKeyResponse,
+    SequencedEvent,
+    StreamEventsRequest,
+    SubscribeEntityRequest,
+    SyncMessage,
+    SyncState,
 };
+
+/// Maximum events allowed in a single gRPC push request.
+const MAX_GRPC_BATCH_SIZE: usize = 1000;
+/// Maximum entity history events returned per request.
+const MAX_ENTITY_HISTORY: usize = 100;
 
 /// gRPC Sequencer v2 service implementation
 pub struct SequencerServiceV2 {
@@ -152,8 +177,10 @@ impl SequencerServiceV2 {
     }
 
     fn rfc3339_to_timestamp(value: &str) -> Result<prost_types::Timestamp, Status> {
-        let dt = DateTime::parse_from_rfc3339(value)
-            .map_err(|e| Status::internal(format!("invalid created_at: {}", e)))?;
+        let dt = DateTime::parse_from_rfc3339(value).map_err(|e| {
+            tracing::error!("invalid created_at: {e}");
+            Status::internal("internal error")
+        })?;
         let dt = dt.with_timezone(&Utc);
         Ok(prost_types::Timestamp {
             seconds: dt.timestamp(),
@@ -275,8 +302,7 @@ impl SequencerServiceV2 {
                     .as_ref()
                     .ok_or_else(|| Status::internal("missing plaintext payload"))?;
                 (
-                    serde_json::to_vec(payload)
-                        .map_err(|e| Status::internal(format!("payload encode error: {}", e)))?,
+                    serde_json::to_vec(payload).map_err(super::grpc_internal_error)?,
                     None,
                 )
             }
@@ -371,8 +397,10 @@ impl SequencerServiceV2 {
 
         let payload = match payload_kind {
             PayloadKind::Plaintext => {
-                let payload: serde_json::Value = serde_json::from_slice(&proto.payload)
-                    .map_err(|e| Status::invalid_argument(format!("invalid payload JSON: {}", e)))?;
+                let payload: serde_json::Value =
+                    serde_json::from_slice(&proto.payload).map_err(|e| {
+                        Status::invalid_argument(format!("invalid payload JSON: {}", e))
+                    })?;
                 Some(payload)
             }
             PayloadKind::Encrypted => None,
@@ -420,6 +448,23 @@ impl SequencerServiceV2 {
                 ))
             }
         };
+
+        // Validate string field lengths (matching HTTP-side limits)
+        if proto.entity_type.is_empty() || proto.entity_type.len() > 128 {
+            return Err(Status::invalid_argument(
+                "entity_type must be between 1 and 128 characters",
+            ));
+        }
+        if proto.entity_id.is_empty() || proto.entity_id.len() > 512 {
+            return Err(Status::invalid_argument(
+                "entity_id must be between 1 and 512 characters",
+            ));
+        }
+        if proto.event_type.is_empty() || proto.event_type.len() > 256 {
+            return Err(Status::invalid_argument(
+                "event_type must be between 1 and 256 characters",
+            ));
+        }
 
         let payload_aad = payload_encrypted.as_ref().map(|_| {
             compute_payload_aad(&PayloadAadParams {
@@ -538,7 +583,7 @@ impl SequencerServiceV2 {
         let events = ves_sequencer
             .read_range(tenant_id, store_id, start, end)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(super::grpc_sequencer_error)?;
 
         for event in events {
             let proto_event = Self::to_proto_event(&event)?;
@@ -552,6 +597,7 @@ impl SequencerServiceV2 {
 #[tonic::async_trait]
 impl SequencerTrait for SequencerServiceV2 {
     /// Push a batch of events for sequencing
+    #[instrument(skip(self, request))]
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushResponse>, Status> {
         let auth_ctx = Self::auth_context(&request);
         let req = request.into_inner();
@@ -567,6 +613,13 @@ impl SequencerTrait for SequencerServiceV2 {
 
         if req.events.is_empty() {
             return Err(Status::invalid_argument("events must not be empty"));
+        }
+        if req.events.len() > MAX_GRPC_BATCH_SIZE {
+            return Err(Status::resource_exhausted(format!(
+                "batch size {} exceeds maximum of {}",
+                req.events.len(),
+                MAX_GRPC_BATCH_SIZE,
+            )));
         }
 
         let tenant_id = Uuid::parse_str(&req.tenant_id)
@@ -614,9 +667,10 @@ impl SequencerTrait for SequencerServiceV2 {
                     .collect();
 
                 if receipt.events_accepted > 0 {
-                    if let (Some(start), Some(end)) =
-                        (receipt.assigned_sequence_start, receipt.assigned_sequence_end)
-                    {
+                    if let (Some(start), Some(end)) = (
+                        receipt.assigned_sequence_start,
+                        receipt.assigned_sequence_end,
+                    ) {
                         if let Err(e) = Self::broadcast_range(
                             self.ves_sequencer.as_ref(),
                             &self.event_tx,
@@ -646,12 +700,13 @@ impl SequencerTrait for SequencerServiceV2 {
             }
             Err(e) => {
                 error!(error = %e, "Push failed");
-                Err(Status::internal(e.to_string()))
+                Err(super::grpc_internal_error(e))
             }
         }
     }
 
     /// Pull events (unary, for simple polling)
+    #[instrument(skip(self, request))]
     async fn pull_events(
         &self,
         request: Request<PullEventsRequest>,
@@ -675,7 +730,33 @@ impl SequencerTrait for SequencerServiceV2 {
 
         let tenant_id = TenantId(tenant_id);
         let store_id = StoreId(store_id);
-        let limit = if req.limit == 0 { 100 } else { req.limit.min(1000) } as u64;
+        let limit = if req.limit == 0 {
+            100
+        } else {
+            req.limit.min(1000)
+        } as u64;
+
+        // Validate filter field lengths
+        if req.entity_type_filter.len() > 128 {
+            return Err(Status::invalid_argument(
+                "entity_type_filter must not exceed 128 characters",
+            ));
+        }
+        if req.entity_id_filter.len() > 512 {
+            return Err(Status::invalid_argument(
+                "entity_id_filter must not exceed 512 characters",
+            ));
+        }
+        if req.event_type_filter.len() > 100 {
+            return Err(Status::invalid_argument(
+                "event_type_filter must not exceed 100 entries",
+            ));
+        }
+        if req.agent_filter.len() > 100 {
+            return Err(Status::invalid_argument(
+                "agent_filter must not exceed 100 entries",
+            ));
+        }
 
         Self::require_read(&auth_ctx)?;
         Self::authorize_tenant_store(&auth_ctx, &tenant_id, &store_id)?;
@@ -685,7 +766,7 @@ impl SequencerTrait for SequencerServiceV2 {
             .ves_sequencer
             .head(&tenant_id, &store_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(super::grpc_internal_error)?;
 
         // Read events (replica -> primary fallback)
         let mut events = self
@@ -694,30 +775,30 @@ impl SequencerTrait for SequencerServiceV2 {
                 &tenant_id,
                 &store_id,
                 req.from_sequence,
-                req.from_sequence
-                    .saturating_add(limit)
-                    .saturating_sub(1),
+                req.from_sequence.saturating_add(limit).saturating_sub(1),
             )
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(super::grpc_sequencer_error)?;
 
         if events.is_empty() {
-            let expected_start = if req.from_sequence == 0 { 1 } else { req.from_sequence };
-            if head >= expected_start {
-                events = self
-                    .ves_sequencer
-                    .read_range(
-                        &tenant_id,
-                        &store_id,
-                        req.from_sequence,
-                        req.from_sequence
-                            .saturating_add(limit)
-                            .saturating_sub(1),
-                    )
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                let expected_start = if req.from_sequence == 0 {
+                    1
+                } else {
+                    req.from_sequence
+                };
+                if head >= expected_start {
+                    events = self
+                        .ves_sequencer
+                        .read_range(
+                            &tenant_id,
+                            &store_id,
+                            req.from_sequence,
+                            req.from_sequence.saturating_add(limit).saturating_sub(1),
+                        )
+                        .await
+                        .map_err(super::grpc_sequencer_error)?;
+                }
             }
-        }
 
         // Apply filters if specified
         let filtered_events: Vec<_> = events
@@ -750,10 +831,7 @@ impl SequencerTrait for SequencerServiceV2 {
             })
             .collect();
 
-        let end_sequence = req
-            .from_sequence
-            .saturating_add(limit)
-            .saturating_sub(1);
+        let end_sequence = req.from_sequence.saturating_add(limit).saturating_sub(1);
         let has_more = head > end_sequence;
 
         // Convert to proto events
@@ -800,20 +878,18 @@ impl SequencerTrait for SequencerServiceV2 {
             .ves_sequencer
             .head(&tenant_id, &store_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(super::grpc_internal_error)?;
 
         let cache = &self.cache_manager.ves_commitments;
         let mut lock_acquired = false;
         let mut latest_commitment = cache.get_latest(&tenant_id.0, &store_id.0).await;
         if latest_commitment.is_none() {
-            let (cached, lock) = cache
-                .get_latest_with_lock(&tenant_id.0, &store_id.0)
-                .await;
+            let (cached, lock) = cache.get_latest_with_lock(&tenant_id.0, &store_id.0).await;
             lock_acquired = lock;
             latest_commitment = cached;
 
             if latest_commitment.is_none() && !lock_acquired {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
                 latest_commitment = cache.get_latest(&tenant_id.0, &store_id.0).await;
             }
 
@@ -832,11 +908,9 @@ impl SequencerTrait for SequencerServiceV2 {
                         Ok(commitment) => commitment,
                         Err(e) => {
                             if lock_acquired {
-                                cache
-                                    .release_latest_lock(&tenant_id.0, &store_id.0)
-                                    .await;
+                                cache.release_latest_lock(&tenant_id.0, &store_id.0).await;
                             }
-                            return Err(Status::internal(e.to_string()));
+                            return Err(super::grpc_internal_error(e));
                         }
                     },
                     Err(_) => match self
@@ -847,11 +921,9 @@ impl SequencerTrait for SequencerServiceV2 {
                         Ok(commitment) => commitment,
                         Err(e) => {
                             if lock_acquired {
-                                cache
-                                    .release_latest_lock(&tenant_id.0, &store_id.0)
-                                    .await;
+                                cache.release_latest_lock(&tenant_id.0, &store_id.0).await;
                             }
-                            return Err(Status::internal(e.to_string()));
+                            return Err(super::grpc_internal_error(e));
                         }
                     },
                 };
@@ -864,9 +936,7 @@ impl SequencerTrait for SequencerServiceV2 {
         }
 
         if lock_acquired {
-            cache
-                .release_latest_lock(&tenant_id.0, &store_id.0)
-                .await;
+            cache.release_latest_lock(&tenant_id.0, &store_id.0).await;
         }
 
         let state_root = latest_commitment
@@ -888,6 +958,7 @@ impl SequencerTrait for SequencerServiceV2 {
     }
 
     /// Get Merkle inclusion proof
+    #[instrument(skip(self, request))]
     async fn get_inclusion_proof(
         &self,
         request: Request<GetInclusionProofRequest>,
@@ -917,13 +988,13 @@ impl SequencerTrait for SequencerServiceV2 {
                         .ves_sequencer
                         .read_by_id(event_id)
                         .await
-                        .map_err(|e| Status::internal(e.to_string()))?
+                        .map_err(super::grpc_internal_error)?
                         .ok_or_else(|| Status::not_found("event not found"))?,
                     Err(_) => self
                         .ves_sequencer
                         .read_by_id(event_id)
                         .await
-                        .map_err(|e| Status::internal(e.to_string()))?
+                        .map_err(super::grpc_internal_error)?
                         .ok_or_else(|| Status::not_found("event not found"))?,
                 }
             }
@@ -932,13 +1003,13 @@ impl SequencerTrait for SequencerServiceV2 {
                     .ves_sequencer_reader
                     .read_range(&tenant_id, &store_id, seq, seq)
                     .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
+                    .map_err(super::grpc_sequencer_error)?;
                 if events.is_empty() {
                     events = self
                         .ves_sequencer
                         .read_range(&tenant_id, &store_id, seq, seq)
                         .await
-                        .map_err(|e| Status::internal(e.to_string()))?;
+                        .map_err(super::grpc_sequencer_error)?;
                 }
                 events
                     .into_iter()
@@ -967,13 +1038,13 @@ impl SequencerTrait for SequencerServiceV2 {
                 .ves_commitment_engine
                 .get_commitment_by_sequence(&tenant_id, &store_id, seq)
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(super::grpc_internal_error)?
                 .ok_or_else(|| Status::not_found("no commitment found"))?,
             Err(_) => self
                 .ves_commitment_engine
                 .get_commitment_by_sequence(&tenant_id, &store_id, seq)
                 .await
-                .map_err(|e| Status::internal(e.to_string()))?
+                .map_err(super::grpc_internal_error)?
                 .ok_or_else(|| Status::not_found("no commitment found"))?,
         };
 
@@ -996,10 +1067,11 @@ impl SequencerTrait for SequencerServiceV2 {
 
         let proof_cache = &self.cache_manager.ves_proofs;
         if let Some(proof) = proof_cache.get(&tenant_id.0, &store_id.0, seq).await {
-            if self
-                .ves_commitment_reader
-                .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
-            {
+            if self.ves_commitment_reader.verify_inclusion(
+                proof.leaf_hash,
+                &proof,
+                commitment.merkle_root,
+            ) {
                 return Ok(Response::new(GetInclusionProofResponse {
                     included: true,
                     proof: Some(InclusionProof {
@@ -1018,10 +1090,11 @@ impl SequencerTrait for SequencerServiceV2 {
             .get_with_lock(&tenant_id.0, &store_id.0, seq)
             .await;
         if let Some(proof) = cached {
-            if self
-                .ves_commitment_reader
-                .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
-            {
+            if self.ves_commitment_reader.verify_inclusion(
+                proof.leaf_hash,
+                &proof,
+                commitment.merkle_root,
+            ) {
                 return Ok(Response::new(GetInclusionProofResponse {
                     included: true,
                     proof: Some(InclusionProof {
@@ -1037,12 +1110,13 @@ impl SequencerTrait for SequencerServiceV2 {
         }
 
         if !lock_acquired {
-            tokio::time::sleep(Duration::from_millis(25)).await;
+            tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
             if let Some(proof) = proof_cache.get(&tenant_id.0, &store_id.0, seq).await {
-                if self
-                    .ves_commitment_reader
-                    .verify_inclusion(proof.leaf_hash, &proof, commitment.merkle_root)
-                {
+                if self.ves_commitment_reader.verify_inclusion(
+                    proof.leaf_hash,
+                    &proof,
+                    commitment.merkle_root,
+                ) {
                     return Ok(Response::new(GetInclusionProofResponse {
                         included: true,
                         proof: Some(InclusionProof {
@@ -1074,7 +1148,7 @@ impl SequencerTrait for SequencerServiceV2 {
                         .release_lock(&tenant_id.0, &store_id.0, seq)
                         .await;
                 }
-                return Err(Status::internal(e.to_string()));
+                return Err(super::grpc_internal_error(e));
             }
         };
 
@@ -1084,7 +1158,8 @@ impl SequencerTrait for SequencerServiceV2 {
                     .release_lock(&tenant_id.0, &store_id.0, seq)
                     .await;
             }
-            return Err(Status::internal("commitment range contains no events"));
+            error!("commitment range contains no events");
+            return Err(Status::internal("internal error"));
         }
 
         let computed_root = self.ves_commitment_reader.compute_merkle_root(&leaves);
@@ -1101,7 +1176,7 @@ impl SequencerTrait for SequencerServiceV2 {
                             .release_lock(&tenant_id.0, &store_id.0, seq)
                             .await;
                     }
-                    return Err(Status::internal(e.to_string()));
+                    return Err(super::grpc_internal_error(e));
                 }
             };
             let computed_root_primary = self.ves_commitment_engine.compute_merkle_root(&leaves);
@@ -1111,9 +1186,8 @@ impl SequencerTrait for SequencerServiceV2 {
                         .release_lock(&tenant_id.0, &store_id.0, seq)
                         .await;
                 }
-                return Err(Status::internal(
-                    "commitment merkle_root does not match ves_events",
-                ));
+                error!("commitment merkle_root does not match ves_events");
+                return Err(Status::internal("internal error"));
             }
         }
 
@@ -1128,7 +1202,7 @@ impl SequencerTrait for SequencerServiceV2 {
                         .release_lock(&tenant_id.0, &store_id.0, seq)
                         .await;
                 }
-                return Err(Status::internal(e.to_string()));
+                return Err(super::grpc_internal_error(e));
             }
         };
 
@@ -1155,6 +1229,7 @@ impl SequencerTrait for SequencerServiceV2 {
     }
 
     /// Get batch commitment
+    #[instrument(skip(self, request))]
     async fn get_commitment(
         &self,
         request: Request<GetCommitmentRequest>,
@@ -1179,41 +1254,39 @@ impl SequencerTrait for SequencerServiceV2 {
                     commitment = cached;
 
                     if commitment.is_none() && !lock_acquired {
-                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
                         commitment = cache.get_by_batch_id(&batch_id).await;
                     }
 
                     if commitment.is_none() {
-                        let fetched = match self.ves_commitment_reader.get_commitment(batch_id).await
-                        {
-                            Ok(Some(commitment)) => Some(commitment),
-                            Ok(None) => match self
-                                .ves_commitment_engine
-                                .get_commitment(batch_id)
-                                .await
-                            {
-                                Ok(commitment) => commitment,
-                                Err(e) => {
-                                    if lock_acquired {
-                                        cache.release_batch_id_lock(&batch_id).await;
+                        let fetched =
+                            match self.ves_commitment_reader.get_commitment(batch_id).await {
+                                Ok(Some(commitment)) => Some(commitment),
+                                Ok(None) => {
+                                    match self.ves_commitment_engine.get_commitment(batch_id).await
+                                    {
+                                        Ok(commitment) => commitment,
+                                        Err(e) => {
+                                            if lock_acquired {
+                                                cache.release_batch_id_lock(&batch_id).await;
+                                            }
+                                            return Err(super::grpc_internal_error(e));
+                                        }
                                     }
-                                    return Err(Status::internal(e.to_string()));
                                 }
-                            },
-                            Err(_) => match self
-                                .ves_commitment_engine
-                                .get_commitment(batch_id)
-                                .await
-                            {
-                                Ok(commitment) => commitment,
-                                Err(e) => {
-                                    if lock_acquired {
-                                        cache.release_batch_id_lock(&batch_id).await;
+                                Err(_) => {
+                                    match self.ves_commitment_engine.get_commitment(batch_id).await
+                                    {
+                                        Ok(commitment) => commitment,
+                                        Err(e) => {
+                                            if lock_acquired {
+                                                cache.release_batch_id_lock(&batch_id).await;
+                                            }
+                                            return Err(super::grpc_internal_error(e));
+                                        }
                                     }
-                                    return Err(Status::internal(e.to_string()));
                                 }
-                            },
-                        };
+                            };
 
                         commitment = fetched;
                         fetched_from_db = true;
@@ -1260,13 +1333,13 @@ impl SequencerTrait for SequencerServiceV2 {
                         .ves_commitment_engine
                         .get_commitment_by_sequence(&tenant_id, &store_id, seq)
                         .await
-                        .map_err(|e| Status::internal(e.to_string()))?
+                        .map_err(super::grpc_internal_error)?
                         .ok_or_else(|| Status::not_found("commitment not found"))?,
                     Err(_) => self
                         .ves_commitment_engine
                         .get_commitment_by_sequence(&tenant_id, &store_id, seq)
                         .await
-                        .map_err(|e| Status::internal(e.to_string()))?
+                        .map_err(super::grpc_internal_error)?
                         .ok_or_else(|| Status::not_found("commitment not found"))?,
                 }
             }
@@ -1286,6 +1359,7 @@ impl SequencerTrait for SequencerServiceV2 {
     }
 
     /// Get entity event history
+    #[instrument(skip(self, request))]
     async fn get_entity_history(
         &self,
         request: Request<GetEntityHistoryRequest>,
@@ -1300,6 +1374,18 @@ impl SequencerTrait for SequencerServiceV2 {
 
         let tenant_id = TenantId(tenant_id);
         let store_id = StoreId(store_id);
+
+        if req.entity_type.is_empty() || req.entity_type.len() > 128 {
+            return Err(Status::invalid_argument(
+                "entity_type must be between 1 and 128 characters",
+            ));
+        }
+        if req.entity_id.is_empty() || req.entity_id.len() > 512 {
+            return Err(Status::invalid_argument(
+                "entity_id must be between 1 and 512 characters",
+            ));
+        }
+
         let entity_type = EntityType::from(req.entity_type.as_str());
 
         Self::require_read(&auth_ctx)?;
@@ -1309,20 +1395,51 @@ impl SequencerTrait for SequencerServiceV2 {
             .ves_sequencer_reader
             .read_entity(&tenant_id, &store_id, &entity_type, &req.entity_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(super::grpc_internal_error)?;
 
         let current_version = events.len() as u64;
+        let requested_from_version = if req.from_version == 0 { 1 } else { req.from_version };
+        let requested_to_version = if req.to_version == 0 {
+            current_version
+        } else {
+            req.to_version
+        };
+
+        if current_version == 0 || requested_from_version > current_version {
+            return Ok(Response::new(GetEntityHistoryResponse {
+                events: Vec::new(),
+                current_version,
+            }));
+        }
+
+        let to_version = requested_to_version.min(current_version);
+        if req.to_version != 0 && requested_from_version > requested_to_version {
+            return Err(Status::invalid_argument(
+                "from_version must be less than or equal to to_version",
+            ));
+        }
+
+        let requested_limit = if req.limit == 0 {
+            MAX_ENTITY_HISTORY as u32
+        } else {
+            req.limit
+        };
+        let limit = (requested_limit as usize).min(MAX_ENTITY_HISTORY);
+        let max_records = to_version
+            .saturating_sub(requested_from_version)
+            .saturating_add(1);
+        let take_count = max_records
+            .min(limit as u64) as usize;
+        let start_index = usize::try_from(requested_from_version - 1).map_err(|_| {
+            Status::invalid_argument("from_version is out of range")
+        })?;
 
         // Apply version range filter
         let filtered_events: Vec<_> = events
             .into_iter()
             .enumerate()
-            .filter(|(version, _)| {
-                let v = (*version + 1) as u64;
-                (req.from_version == 0 || v >= req.from_version)
-                    && (req.to_version == 0 || v <= req.to_version)
-            })
-            .take(if req.limit > 0 { req.limit as usize } else { 100 })
+            .skip(start_index)
+            .take(take_count)
             .map(|(_, e)| e)
             .collect();
 
@@ -1376,6 +1493,23 @@ impl SequencerTrait for SequencerServiceV2 {
         let tenant_id_clone = TenantId(tenant_id);
         let store_id_clone = StoreId(store_id);
 
+        // Validate filter field lengths
+        if req.entity_type_filter.len() > 100 {
+            return Err(Status::invalid_argument(
+                "entity_type_filter must not exceed 100 entries",
+            ));
+        }
+        if req.event_type_filter.len() > 100 {
+            return Err(Status::invalid_argument(
+                "event_type_filter must not exceed 100 entries",
+            ));
+        }
+        if req.agent_filter.len() > 100 {
+            return Err(Status::invalid_argument(
+                "agent_filter must not exceed 100 entries",
+            ));
+        }
+
         Self::require_read(&auth_ctx)?;
         Self::authorize_tenant_store(&auth_ctx, &tenant_id_clone, &store_id_clone)?;
 
@@ -1401,10 +1535,11 @@ impl SequencerTrait for SequencerServiceV2 {
                             from_sequence.saturating_add(99),
                         )
                         .await
+                        .map_err(super::grpc_sequencer_error)
                     {
                         Ok(e) => e,
                         Err(e) => {
-                            let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                            let _ = tx.send(Err(e)).await;
                             return;
                         }
                     };
@@ -1523,13 +1658,7 @@ impl SequencerTrait for SequencerServiceV2 {
             let allowed_store_ids: Option<HashSet<String>> = if auth_ctx.store_ids.is_empty() {
                 None
             } else {
-                Some(
-                    auth_ctx
-                        .store_ids
-                        .iter()
-                        .map(|id| id.to_string())
-                        .collect(),
-                )
+                Some(auth_ctx.store_ids.iter().map(|id| id.to_string()).collect())
             };
 
             // Handle inbound messages
@@ -1654,7 +1783,7 @@ impl SequencerTrait for SequencerServiceV2 {
                                                 })).await;
                                             }
                                             Err(e) => {
-                                                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                                                let _ = tx.send(Err(super::grpc_internal_error(e))).await;
                                             }
                                         }
                                     }
@@ -1690,12 +1819,16 @@ impl SequencerTrait for SequencerServiceV2 {
                                             .from_sequence
                                             .saturating_add(limit)
                                             .saturating_sub(1);
-                                        match ves_sequencer.read_range(&tenant_id, &store_id, pull_req.from_sequence, end_sequence).await {
+                                        match ves_sequencer
+                                            .read_range(&tenant_id, &store_id, pull_req.from_sequence, end_sequence)
+                                            .await
+                                            .map_err(super::grpc_sequencer_error)
+                                        {
                                             Ok(events) => {
                                                 let head = match ves_sequencer.head(&tenant_id, &store_id).await {
                                                     Ok(head) => head,
                                                     Err(e) => {
-                                                        let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                                                        let _ = tx.send(Err(super::grpc_internal_error(e))).await;
                                                         continue;
                                                     }
                                                 };
@@ -1753,7 +1886,7 @@ impl SequencerTrait for SequencerServiceV2 {
                                                 })).await;
                                             }
                                             Err(e) => {
-                                                let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                                                let _ = tx.send(Err(e)).await;
                                             }
                                         }
                                     }
@@ -1850,6 +1983,18 @@ impl SequencerTrait for SequencerServiceV2 {
 
         let tenant_id_cmp = TenantId(tenant_id);
         let store_id_cmp = StoreId(store_id);
+
+        if req.entity_type.is_empty() || req.entity_type.len() > 128 {
+            return Err(Status::invalid_argument(
+                "entity_type must be between 1 and 128 characters",
+            ));
+        }
+        if req.entity_id.is_empty() || req.entity_id.len() > 512 {
+            return Err(Status::invalid_argument(
+                "entity_id must be between 1 and 512 characters",
+            ));
+        }
+
         let entity_type = EntityType::from(req.entity_type.as_str());
 
         Self::require_read(&auth_ctx)?;
@@ -1885,7 +2030,7 @@ impl SequencerTrait for SequencerServiceV2 {
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(Err(Status::internal(e.to_string()))).await;
+                        let _ = tx.send(Err(super::grpc_internal_error(e))).await;
                         return;
                     }
                 }
@@ -1900,10 +2045,9 @@ impl SequencerTrait for SequencerServiceV2 {
                                 && env.store_id == store_id.to_string()
                                 && env.entity_type == entity_type_str
                                 && env.entity_id == entity_id
+                                && tx.send(Ok(event)).await.is_err()
                             {
-                                if tx.send(Ok(event)).await.is_err() {
-                                    break;
-                                }
+                                break;
                             }
                         }
                     }
@@ -1964,14 +2108,10 @@ impl KeyManagementServiceV2 {
         field: &str,
     ) -> Result<DateTime<Utc>, Status> {
         if ts.nanos < 0 || ts.nanos > 999_999_999 {
-            return Err(Status::invalid_argument(format!(
-                "invalid {} nanos",
-                field
-            )));
+            return Err(Status::invalid_argument(format!("invalid {} nanos", field)));
         }
-        DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32).ok_or_else(|| {
-            Status::invalid_argument(format!("invalid {} timestamp", field))
-        })
+        DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+            .ok_or_else(|| Status::invalid_argument(format!("invalid {} timestamp", field)))
     }
 
     fn datetime_to_timestamp(dt: &DateTime<Utc>) -> prost_types::Timestamp {
@@ -2011,9 +2151,7 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
 
         let key_type = KeyType::try_from(req.key_type).unwrap_or(KeyType::Unspecified);
         if key_type != KeyType::Signing {
-            return Err(Status::unimplemented(
-                "only signing keys are supported",
-            ));
+            return Err(Status::unimplemented("only signing keys are supported"));
         }
 
         if req.public_key.len() != 32 {
@@ -2052,10 +2190,8 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
             .register_key(&lookup, entry)
             .await
             .map_err(|e| match e {
-                AgentKeyError::KeyAlreadyExists => {
-                    Status::already_exists("key already exists")
-                }
-                _ => Status::internal(e.to_string()),
+                AgentKeyError::KeyAlreadyExists => Status::already_exists("key already exists"),
+                _ => super::grpc_internal_error(e),
             })?;
 
         Ok(Response::new(RegisterKeyResponse {
@@ -2090,7 +2226,8 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
         let tenant_id = TenantId(tenant_id);
         Self::authorize_tenant(&auth_ctx, &tenant_id)?;
 
-        let key_type_filter = KeyType::try_from(req.key_type_filter).unwrap_or(KeyType::Unspecified);
+        let key_type_filter =
+            KeyType::try_from(req.key_type_filter).unwrap_or(KeyType::Unspecified);
         if key_type_filter == KeyType::Encryption {
             return Ok(Response::new(GetAgentKeysResponse { keys: vec![] }));
         }
@@ -2100,7 +2237,7 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
             .registry
             .list_agent_keys(&tenant_id.0, &agent_id)
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(super::grpc_internal_error)?;
 
         let mut keys = Vec::with_capacity(entries.len());
         for (key_id, entry) in entries {
@@ -2166,7 +2303,7 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
             .await
             .map_err(|e| match e {
                 AgentKeyError::KeyNotFound { .. } => Status::not_found("key not found"),
-                _ => Status::internal(e.to_string()),
+                _ => super::grpc_internal_error(e),
             })?;
 
         Ok(Response::new(RevokeKeyResponse {

@@ -101,7 +101,11 @@ impl std::fmt::Display for VesRejectionReason {
             Self::UnsupportedVersion => write!(f, "unsupported_version"),
             Self::SchemaValidation(msg) => write!(f, "schema_validation: {}", msg),
             Self::VersionConflict { expected, actual } => {
-                write!(f, "version_conflict: expected {}, actual {}", expected, actual)
+                write!(
+                    f,
+                    "version_conflict: expected {}, actual {}",
+                    expected, actual
+                )
             }
         }
     }
@@ -171,10 +175,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     fn encode_sequence(value: u64) -> Result<i64> {
         i64::try_from(value).map_err(|_| SequencerError::InvariantViolation {
             invariant: "sequence_counter".to_string(),
-            message: format!(
-                "sequence counter must be <= {}",
-                Self::MAX_SEQUENCE
-            ),
+            message: format!("sequence counter must be <= {}", Self::MAX_SEQUENCE),
         })
     }
 
@@ -182,10 +183,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         if head > Self::MAX_SEQUENCE {
             return Err(SequencerError::InvariantViolation {
                 invariant: "sequence_counter".to_string(),
-                message: format!(
-                    "sequence counter must be <= {}",
-                    Self::MAX_SEQUENCE
-                ),
+                message: format!("sequence counter must be <= {}", Self::MAX_SEQUENCE),
             });
         }
         if count == 0 {
@@ -195,19 +193,16 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             invariant: "sequence_counter".to_string(),
             message: "sequence counter increment overflow".to_string(),
         })?;
-        let last = head
-            .checked_add(count_u64)
-            .ok_or_else(|| SequencerError::InvariantViolation {
-                invariant: "sequence_counter".to_string(),
-                message: "sequence counter overflow".to_string(),
-            })?;
+        let last =
+            head.checked_add(count_u64)
+                .ok_or_else(|| SequencerError::InvariantViolation {
+                    invariant: "sequence_counter".to_string(),
+                    message: "sequence counter overflow".to_string(),
+                })?;
         if last > Self::MAX_SEQUENCE {
             return Err(SequencerError::InvariantViolation {
                 invariant: "sequence_counter".to_string(),
-                message: format!(
-                    "sequence counter must be <= {}",
-                    Self::MAX_SEQUENCE
-                ),
+                message: format!("sequence counter must be <= {}", Self::MAX_SEQUENCE),
             });
         }
         Ok(())
@@ -282,6 +277,54 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 )
             })
             .unwrap_or(false)
+    }
+
+    fn normalize_range_start(start: u64) -> u64 {
+        if start == 0 { 1 } else { start }
+    }
+
+    fn ensure_sequence_contiguity(start: u64, events: &[SequencedVesEvent]) -> Result<u64> {
+        let mut expected = start;
+        let mut last = 0u64;
+
+        for event in events {
+            let sequence = event.sequence_number();
+            if sequence != expected {
+                return Err(SequencerError::InvariantViolation {
+                    invariant: "sequence_range".to_string(),
+                    message: format!(
+                        "non-contiguous event sequence: expected {expected}, got {sequence}"
+                    ),
+                });
+            }
+            expected = sequence.checked_add(1).ok_or_else(|| SequencerError::InvariantViolation {
+                invariant: "sequence_range".to_string(),
+                message: "sequence number overflow while validating range".to_string(),
+            })?;
+            last = sequence;
+        }
+
+        Ok(last)
+    }
+
+    async fn head_sequence(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+    ) -> Result<u64> {
+        let row: (i64,) = sqlx::query_as(
+            r#"
+            SELECT COALESCE(MAX(sequence_number), 0)
+            FROM ves_events
+            WHERE tenant_id = $1 AND store_id = $2
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Self::decode_sequence(row.0)
     }
 
     /// Create a new VES sequencer
@@ -412,12 +455,11 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         tx: &mut Transaction<'_, Postgres>,
         event_id: Uuid,
     ) -> Result<Option<ExistingVesEvent>> {
-        let row: Option<ExistingVesEvent> = sqlx::query_as(
-            "SELECT tenant_id, store_id FROM ves_events WHERE event_id = $1",
-        )
-        .bind(event_id)
-        .fetch_optional(&mut **tx)
-        .await?;
+        let row: Option<ExistingVesEvent> =
+            sqlx::query_as("SELECT tenant_id, store_id FROM ves_events WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_optional(&mut **tx)
+                .await?;
 
         Ok(row)
     }
@@ -500,14 +542,14 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             |field: &str, value: &str| -> std::result::Result<Vec<u8>, VesRejectedEvent> {
                 let bytes = base64_url_decode(value)
                     .map_err(|_| reject(field, "must be base64url".to_string()))?;
-            if strict_format && base64_url_encode(&bytes) != value {
-                return Err(reject(
-                    field,
-                    "must be canonical base64url without padding".to_string(),
-                ));
-            }
-            Ok(bytes)
-        };
+                if strict_format && base64_url_encode(&bytes) != value {
+                    return Err(reject(
+                        field,
+                        "must be canonical base64url without padding".to_string(),
+                    ));
+                }
+                Ok(bytes)
+            };
 
         if encrypted.enc_version != 1 {
             return Some(reject(
@@ -562,11 +604,13 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             ));
         }
 
-        let ciphertext =
-            match decode_base64("payload_encrypted.ciphertext_b64u", &encrypted.ciphertext_b64u) {
-                Ok(bytes) => bytes,
-                Err(rejection) => return Some(rejection),
-            };
+        let ciphertext = match decode_base64(
+            "payload_encrypted.ciphertext_b64u",
+            &encrypted.ciphertext_b64u,
+        ) {
+            Ok(bytes) => bytes,
+            Err(rejection) => return Some(rejection),
+        };
         if ciphertext.is_empty() {
             return Some(reject(
                 "payload_encrypted.ciphertext_b64u",
@@ -604,13 +648,11 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             }
             last_kid = Some(recipient.recipient_kid);
 
-            let enc = match decode_base64(
-                "payload_encrypted.recipients.enc_b64u",
-                &recipient.enc_b64u,
-            ) {
-                Ok(bytes) => bytes,
-                Err(rejection) => return Some(rejection),
-            };
+            let enc =
+                match decode_base64("payload_encrypted.recipients.enc_b64u", &recipient.enc_b64u) {
+                    Ok(bytes) => bytes,
+                    Err(rejection) => return Some(rejection),
+                };
             if enc.len() != RECIPIENT_ENC_SIZE {
                 return Some(reject(
                     "payload_encrypted.recipients.enc_b64u",
@@ -618,10 +660,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 ));
             }
 
-            let ct = match decode_base64(
-                "payload_encrypted.recipients.ct_b64u",
-                &recipient.ct_b64u,
-            ) {
+            let ct = match decode_base64("payload_encrypted.recipients.ct_b64u", &recipient.ct_b64u)
+            {
                 Ok(bytes) => bytes,
                 Err(rejection) => return Some(rejection),
             };
@@ -843,6 +883,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
         let event_signing_hash = event.compute_signing_hash();
         let sequence_number = Self::encode_sequence(event.sequence_number())?;
+        let base_version = env
+            .base_version
+            .map(Self::encode_sequence)
+            .transpose()?;
 
         // Serialize payload or encrypted payload
         let (payload_json, encrypted_json) = if env.is_plaintext() {
@@ -908,7 +952,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .bind(event_signing_hash.as_slice())
         .bind(env.agent_signature.as_slice())
         .bind(sequence_number)
-        .bind(env.base_version.map(|v| v as i64))
+            .bind(base_version)
         .execute(&mut **tx)
         .await?;
 
@@ -996,6 +1040,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             SELECT version
             FROM entity_versions
             WHERE tenant_id = $1 AND store_id = $2 AND entity_type = $3 AND entity_id = $4
+            FOR UPDATE
             "#,
         )
         .bind(tenant_id.0)
@@ -1005,14 +1050,13 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .fetch_optional(&mut **tx)
         .await?;
 
-        Ok(row
-            .map(|(v,)| {
-                u64::try_from(v).map_err(|_| SequencerError::InvariantViolation {
-                    invariant: "entity_version".to_string(),
-                    message: "entity version must be non-negative".to_string(),
-                })
+        row.map(|(v,)| {
+            u64::try_from(v).map_err(|_| SequencerError::InvariantViolation {
+                invariant: "entity_version".to_string(),
+                message: "entity version must be non-negative".to_string(),
             })
-            .transpose()?)
+        })
+        .transpose()
     }
 
     /// Bump entity version within a transaction
@@ -1258,21 +1302,21 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 }
             }
 
-            let next_seq = head.checked_add(1).ok_or_else(|| {
-                SequencerError::InvariantViolation {
-                    invariant: "sequence_counter".to_string(),
-                    message: "sequence counter overflow".to_string(),
-                }
-            })?;
+            let next_seq =
+                head.checked_add(1)
+                    .ok_or_else(|| SequencerError::InvariantViolation {
+                        invariant: "sequence_counter".to_string(),
+                        message: "sequence counter overflow".to_string(),
+                    })?;
             let sequenced = SequencedVesEvent::new(event, next_seq);
 
             let inserted = self.store_event_tx(&mut tx, &sequenced).await?;
             if !inserted {
                 if let Some(cmd_id) = sequenced.envelope.command_id {
                     if reserved_command_ids.contains(&cmd_id) {
-                        let existing_cmd_id =
-                            self.fetch_existing_command_id_tx(&mut tx, sequenced.event_id())
-                                .await?;
+                        let existing_cmd_id = self
+                            .fetch_existing_command_id_tx(&mut tx, sequenced.event_id())
+                            .await?;
                         if existing_cmd_id != Some(cmd_id) {
                             self.release_command_id_tx(&mut tx, &tenant_id, &store_id, cmd_id)
                                 .await?;
@@ -1466,7 +1510,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(after_sequence as i64)
+        .bind(Self::encode_sequence(after_sequence)?)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await?;
@@ -1490,6 +1534,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         if end < start {
             return Ok(Vec::new());
         }
+        let start = Self::normalize_range_start(start);
+        if start > end || end == 0 {
+            return Ok(Vec::new());
+        }
 
         let rows: Vec<VesEventRow> = sqlx::query_as(
             r#"
@@ -1511,14 +1559,37 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(start as i64)
-        .bind(end as i64)
+        .bind(Self::encode_sequence(start)?)
+        .bind(Self::encode_sequence(end)?)
         .fetch_all(&self.pool)
         .await?;
 
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
             events.push(Self::decode_event_row(row)?);
+        }
+
+        let head_sequence = self.head_sequence(tenant_id, store_id).await?;
+        if events.is_empty() {
+            if head_sequence >= start {
+                return Err(SequencerError::InvariantViolation {
+                    invariant: "sequence_range".to_string(),
+                    message: format!(
+                        "sequence gap in range {start}..={end}: head {head_sequence}"
+                    ),
+                });
+            }
+            return Ok(events);
+        }
+
+        let last_sequence = Self::ensure_sequence_contiguity(start, &events)?;
+        if last_sequence < end && head_sequence > last_sequence {
+            return Err(SequencerError::InvariantViolation {
+                invariant: "sequence_range".to_string(),
+                message: format!(
+                    "sequence gap in range {start}..={end}: last event {last_sequence}, head {head_sequence}"
+                ),
+            });
         }
 
         Ok(events)
@@ -1548,6 +1619,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             WHERE tenant_id = $1 AND store_id = $2
               AND entity_type = $3 AND entity_id = $4
             ORDER BY sequence_number ASC
+            LIMIT 10000
             "#,
         )
         .bind(tenant_id.0)
@@ -1704,8 +1776,9 @@ mod tests {
             payload_plain_hash: &payload_plain_hash,
         };
         let payload_aad = compute_payload_aad(&aad_params);
-        let payload_cipher_hash = compute_cipher_hash_from_encrypted(&payload_encrypted, &payload_aad)
-            .expect("payload_encrypted should be decodable");
+        let payload_cipher_hash =
+            compute_cipher_hash_from_encrypted(&payload_encrypted, &payload_aad)
+                .expect("payload_encrypted should be decodable");
 
         let signing_params = EventSigningParams {
             ves_version: VES_VERSION,
@@ -1934,11 +2007,7 @@ mod tests {
     async fn validate_event_rejects_encrypted_invalid_nonce() {
         let signing_key = AgentSigningKey::generate();
         let mut event = build_encrypted_event(&signing_key, valid_payload_encrypted());
-        event
-            .payload_encrypted
-            .as_mut()
-            .unwrap()
-            .nonce_b64u = "!!!".to_string();
+        event.payload_encrypted.as_mut().unwrap().nonce_b64u = "!!!".to_string();
 
         let registry = Arc::new(InMemoryAgentKeyRegistry::new());
         register_key(&registry, &event, &signing_key).await;
@@ -1993,8 +2062,7 @@ mod tests {
     #[test]
     fn sequence_capacity_rejects_overflow() {
         let head = VesSequencer::<InMemoryAgentKeyRegistry>::MAX_SEQUENCE;
-        let result =
-            VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_capacity(head, 1);
+        let result = VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_capacity(head, 1);
         assert!(result.is_err());
     }
 
@@ -2002,5 +2070,32 @@ mod tests {
     fn decode_sequence_rejects_negative() {
         let result = VesSequencer::<InMemoryAgentKeyRegistry>::decode_sequence(-1);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn normalize_range_start_maps_zero_to_one() {
+        assert_eq!(VesSequencer::<InMemoryAgentKeyRegistry>::normalize_range_start(0), 1);
+    }
+
+    #[test]
+    fn ensure_sequence_contiguity_succeeds_for_consecutive_events() {
+        let signing_key = AgentSigningKey::generate();
+        let events = vec![
+            SequencedVesEvent::new(build_encrypted_event(&signing_key, valid_payload_encrypted()), 10),
+            SequencedVesEvent::new(build_encrypted_event(&signing_key, valid_payload_encrypted()), 11),
+        ];
+
+        assert!(VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_contiguity(10, &events).is_ok());
+    }
+
+    #[test]
+    fn ensure_sequence_contiguity_detects_gap() {
+        let signing_key = AgentSigningKey::generate();
+        let events = vec![
+            SequencedVesEvent::new(build_encrypted_event(&signing_key, valid_payload_encrypted()), 10),
+            SequencedVesEvent::new(build_encrypted_event(&signing_key, valid_payload_encrypted()), 12),
+        ];
+
+        assert!(VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_contiguity(10, &events).is_err());
     }
 }
