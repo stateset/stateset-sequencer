@@ -23,7 +23,8 @@ spec:
         fsGroup: 1000
       containers:
         - name: sequencer
-          image: us-central1-docker.pkg.dev/stateset-network/stateset-container/stateset-sequencer@sha256:009562008f8d87d2cbd959f4f6d11dcbcb8dd89b32a8317c39952606c5792751
+          # Set this to your built image before applying (or via a kustomize patch/overlay).
+          image: "${SEQUENCER_IMAGE}"
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
@@ -71,7 +72,7 @@ spec:
             - "--health-check"
             - "--http-address=0.0.0.0"
             - "--port=5432"
-            - "stateset-network:us-central1:stateset-prod"
+            - "${CLOUD_SQL_INSTANCE_CONNECTION_NAME}"
           securityContext:
             runAsUser: 65532
             runAsNonRoot: true

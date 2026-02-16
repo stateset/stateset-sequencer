@@ -1250,7 +1250,7 @@ prefix for legacy clients.
   "success": true,
   "agentId": "uuid",
   "tenantId": "uuid",
-  "apiKey": "sk_live_...",
+  "apiKey": "your_api_key",
   "permissions": "read_write",
   "message": "Agent registered successfully. Store your API key securely - it cannot be retrieved later."
 }
@@ -1536,7 +1536,7 @@ Coming soon: webhook notifications for events.
 {
   "webhook_url": "https://your-app.com/webhooks/events",
   "events": ["order.created", "order.shipped"],
-  "secret": "whsec_..."
+  "secret": "your_webhook_secret",
 }
 ```
 
@@ -1555,7 +1555,7 @@ import { SequencerClient } from '@stateset/sequencer-client';
 
 const client = new SequencerClient({
   baseUrl: 'https://sequencer.stateset.io',
-  apiKey: 'sk_live_...',
+  apiKey: 'your_api_key',
   tenantId: 'your-tenant-id',
   storeId: 'your-store-id',
 });

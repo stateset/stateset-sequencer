@@ -68,6 +68,8 @@ coverage-integration/
 # Kubernetes manifests
 k8s/*.local.yaml
 k8s/*.local.yml
+k8s/*-secrets.yaml
+k8s/*-secrets.yml
 k8s/sequencer-secrets.yaml
 k8s/secret.local.yaml
 

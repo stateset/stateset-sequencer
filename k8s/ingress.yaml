@@ -16,10 +16,10 @@ spec:
   ingressClassName: nginx
   tls:
     - hosts:
-        - api.sequencer.stateset.app
+        - "${SEQ_API_HOST}"
       secretName: sequencer-tls
   rules:
-    - host: api.sequencer.stateset.app
+    - host: "${SEQ_API_HOST}"
       http:
         paths:
           - path: /
