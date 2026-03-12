@@ -211,7 +211,7 @@ pub async fn commit_and_anchor_ves_commitment(
         .insert(commitment.clone())
         .await;
 
-    if commitment.is_anchored() {
+    if commitment.is_submitted() {
         return Ok(Json(serde_json::json!({
             "batch_id": commitment.batch_id,
             "status": "already_anchored",
@@ -353,10 +353,10 @@ pub async fn notify_ves_commitment_anchored(
         )
     })?;
 
-    if commitment.is_anchored() {
+    if commitment.is_submitted() {
         let existing = commitment.chain_tx_hash.ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Commitment marked as anchored but missing tx hash".to_string(),
+            "Commitment marked as submitted but missing tx hash".to_string(),
         ))?;
         if existing == tx_hash {
             return Ok(Json(serde_json::json!({

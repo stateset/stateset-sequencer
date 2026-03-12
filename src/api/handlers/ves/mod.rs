@@ -24,6 +24,8 @@ use crate::server::AppState;
 
 /// Generate canonical public inputs for VES validity proofs.
 pub fn ves_validity_public_inputs(commitment: &VesBatchCommitment) -> serde_json::Value {
+    const ZERO_HASH: [u8; 32] = [0u8; 32];
+
     serde_json::json!({
         "batchId": commitment.batch_id,
         "tenantId": commitment.tenant_id.0,
@@ -37,6 +39,9 @@ pub fn ves_validity_public_inputs(commitment: &VesBatchCommitment) -> serde_json
         "newStateRoot": hex::encode(commitment.new_state_root),
         "sequenceStart": commitment.sequence_range.0,
         "sequenceEnd": commitment.sequence_range.1,
+        "allCompliant": true,
+        "policyHash": hex::encode(ZERO_HASH),
+        "policyLimit": 0,
     })
 }
 

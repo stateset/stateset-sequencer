@@ -12,6 +12,7 @@
 //! - Audit logging (admin operations)
 //! - Dead letter queue (failed projections)
 
+mod anchor_worker;
 mod audit;
 mod batch;
 mod cache;
@@ -72,6 +73,7 @@ pub use traits::*;
 pub use ves_commitment::PgVesCommitmentEngine;
 pub use ves_compliance::{PgVesComplianceProofStore, VesComplianceEventInputs};
 pub use ves_validity::PgVesValidityProofStore;
+pub use anchor_worker::{spawn_anchor_worker, AnchorWorkerConfig, AnchorWorkerMessage};
 pub use x402_batch_worker::{
     spawn_batch_worker, BatchWorkerMessage, X402BatchWorker, X402BatchWorkerConfig,
 };

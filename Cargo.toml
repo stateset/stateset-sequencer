@@ -103,6 +103,7 @@ hex = "0.4"
 # StateSet STARK (Winterfell) verification
 ves-stark-verifier = { path = "../stateset-stark/crates/ves-stark-verifier" }
 ves-stark-primitives = { path = "../stateset-stark/crates/ves-stark-primitives" }
+ves-stark-batch = { path = "../stateset-stark/crates/ves-stark-batch" }
 
 # Ethereum/EVM interaction
 alloy = { version = "0.8", features = ["full", "signer-local"] }

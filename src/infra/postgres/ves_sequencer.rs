@@ -64,6 +64,7 @@ struct ExistingReceiptRow {
     sequenced_at: chrono::DateTime<Utc>,
     receipt_hash: Vec<u8>,
     sequencer_signature: Option<Vec<u8>>,
+    sequencer_key_version: i32,
 }
 
 /// Rejection reason for VES events
@@ -119,7 +120,7 @@ pub struct VesRejectedEvent {
     pub message: String,
 }
 
-/// Sequencer receipt per VES v1.0 Section 6.4
+/// Sequencer receipt per VES v1.0 Section 10.3
 #[derive(Debug, Clone)]
 pub struct VesSequencerReceipt {
     /// Sequencer identifier
@@ -136,6 +137,8 @@ pub struct VesSequencerReceipt {
     pub signature_alg: String,
     /// Sequencer signature over receipt_hash
     pub sequencer_signature: Option<Signature64>,
+    /// Key rotation index for the signing key (Section 10.5)
+    pub sequencer_key_version: u32,
 }
 
 /// VES ingest receipt
@@ -158,6 +161,8 @@ pub struct VesSequencer<R: AgentKeyRegistry> {
     sequencer_id: Uuid,
     /// Optional sequencer signing key for receipts
     sequencer_signing_key: Option<AgentSigningKey>,
+    /// Key rotation index for the signing key (monotonic)
+    sequencer_key_version: u32,
     /// Enforce strict formatting for VES hex/base64url fields
     strict_format_validation: bool,
 }
@@ -334,6 +339,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             key_registry,
             sequencer_id: Uuid::new_v4(),
             sequencer_signing_key: None,
+            sequencer_key_version: 0,
             strict_format_validation: Self::strict_format_from_env(),
         }
     }
@@ -347,6 +353,12 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     /// Set the sequencer signing key for receipts
     pub fn with_signing_key(mut self, key: AgentSigningKey) -> Self {
         self.sequencer_signing_key = Some(key);
+        self
+    }
+
+    /// Set the signing key version (monotonic rotation index, Section 10.5)
+    pub fn with_signing_key_version(mut self, version: u32) -> Self {
+        self.sequencer_key_version = version;
         self
     }
 
@@ -471,7 +483,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     ) -> Result<Option<VesSequencerReceipt>> {
         let row: Option<ExistingReceiptRow> = sqlx::query_as(
             r#"
-            SELECT sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature
+            SELECT sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature, sequencer_key_version
             FROM ves_sequencer_receipts
             WHERE event_id = $1
             "#,
@@ -516,6 +528,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             receipt_hash,
             signature_alg,
             sequencer_signature,
+            sequencer_key_version: row.sequencer_key_version as u32,
         }))
     }
 
@@ -691,28 +704,28 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         }
 
         let entity_type = event.entity_type.as_str();
-        if entity_type.is_empty() || entity_type.len() > 64 {
+        if entity_type.is_empty() || entity_type.len() > 128 {
             return Some(VesRejectedEvent {
                 event_id: event.event_id,
                 reason: VesRejectionReason::SchemaValidation("entity_type".to_string()),
-                message: "entity_type must be 1-64 characters".to_string(),
+                message: "entity_type must be 1-128 characters".to_string(),
             });
         }
 
-        if event.entity_id.is_empty() || event.entity_id.len() > 256 {
+        if event.entity_id.is_empty() || event.entity_id.len() > 512 {
             return Some(VesRejectedEvent {
                 event_id: event.event_id,
                 reason: VesRejectionReason::SchemaValidation("entity_id".to_string()),
-                message: "entity_id must be 1-256 characters".to_string(),
+                message: "entity_id must be 1-512 characters".to_string(),
             });
         }
 
         let event_type = event.event_type.as_str();
-        if event_type.is_empty() || event_type.len() > 64 {
+        if event_type.is_empty() || event_type.len() > 256 {
             return Some(VesRejectedEvent {
                 event_id: event.event_id,
                 reason: VesRejectionReason::SchemaValidation("event_type".to_string()),
-                message: "event_type must be 1-64 characters".to_string(),
+                message: "event_type must be 1-256 characters".to_string(),
             });
         }
 
@@ -968,9 +981,9 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         sqlx::query(
             r#"
             INSERT INTO ves_sequencer_receipts (
-                event_id, sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature
+                event_id, sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature, sequencer_key_version
             )
-            SELECT $1, $2, $3, $4, $5, $6
+            SELECT $1, $2, $3, $4, $5, $6, $7
             WHERE NOT EXISTS (
                 SELECT 1 FROM ves_sequencer_receipts WHERE event_id = $1
             )
@@ -987,6 +1000,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 .as_ref()
                 .map(|sig| sig.as_slice()),
         )
+        .bind(receipt.sequencer_key_version as i32)
         .execute(&mut **tx)
         .await?;
 
@@ -1115,6 +1129,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             receipt_hash,
             signature_alg,
             sequencer_signature,
+            sequencer_key_version: self.sequencer_key_version,
         }
     }
 
@@ -1691,6 +1706,7 @@ mod tests {
             key_registry: registry,
             sequencer_id: Uuid::new_v4(),
             sequencer_signing_key: None,
+            sequencer_key_version: 0,
             strict_format_validation: strict_format,
         }
     }

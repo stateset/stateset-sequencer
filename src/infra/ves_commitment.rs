@@ -946,6 +946,115 @@ impl PgVesCommitmentEngine {
         rows.into_iter().map(VesBatchCommitment::try_from).collect()
     }
 
+    /// Record a pending anchor transaction (submitted but not yet finalized).
+    /// Sets chain_id, chain_tx_hash, chain_block_number but NOT anchored_at.
+    pub async fn update_chain_tx_pending(
+        &self,
+        batch_id: Uuid,
+        chain_id: u32,
+        tx_hash: Hash256,
+        chain_block_number: Option<u64>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE ves_commitments
+            SET chain_id = $1,
+                chain_tx_hash = $2,
+                chain_block_number = $3
+            WHERE batch_id = $4
+              AND anchored_at IS NULL
+            "#,
+        )
+        .bind(chain_id as i32)
+        .bind(&tx_hash[..])
+        .bind(chain_block_number.map(|v| v as i64))
+        .bind(batch_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Confirm a commitment as finalized on-chain (set anchored_at).
+    pub async fn confirm_anchored(&self, batch_id: Uuid) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE ves_commitments
+            SET anchored_at = NOW()
+            WHERE batch_id = $1
+              AND chain_tx_hash IS NOT NULL
+              AND anchored_at IS NULL
+            "#,
+        )
+        .bind(batch_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List commitments that have been submitted (chain_tx_hash set) but not
+    /// yet finalized (anchored_at is NULL).
+    pub async fn list_pending_finality(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<VesBatchCommitment>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let rows: Vec<VesCommitmentRow> = sqlx::query_as(
+            r#"
+            SELECT
+                batch_id,
+                tenant_id,
+                store_id,
+                ves_version,
+                tree_depth,
+                leaf_count,
+                padded_leaf_count,
+                merkle_root,
+                prev_state_root,
+                new_state_root,
+                sequence_start,
+                sequence_end,
+                committed_at,
+                chain_id,
+                chain_tx_hash,
+                chain_block_number,
+                anchored_at
+            FROM ves_commitments
+            WHERE chain_tx_hash IS NOT NULL
+              AND anchored_at IS NULL
+            ORDER BY committed_at ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(VesBatchCommitment::try_from).collect()
+    }
+
+    /// Clear anchor state for a commitment (reorg recovery).
+    /// Resets chain_tx_hash, chain_block_number, and anchored_at to NULL,
+    /// returning the commitment to the unanchored pool.
+    pub async fn clear_chain_tx(&self, batch_id: Uuid) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE ves_commitments
+            SET chain_id = NULL,
+                chain_tx_hash = NULL,
+                chain_block_number = NULL,
+                anchored_at = NULL
+            WHERE batch_id = $1
+            "#,
+        )
+        .bind(batch_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn leaf_hash_for_sequence(
         &self,
         tenant_id: &TenantId,

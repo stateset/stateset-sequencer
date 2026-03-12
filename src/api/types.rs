@@ -57,6 +57,7 @@ pub struct VesReceiptResponse {
     pub receipt_hash: String,
     pub signature_alg: String,
     pub sequencer_signature: String,
+    pub sequencer_key_version: u32,
 }
 
 /// Response for VES event ingestion.

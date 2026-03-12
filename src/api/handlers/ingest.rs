@@ -849,6 +849,7 @@ pub async fn ingest_ves_events(
                         .as_ref()
                         .map(hex::encode)
                         .unwrap_or_default(),
+                    sequencer_key_version: r.sequencer_key_version,
                 })
                 .collect();
 

@@ -5155,6 +5155,7 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
+ "ves-stark-batch",
  "ves-stark-primitives",
  "ves-stark-prover",
  "ves-stark-verifier",
@@ -6001,7 +6002,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "ves-stark-air"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "thiserror 2.0.17",
@@ -6012,8 +6013,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "ves-stark-batch"
+version = "0.2.1"
+dependencies = [
+ "hex",
+ "rayon",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "thiserror 2.0.17",
+ "uuid",
+ "ves-stark-air",
+ "ves-stark-primitives",
+ "ves-stark-prover",
+ "ves-stark-verifier",
+ "winter-air",
+ "winter-crypto",
+ "winter-math",
+ "winter-prover",
+ "winter-verifier",
+]
+
+[[package]]
 name = "ves-stark-primitives"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hex",
  "serde",
@@ -6029,7 +6052,7 @@ dependencies = [
 
 [[package]]
 name = "ves-stark-prover"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -6048,7 +6071,7 @@ dependencies = [
 
 [[package]]
 name = "ves-stark-verifier"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hex",
  "serde",

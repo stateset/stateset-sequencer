@@ -42,11 +42,19 @@ spec:
             limits:
               memory: "1Gi"
               cpu: "1000m"
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
           livenessProbe:
             httpGet:
               path: /health
               port: http
-            initialDelaySeconds: 10
+            initialDelaySeconds: 0
             periodSeconds: 30
             timeoutSeconds: 5
             failureThreshold: 3
@@ -54,7 +62,7 @@ spec:
             httpGet:
               path: /ready
               port: http
-            initialDelaySeconds: 5
+            initialDelaySeconds: 0
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3

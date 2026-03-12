@@ -248,7 +248,16 @@ fn print_command_help_hint(command: &str) {
             eprintln!("Options:");
             eprintln!("  Use `stateset-sequencer-admin {command} --help` for full option list.");
         }
-        None => {
+        (Some(usage), None) => {
+            eprintln!("Usage:");
+            eprintln!("  stateset-sequencer-admin {usage}");
+            eprintln!("Description:");
+            eprintln!("  (No synopsis available)");
+            eprintln!();
+            eprintln!("Options:");
+            eprintln!("  Use `stateset-sequencer-admin {command} --help` for full option list.");
+        }
+        (None, None) => {
             eprintln!("unknown command: {command}");
             if let Some(suggestion) = suggest_command(command) {
                 eprintln!("Did you mean: {suggestion}?");
@@ -1823,7 +1832,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
 
-            if commitment.is_anchored() {
+            if commitment.is_submitted() {
                 println!(
                     "ok: already anchored batch_id={} chain_tx_hash={}",
                     commitment.batch_id,

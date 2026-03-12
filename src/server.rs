@@ -48,7 +48,8 @@ use crate::infra::{
     CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry, PgAuditLogger,
     PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer, PgVesCommitmentEngine,
     PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository, PoolMonitor,
-    SchemaValidationMode, SecretsProvider, VesSequencer, X402BatchWorkerConfig, spawn_batch_worker,
+    AnchorWorkerConfig, AnchorWorkerMessage, SchemaValidationMode, SecretsProvider, VesSequencer,
+    X402BatchWorkerConfig, spawn_batch_worker, spawn_anchor_worker,
 };
 use crate::metrics::{ComponentMetrics, MetricsRegistry};
 
@@ -255,6 +256,79 @@ fn read_u64_env(var: &str, default: u64) -> u64 {
         .max(1)
 }
 
+fn parse_bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
+    match std::env::var(name) {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "on" | "yes" => Ok(true),
+            "0" | "false" | "off" | "no" => Ok(false),
+            _ => Err(anyhow::anyhow!(
+                "Invalid value for {name}: '{raw}'. Expected true/false, 1/0, on/off, or yes/no"
+            )),
+        },
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_u16_env(name: &str, default: u16) -> anyhow::Result<u16> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<u16>()
+            .map_err(|_| anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected 0..=65535")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_optional_positive_u32(name: &str) -> anyhow::Result<Option<u32>> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw
+                .parse::<u32>()
+                .map_err(|_| anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer"))?;
+            if value == 0 {
+                return Err(anyhow::anyhow!(
+                    "Invalid value for {name}: '{raw}'. Expected a value greater than 0"
+                ));
+            }
+            Ok(Some(value))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn parse_optional_positive_u64(name: &str) -> anyhow::Result<Option<u64>> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw
+                .parse::<u64>()
+                .map_err(|_| anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer"))?;
+            if value == 0 {
+                return Err(anyhow::anyhow!(
+                    "Invalid value for {name}: '{raw}'. Expected a value greater than 0"
+                ));
+            }
+            Ok(Some(value))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn parse_optional_positive_usize(name: &str) -> anyhow::Result<Option<usize>> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw
+                .parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer"))?;
+            if value == 0 {
+                return Err(anyhow::anyhow!(
+                    "Invalid value for {name}: '{raw}'. Expected a value greater than 0"
+                ));
+            }
+            Ok(Some(value))
+        }
+        Err(_) => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum AuthMode {
     Required,
@@ -270,18 +344,6 @@ fn parse_auth_mode() -> anyhow::Result<AuthMode> {
             "Invalid AUTH_MODE value: {auth_mode}; expected required or disabled"
         )),
     }
-}
-
-fn parse_truthy_env(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
-        .unwrap_or(false)
 }
 
 /// Server configuration.
@@ -317,10 +379,7 @@ impl Config {
             .ok()
             .filter(|v| !v.trim().is_empty());
 
-        let port: u16 = std::env::var("PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(8080);
+        let port: u16 = parse_u16_env("PORT", 8080)?;
 
         let host = std::env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
 
@@ -330,13 +389,19 @@ impl Config {
 
         // gRPC port configuration (defaults to HTTP port + 1, e.g., 8081 if HTTP is 8080)
         let grpc_addr: Option<SocketAddr> =
-            if std::env::var("GRPC_DISABLED").is_ok() {
+            if parse_bool_env("GRPC_DISABLED", false)? {
                 None
             } else {
-                let grpc_port: u16 = std::env::var("GRPC_PORT")
-                    .ok()
-                    .and_then(|p| p.parse().ok())
-                    .unwrap_or(port + 1);
+        let grpc_port: u16 = match std::env::var("GRPC_PORT") {
+            Ok(raw) => raw
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("Invalid value for GRPC_PORT: '{raw}'. Expected 0..=65535"))?,
+            Err(_) => port.checked_add(1).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "PORT is 65535 and GRPC_PORT is not set; set GRPC_PORT explicitly to avoid overflow"
+                )
+            })?,
+        };
                 Some(format!("{host}:{grpc_port}").parse().map_err(|e| {
                     anyhow::anyhow!("Invalid gRPC address '{host}:{grpc_port}': {e}")
                 })?)
@@ -423,6 +488,48 @@ async fn build_pg_pool(
     });
 
     Ok(options.connect(url).await?)
+}
+
+/// Connect to PostgreSQL with retry logic for startup resilience.
+///
+/// This gives sidecar proxies (e.g. Cloud SQL Proxy) time to become ready
+/// before the sequencer gives up.
+async fn connect_with_retry(
+    label: &str,
+    url: &str,
+    pool_config: &DbPoolConfig,
+    session_config: &DbSessionConfig,
+    max_retries: u32,
+    retry_delay_secs: u64,
+) -> anyhow::Result<sqlx::PgPool> {
+    let mut last_err = None;
+    for attempt in 1..=(max_retries + 1) {
+        match build_pg_pool(url, pool_config, session_config).await {
+            Ok(pool) => {
+                info!("Connected to PostgreSQL ({label}) on attempt {attempt}");
+                return Ok(pool);
+            }
+            Err(e) => {
+                if attempt <= max_retries {
+                    warn!(
+                        attempt,
+                        max_retries,
+                        error = %e,
+                        "Failed to connect to PostgreSQL ({label}), retrying in {retry_delay_secs}s..."
+                    );
+                    tokio::time::sleep(Duration::from_secs(retry_delay_secs)).await;
+                } else {
+                    tracing::error!(
+                        attempt,
+                        error = %e,
+                        "Failed to connect to PostgreSQL ({label}) after all retries"
+                    );
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Failed to connect to PostgreSQL ({label})")))
 }
 
 /// Application state shared across handlers.
@@ -564,7 +671,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Auth configuration
     let auth_mode = parse_auth_mode()?;
-    let allow_auth_disabled = parse_truthy_env("ALLOW_AUTH_DISABLED");
+    let allow_auth_disabled = parse_bool_env("ALLOW_AUTH_DISABLED", false)?;
     let require_auth = match auth_mode {
         AuthMode::Required => true,
         AuthMode::Disabled if !allow_auth_disabled => {
@@ -625,57 +732,38 @@ pub async fn run() -> anyhow::Result<()> {
         None => None,
     };
 
-    let rate_limiter = std::env::var("RATE_LIMIT_PER_MINUTE")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|v| *v > 0)
+    let rate_limiter = parse_optional_positive_u32("RATE_LIMIT_PER_MINUTE")?
         .map(|rpm| Arc::new(RateLimiter::new(rpm)));
 
-    let public_registration_enabled = std::env::var("PUBLIC_AGENT_REGISTRATION_ENABLED")
-        .ok()
-        .map(|v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off"
-            )
-        })
-        .unwrap_or(true);
+    let public_registration_enabled = parse_bool_env("PUBLIC_AGENT_REGISTRATION_ENABLED", true)?;
 
-    let public_registration_limiter =
-        std::env::var("PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .filter(|v| *v > 0)
-            .map(|rpm| {
-                let mut config = RateLimiterConfig {
-                    requests_per_minute: rpm,
-                    ..Default::default()
-                };
-                if let Some(max_entries) = std::env::var("PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                {
-                    config.max_entries = max_entries;
-                }
-                if let Some(window_seconds) =
-                    std::env::var("PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS")
-                        .ok()
-                        .and_then(|v| v.parse::<u64>().ok())
-                {
-                    config.window_seconds = window_seconds;
-                }
-                Arc::new(RateLimiter::with_config(config))
-            });
+    let public_registration_limiter = if let Some(rpm) =
+        parse_optional_positive_u32("PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE")?
+    {
+        let mut config = RateLimiterConfig {
+            requests_per_minute: rpm,
+            ..Default::default()
+        };
+        if let Some(max_entries) = parse_optional_positive_usize("PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES")? {
+            config.max_entries = max_entries;
+        }
+        if let Some(window_seconds) =
+            parse_optional_positive_u64("PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS")?
+        {
+            config.window_seconds = window_seconds;
+        }
+        Some(Arc::new(RateLimiter::with_config(config)))
+    } else if public_registration_enabled {
+        warn!("PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE is unset; defaulting to 30 requests/minute");
+        Some(Arc::new(RateLimiter::with_config(RateLimiterConfig {
+            requests_per_minute: 30,
+            ..Default::default()
+        })))
+    } else {
+        None
+    };
 
-    let trust_proxy_headers = std::env::var("TRUST_PROXY_HEADERS")
-        .ok()
-        .map(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "on" | "yes"
-            )
-        })
-        .unwrap_or(false);
+    let trust_proxy_headers = parse_bool_env("TRUST_PROXY_HEADERS", false)?;
 
     let admin_allowlist = parse_admin_allowlist()?;
     if let Some(list) = &admin_allowlist {
@@ -723,18 +811,39 @@ pub async fn run() -> anyhow::Result<()> {
         config.cache.ves_proof_ttl_secs
     );
 
-    // Connect to PostgreSQL
-    info!("Connecting to PostgreSQL (primary)...");
-    let pool = build_pg_pool(&config.database_url, &config.write_pool, &config.session).await?;
-    info!("Connected to PostgreSQL (primary)");
+    // Connect to PostgreSQL with retry (allows Cloud SQL Proxy sidecar time to start)
+    let max_startup_retries: u32 = std::env::var("DB_STARTUP_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10);
+    let startup_retry_delay_secs: u64 = std::env::var("DB_STARTUP_RETRY_DELAY_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+
+    info!("Connecting to PostgreSQL (primary), max retries: {max_startup_retries}...");
+    let pool = connect_with_retry(
+        "primary",
+        &config.database_url,
+        &config.write_pool,
+        &config.session,
+        max_startup_retries,
+        startup_retry_delay_secs,
+    )
+    .await?;
 
     let read_pool = match &config.read_database_url {
         Some(read_url) => {
-            info!("Connecting to PostgreSQL (read replica)...");
-            let read_pool =
-                build_pg_pool(read_url, &config.read_pool, &config.read_session).await?;
-            info!("Connected to PostgreSQL (read replica)");
-            read_pool
+            info!("Connecting to PostgreSQL (read replica), max retries: {max_startup_retries}...");
+            connect_with_retry(
+                "read replica",
+                read_url,
+                &config.read_pool,
+                &config.read_session,
+                max_startup_retries,
+                startup_retry_delay_secs,
+            )
+            .await?
         }
         None => pool.clone(),
     };
@@ -880,7 +989,7 @@ pub async fn run() -> anyhow::Result<()> {
     // Start x402 batch worker
     let (x402_batch_worker_task, x402_batch_worker_control) =
         spawn_batch_worker(X402BatchWorkerConfig::from_env(), x402_repository.clone());
-    let mut batch_worker_shutdown = shutdown_coordinator.signal();
+    let batch_worker_shutdown = shutdown_coordinator.signal();
     tokio::spawn(async move {
         batch_worker_shutdown.wait().await;
         let _ = x402_batch_worker_control
@@ -942,6 +1051,24 @@ pub async fn run() -> anyhow::Result<()> {
             None
         }
     };
+
+    // Start anchor worker (only if anchor service is configured)
+    if let Some(ref anchor_svc) = anchor_service {
+        let (anchor_worker_task, anchor_worker_control) = spawn_anchor_worker(
+            AnchorWorkerConfig::from_env(),
+            anchor_svc.clone(),
+            ves_commitment_engine.clone(),
+        );
+        let anchor_worker_shutdown = shutdown_coordinator.signal();
+        tokio::spawn(async move {
+            anchor_worker_shutdown.wait().await;
+            let _ = anchor_worker_control
+                .send(AnchorWorkerMessage::Shutdown)
+                .await;
+            let _ = anchor_worker_task.await;
+        });
+        info!("Anchor worker started");
+    }
 
     let auth_state = AuthMiddlewareState {
         authenticator,

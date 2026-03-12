@@ -68,8 +68,8 @@ fn parse_proxy_entry(entry: &str) -> Option<IpNet> {
 
     let parsed_ip = entry.parse::<IpAddr>().ok()?;
     let cidr = match parsed_ip {
-        IpAddr::V4(addr) => IpNet::new_v4(addr, 32).ok()?,
-        IpAddr::V6(addr) => IpNet::new_v6(addr, 128).ok()?,
+        IpAddr::V4(addr) => IpNet::new(IpAddr::V4(addr), 32).ok()?,
+        IpAddr::V6(addr) => IpNet::new(IpAddr::V6(addr), 128).ok()?,
     };
 
     Some(cidr)

@@ -37,7 +37,7 @@ pub async fn anchor_commitment(
 
     ensure_admin(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
 
-    // Check if already anchored
+    // Check if already submitted
     if commitment.is_anchored() {
         return Ok(Json(serde_json::json!({
             "batch_id": commitment.batch_id,

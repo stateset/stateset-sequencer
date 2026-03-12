@@ -181,7 +181,7 @@ impl PgX402Repository {
             )
             .bind(intent_id)
             .bind(batch_id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
             if result.rows_affected() == 0 {

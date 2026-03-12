@@ -28,7 +28,7 @@ pub async fn anchor_ves_commitment(
 
     ensure_admin(&auth, commitment.tenant_id.0, commitment.store_id.0)?;
 
-    if commitment.is_anchored() {
+    if commitment.is_submitted() {
         return Ok(Json(serde_json::json!({
             "batch_id": commitment.batch_id,
             "status": "already_anchored",

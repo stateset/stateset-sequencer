@@ -114,7 +114,13 @@ impl VesBatchCommitment {
         }
     }
 
-    pub fn is_anchored(&self) -> bool {
+    /// Returns `true` if this commitment has been submitted to L2 (tx hash recorded).
+    pub fn is_submitted(&self) -> bool {
         self.chain_tx_hash.is_some()
+    }
+
+    /// Returns `true` if this commitment has been finalized on L2 (anchored_at set).
+    pub fn is_anchored(&self) -> bool {
+        self.anchored_at.is_some()
     }
 }
