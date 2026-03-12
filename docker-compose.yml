@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   sequencer:
-    build: .
+    build:
+      context: ..
+      dockerfile: stateset-sequencer/Dockerfile
     ports:
       - "8080:8080"
     extra_hosts:

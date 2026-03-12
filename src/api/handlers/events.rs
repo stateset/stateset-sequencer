@@ -111,31 +111,6 @@ pub async fn get_head(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_map_read_range_error_returns_conflict_for_sequence_gap() {
-        let err = SequencerError::InvariantViolation {
-            invariant: "sequence_range".to_string(),
-            message: "sequence gap detected".to_string(),
-        };
-
-        let mapped = map_read_range_error(err);
-        assert_eq!(mapped.0, StatusCode::CONFLICT);
-        assert_eq!(mapped.1, "sequence gap detected");
-    }
-
-    #[test]
-    fn test_map_read_range_error_defaults_to_internal_error() {
-        let err = SequencerError::EventNotFound(uuid::Uuid::nil());
-        let mapped = map_read_range_error(err);
-        assert_eq!(mapped.0, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(mapped.1, "Internal server error");
-    }
-}
-
 /// GET /api/v1/entities/:entity_type/:entity_id - Get event history for an entity.
 #[instrument(skip(state, auth), fields(
     tenant_id = %query.tenant_id,
@@ -210,5 +185,30 @@ pub async fn get_entity_history(
             })))
         }
         Err(e) => Err(internal_error(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_map_read_range_error_returns_conflict_for_sequence_gap() {
+        let err = SequencerError::InvariantViolation {
+            invariant: "sequence_range".to_string(),
+            message: "sequence gap detected".to_string(),
+        };
+
+        let mapped = map_read_range_error(err);
+        assert_eq!(mapped.0, StatusCode::CONFLICT);
+        assert_eq!(mapped.1, "sequence gap detected");
+    }
+
+    #[test]
+    fn test_map_read_range_error_defaults_to_internal_error() {
+        let err = SequencerError::EventNotFound(uuid::Uuid::nil());
+        let mapped = map_read_range_error(err);
+        assert_eq!(mapped.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(mapped.1, "Internal server error");
     }
 }

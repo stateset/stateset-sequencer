@@ -50,12 +50,6 @@ struct VesEventRow {
     base_version: Option<i64>,
 }
 
-#[derive(sqlx::FromRow)]
-struct ExistingVesEvent {
-    tenant_id: Uuid,
-    store_id: Uuid,
-}
-
 /// Row data for an existing sequencer receipt
 #[derive(sqlx::FromRow)]
 struct ExistingReceiptRow {
@@ -285,7 +279,11 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     }
 
     fn normalize_range_start(start: u64) -> u64 {
-        if start == 0 { 1 } else { start }
+        if start == 0 {
+            1
+        } else {
+            start
+        }
     }
 
     fn ensure_sequence_contiguity(start: u64, events: &[SequencedVesEvent]) -> Result<u64> {
@@ -302,21 +300,20 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                     ),
                 });
             }
-            expected = sequence.checked_add(1).ok_or_else(|| SequencerError::InvariantViolation {
-                invariant: "sequence_range".to_string(),
-                message: "sequence number overflow while validating range".to_string(),
-            })?;
+            expected =
+                sequence
+                    .checked_add(1)
+                    .ok_or_else(|| SequencerError::InvariantViolation {
+                        invariant: "sequence_range".to_string(),
+                        message: "sequence number overflow while validating range".to_string(),
+                    })?;
             last = sequence;
         }
 
         Ok(last)
     }
 
-    async fn head_sequence(
-        &self,
-        tenant_id: &TenantId,
-        store_id: &StoreId,
-    ) -> Result<u64> {
+    async fn head_sequence(&self, tenant_id: &TenantId, store_id: &StoreId) -> Result<u64> {
         let row: (i64,) = sqlx::query_as(
             r#"
             SELECT COALESCE(MAX(sequence_number), 0)
@@ -466,14 +463,28 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         &self,
         tx: &mut Transaction<'_, Postgres>,
         event_id: Uuid,
-    ) -> Result<Option<ExistingVesEvent>> {
-        let row: Option<ExistingVesEvent> =
-            sqlx::query_as("SELECT tenant_id, store_id FROM ves_events WHERE event_id = $1")
-                .bind(event_id)
-                .fetch_optional(&mut **tx)
-                .await?;
+    ) -> Result<Option<SequencedVesEvent>> {
+        let row: Option<VesEventRow> = sqlx::query_as(
+            r#"
+            SELECT
+                event_id, command_id, ves_version,
+                tenant_id, store_id,
+                source_agent_id, agent_key_id,
+                entity_type, entity_id, event_type,
+                created_at, created_at_str, sequenced_at,
+                payload_kind, payload, payload_encrypted,
+                payload_plain_hash, payload_cipher_hash,
+                agent_signature,
+                sequence_number, base_version
+            FROM ves_events
+            WHERE event_id = $1
+            "#,
+        )
+        .bind(event_id)
+        .fetch_optional(&mut **tx)
+        .await?;
 
-        Ok(row)
+        row.map(Self::decode_event_row).transpose()
     }
 
     async fn get_existing_receipt(
@@ -530,6 +541,58 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             sequencer_signature,
             sequencer_key_version: row.sequencer_key_version as u32,
         }))
+    }
+
+    fn payloads_match(left: Option<&PayloadEncrypted>, right: Option<&PayloadEncrypted>) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.enc_version == right.enc_version
+                    && left.aead == right.aead
+                    && left.nonce_b64u == right.nonce_b64u
+                    && left.ciphertext_b64u == right.ciphertext_b64u
+                    && left.tag_b64u == right.tag_b64u
+                    && left.hpke.mode == right.hpke.mode
+                    && left.hpke.kem == right.hpke.kem
+                    && left.hpke.kdf == right.hpke.kdf
+                    && left.hpke.aead == right.hpke.aead
+                    && left.recipients.len() == right.recipients.len()
+                    && left
+                        .recipients
+                        .iter()
+                        .zip(&right.recipients)
+                        .all(|(left, right)| {
+                            left.recipient_kid == right.recipient_kid
+                                && left.enc_b64u == right.enc_b64u
+                                && left.ct_b64u == right.ct_b64u
+                        })
+            }
+            _ => false,
+        }
+    }
+
+    fn is_exact_replay(existing: &SequencedVesEvent, incoming: &VesEventEnvelope) -> bool {
+        existing.envelope.ves_version == incoming.ves_version
+            && existing.envelope.event_id == incoming.event_id
+            && existing.envelope.tenant_id == incoming.tenant_id
+            && existing.envelope.store_id == incoming.store_id
+            && existing.envelope.source_agent_id == incoming.source_agent_id
+            && existing.envelope.agent_key_id == incoming.agent_key_id
+            && existing.envelope.entity_type == incoming.entity_type
+            && existing.envelope.entity_id == incoming.entity_id
+            && existing.envelope.event_type == incoming.event_type
+            && existing.envelope.created_at == incoming.created_at
+            && existing.envelope.payload_kind == incoming.payload_kind
+            && existing.envelope.payload == incoming.payload
+            && Self::payloads_match(
+                existing.envelope.payload_encrypted.as_ref(),
+                incoming.payload_encrypted.as_ref(),
+            )
+            && existing.envelope.payload_plain_hash == incoming.payload_plain_hash
+            && existing.envelope.payload_cipher_hash == incoming.payload_cipher_hash
+            && existing.envelope.agent_signature == incoming.agent_signature
+            && existing.envelope.command_id == incoming.command_id
+            && existing.envelope.base_version == incoming.base_version
     }
 
     fn validate_payload_encrypted(
@@ -896,10 +959,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
         let event_signing_hash = event.compute_signing_hash();
         let sequence_number = Self::encode_sequence(event.sequence_number())?;
-        let base_version = env
-            .base_version
-            .map(Self::encode_sequence)
-            .transpose()?;
+        let base_version = env.base_version.map(Self::encode_sequence).transpose()?;
 
         // Serialize payload or encrypted payload
         let (payload_json, encrypted_json) = if env.is_plaintext() {
@@ -965,7 +1025,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .bind(event_signing_hash.as_slice())
         .bind(env.agent_signature.as_slice())
         .bind(sequence_number)
-            .bind(base_version)
+        .bind(base_version)
         .execute(&mut **tx)
         .await?;
 
@@ -1177,11 +1237,20 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 continue;
             }
             if let Some(existing) = self.get_existing_event(&mut tx, event.event_id).await? {
-                if existing.tenant_id != tenant_id.0 || existing.store_id != store_id.0 {
+                if existing.tenant_id().0 != tenant_id.0 || existing.store_id().0 != store_id.0 {
                     rejected.push(VesRejectedEvent {
                         event_id: event.event_id,
                         reason: VesRejectionReason::DuplicateEventId,
                         message: "Event ID already exists".to_string(),
+                    });
+                    continue;
+                }
+
+                if !Self::is_exact_replay(&existing, &event) {
+                    rejected.push(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::DuplicateEventId,
+                        message: "Event ID already exists with different contents".to_string(),
                     });
                     continue;
                 }
@@ -1368,7 +1437,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
         Ok(VesIngestReceipt {
             batch_id,
-            events_accepted: receipts.len() as u32,
+            events_accepted: new_events_accepted,
             events_rejected: rejected,
             assigned_sequence_start,
             assigned_sequence_end,
@@ -1589,9 +1658,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             if head_sequence >= start {
                 return Err(SequencerError::InvariantViolation {
                     invariant: "sequence_range".to_string(),
-                    message: format!(
-                        "sequence gap in range {start}..={end}: head {head_sequence}"
-                    ),
+                    message: format!("sequence gap in range {start}..={end}: head {head_sequence}"),
                 });
             }
             return Ok(events);
@@ -1634,7 +1701,6 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             WHERE tenant_id = $1 AND store_id = $2
               AND entity_type = $3 AND entity_id = $4
             ORDER BY sequence_number ASC
-            LIMIT 10000
             "#,
         )
         .bind(tenant_id.0)
@@ -2090,28 +2156,74 @@ mod tests {
 
     #[test]
     fn normalize_range_start_maps_zero_to_one() {
-        assert_eq!(VesSequencer::<InMemoryAgentKeyRegistry>::normalize_range_start(0), 1);
+        assert_eq!(
+            VesSequencer::<InMemoryAgentKeyRegistry>::normalize_range_start(0),
+            1
+        );
     }
 
     #[test]
     fn ensure_sequence_contiguity_succeeds_for_consecutive_events() {
         let signing_key = AgentSigningKey::generate();
         let events = vec![
-            SequencedVesEvent::new(build_encrypted_event(&signing_key, valid_payload_encrypted()), 10),
-            SequencedVesEvent::new(build_encrypted_event(&signing_key, valid_payload_encrypted()), 11),
+            SequencedVesEvent::new(
+                build_encrypted_event(&signing_key, valid_payload_encrypted()),
+                10,
+            ),
+            SequencedVesEvent::new(
+                build_encrypted_event(&signing_key, valid_payload_encrypted()),
+                11,
+            ),
         ];
 
-        assert!(VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_contiguity(10, &events).is_ok());
+        assert!(
+            VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_contiguity(10, &events)
+                .is_ok()
+        );
     }
 
     #[test]
     fn ensure_sequence_contiguity_detects_gap() {
         let signing_key = AgentSigningKey::generate();
         let events = vec![
-            SequencedVesEvent::new(build_encrypted_event(&signing_key, valid_payload_encrypted()), 10),
-            SequencedVesEvent::new(build_encrypted_event(&signing_key, valid_payload_encrypted()), 12),
+            SequencedVesEvent::new(
+                build_encrypted_event(&signing_key, valid_payload_encrypted()),
+                10,
+            ),
+            SequencedVesEvent::new(
+                build_encrypted_event(&signing_key, valid_payload_encrypted()),
+                12,
+            ),
         ];
 
-        assert!(VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_contiguity(10, &events).is_err());
+        assert!(
+            VesSequencer::<InMemoryAgentKeyRegistry>::ensure_sequence_contiguity(10, &events)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn exact_replay_matches_identical_event() {
+        let signing_key = AgentSigningKey::generate();
+        let event = build_encrypted_event(&signing_key, valid_payload_encrypted());
+        let existing = SequencedVesEvent::new(event.clone(), 42);
+
+        assert!(VesSequencer::<InMemoryAgentKeyRegistry>::is_exact_replay(
+            &existing, &event
+        ));
+    }
+
+    #[test]
+    fn exact_replay_rejects_changed_payload() {
+        let signing_key = AgentSigningKey::generate();
+        let event = build_encrypted_event(&signing_key, valid_payload_encrypted());
+        let existing = SequencedVesEvent::new(event.clone(), 42);
+
+        let mut replay = event.clone();
+        replay.payload_cipher_hash = [7u8; 32];
+
+        assert!(!VesSequencer::<InMemoryAgentKeyRegistry>::is_exact_replay(
+            &existing, &replay
+        ));
     }
 }

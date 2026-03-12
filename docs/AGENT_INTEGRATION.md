@@ -55,9 +55,6 @@ curl -X POST https://sequencer.example.com/api/v1/agents/register \
   }'
 ```
 
-**Compatibility note:** The same endpoint is also available at `/v1/agents/register` without the
-`/api` prefix.
-
 Constraints:
 - `name` must be 1-128 characters.
 - `description` is optional, max 1024 characters.

@@ -8,7 +8,7 @@ info:
     ## Authentication
 
     All API endpoints require authentication via API key or JWT token, except:
-    - `POST /v1/agents/register` (public self-service registration)
+    - `POST /v1/agents/register` (public self-service registration, served under the `/api` base URL)
     - `GET /health`
     - `GET /ready`
     - **API Key**: Pass in `X-API-Key` header

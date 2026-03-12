@@ -34,8 +34,8 @@ use crate::auth::{AgentKeyRegistry, AuthContextExt};
 use crate::domain::{
     AgentId, AgentKeyId, GetX402BatchResponse, GetX402ReceiptResponse, Hash256, Signature64,
     StoreId, SubmitX402PaymentRequest, SubmitX402PaymentResponse, TenantId, X402BatchStatus,
-    X402_DEFAULT_BATCH_SIZE, X402IntentStatus, X402Network, X402_MAX_BATCH_SIZE,
-    X402PaymentBatch, X402PaymentIntent, X402PaymentIntentFilter, X402_MAX_VALIDITY_SECS,
+    X402IntentStatus, X402Network, X402PaymentBatch, X402PaymentIntent, X402PaymentIntentFilter,
+    X402_DEFAULT_BATCH_SIZE, X402_MAX_BATCH_SIZE, X402_MAX_VALIDITY_SECS,
 };
 use crate::infra::PgX402Repository;
 use crate::server::AppState;
@@ -132,8 +132,16 @@ pub async fn submit_payment_intent(
         ));
     }
 
-    validate_hex_string(&payload.payer_address, "payer_address", X402_MAX_ADDRESS_LEN)?;
-    validate_hex_string(&payload.payee_address, "payee_address", X402_MAX_ADDRESS_LEN)?;
+    validate_hex_string(
+        &payload.payer_address,
+        "payer_address",
+        X402_MAX_ADDRESS_LEN,
+    )?;
+    validate_hex_string(
+        &payload.payee_address,
+        "payee_address",
+        X402_MAX_ADDRESS_LEN,
+    )?;
 
     if payload.payer_address == payload.payee_address {
         return Err(ApiError::new(
@@ -691,15 +699,22 @@ pub async fn settle_batch(
     );
 
     // Fetch batch from database
-    let batch = state.x402_repository.get_batch(batch_id).await.map_err(|e| {
-        ApiError::new(
-            ErrorCode::InternalError,
-            format!("Failed to fetch batch: {}", e),
-        )
-    })?;
+    let batch = state
+        .x402_repository
+        .get_batch(batch_id)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::InternalError,
+                format!("Failed to fetch batch: {}", e),
+            )
+        })?;
 
     let batch = batch.ok_or_else(|| {
-        ApiError::new(ErrorCode::BatchNotFound, format!("Batch {} not found", batch_id))
+        ApiError::new(
+            ErrorCode::BatchNotFound,
+            format!("Batch {} not found", batch_id),
+        )
     })?;
 
     ensure_admin(&auth, batch.tenant_id.0, batch.store_id.0)
@@ -718,14 +733,14 @@ pub async fn settle_batch(
                 .x402_repository
                 .submit_batch(batch_id, &tx_hash)
                 .await
-                .map_err(|e| ApiError::from(e))?;
+                .map_err(ApiError::from)?;
 
             if let Some(block_number) = payload.block_number {
                 state
                     .x402_repository
                     .settle_batch(batch_id, &tx_hash, block_number, payload.gas_used)
                     .await
-                    .map_err(|e| ApiError::from(e))?;
+                    .map_err(ApiError::from)?;
 
                 Ok(Json(SettleBatchResponse {
                     batch_id,
@@ -778,7 +793,7 @@ pub async fn settle_batch(
                 .x402_repository
                 .settle_batch(batch_id, &tx_hash, block_number, payload.gas_used)
                 .await
-                .map_err(|e| ApiError::from(e))?;
+                .map_err(ApiError::from)?;
 
             Ok(Json(SettleBatchResponse {
                 batch_id,
@@ -1043,6 +1058,7 @@ fn parse_hash256(s: &str) -> Result<Hash256, String> {
         .map_err(|_| "Expected 32 bytes for hash".to_string())
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_length(value: &str, field_name: &str, max_len: usize) -> Result<(), ApiError> {
     if value.len() > max_len {
         return Err(ApiError::new(
@@ -1061,11 +1077,8 @@ fn validate_length(value: &str, field_name: &str, max_len: usize) -> Result<(), 
     Ok(())
 }
 
-fn validate_hex_string(
-    value: &str,
-    field_name: &str,
-    max_len: usize,
-) -> Result<(), ApiError> {
+#[allow(clippy::result_large_err)]
+fn validate_hex_string(value: &str, field_name: &str, max_len: usize) -> Result<(), ApiError> {
     if value.len() > max_len {
         return Err(ApiError::new(
             ErrorCode::PayloadTooLarge,
@@ -1088,10 +1101,7 @@ fn validate_hex_string(
     if hex_part.is_empty() {
         return Err(ApiError::new(
             ErrorCode::InvalidFieldValue,
-            format!(
-                "{} must be a hexadecimal string",
-                field_name
-            ),
+            format!("{} must be a hexadecimal string", field_name),
         ));
     }
 
@@ -1102,7 +1112,7 @@ fn validate_hex_string(
         ));
     }
 
-    if hex_part.len() % 2 != 0 {
+    if !hex_part.len().is_multiple_of(2) {
         return Err(ApiError::new(
             ErrorCode::InvalidFieldValue,
             format!("{} hex length must be even", field_name),
@@ -1199,12 +1209,8 @@ mod tests {
 
     #[test]
     fn test_validate_hex_string() {
-        assert!(
-            validate_hex_string("0xabcdef", "address", X402_MAX_ADDRESS_LEN).is_ok()
-        );
-        assert!(
-            validate_hex_string("abcdef", "address", X402_MAX_ADDRESS_LEN).is_ok()
-        );
+        assert!(validate_hex_string("0xabcdef", "address", X402_MAX_ADDRESS_LEN).is_ok());
+        assert!(validate_hex_string("abcdef", "address", X402_MAX_ADDRESS_LEN).is_ok());
         assert!(validate_hex_string("0x", "address", X402_MAX_ADDRESS_LEN).is_err());
         assert!(validate_hex_string("0xxyz", "address", X402_MAX_ADDRESS_LEN).is_err());
         assert!(validate_hex_string("abc", "address", X402_MAX_ADDRESS_LEN).is_err());

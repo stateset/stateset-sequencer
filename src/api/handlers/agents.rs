@@ -17,7 +17,9 @@ use crate::api::types::{
     AgentRegistrationRequest, AgentRegistrationResponse, AgentResponse, ApiKeyResponse,
     CreateApiKeyRequest, ListApiKeysResponse,
 };
-use crate::auth::{ApiKeyRecord, ApiKeyStore, ApiKeyValidator, AuthContextExt, Permissions};
+use crate::auth::{
+    ApiKeyRecord, ApiKeyStore, ApiKeyValidator, AuthContext, AuthContextExt, Permissions,
+};
 use crate::infra::{extract_client_ip, AuditAction, AuditLogBuilder};
 use crate::server::AppState;
 
@@ -25,6 +27,113 @@ const MAX_AGENT_NAME_LEN: usize = 128;
 const MAX_DESCRIPTION_LEN: usize = 1024;
 const MAX_STORE_IDS: usize = 50;
 const MAX_RATE_LIMIT_RPM: u32 = 10_000;
+
+fn resolve_new_key_permissions(
+    auth: &AuthContext,
+    request: &CreateApiKeyRequest,
+) -> Result<Permissions, (StatusCode, Json<serde_json::Value>)> {
+    if auth.is_admin() {
+        return Ok(if request.admin.unwrap_or(false) {
+            Permissions::admin()
+        } else if request.read_only.unwrap_or(false) {
+            Permissions::read_only()
+        } else {
+            Permissions::read_write()
+        });
+    }
+
+    if request.admin.unwrap_or(false) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Only admins can mint admin keys",
+                "code": "FORBIDDEN"
+            })),
+        ));
+    }
+
+    let read_only = request.read_only.unwrap_or(!auth.can_write());
+    if !read_only && !auth.can_write() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Cannot mint a key with broader write permissions",
+                "code": "FORBIDDEN"
+            })),
+        ));
+    }
+
+    Ok(if read_only {
+        Permissions::read_only()
+    } else {
+        Permissions::read_write()
+    })
+}
+
+fn resolve_new_key_store_scope(
+    auth: &AuthContext,
+    request: &CreateApiKeyRequest,
+) -> Result<Vec<Uuid>, (StatusCode, Json<serde_json::Value>)> {
+    if auth.is_admin() {
+        return Ok(request.store_ids.clone().unwrap_or_default());
+    }
+
+    match request.store_ids.clone() {
+        None => Ok(auth.store_ids.clone()),
+        Some(store_ids) => {
+            if store_ids.is_empty() && !auth.store_ids.is_empty() {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": "Cannot widen store scope beyond the authenticating key",
+                        "code": "FORBIDDEN"
+                    })),
+                ));
+            }
+
+            if auth.store_ids.is_empty() || store_ids.iter().all(|id| auth.store_ids.contains(id)) {
+                Ok(store_ids)
+            } else {
+                Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "success": false,
+                        "error": "Cannot mint a key for stores outside the authenticating key scope",
+                        "code": "FORBIDDEN"
+                    })),
+                ))
+            }
+        }
+    }
+}
+
+fn resolve_new_key_rate_limit(
+    auth: &AuthContext,
+    request: &CreateApiKeyRequest,
+) -> Result<Option<u32>, (StatusCode, Json<serde_json::Value>)> {
+    if auth.is_admin() {
+        return Ok(request.rate_limit);
+    }
+
+    let requested = request.rate_limit;
+    if let (Some(current), Some(next)) = (auth.rate_limit, requested) {
+        if next > current {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": "Cannot mint a key with a higher rate limit than the authenticating key",
+                    "code": "FORBIDDEN"
+                })),
+            ));
+        }
+    }
+
+    Ok(requested.or(auth.rate_limit))
+}
 
 /// POST /api/v1/agents/register - Register a new agent and receive an API key.
 ///
@@ -648,22 +757,18 @@ pub async fn create_agent_api_key(
     // Generate new API key
     let (plaintext_key, key_hash) = ApiKeyValidator::generate_key(&tenant_id);
 
-    let permissions = if request.admin.unwrap_or(false) && auth.is_admin() {
-        Permissions::admin()
-    } else if request.read_only.unwrap_or(false) {
-        Permissions::read_only()
-    } else {
-        Permissions::read_write()
-    };
+    let permissions = resolve_new_key_permissions(&auth, &request)?;
+    let store_ids = resolve_new_key_store_scope(&auth, &request)?;
+    let rate_limit = resolve_new_key_rate_limit(&auth, &request)?;
 
     let api_key_record = ApiKeyRecord {
         key_hash: key_hash.clone(),
         tenant_id,
-        store_ids: request.store_ids.clone().unwrap_or_default(),
-        permissions,
+        store_ids,
+        permissions: permissions.clone(),
         agent_id: Some(agent_id),
         active: true,
-        rate_limit: request.rate_limit,
+        rate_limit,
     };
 
     if let Err(e) = state.api_key_store.store(&api_key_record).await {
@@ -684,12 +789,12 @@ pub async fn create_agent_api_key(
         success: true,
         api_key: plaintext_key,
         key_hash_prefix: key_hash[..16].to_string(),
-        permissions: if request.admin.unwrap_or(false) && auth.is_admin() {
+        permissions: if permissions.admin {
             "admin".to_string()
-        } else if request.read_only.unwrap_or(false) {
-            "read".to_string()
-        } else {
+        } else if permissions.write {
             "read_write".to_string()
+        } else {
+            "read".to_string()
         },
         message: "API key created. Store it securely - it cannot be retrieved later.".to_string(),
     }))
@@ -869,4 +974,79 @@ pub async fn revoke_agent_api_key(
         "success": true,
         "message": "API key revoked successfully"
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth_context(
+        store_ids: Vec<Uuid>,
+        permissions: Permissions,
+        rate_limit: Option<u32>,
+    ) -> AuthContext {
+        AuthContext {
+            tenant_id: Uuid::new_v4(),
+            store_ids,
+            agent_id: Some(Uuid::new_v4()),
+            rate_limit,
+            permissions,
+        }
+    }
+
+    #[test]
+    fn non_admin_cannot_escalate_to_write() {
+        let auth = auth_context(vec![Uuid::new_v4()], Permissions::read_only(), Some(100));
+        let request = CreateApiKeyRequest {
+            store_ids: None,
+            read_only: Some(false),
+            admin: Some(false),
+            rate_limit: Some(50),
+        };
+
+        assert!(resolve_new_key_permissions(&auth, &request).is_err());
+    }
+
+    #[test]
+    fn non_admin_inherits_store_scope_by_default() {
+        let allowed_store = Uuid::new_v4();
+        let auth = auth_context(vec![allowed_store], Permissions::read_write(), Some(100));
+        let request = CreateApiKeyRequest {
+            store_ids: None,
+            read_only: None,
+            admin: None,
+            rate_limit: None,
+        };
+
+        let store_ids = resolve_new_key_store_scope(&auth, &request).unwrap();
+        assert_eq!(store_ids, auth.store_ids);
+    }
+
+    #[test]
+    fn non_admin_cannot_widen_store_scope() {
+        let allowed_store = Uuid::new_v4();
+        let requested_store = Uuid::new_v4();
+        let auth = auth_context(vec![allowed_store], Permissions::read_write(), Some(100));
+        let request = CreateApiKeyRequest {
+            store_ids: Some(vec![requested_store]),
+            read_only: None,
+            admin: None,
+            rate_limit: None,
+        };
+
+        assert!(resolve_new_key_store_scope(&auth, &request).is_err());
+    }
+
+    #[test]
+    fn non_admin_cannot_raise_rate_limit() {
+        let auth = auth_context(Vec::new(), Permissions::read_write(), Some(100));
+        let request = CreateApiKeyRequest {
+            store_ids: None,
+            read_only: None,
+            admin: None,
+            rate_limit: Some(200),
+        };
+
+        assert!(resolve_new_key_rate_limit(&auth, &request).is_err());
+    }
 }

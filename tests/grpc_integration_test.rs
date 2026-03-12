@@ -10,26 +10,27 @@ use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use uuid::Uuid;
 
-use stateset_sequencer::auth::{AgentKeyEntry, AgentKeyLookup};
+use stateset_sequencer::auth::{AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry};
+use stateset_sequencer::crypto::AgentSigningKey;
 use stateset_sequencer::domain::{
     AgentId, AgentKeyId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
     VesEventEnvelope,
 };
-use stateset_sequencer::crypto::AgentSigningKey;
 use stateset_sequencer::grpc::{SequencerService, SequencerServiceV2};
 use stateset_sequencer::infra::{
-    CommitmentEngine, IngestService, PayloadEncryption, PgCommitmentEngine, PgEventStore,
-    PgAgentKeyRegistry, PgSequencer, PgVesCommitmentEngine, VesSequencer,
+    CommitmentEngine, IngestService, PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine,
+    PgEventStore, PgSequencer, PgVesCommitmentEngine, VesSequencer,
 };
 use stateset_sequencer::proto::sequencer_server::Sequencer as SequencerTrait;
+use stateset_sequencer::proto::v2::sequencer_server::Sequencer as SequencerTraitV2;
+use stateset_sequencer::proto::v2::GetEntityHistoryRequest as V2GetEntityHistoryRequest;
 use stateset_sequencer::proto::{
     GetCommitmentRequest, GetEntityHistoryRequest, GetHeadRequest, GetInclusionProofRequest,
     PushRequest,
 };
-use stateset_sequencer::proto::v2::GetEntityHistoryRequest as V2GetEntityHistoryRequest;
 
-use tonic::Request;
 use tonic::Code;
+use tonic::Request;
 
 // Note: common module provides test helpers but not all are used here
 #[allow(unused_imports)]
@@ -67,19 +68,13 @@ async fn create_grpc_service(pool: sqlx::PgPool) -> SequencerService {
 
 async fn create_grpc_service_v2(pool: sqlx::PgPool) -> SequencerServiceV2 {
     let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
-    let ves_sequencer = Arc::new(VesSequencer::new(
-        pool.clone(),
-        agent_key_registry.clone(),
-    ));
+    let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), agent_key_registry.clone()));
     let ves_commitment_engine = Arc::new(PgVesCommitmentEngine::new(pool.clone()));
 
     SequencerServiceV2::new(
         ves_sequencer,
         ves_commitment_engine.clone(),
-        Arc::new(VesSequencer::new(
-            pool.clone(),
-            agent_key_registry,
-        )),
+        Arc::new(VesSequencer::new(pool.clone(), agent_key_registry)),
         ves_commitment_engine,
         Arc::new(stateset_sequencer::infra::CacheManager::new()),
     )
@@ -96,10 +91,10 @@ fn create_test_event(
         store_id.clone(),
         EntityType::order(),
         entity_id.to_string(),
-    EventType::new("order.created"),
-    json!({ "test": true, "entity_id": entity_id }),
-    agent_id.clone(),
-)
+        EventType::new("order.created"),
+        json!({ "test": true, "entity_id": entity_id }),
+        agent_id.clone(),
+    )
 }
 
 fn create_v2_test_event(

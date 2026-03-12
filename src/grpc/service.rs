@@ -13,7 +13,7 @@ use tonic::{Request, Response, Status};
 use tracing::{debug, error, info, instrument};
 use uuid::Uuid;
 
-use crate::auth::{AuthContext, Permissions};
+use crate::auth::AuthContext;
 /// Convert domain event to proto event (free function for use in async blocks)
 fn to_proto_event(event: &crate::domain::SequencedEvent) -> crate::proto::SequencedEvent {
     crate::proto::SequencedEvent {
@@ -93,17 +93,12 @@ impl SequencerService {
         }
     }
 
-    fn auth_context<T>(request: &Request<T>) -> AuthContext {
+    fn auth_context<T>(request: &Request<T>) -> Result<AuthContext, Status> {
         request
             .extensions()
             .get::<AuthContext>()
             .cloned()
-            .unwrap_or(AuthContext {
-                tenant_id: Uuid::nil(),
-                store_ids: Vec::new(),
-                agent_id: None,
-                permissions: Permissions::admin(),
-            })
+            .ok_or_else(|| Status::unauthenticated("missing auth context"))
     }
 
     fn require_read(ctx: &AuthContext) -> Result<(), Status> {
@@ -452,7 +447,7 @@ impl SequencerTrait for SequencerService {
     /// Push a batch of events for sequencing
     #[instrument(skip(self, request))]
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         info!(
@@ -571,7 +566,7 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<PullRequest>,
     ) -> Result<Response<Self::PullStream>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         debug!(
@@ -692,7 +687,7 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<GetHeadRequest>,
     ) -> Result<Response<GetHeadResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         let tenant_id = Uuid::parse_str(&req.tenant_id)
@@ -794,7 +789,7 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<GetInclusionProofRequest>,
     ) -> Result<Response<GetInclusionProofResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         Self::require_read(&auth_ctx)?;
@@ -986,7 +981,7 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<GetCommitmentRequest>,
     ) -> Result<Response<GetCommitmentResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         Self::require_read(&auth_ctx)?;
@@ -1009,7 +1004,7 @@ impl SequencerTrait for SequencerService {
         &self,
         request: Request<GetEntityHistoryRequest>,
     ) -> Result<Response<GetEntityHistoryResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         let tenant_id = Uuid::parse_str(&req.tenant_id)
@@ -1043,7 +1038,11 @@ impl SequencerTrait for SequencerService {
             .map_err(super::grpc_internal_error)?;
 
         let current_version = events.len() as u64;
-        let requested_from_version = if req.from_version == 0 { 1 } else { req.from_version };
+        let requested_from_version = if req.from_version == 0 {
+            1
+        } else {
+            req.from_version
+        };
         let requested_to_version = if req.to_version == 0 {
             current_version
         } else {

@@ -11,9 +11,7 @@ use axum::{
 };
 use std::sync::Arc;
 
-use super::{
-    ApiKeyStore, ApiKeyValidator, AuthContext, AuthError, JwtValidator, API_KEY_PREFIX,
-};
+use super::{ApiKeyStore, ApiKeyValidator, AuthContext, AuthError, JwtValidator, API_KEY_PREFIX};
 
 /// Combined authenticator supporting both API keys and JWT
 pub struct Authenticator {

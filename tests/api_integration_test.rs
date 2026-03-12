@@ -334,7 +334,7 @@ async fn test_public_agent_registration_rejects_tenant_id() {
 
 #[tokio::test]
 #[ignore]
-async fn test_public_agent_registration_root_alias() {
+async fn test_public_agent_registration_root_alias_not_exposed() {
     let Some(pool) = connect_db().await else {
         eprintln!("DATABASE_URL not set; skipping");
         return;
@@ -360,8 +360,8 @@ async fn test_public_agent_registration_root_alias() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["success"], true);
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.is_null() || body == serde_json::Value::Object(serde_json::Map::new()));
 }
 
 #[tokio::test]

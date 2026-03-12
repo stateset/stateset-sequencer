@@ -17,8 +17,8 @@
 //! - `X402_BATCH_NETWORKS` - Comma-separated networks to process (default: set_chain)
 //! - `X402_BATCH_AUTO_COMMIT` - Set to true/1/on/yes to auto-commit (default: true)
 
-use std::sync::Arc;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -82,19 +82,21 @@ impl X402BatchWorkerConfig {
         fn parse_batch_networks(raw: String) -> Vec<X402Network> {
             let parsed: Vec<X402Network> = raw
                 .split(',')
-                .filter_map(|network| match network.trim().to_ascii_lowercase().as_str() {
-                    "set_chain" => Some(X402Network::SetChain),
-                    "set_chain_testnet" => Some(X402Network::SetChainTestnet),
-                    "arc" => Some(X402Network::Arc),
-                    "arc_testnet" => Some(X402Network::ArcTestnet),
-                    "base" => Some(X402Network::Base),
-                    "base_sepolia" => Some(X402Network::BaseSepolia),
-                    "ethereum" => Some(X402Network::Ethereum),
-                    "ethereum_sepolia" => Some(X402Network::EthereumSepolia),
-                    "arbitrum" => Some(X402Network::Arbitrum),
-                    "optimism" => Some(X402Network::Optimism),
-                    _ => None,
-                })
+                .filter_map(
+                    |network| match network.trim().to_ascii_lowercase().as_str() {
+                        "set_chain" => Some(X402Network::SetChain),
+                        "set_chain_testnet" => Some(X402Network::SetChainTestnet),
+                        "arc" => Some(X402Network::Arc),
+                        "arc_testnet" => Some(X402Network::ArcTestnet),
+                        "base" => Some(X402Network::Base),
+                        "base_sepolia" => Some(X402Network::BaseSepolia),
+                        "ethereum" => Some(X402Network::Ethereum),
+                        "ethereum_sepolia" => Some(X402Network::EthereumSepolia),
+                        "arbitrum" => Some(X402Network::Arbitrum),
+                        "optimism" => Some(X402Network::Optimism),
+                        _ => None,
+                    },
+                )
                 .collect();
 
             if parsed.is_empty() {
@@ -429,25 +431,23 @@ impl X402BatchWorker {
                     }
                 }
             }
-        } else {
-            if let Err(e) = self
+        } else if let Err(e) = self
+            .repository
+            .assign_intents_to_batch(batch.batch_id, &intent_ids)
+            .await
+        {
+            if let Err(mark_err) = self
                 .repository
-                .assign_intents_to_batch(batch.batch_id, &intent_ids)
+                .mark_batch_failed_if_pending(batch.batch_id)
                 .await
             {
-                if let Err(mark_err) = self
-                    .repository
-                    .mark_batch_failed_if_pending(batch.batch_id)
-                    .await
-                {
-                    warn!(
-                        batch_id = %batch.batch_id,
-                        error = ?mark_err,
-                        "Failed to mark batch as failed"
-                    );
-                }
-                return Err(e.to_string());
+                warn!(
+                    batch_id = %batch.batch_id,
+                    error = ?mark_err,
+                    "Failed to mark batch as failed"
+                );
             }
+            return Err(e.to_string());
         }
 
         info!(

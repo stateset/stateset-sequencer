@@ -16,7 +16,7 @@ All API requests require authentication via Bearer token:
 Authorization: Bearer <your-api-key>
 ```
 
-**Public endpoints:** `/v1/agents/register`, `/health`, `/ready`
+**Public endpoints:** `/api/v1/agents/register` when public registration is explicitly enabled, plus `/health` and `/ready`
 
 **Metrics:** `/metrics` requires an admin API key.
 
@@ -1201,14 +1201,12 @@ GET /v1/ves/anchor/{batch_id}/verify
 ## Agent Registration (Public)
 
 Register a new agent and receive an API key for self-service onboarding. This endpoint is
-unauthenticated when public registration is enabled.
+unauthenticated when public registration is enabled. Externally, it is served at
+`/api/v1/agents/register`.
 
 ```http
 POST /v1/agents/register
 ```
-
-**Compatibility Note:** This endpoint is also exposed at `/v1/agents/register` without the `/api`
-prefix for legacy clients.
 
 **Request Body:**
 ```json

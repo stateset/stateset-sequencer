@@ -344,7 +344,7 @@ async fn test_compliance_proof_workflow(pool: PgPool) -> Result<(), Box<dyn std:
     let proofs: Vec<(String, String)> = sqlx::query_as(
         "SELECT proof_type, policy_hash FROM ves_compliance_proofs WHERE event_id = $1",
     )
-    .bind(&receipt.event_id)
+    .bind(receipt.event_id)
     .fetch_all(&pool)
     .await?;
 

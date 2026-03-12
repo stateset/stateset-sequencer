@@ -906,14 +906,14 @@ mod tests {
         PayloadEncrypted {
             enc_version: 1,
             aead: "AES-256-GCM".to_string(),
-            nonce_b64u: base64_url_encode(&vec![0u8; NONCE_SIZE]),
+            nonce_b64u: base64_url_encode(&[0u8; NONCE_SIZE]),
             ciphertext_b64u: base64_url_encode(&[1u8]),
-            tag_b64u: base64_url_encode(&vec![2u8; TAG_SIZE]),
+            tag_b64u: base64_url_encode(&[2u8; TAG_SIZE]),
             hpke: HpkeParams::default(),
             recipients: vec![Recipient {
                 recipient_kid: 1,
-                enc_b64u: base64_url_encode(&vec![3u8; 32]),
-                ct_b64u: base64_url_encode(&vec![4u8; 48]),
+                enc_b64u: base64_url_encode(&[3u8; 32]),
+                ct_b64u: base64_url_encode(&[4u8; 48]),
             }],
         }
     }

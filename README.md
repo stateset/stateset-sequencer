@@ -94,7 +94,7 @@ curl -H "Authorization: ApiKey dev_admin_key" \
 cargo build
 
 # Set required environment variables
-export DATABASE_URL="postgres://localhost/stateset_sequencer"
+export DATABASE_URL="postgres://sequencer:sequencer@localhost:5433/stateset_sequencer"
 export BOOTSTRAP_ADMIN_API_KEY="dev_admin_key"
 
 # Run the server (migrations run automatically)
@@ -252,7 +252,7 @@ GET /metrics    # Prometheus metrics
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | `postgres://localhost/stateset_sequencer` | PostgreSQL connection URL |
+| `DATABASE_URL` | `postgres://localhost/stateset_sequencer` | PostgreSQL connection URL. For the bundled `docker-compose.yml`, use `postgres://sequencer:sequencer@localhost:5433/stateset_sequencer` |
 | `READ_DATABASE_URL` | (unset) | Optional read replica URL (routes read traffic to a separate pool) |
 | `HOST` | `0.0.0.0` | Server bind address |
 | `PORT` | `8080` | Server port |
@@ -263,7 +263,7 @@ GET /metrics    # Prometheus metrics
 | `DB_APPLICATION_NAME` | `stateset-sequencer` | PostgreSQL `application_name` for write pool |
 | `READ_DB_APPLICATION_NAME` | `${DB_APPLICATION_NAME}-read` | PostgreSQL `application_name` for read pool |
 | `DB_MIGRATE_ON_STARTUP` | `true` | Auto-run SQL migrations on startup |
-| `PUBLIC_AGENT_REGISTRATION_ENABLED` | `true` | Enable public agent self-registration |
+| `PUBLIC_AGENT_REGISTRATION_ENABLED` | `false` | Enable public agent self-registration |
 | `TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` / `Forwarded` / `X-Real-IP` when extracting client IPs (only enable behind a trusted proxy/LB) |
 
 ### Database Pool Tuning
@@ -475,6 +475,9 @@ stateset-sequencer/
 ```bash
 # Run all tests
 cargo test
+
+# Run ignored integration tests (requires PostgreSQL and DATABASE_URL)
+cargo test --workspace --tests -- --ignored
 
 # Run with output
 cargo test -- --nocapture

@@ -165,6 +165,7 @@ impl JwtValidator {
             tenant_id,
             store_ids,
             agent_id,
+            rate_limit: None,
             permissions,
         })
     }

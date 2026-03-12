@@ -54,6 +54,9 @@ pub struct AuthContext {
     /// Agent ID (if authenticated as an agent)
     pub agent_id: Option<Uuid>,
 
+    /// Optional per-principal rate limit inherited from the credential.
+    pub rate_limit: Option<u32>,
+
     /// Allowed operations
     pub permissions: Permissions,
 }
@@ -104,6 +107,7 @@ impl AuthContext {
             tenant_id: Uuid::nil(),
             store_ids: Vec::new(),
             agent_id: None,
+            rate_limit: None,
             permissions: Permissions::admin(),
         }
     }

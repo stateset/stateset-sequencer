@@ -37,23 +37,23 @@ run: ## Run the sequencer (debug)
 	@echo "Starting sequencer in debug mode..."
 	@docker-compose up -d postgres
 	@sleep 3
-	cargo run
+	DATABASE_URL=postgres://sequencer:sequencer@localhost:5433/stateset_sequencer cargo run
 
 run-release: ## Run the sequencer (release)
 	@echo "Starting sequencer in release mode..."
 	@docker-compose up -d postgres
 	@sleep 3
-	cargo run --release
+	DATABASE_URL=postgres://sequencer:sequencer@localhost:5433/stateset_sequencer cargo run --release
 
 ## Testing
 test: ## Run all tests
-	cargo test
+	cargo test --all-targets
 
 test-unit: ## Run unit tests only
-	cargo test -- --ignored
+	cargo test --lib --bins
 
 test-integration: ## Run integration tests only
-	cargo test -- --ignored
+	cargo test --tests -- --ignored
 
 test-coverage: ## Generate test coverage report
 	@echo "Requires cargo-tarpaulin: cargo install cargo-tarpaulin"
@@ -71,9 +71,7 @@ fmt-check: ## Check code formatting
 clippy: ## Run clippy linter
 	cargo clippy --all-targets -- -D warnings
 
-check: fmt check ## Check code quality (format + clippy)
-	cargo fmt -- --check
-	cargo clippy --all-targets -- -D warnings
+check: fmt-check clippy ## Check code quality (format + clippy)
 
 ## Docker
 docker-build: ## Build Docker image

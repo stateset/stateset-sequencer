@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::auth::{
     AgentKeyEntry, AgentKeyError, AgentKeyLookup, AgentKeyRegistry, AuthContext,
-    KeyStatus as DomainKeyStatus, Permissions,
+    KeyStatus as DomainKeyStatus,
 };
 use crate::crypto::{
     base64_url_decode, base64_url_encode, compute_cipher_hash_from_encrypted, compute_payload_aad,
@@ -102,17 +102,12 @@ impl SequencerServiceV2 {
         }
     }
 
-    fn auth_context<T>(request: &Request<T>) -> AuthContext {
+    fn auth_context<T>(request: &Request<T>) -> Result<AuthContext, Status> {
         request
             .extensions()
             .get::<AuthContext>()
             .cloned()
-            .unwrap_or(AuthContext {
-                tenant_id: Uuid::nil(),
-                store_ids: Vec::new(),
-                agent_id: None,
-                permissions: Permissions::admin(),
-            })
+            .ok_or_else(|| Status::unauthenticated("missing auth context"))
     }
 
     fn require_read(ctx: &AuthContext) -> Result<(), Status> {
@@ -599,7 +594,7 @@ impl SequencerTrait for SequencerServiceV2 {
     /// Push a batch of events for sequencing
     #[instrument(skip(self, request))]
     async fn push(&self, request: Request<PushRequest>) -> Result<Response<PushResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         info!(
@@ -711,7 +706,7 @@ impl SequencerTrait for SequencerServiceV2 {
         &self,
         request: Request<PullEventsRequest>,
     ) -> Result<Response<PullEventsResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         debug!(
@@ -781,24 +776,24 @@ impl SequencerTrait for SequencerServiceV2 {
             .map_err(super::grpc_sequencer_error)?;
 
         if events.is_empty() {
-                let expected_start = if req.from_sequence == 0 {
-                    1
-                } else {
-                    req.from_sequence
-                };
-                if head >= expected_start {
-                    events = self
-                        .ves_sequencer
-                        .read_range(
-                            &tenant_id,
-                            &store_id,
-                            req.from_sequence,
-                            req.from_sequence.saturating_add(limit).saturating_sub(1),
-                        )
-                        .await
-                        .map_err(super::grpc_sequencer_error)?;
-                }
+            let expected_start = if req.from_sequence == 0 {
+                1
+            } else {
+                req.from_sequence
+            };
+            if head >= expected_start {
+                events = self
+                    .ves_sequencer
+                    .read_range(
+                        &tenant_id,
+                        &store_id,
+                        req.from_sequence,
+                        req.from_sequence.saturating_add(limit).saturating_sub(1),
+                    )
+                    .await
+                    .map_err(super::grpc_sequencer_error)?;
             }
+        }
 
         // Apply filters if specified
         let filtered_events: Vec<_> = events
@@ -860,7 +855,7 @@ impl SequencerTrait for SequencerServiceV2 {
         &self,
         request: Request<GetSyncStateRequest>,
     ) -> Result<Response<SyncState>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         let tenant_id = Uuid::parse_str(&req.tenant_id)
@@ -963,7 +958,7 @@ impl SequencerTrait for SequencerServiceV2 {
         &self,
         request: Request<GetInclusionProofRequest>,
     ) -> Result<Response<GetInclusionProofResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         let tenant_id = Uuid::parse_str(&req.tenant_id)
@@ -1234,7 +1229,7 @@ impl SequencerTrait for SequencerServiceV2 {
         &self,
         request: Request<GetCommitmentRequest>,
     ) -> Result<Response<BatchCommitment>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         Self::require_read(&auth_ctx)?;
@@ -1364,7 +1359,7 @@ impl SequencerTrait for SequencerServiceV2 {
         &self,
         request: Request<GetEntityHistoryRequest>,
     ) -> Result<Response<GetEntityHistoryResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         let tenant_id = Uuid::parse_str(&req.tenant_id)
@@ -1398,7 +1393,11 @@ impl SequencerTrait for SequencerServiceV2 {
             .map_err(super::grpc_internal_error)?;
 
         let current_version = events.len() as u64;
-        let requested_from_version = if req.from_version == 0 { 1 } else { req.from_version };
+        let requested_from_version = if req.from_version == 0 {
+            1
+        } else {
+            req.from_version
+        };
         let requested_to_version = if req.to_version == 0 {
             current_version
         } else {
@@ -1428,11 +1427,9 @@ impl SequencerTrait for SequencerServiceV2 {
         let max_records = to_version
             .saturating_sub(requested_from_version)
             .saturating_add(1);
-        let take_count = max_records
-            .min(limit as u64) as usize;
-        let start_index = usize::try_from(requested_from_version - 1).map_err(|_| {
-            Status::invalid_argument("from_version is out of range")
-        })?;
+        let take_count = max_records.min(limit as u64) as usize;
+        let start_index = usize::try_from(requested_from_version - 1)
+            .map_err(|_| Status::invalid_argument("from_version is out of range"))?;
 
         // Apply version range filter
         let filtered_events: Vec<_> = events
@@ -1474,7 +1471,7 @@ impl SequencerTrait for SequencerServiceV2 {
         &self,
         request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         info!(
@@ -1638,7 +1635,7 @@ impl SequencerTrait for SequencerServiceV2 {
         &self,
         request: Request<Streaming<SyncMessage>>,
     ) -> Result<Response<Self::SyncStreamStream>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let mut inbound = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
 
@@ -1965,7 +1962,7 @@ impl SequencerTrait for SequencerServiceV2 {
         &self,
         request: Request<SubscribeEntityRequest>,
     ) -> Result<Response<Self::SubscribeEntityStream>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         info!(
@@ -2075,17 +2072,12 @@ impl KeyManagementServiceV2 {
         Self { registry }
     }
 
-    fn auth_context<T>(request: &Request<T>) -> AuthContext {
+    fn auth_context<T>(request: &Request<T>) -> Result<AuthContext, Status> {
         request
             .extensions()
             .get::<AuthContext>()
             .cloned()
-            .unwrap_or(AuthContext {
-                tenant_id: Uuid::nil(),
-                store_ids: Vec::new(),
-                agent_id: None,
-                permissions: Permissions::admin(),
-            })
+            .ok_or_else(|| Status::unauthenticated("missing auth context"))
     }
 
     fn require_admin(ctx: &AuthContext) -> Result<(), Status> {
@@ -2128,7 +2120,7 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
         &self,
         request: Request<RegisterKeyRequest>,
     ) -> Result<Response<RegisterKeyResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         info!(
@@ -2208,7 +2200,7 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
         &self,
         request: Request<GetAgentKeysRequest>,
     ) -> Result<Response<GetAgentKeysResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         info!(
@@ -2271,7 +2263,7 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
         &self,
         request: Request<RevokeKeyRequest>,
     ) -> Result<Response<RevokeKeyResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request);
+        let auth_ctx = Self::auth_context(&request)?;
         let req = request.into_inner();
 
         info!(

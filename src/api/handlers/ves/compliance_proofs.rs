@@ -315,7 +315,7 @@ pub async fn submit_ves_compliance_proof(
                 "STARK verifier is busy, try again later".to_string(),
             )
         })?
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
 
         let verify_res = tokio::time::timeout(
             STARK_VERIFY_TIMEOUT,
@@ -334,7 +334,7 @@ pub async fn submit_ves_compliance_proof(
                 "STARK proof verification timed out".to_string(),
             )
         })?
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
 
         match verify_res {
             Ok(result) if result.valid => {}

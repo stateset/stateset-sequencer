@@ -37,8 +37,8 @@ use base64::Engine;
 use serde::Deserialize;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tracing::instrument;
 use tokio::sync::Semaphore;
+use tracing::instrument;
 use uuid::Uuid;
 use ves_stark_batch::public_inputs::{BatchPolicyKind, BatchPublicInputs};
 use ves_stark_batch::verifier::verify_batch_proof;
@@ -162,7 +162,10 @@ fn parse_hex_to_u64_array(
     if bytes.len() != expected_len {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("{field} must decode to {expected_len} bytes (got {})", bytes.len()),
+            format!(
+                "{field} must decode to {expected_len} bytes (got {})",
+                bytes.len()
+            ),
         ));
     }
 
@@ -180,7 +183,7 @@ fn parse_hex_to_u64_array(
     }
 
     let mut out = vec![0u64; chunk_count];
-    for idx in 0..chunk_count {
+    for (idx, slot) in out.iter_mut().enumerate() {
         let offset = idx * chunk_bytes;
         let limb = if chunk_bytes == 8 {
             let mut chunk = [0u8; 8];
@@ -191,7 +194,7 @@ fn parse_hex_to_u64_array(
             chunk.copy_from_slice(&bytes[offset..offset + 4]);
             u64::from(u32::from_le_bytes(chunk))
         };
-        out[idx] = limb;
+        *slot = limb;
     }
 
     Ok(out)
@@ -210,8 +213,13 @@ fn uuid_to_felts(id: &Uuid) -> [Felt; 4] {
 fn parse_batch_public_inputs(
     value: &serde_json::Value,
 ) -> Result<BatchPublicInputs, (StatusCode, String)> {
-    let parsed: VesValidityBatchPublicInputs = serde_json::from_value(value.clone())
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid public inputs: {e}")))?;
+    let parsed: VesValidityBatchPublicInputs =
+        serde_json::from_value(value.clone()).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid public inputs: {e}"),
+            )
+        })?;
 
     let prev_root_u64 = parse_hex_to_u64_array("prevStateRoot", &parsed.prev_state_root, 8, 4)?;
     let new_root_u64 = parse_hex_to_u64_array("newStateRoot", &parsed.new_state_root, 8, 4)?;
@@ -381,11 +389,10 @@ pub async fn submit_ves_validity_proof(
     };
 
     if is_stark && stark_verify_on_submit_enabled() {
-        let batch_public_inputs = parse_batch_public_inputs(
-            public_inputs
-                .as_ref()
-                .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "Missing public inputs".to_string()))?,
-        )?;
+        let batch_public_inputs = parse_batch_public_inputs(public_inputs.as_ref().ok_or((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Missing public inputs".to_string(),
+        ))?)?;
 
         let proof_bytes = proof.clone();
 
@@ -400,7 +407,7 @@ pub async fn submit_ves_validity_proof(
                 "STARK verifier is busy, try again later".to_string(),
             )
         })?
-        .map_err(|e| internal_error(e))?;
+        .map_err(internal_error)?;
 
         let verify_res = tokio::time::timeout(
             STARK_VERIFY_TIMEOUT,
@@ -417,7 +424,7 @@ pub async fn submit_ves_validity_proof(
         })?;
 
         let verify_res = verify_res
-            .map_err(|e| internal_error(e))?
+            .map_err(internal_error)?
             .map_err(internal_error)?;
 
         if !verify_res.valid {
@@ -602,7 +609,13 @@ pub async fn verify_ves_validity_proof(
     let mut stark_error: Option<String> = None;
     let mut stark_verification_time_ms: Option<u64> = None;
 
-    if is_stark && valid_base_validation(proof_hash_match, proof.public_inputs.as_ref(), public_inputs_match) {
+    if is_stark
+        && valid_base_validation(
+            proof_hash_match,
+            proof.public_inputs.as_ref(),
+            public_inputs_match,
+        )
+    {
         if proof.proof_version != ves_stark_verifier::PROOF_VERSION {
             stark_valid = Some(false);
             stark_error = Some(format!(
@@ -614,9 +627,11 @@ pub async fn verify_ves_validity_proof(
             let batch_public_inputs = parse_batch_public_inputs(&canonical_public_inputs)?;
             let proof_bytes = proof.proof.clone();
 
-            let permit_res =
-                tokio::time::timeout(STARK_VERIFY_ACQUIRE_TIMEOUT, stark_verify_semaphore().acquire())
-                    .await;
+            let permit_res = tokio::time::timeout(
+                STARK_VERIFY_ACQUIRE_TIMEOUT,
+                stark_verify_semaphore().acquire(),
+            )
+            .await;
 
             let verify_res = match permit_res {
                 Err(_) => Err("STARK verifier is busy, try again later".to_string()),

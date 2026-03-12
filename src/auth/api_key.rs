@@ -44,6 +44,7 @@ impl ApiKeyRecord {
             tenant_id: self.tenant_id,
             store_ids: self.store_ids.clone(),
             agent_id: self.agent_id,
+            rate_limit: self.rate_limit,
             permissions: self.permissions.clone(),
         }
     }

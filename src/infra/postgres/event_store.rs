@@ -60,23 +60,20 @@ impl PgEventStore {
                 });
             }
 
-            expected = sequence.checked_add(1).ok_or_else(|| {
-                SequencerError::InvariantViolation {
-                    invariant: "sequence_range".to_string(),
-                    message: "sequence number overflow while validating range".to_string(),
-                }
-            })?;
+            expected =
+                sequence
+                    .checked_add(1)
+                    .ok_or_else(|| SequencerError::InvariantViolation {
+                        invariant: "sequence_range".to_string(),
+                        message: "sequence number overflow while validating range".to_string(),
+                    })?;
             last = sequence;
         }
 
         Ok(last)
     }
 
-    async fn head_sequence(
-        &self,
-        tenant_id: &TenantId,
-        store_id: &StoreId,
-    ) -> Result<u64> {
+    async fn head_sequence(&self, tenant_id: &TenantId, store_id: &StoreId) -> Result<u64> {
         let row: (i64,) = sqlx::query_as(
             r#"
             SELECT COALESCE(MAX(sequence_number), 0)
@@ -180,10 +177,7 @@ impl EventStore for PgEventStore {
         for event in events {
             let env = &event.envelope;
             let sequence_number = Self::encode_sequence(env.sequence_number.unwrap_or(0))?;
-            let base_version = env
-                .base_version
-                .map(Self::encode_sequence)
-                .transpose()?;
+            let base_version = env.base_version.map(Self::encode_sequence).transpose()?;
 
             let payload_bytes = serde_json::to_vec(&env.payload)
                 .map_err(|e| SequencerError::Internal(e.to_string()))?;
@@ -276,9 +270,7 @@ impl EventStore for PgEventStore {
             if head_sequence >= start {
                 return Err(SequencerError::InvariantViolation {
                     invariant: "sequence_range".to_string(),
-                    message: format!(
-                        "sequence gap in range {start}..={end}: head {head_sequence}"
-                    ),
+                    message: format!("sequence gap in range {start}..={end}: head {head_sequence}"),
                 });
             }
             return Ok(events);
@@ -316,7 +308,6 @@ impl EventStore for PgEventStore {
             WHERE tenant_id = $1 AND store_id = $2
               AND entity_type = $3 AND entity_id = $4
             ORDER BY sequence_number ASC
-            LIMIT 10000
             "#,
         )
         .bind(tenant_id.0)
@@ -473,7 +464,7 @@ impl PgEventStore {
         .fetch_one(&self.pool)
         .await?;
 
-        Ok(Self::decode_sequence(row.0)?)
+        Self::decode_sequence(row.0)
     }
 
     /// Get leaf inputs for a sequence range (for Merkle tree construction).

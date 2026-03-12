@@ -237,107 +237,113 @@ impl ProjectionRunner {
             "Starting projection runner"
         );
 
-        // Get starting checkpoint
-        let checkpoint = self
-            .checkpoint_store
-            .get_checkpoint(tenant_id, store_id)
-            .await?;
-
-        let mut from_sequence = checkpoint.map(|c| c.last_sequence + 1).unwrap_or(0);
-        let mut events_since_checkpoint = 0u64;
-
-        loop {
-            // Check if we should stop
-            if !*self.running.read().await {
-                info!("Projection runner stopping");
-                break;
-            }
-
-            // Fetch next batch of events
-            let events = self
-                .event_source
-                .get_events_from(tenant_id, store_id, from_sequence, self.config.batch_size)
+        let result = async {
+            // Get starting checkpoint
+            let checkpoint = self
+                .checkpoint_store
+                .get_checkpoint(tenant_id, store_id)
                 .await?;
 
-            if events.is_empty() {
-                // No more events, wait before polling again
-                tokio::time::sleep(tokio::time::Duration::from_millis(
-                    self.config.poll_interval_ms,
-                ))
-                .await;
-                continue;
-            }
+            let mut from_sequence = checkpoint.map(|c| c.last_sequence + 1).unwrap_or(0);
+            let mut events_since_checkpoint = 0u64;
 
-            // Process each event
-            for event in events {
-                let result = self.process_event(tenant_id, store_id, &event).await;
+            loop {
+                // Check if we should stop
+                if !*self.running.read().await {
+                    info!("Projection runner stopping");
+                    break;
+                }
 
-                match result {
-                    Ok(()) => {
-                        from_sequence = event.sequence_number() + 1;
-                        events_since_checkpoint += 1;
+                // Fetch next batch of events
+                let events = self
+                    .event_source
+                    .get_events_from(tenant_id, store_id, from_sequence, self.config.batch_size)
+                    .await?;
 
-                        // Update stats
-                        {
-                            let mut stats = self.stats.write().await;
-                            stats.events_processed += 1;
-                            stats.last_sequence = Some(event.sequence_number());
+                if events.is_empty() {
+                    // No more events, wait before polling again
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        self.config.poll_interval_ms,
+                    ))
+                    .await;
+                    continue;
+                }
+
+                // Process each event
+                for event in events {
+                    let result = self.process_event(tenant_id, store_id, &event).await;
+
+                    match result {
+                        Ok(()) => {
+                            from_sequence = event.sequence_number() + 1;
+                            events_since_checkpoint += 1;
+
+                            // Update stats
+                            {
+                                let mut stats = self.stats.write().await;
+                                stats.events_processed += 1;
+                                stats.last_sequence = Some(event.sequence_number());
+                            }
+
+                            // Checkpoint if needed
+                            if events_since_checkpoint >= self.config.checkpoint_interval {
+                                self.checkpoint_store
+                                    .set_checkpoint(tenant_id, store_id, event.sequence_number())
+                                    .await?;
+                                events_since_checkpoint = 0;
+                                debug!(sequence = event.sequence_number(), "Checkpoint updated");
+                            }
                         }
+                        Err(e) => {
+                            error!(
+                                event_id = %event.event_id(),
+                                sequence = event.sequence_number(),
+                                error = %e,
+                                "Error processing event"
+                            );
 
-                        // Checkpoint if needed
-                        if events_since_checkpoint >= self.config.checkpoint_interval {
-                            self.checkpoint_store
-                                .set_checkpoint(tenant_id, store_id, event.sequence_number())
-                                .await?;
-                            events_since_checkpoint = 0;
-                            debug!(sequence = event.sequence_number(), "Checkpoint updated");
+                            // Send to dead letter queue
+                            self.send_to_dead_letter_queue(
+                                tenant_id,
+                                store_id,
+                                &event,
+                                DeadLetterReason::HandlerError,
+                                &e.to_string(),
+                                event.payload().clone(),
+                            )
+                            .await;
+
+                            {
+                                let mut stats = self.stats.write().await;
+                                stats.errors += 1;
+                            }
+
+                            if !self.config.continue_on_error {
+                                return Err(e);
+                            }
+
+                            // Skip this event and continue
+                            from_sequence = event.sequence_number() + 1;
                         }
-                    }
-                    Err(e) => {
-                        error!(
-                            event_id = %event.event_id(),
-                            sequence = event.sequence_number(),
-                            error = %e,
-                            "Error processing event"
-                        );
-
-                        // Send to dead letter queue
-                        self.send_to_dead_letter_queue(
-                            tenant_id,
-                            store_id,
-                            &event,
-                            DeadLetterReason::HandlerError,
-                            &e.to_string(),
-                            event.payload().clone(),
-                        )
-                        .await;
-
-                        {
-                            let mut stats = self.stats.write().await;
-                            stats.errors += 1;
-                        }
-
-                        if !self.config.continue_on_error {
-                            return Err(e);
-                        }
-
-                        // Skip this event and continue
-                        from_sequence = event.sequence_number() + 1;
                     }
                 }
             }
-        }
 
-        // Final checkpoint
-        if events_since_checkpoint > 0 {
-            if let Some(seq) = self.stats.read().await.last_sequence {
-                self.checkpoint_store
-                    .set_checkpoint(tenant_id, store_id, seq)
-                    .await?;
+            // Final checkpoint
+            if events_since_checkpoint > 0 {
+                if let Some(seq) = self.stats.read().await.last_sequence {
+                    self.checkpoint_store
+                        .set_checkpoint(tenant_id, store_id, seq)
+                        .await?;
+                }
             }
-        }
 
-        Ok(())
+            Ok(())
+        }
+        .await;
+
+        *self.running.write().await = false;
+        result
     }
 
     /// Stop the projection runner

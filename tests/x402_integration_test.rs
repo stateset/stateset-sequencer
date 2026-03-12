@@ -21,6 +21,7 @@ use stateset_sequencer::domain::{
 use stateset_sequencer::infra::PgX402Repository;
 
 /// Compute signing hash matching the sequencer's implementation
+#[allow(clippy::too_many_arguments)]
 fn compute_signing_hash(
     payer: &str,
     payee: &str,
@@ -39,12 +40,12 @@ fn compute_signing_hash(
     // Payment parameters
     hasher.update(payer.as_bytes());
     hasher.update(payee.as_bytes());
-    hasher.update(&amount.to_be_bytes());
+    hasher.update(amount.to_be_bytes());
     hasher.update(asset.as_bytes());
     hasher.update(network.as_bytes());
-    hasher.update(&chain_id.to_be_bytes());
-    hasher.update(&valid_until.to_be_bytes());
-    hasher.update(&nonce.to_be_bytes());
+    hasher.update(chain_id.to_be_bytes());
+    hasher.update(valid_until.to_be_bytes());
+    hasher.update(nonce.to_be_bytes());
 
     let result = hasher.finalize();
     let mut hash = [0u8; 32];

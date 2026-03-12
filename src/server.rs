@@ -44,12 +44,12 @@ use crate::auth::{
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::ShutdownCoordinator;
 use crate::infra::{
-    extract_client_ip, BatchWorkerMessage, CacheManager, CacheManagerConfig,
-    CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry, PgAuditLogger,
-    PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer, PgVesCommitmentEngine,
-    PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository, PoolMonitor,
-    AnchorWorkerConfig, AnchorWorkerMessage, SchemaValidationMode, SecretsProvider, VesSequencer,
-    X402BatchWorkerConfig, spawn_batch_worker, spawn_anchor_worker,
+    extract_client_ip, spawn_anchor_worker, spawn_batch_worker, AnchorWorkerConfig,
+    AnchorWorkerMessage, BatchWorkerMessage, CacheManager, CacheManagerConfig,
+    CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry,
+    PgAuditLogger, PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer,
+    PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository,
+    PoolMonitor, SchemaValidationMode, SecretsProvider, VesSequencer, X402BatchWorkerConfig,
 };
 use crate::metrics::{ComponentMetrics, MetricsRegistry};
 
@@ -281,9 +281,9 @@ fn parse_u16_env(name: &str, default: u16) -> anyhow::Result<u16> {
 fn parse_optional_positive_u32(name: &str) -> anyhow::Result<Option<u32>> {
     match std::env::var(name) {
         Ok(raw) => {
-            let value = raw
-                .parse::<u32>()
-                .map_err(|_| anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer"))?;
+            let value = raw.parse::<u32>().map_err(|_| {
+                anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer")
+            })?;
             if value == 0 {
                 return Err(anyhow::anyhow!(
                     "Invalid value for {name}: '{raw}'. Expected a value greater than 0"
@@ -298,9 +298,9 @@ fn parse_optional_positive_u32(name: &str) -> anyhow::Result<Option<u32>> {
 fn parse_optional_positive_u64(name: &str) -> anyhow::Result<Option<u64>> {
     match std::env::var(name) {
         Ok(raw) => {
-            let value = raw
-                .parse::<u64>()
-                .map_err(|_| anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer"))?;
+            let value = raw.parse::<u64>().map_err(|_| {
+                anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer")
+            })?;
             if value == 0 {
                 return Err(anyhow::anyhow!(
                     "Invalid value for {name}: '{raw}'. Expected a value greater than 0"
@@ -315,9 +315,9 @@ fn parse_optional_positive_u64(name: &str) -> anyhow::Result<Option<u64>> {
 fn parse_optional_positive_usize(name: &str) -> anyhow::Result<Option<usize>> {
     match std::env::var(name) {
         Ok(raw) => {
-            let value = raw
-                .parse::<usize>()
-                .map_err(|_| anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer"))?;
+            let value = raw.parse::<usize>().map_err(|_| {
+                anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer")
+            })?;
             if value == 0 {
                 return Err(anyhow::anyhow!(
                     "Invalid value for {name}: '{raw}'. Expected a value greater than 0"
@@ -388,11 +388,10 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("Invalid listen address '{host}:{port}': {e}"))?;
 
         // gRPC port configuration (defaults to HTTP port + 1, e.g., 8081 if HTTP is 8080)
-        let grpc_addr: Option<SocketAddr> =
-            if parse_bool_env("GRPC_DISABLED", false)? {
-                None
-            } else {
-        let grpc_port: u16 = match std::env::var("GRPC_PORT") {
+        let grpc_addr: Option<SocketAddr> = if parse_bool_env("GRPC_DISABLED", false)? {
+            None
+        } else {
+            let grpc_port: u16 = match std::env::var("GRPC_PORT") {
             Ok(raw) => raw
                 .parse::<u16>()
                 .map_err(|_| anyhow::anyhow!("Invalid value for GRPC_PORT: '{raw}'. Expected 0..=65535"))?,
@@ -402,10 +401,12 @@ impl Config {
                 )
             })?,
         };
-                Some(format!("{host}:{grpc_port}").parse().map_err(|e| {
+            Some(
+                format!("{host}:{grpc_port}").parse().map_err(|e| {
                     anyhow::anyhow!("Invalid gRPC address '{host}:{grpc_port}': {e}")
-                })?)
-            };
+                })?,
+            )
+        };
 
         let write_pool = DbPoolConfig::from_env("", 10);
         let read_pool = DbPoolConfig::from_env("READ_", write_pool.max_connections);
@@ -735,7 +736,7 @@ pub async fn run() -> anyhow::Result<()> {
     let rate_limiter = parse_optional_positive_u32("RATE_LIMIT_PER_MINUTE")?
         .map(|rpm| Arc::new(RateLimiter::new(rpm)));
 
-    let public_registration_enabled = parse_bool_env("PUBLIC_AGENT_REGISTRATION_ENABLED", true)?;
+    let public_registration_enabled = parse_bool_env("PUBLIC_AGENT_REGISTRATION_ENABLED", false)?;
 
     let public_registration_limiter = if let Some(rpm) =
         parse_optional_positive_u32("PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE")?
@@ -744,7 +745,9 @@ pub async fn run() -> anyhow::Result<()> {
             requests_per_minute: rpm,
             ..Default::default()
         };
-        if let Some(max_entries) = parse_optional_positive_usize("PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES")? {
+        if let Some(max_entries) =
+            parse_optional_positive_usize("PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES")?
+        {
             config.max_entries = max_entries;
         }
         if let Some(window_seconds) =
@@ -936,10 +939,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Initialize services
     let sequencer = Arc::new(PgSequencer::new(pool.clone(), payload_encryption.clone()));
-    let event_store = Arc::new(PgEventStore::new(
-        read_pool.clone(),
-        payload_encryption.clone(),
-    ));
+    let event_store = Arc::new(PgEventStore::new(pool.clone(), payload_encryption.clone()));
     let commitment_engine = Arc::new(PgCommitmentEngine::new(pool.clone()));
     let commitment_reader = Arc::new(PgCommitmentEngine::new(read_pool.clone()));
     let ves_commitment_engine = Arc::new(PgVesCommitmentEngine::new(pool.clone()));
@@ -958,7 +958,7 @@ pub async fn run() -> anyhow::Result<()> {
         PgAgentKeyRegistry::new(pool.clone()).with_cache(cache_manager.agent_keys.clone()),
     );
     let mut ves_sequencer = VesSequencer::new(pool.clone(), agent_key_registry.clone());
-    let mut ves_sequencer_reader = VesSequencer::new(read_pool.clone(), agent_key_registry.clone());
+    let mut ves_sequencer_reader = VesSequencer::new(pool.clone(), agent_key_registry.clone());
     if let Some(sequencer_id) = load_ves_sequencer_id(secrets.as_ref())? {
         info!("VES sequencer id configured: {}", sequencer_id);
         ves_sequencer = ves_sequencer.with_sequencer_id(sequencer_id);
@@ -1345,7 +1345,6 @@ fn build_router(
     admin_access_state: AdminAccessState,
 ) -> anyhow::Result<Router<AppState>> {
     let public_api = crate::api::public_router();
-    let public_api_root = crate::api::public_router();
     let admin_allowlist_layer =
         axum::middleware::from_fn_with_state(admin_access_state, admin_ip_allowlist_middleware);
     let api = crate::api::router().layer(axum::middleware::from_fn_with_state(
@@ -1377,7 +1376,7 @@ fn build_router(
             get(crate::api::handlers::health::detailed_health_check),
         )
         .layer(axum::middleware::from_fn_with_state(
-            auth_state,
+            auth_state.clone(),
             crate::auth::auth_middleware,
         ))
         .layer(admin_allowlist_layer.clone());
@@ -1385,11 +1384,14 @@ fn build_router(
     let admin_dashboard = Router::new()
         .route("/admin", get(crate::api::handlers::admin::admin_dashboard))
         .route("/admin/", get(crate::api::handlers::admin::admin_dashboard))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            crate::auth::auth_middleware,
+        ))
         .layer(admin_allowlist_layer.clone());
 
     let mut router = Router::new()
         .nest("/api", public_api)
-        .merge(public_api_root)
         .merge(metrics_router)
         .merge(detailed_health_router)
         .merge(anchor_compat)
@@ -1679,6 +1681,7 @@ mod tests {
             tenant_id: Uuid::new_v4(),
             store_ids: Vec::new(),
             agent_id: None,
+            rate_limit: None,
             permissions: Permissions::read_only(),
         };
         let response =
@@ -1689,6 +1692,7 @@ mod tests {
             tenant_id: Uuid::nil(),
             store_ids: Vec::new(),
             agent_id: None,
+            rate_limit: None,
             permissions: Permissions::admin(),
         };
         let response = metrics_handler(State(state), Extension(AuthContextExt(admin_ctx))).await;

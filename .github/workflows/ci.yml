@@ -72,10 +72,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run unit tests
-        run: cargo test --locked
+        run: cargo test --locked --lib --bins
 
       - name: Run integration tests
-        run: cargo test --locked -- --ignored
+        run: cargo test --locked --tests -- --ignored
 
       - name: Run property tests
         run: cargo test --locked property_test
@@ -143,7 +143,7 @@ jobs:
             --exclude-files "benches/*" \
             --exclude-files "src/proto/*" \
             --timeout 600 \
-            -- --ignored || true
+            -- --ignored
 
       - name: Check coverage threshold
         run: |

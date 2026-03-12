@@ -147,7 +147,7 @@ spec:
 
         - alert: SequencerAgentRegistrationErrors
           expr: |
-            rate(sequencer_http_requests_total{path=~\"/v1/agents/register|/api/v1/agents/register\",status=~\"5..\"}[5m]) > 0
+            rate(sequencer_http_requests_total{path=\"/api/v1/agents/register\",status=~\"5..\"}[5m]) > 0
           for: 5m
           labels:
             severity: warning
@@ -157,7 +157,7 @@ spec:
 
         - alert: SequencerAgentRegistrationLatency
           expr: |
-            histogram_quantile(0.95, rate(sequencer_http_request_latency_seconds_bucket{path=~\"/v1/agents/register|/api/v1/agents/register\"}[5m])) > 1
+            histogram_quantile(0.95, rate(sequencer_http_request_latency_seconds_bucket{path=\"/api/v1/agents/register\"}[5m])) > 1
           for: 5m
           labels:
             severity: warning

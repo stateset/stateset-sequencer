@@ -218,7 +218,7 @@ export PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS=60
 This endpoint is unauthenticated by design; protect it with WAF rules and monitoring. Recommended:
 - Block suspicious user agents and bots
 - Enforce IP-based throttling at the edge
-- Alert on spikes in 4xx/5xx for `/v1/agents/register`
+- Alert on spikes in 4xx/5xx for `/api/v1/agents/register`
 - Expiration dates enforced
 
 ```bash

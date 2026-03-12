@@ -185,12 +185,13 @@ impl PgSequencer {
         }
 
         let head = self.head(tenant_id, store_id).await?;
-        Self::ensure_sequence_capacity(head, usize::try_from(count).map_err(|_| {
-            SequencerError::InvariantViolation {
+        Self::ensure_sequence_capacity(
+            head,
+            usize::try_from(count).map_err(|_| SequencerError::InvariantViolation {
                 invariant: "sequence_counter".to_string(),
                 message: "sequence request count too large".to_string(),
-            }
-        })?)?;
+            })?,
+        )?;
 
         let row: (i64,) = sqlx::query_as(
             r#"
@@ -205,21 +206,19 @@ impl PgSequencer {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(i64::try_from(count).map_err(|_| SequencerError::InvariantViolation {
-            invariant: "sequence_counter".to_string(),
-            message: format!("sequence request count must be <= {}", Self::MAX_SEQUENCE),
-        })?)
+        .bind(i64::from(count))
         .fetch_one(&self.pool)
         .await?;
 
         let end = Self::decode_sequence(row.0)?;
         let count = count as u64;
-        let start = end.checked_sub(count).and_then(|value| value.checked_add(1)).ok_or_else(
-            || SequencerError::InvariantViolation {
+        let start = end
+            .checked_sub(count)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| SequencerError::InvariantViolation {
                 invariant: "sequence_counter".to_string(),
                 message: "sequence range calculation overflow".to_string(),
-            },
-        )?;
+            })?;
         Ok((start, end))
     }
 
@@ -288,10 +287,7 @@ impl PgSequencer {
     ) -> Result<bool> {
         let env = &event.envelope;
         let sequence_number = Self::encode_sequence(env.sequence_number.unwrap_or(0))?;
-        let base_version = env
-            .base_version
-            .map(Self::encode_sequence)
-            .transpose()?;
+        let base_version = env.base_version.map(Self::encode_sequence).transpose()?;
 
         let payload_bytes = serde_json::to_vec(&env.payload)
             .map_err(|e| SequencerError::Internal(e.to_string()))?;
@@ -317,18 +313,18 @@ impl PgSequencer {
         )
         .bind(env.event_id)
         .bind(env.command_id)
-            .bind(sequence_number)
+        .bind(sequence_number)
         .bind(env.tenant_id.0)
         .bind(env.store_id.0)
         .bind(env.entity_type.as_str())
         .bind(&env.entity_id)
         .bind(env.event_type.as_str())
-            .bind(&payload_encrypted)
-            .bind(&env.payload_hash[..])
-            .bind(base_version)
-            .bind(env.source_agent.0)
-            .bind(env.signature.as_ref())
-            .bind(env.created_at)
+        .bind(&payload_encrypted)
+        .bind(&env.payload_hash[..])
+        .bind(base_version)
+        .bind(env.source_agent.0)
+        .bind(env.signature.as_ref())
+        .bind(env.created_at)
         .bind(event.sequenced_at)
         .execute(&mut **tx)
         .await?;
@@ -389,7 +385,7 @@ impl PgSequencer {
         .fetch_optional(&mut **tx)
         .await?;
 
-        Ok(row.map(|(v,)| Self::decode_sequence(v)).transpose()?)
+        row.map(|(v,)| Self::decode_sequence(v)).transpose()
     }
 
     async fn fetch_existing_command_id_tx(
@@ -632,10 +628,12 @@ impl IngestService for PgSequencer {
                 }
             }
 
-            let next_seq = head.checked_add(1).ok_or_else(|| SequencerError::InvariantViolation {
-                invariant: "sequence_counter".to_string(),
-                message: "sequence counter overflow".to_string(),
-            })?;
+            let next_seq =
+                head.checked_add(1)
+                    .ok_or_else(|| SequencerError::InvariantViolation {
+                        invariant: "sequence_counter".to_string(),
+                        message: "sequence counter overflow".to_string(),
+                    })?;
             let sequenced = SequencedEvent::new(event, next_seq);
 
             // Insert; if we raced a duplicate event_id (global), reject without advancing.
