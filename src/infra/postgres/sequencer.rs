@@ -252,28 +252,28 @@ impl PgSequencer {
         }
 
         let entity_type = event.entity_type.as_str();
-        if entity_type.is_empty() || entity_type.len() > 64 {
+        if entity_type.is_empty() || entity_type.len() > 128 {
             return Some(RejectedEvent {
                 event_id: event.event_id,
                 reason: RejectionReason::SchemaValidation,
-                message: "entity_type must be 1-64 characters".to_string(),
+                message: "entity_type must be 1-128 characters".to_string(),
             });
         }
 
-        if event.entity_id.is_empty() || event.entity_id.len() > 256 {
+        if event.entity_id.is_empty() || event.entity_id.len() > 512 {
             return Some(RejectedEvent {
                 event_id: event.event_id,
                 reason: RejectionReason::SchemaValidation,
-                message: "entity_id must be 1-256 characters".to_string(),
+                message: "entity_id must be 1-512 characters".to_string(),
             });
         }
 
         let event_type = event.event_type.as_str();
-        if event_type.is_empty() || event_type.len() > 64 {
+        if event_type.is_empty() || event_type.len() > 256 {
             return Some(RejectedEvent {
                 event_id: event.event_id,
                 reason: RejectionReason::SchemaValidation,
-                message: "event_type must be 1-64 characters".to_string(),
+                message: "event_type must be 1-256 characters".to_string(),
             });
         }
 
@@ -817,9 +817,9 @@ impl PgSequencer {
                 sequence_number BIGINT NOT NULL,
                 tenant_id UUID NOT NULL,
                 store_id UUID NOT NULL,
-                entity_type VARCHAR(64) NOT NULL,
-                entity_id VARCHAR(256) NOT NULL,
-                event_type VARCHAR(64) NOT NULL,
+                entity_type VARCHAR(128) NOT NULL,
+                entity_id VARCHAR(512) NOT NULL,
+                event_type VARCHAR(256) NOT NULL,
                 payload_encrypted BYTEA NOT NULL,
                 payload_hash BYTEA NOT NULL,
                 base_version BIGINT,
@@ -904,8 +904,8 @@ impl PgSequencer {
             CREATE TABLE IF NOT EXISTS entity_versions (
                 tenant_id UUID NOT NULL,
                 store_id UUID NOT NULL,
-                entity_type VARCHAR(64) NOT NULL,
-                entity_id VARCHAR(256) NOT NULL,
+                entity_type VARCHAR(128) NOT NULL,
+                entity_id VARCHAR(512) NOT NULL,
                 version BIGINT NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (tenant_id, store_id, entity_type, entity_id)

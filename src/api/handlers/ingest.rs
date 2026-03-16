@@ -46,6 +46,90 @@ use crate::infra::{IngestService, SchemaStore, SchemaValidationMode, Sequencer};
 use crate::metrics::{metric_names, TimerGuard};
 use crate::server::AppState;
 
+/// Shared schema validation outcome for a single event's payload.
+///
+/// Evaluates the `SchemaValidationResult` against the configured mode and
+/// returns `Ok(())` if the event should be accepted, or `Err(message)` if it
+/// should be rejected.
+fn evaluate_validation_result(
+    event_id: Uuid,
+    event_type: &str,
+    validation_result: &crate::domain::SchemaValidationResult,
+    validation_mode: SchemaValidationMode,
+) -> Result<(), String> {
+    // No schema registered
+    if validation_result.schema_id.is_none() {
+        if validation_mode.should_reject_missing_schema() {
+            return Err(format!(
+                "No schema registered for event type '{}'",
+                event_type
+            ));
+        }
+
+        if matches!(validation_mode, SchemaValidationMode::WarnOnly) {
+            tracing::warn!(
+                event_id = %event_id,
+                event_type = %event_type,
+                "No schema registered for event type"
+            );
+        }
+
+        return Ok(());
+    }
+
+    // Schema exists — check result
+    if validation_result.valid {
+        return Ok(());
+    }
+
+    let error_messages: Vec<String> = validation_result
+        .errors
+        .iter()
+        .map(|e| format!("{}: {}", e.path, e.message))
+        .collect();
+
+    let message = format!(
+        "Schema validation failed for event type '{}': {}",
+        event_type,
+        error_messages.join("; ")
+    );
+
+    if validation_mode.should_reject_on_failure() {
+        Err(message)
+    } else {
+        tracing::warn!(
+            event_id = %event_id,
+            event_type = %event_type,
+            errors = ?error_messages,
+            "Schema validation failed (warn mode)"
+        );
+        Ok(())
+    }
+}
+
+/// Handle schema store errors uniformly.  Returns `Ok(None)` when the event
+/// should be accepted despite the error, or `Err(message)` when it should be
+/// rejected.
+fn handle_schema_store_error(
+    event_id: Uuid,
+    event_type: &str,
+    error: &dyn std::fmt::Display,
+    validation_mode: SchemaValidationMode,
+) -> Result<(), String> {
+    tracing::warn!(
+        event_id = %event_id,
+        event_type = %event_type,
+        error = %error,
+        "Schema validation error"
+    );
+
+    if validation_mode.should_reject_missing_schema() {
+        Err(format!("Schema validation error: {}", error))
+    } else {
+        Ok(())
+    }
+}
+
 /// Validate events against registered schemas.
 ///
 /// Returns (valid_events, rejected_events) based on schema validation results.
@@ -57,7 +141,6 @@ async fn validate_events_against_schemas(
 ) -> (Vec<EventEnvelope>, Vec<RejectedEvent>) {
     debug!("Validating {} events against schemas", events.len());
 
-    // If validation is disabled, return all events as valid
     if !validation_mode.should_validate() {
         return (events, Vec::new());
     }
@@ -68,99 +151,33 @@ async fn validate_events_against_schemas(
     for event in events {
         let tenant_id = TenantId::from_uuid(event.tenant_id.0);
 
-        // Validate payload against schema
         let validation_result = match schema_store
             .validate(&tenant_id, &event.event_type, &event.payload)
             .await
         {
             Ok(result) => result,
             Err(e) => {
-                // Schema store error - log and treat as no schema depending on mode
-                tracing::warn!(
-                    event_id = %event.event_id,
-                    event_type = %event.event_type,
-                    error = %e,
-                    "Schema validation error"
-                );
-
-                if validation_mode.should_reject_missing_schema() {
-                    rejected_events.push(RejectedEvent {
-                        event_id: event.event_id,
-                        reason: RejectionReason::SchemaValidation,
-                        message: format!("Schema validation error: {}", e),
-                    });
-                    continue;
+                match handle_schema_store_error(event.event_id, event.event_type.as_str(), &e, validation_mode) {
+                    Ok(()) => { valid_events.push(event); continue; }
+                    Err(msg) => {
+                        rejected_events.push(RejectedEvent {
+                            event_id: event.event_id,
+                            reason: RejectionReason::SchemaValidation,
+                            message: msg,
+                        });
+                        continue;
+                    }
                 }
-
-                valid_events.push(event);
-                continue;
             }
         };
 
-        // Check if schema exists
-        if validation_result.schema_id.is_none() {
-            // No schema registered for this event type
-            if validation_mode.should_reject_missing_schema() {
-                rejected_events.push(RejectedEvent {
-                    event_id: event.event_id,
-                    reason: RejectionReason::SchemaValidation,
-                    message: format!(
-                        "No schema registered for event type '{}'",
-                        event.event_type.as_str()
-                    ),
-                });
-                continue;
-            }
-
-            // Log warning if in warn mode
-            if matches!(
-                validation_mode,
-                crate::infra::SchemaValidationMode::WarnOnly
-            ) {
-                tracing::warn!(
-                    event_id = %event.event_id,
-                    event_type = %event.event_type,
-                    "No schema registered for event type"
-                );
-            }
-
-            valid_events.push(event);
-            continue;
-        }
-
-        // Schema exists, check validation result
-        if validation_result.valid {
-            valid_events.push(event);
-        } else {
-            // Validation failed
-            let error_messages: Vec<String> = validation_result
-                .errors
-                .iter()
-                .map(|e| format!("{}: {}", e.path, e.message))
-                .collect();
-
-            let message = format!(
-                "Schema validation failed for event type '{}': {}",
-                event.event_type.as_str(),
-                error_messages.join("; ")
-            );
-
-            if validation_mode.should_reject_on_failure() {
-                rejected_events.push(RejectedEvent {
-                    event_id: event.event_id,
-                    reason: RejectionReason::SchemaValidation,
-                    message,
-                });
-            } else {
-                // Warn mode - log and accept
-                tracing::warn!(
-                    event_id = %event.event_id,
-                    event_type = %event.event_type,
-                    errors = ?error_messages,
-                    "Schema validation failed (warn mode)"
-                );
-                valid_events.push(event);
-            }
+        match evaluate_validation_result(event.event_id, event.event_type.as_str(), &validation_result, validation_mode) {
+            Ok(()) => valid_events.push(event),
+            Err(msg) => rejected_events.push(RejectedEvent {
+                event_id: event.event_id,
+                reason: RejectionReason::SchemaValidation,
+                message: msg,
+            }),
         }
     }
 
@@ -178,7 +195,6 @@ async fn validate_ves_events_against_schemas(
 ) -> (Vec<VesEventEnvelope>, Vec<RejectionInfo>) {
     debug!("Validating {} VES events against schemas", events.len());
 
-    // If validation is disabled, return all events as valid
     if !validation_mode.should_validate() {
         return (events, Vec::new());
     }
@@ -187,6 +203,7 @@ async fn validate_ves_events_against_schemas(
     let mut rejected_events = Vec::new();
 
     for event in events {
+        // Encrypted events can't be schema-validated; check schema existence only.
         if event.is_encrypted() {
             if matches!(
                 validation_mode,
@@ -220,20 +237,16 @@ async fn validate_ves_events_against_schemas(
                         );
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            event_id = %event.event_id,
-                            event_type = %event.event_type,
-                            error = %e,
-                            "Schema lookup error"
-                        );
-
-                        if validation_mode.should_reject_missing_schema() {
-                            rejected_events.push(RejectionInfo {
-                                event_id: event.event_id,
-                                reason: "schema_validation".to_string(),
-                                message: format!("Schema validation error: {}", e),
-                            });
-                            continue;
+                        match handle_schema_store_error(event.event_id, event.event_type.as_str(), &e, validation_mode) {
+                            Ok(()) => {}
+                            Err(msg) => {
+                                rejected_events.push(RejectionInfo {
+                                    event_id: event.event_id,
+                                    reason: "schema_validation".to_string(),
+                                    message: msg,
+                                });
+                                continue;
+                            }
                         }
                     }
                 }
@@ -266,84 +279,27 @@ async fn validate_ves_events_against_schemas(
         {
             Ok(result) => result,
             Err(e) => {
-                tracing::warn!(
-                    event_id = %event.event_id,
-                    event_type = %event.event_type,
-                    error = %e,
-                    "Schema validation error"
-                );
-
-                if validation_mode.should_reject_missing_schema() {
-                    rejected_events.push(RejectionInfo {
-                        event_id: event.event_id,
-                        reason: "schema_validation".to_string(),
-                        message: format!("Schema validation error: {}", e),
-                    });
-                    continue;
+                match handle_schema_store_error(event.event_id, event.event_type.as_str(), &e, validation_mode) {
+                    Ok(()) => { valid_events.push(event); continue; }
+                    Err(msg) => {
+                        rejected_events.push(RejectionInfo {
+                            event_id: event.event_id,
+                            reason: "schema_validation".to_string(),
+                            message: msg,
+                        });
+                        continue;
+                    }
                 }
-
-                valid_events.push(event);
-                continue;
             }
         };
 
-        // Check if schema exists
-        if validation_result.schema_id.is_none() {
-            if validation_mode.should_reject_missing_schema() {
-                rejected_events.push(RejectionInfo {
-                    event_id: event.event_id,
-                    reason: "schema_validation".to_string(),
-                    message: format!(
-                        "No schema registered for event type '{}'",
-                        event.event_type.as_str()
-                    ),
-                });
-                continue;
-            }
-
-            if matches!(validation_mode, SchemaValidationMode::WarnOnly) {
-                tracing::warn!(
-                    event_id = %event.event_id,
-                    event_type = %event.event_type,
-                    "No schema registered for event type"
-                );
-            }
-
-            valid_events.push(event);
-            continue;
-        }
-
-        // Schema exists, check validation result
-        if validation_result.valid {
-            valid_events.push(event);
-        } else {
-            let error_messages: Vec<String> = validation_result
-                .errors
-                .iter()
-                .map(|e| format!("{}: {}", e.path, e.message))
-                .collect();
-
-            let message = format!(
-                "Schema validation failed for event type '{}': {}",
-                event.event_type.as_str(),
-                error_messages.join("; ")
-            );
-
-            if validation_mode.should_reject_on_failure() {
-                rejected_events.push(RejectionInfo {
-                    event_id: event.event_id,
-                    reason: "schema_validation".to_string(),
-                    message,
-                });
-            } else {
-                tracing::warn!(
-                    event_id = %event.event_id,
-                    event_type = %event.event_type,
-                    errors = ?error_messages,
-                    "Schema validation failed (warn mode)"
-                );
-                valid_events.push(event);
-            }
+        match evaluate_validation_result(event.event_id, event.event_type.as_str(), &validation_result, validation_mode) {
+            Ok(()) => valid_events.push(event),
+            Err(msg) => rejected_events.push(RejectionInfo {
+                event_id: event.event_id,
+                reason: "schema_validation".to_string(),
+                message: msg,
+            }),
         }
     }
 

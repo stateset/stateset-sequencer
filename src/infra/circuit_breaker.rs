@@ -438,13 +438,8 @@ impl CircuitBreaker {
         // Add jitter to prevent thundering herd
         let jitter = if self.config.jitter_factor > 0.0 {
             let jitter_range = capped_backoff * self.config.jitter_factor;
-            // Use a simple pseudo-random based on current time
-            let now_nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos() as f64
-                / 1_000_000_000.0;
-            jitter_range * now_nanos
+            let random_factor: f64 = rand::random();
+            jitter_range * random_factor
         } else {
             0.0
         };

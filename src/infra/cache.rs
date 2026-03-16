@@ -68,8 +68,9 @@ pub struct LruCache<K, V> {
     stats: CacheStats,
     /// Refresh configuration
     refresh_config: CacheRefreshConfig,
-    /// Keys currently being refreshed (to prevent duplicate refresh)
-    refreshing: RwLock<std::collections::HashSet<K>>,
+    /// Keys currently being refreshed (to prevent duplicate refresh).
+    /// Arc-wrapped so cancellation-safe drop guards can release keys.
+    refreshing: Arc<RwLock<std::collections::HashSet<K>>>,
 }
 
 struct CacheEntry<V> {
@@ -145,7 +146,7 @@ where
             entries: RwLock::new(HashMap::new()),
             stats: CacheStats::default(),
             refresh_config: CacheRefreshConfig::default(),
-            refreshing: RwLock::new(std::collections::HashSet::new()),
+            refreshing: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
@@ -161,18 +162,53 @@ where
             entries: RwLock::new(HashMap::new()),
             stats: CacheStats::default(),
             refresh_config,
-            refreshing: RwLock::new(std::collections::HashSet::new()),
+            refreshing: Arc::new(RwLock::new(std::collections::HashSet::new())),
         }
     }
 
     /// Get a value from the cache
+    ///
+    /// Uses a read-lock fast path for fresh cache hits and only upgrades to a
+    /// write-lock when the entry must be mutated (stale flag, eviction, or
+    /// last_accessed update).
     pub async fn get(&self, key: &K) -> Option<V> {
+        // ---- fast path: read-lock only ----
+        {
+            let entries = self.entries.read().await;
+            if let Some(entry) = entries.get(key) {
+                let age = entry.created_at.elapsed();
+
+                // Completely expired – fall through to write path for removal
+                if age > self.ttl + self.refresh_config.max_stale_age {
+                    // drop read lock, will remove below
+                } else if age > self.ttl {
+                    if !self.refresh_config.stale_while_revalidate {
+                        // drop read lock, will remove below
+                    } else if entry.is_stale {
+                        // Already marked stale – no mutation needed, serve directly
+                        self.stats.stale_hits.fetch_add(1, Ordering::Relaxed);
+                        return Some(entry.value.clone());
+                    }
+                    // else: needs is_stale = true → fall through to write path
+                } else {
+                    // Fresh hit – serve without mutating last_accessed.
+                    // LRU accuracy is slightly reduced but contention drops
+                    // dramatically under concurrent reads.
+                    self.stats.hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(entry.value.clone());
+                }
+            } else {
+                self.stats.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+
+        // ---- slow path: write-lock for mutation / eviction ----
         let mut entries = self.entries.write().await;
 
         if let Some(entry) = entries.get_mut(key) {
             let age = entry.created_at.elapsed();
 
-            // Check if completely expired (beyond stale grace period)
             if age > self.ttl + self.refresh_config.max_stale_age {
                 entries.remove(key);
                 self.stats.expirations.fetch_add(1, Ordering::Relaxed);
@@ -180,7 +216,6 @@ where
                 return None;
             }
 
-            // Check if stale but within grace period (stale-while-revalidate)
             if age > self.ttl {
                 if self.refresh_config.stale_while_revalidate {
                     entry.is_stale = true;
@@ -195,7 +230,6 @@ where
                 }
             }
 
-            // Update last accessed time
             entry.last_accessed = Instant::now();
             self.stats.hits.fetch_add(1, Ordering::Relaxed);
             return Some(entry.value.clone());
@@ -361,24 +395,64 @@ where
     ///
     /// This is typically called when get_or_refresh detects the entry needs refresh.
     /// The caller should spawn this as a background task.
+    ///
+    /// The refresh lock is released via a drop guard so it is freed even if the
+    /// future is cancelled (e.g. by a tokio timeout or task abort).
     pub async fn refresh<F, Fut, E>(&self, key: K, refresh_fn: F) -> Result<(), E>
     where
+        K: Send + Sync + 'static,
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<V, E>>,
     {
+        // RAII guard: ensures the refresh lock is released on drop, including
+        // cancellation paths that would otherwise leak the lock permanently.
+        let guard = RefreshGuard {
+            refreshing: Arc::clone(&self.refreshing),
+            key: Some(key.clone()),
+        };
+
         let result = refresh_fn().await;
 
         match result {
             Ok(value) => {
-                self.insert(key.clone(), value).await;
-                self.release_refresh(&key).await;
+                self.insert(key, value).await;
+                guard.disarm(); // explicit release via release_refresh path below is redundant
                 Ok(())
             }
             Err(e) => {
                 self.stats.refresh_failures.fetch_add(1, Ordering::Relaxed);
-                self.release_refresh(&key).await;
+                guard.disarm();
                 Err(e)
             }
+        }
+    }
+}
+
+/// RAII guard that releases a refresh lock on drop, ensuring cancellation safety.
+///
+/// If the future driving `refresh()` is dropped (e.g. by tokio timeout or task
+/// abort), this guard spawns a cleanup task to remove the key from the refresh
+/// set, preventing a permanent deadlock.
+struct RefreshGuard<K: Clone + Eq + Hash + Send + Sync + 'static> {
+    refreshing: Arc<RwLock<std::collections::HashSet<K>>>,
+    key: Option<K>,
+}
+
+impl<K: Clone + Eq + Hash + Send + Sync + 'static> RefreshGuard<K> {
+    /// Disarm the guard so it does not release the lock on drop.
+    fn disarm(mut self) {
+        self.key = None;
+    }
+}
+
+impl<K: Clone + Eq + Hash + Send + Sync + 'static> Drop for RefreshGuard<K> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            let refreshing = Arc::clone(&self.refreshing);
+            tokio::task::spawn(async move {
+                let mut set = refreshing.write().await;
+                set.remove(&key);
+            });
         }
     }
 }
@@ -1158,11 +1232,15 @@ mod tests {
         let cache: LruCache<i32, i32> = LruCache::new(3, Duration::from_secs(60));
 
         cache.insert(1, 100).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
         cache.insert(2, 200).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
         cache.insert(3, 300).await;
 
-        // Access key 1 to make it recently used
-        cache.get(&1).await;
+        // Re-insert key 1 to refresh its last_accessed timestamp.
+        // (Note: read-only `get()` uses a read-lock fast path that does not
+        // update last_accessed for fresh entries, so insert is used here.)
+        cache.insert(1, 100).await;
 
         // Insert key 4, should evict key 2 (oldest accessed)
         cache.insert(4, 400).await;

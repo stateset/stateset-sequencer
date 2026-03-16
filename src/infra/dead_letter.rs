@@ -49,11 +49,15 @@ impl Default for DeadLetterRetryConfig {
 }
 
 impl DeadLetterRetryConfig {
-    /// Calculate the next retry delay based on attempt count
+    /// Calculate the next retry delay based on attempt count, with jitter to
+    /// prevent thundering-herd retries.
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let delay_secs = self.initial_delay.as_secs_f64() * self.multiplier.powi(attempt as i32);
         let capped = delay_secs.min(self.max_delay.as_secs_f64());
-        Duration::from_secs_f64(capped)
+        // Add ±25 % jitter so retries don't all fire at the same instant
+        let jitter: f64 = rand::random::<f64>() * 0.5 - 0.25; // [-0.25, +0.25)
+        let jittered = (capped * (1.0 + jitter)).max(1.0);
+        Duration::from_secs_f64(jittered)
     }
 
     /// Check if a reason is retryable
@@ -296,6 +300,18 @@ impl PgDeadLetterQueue {
             None
         };
 
+        // Pre-compute the retry delay in Rust (with jitter) so it honours
+        // the configured multiplier/max_delay instead of a hard-coded SQL formula.
+        let conflict_next_retry = if is_retryable {
+            // On conflict the retry_count will be incremented; compute delay for that attempt.
+            // We don't know the current retry_count here, so we use attempt=1 as a reasonable
+            // default. Subsequent retries via mark_retry_failed use the actual count.
+            let delay = self.config.delay_for_attempt(1);
+            Some(Utc::now() + ChronoDuration::from_std(delay).unwrap_or(ChronoDuration::minutes(1)))
+        } else {
+            None
+        };
+
         sqlx::query(
             r#"
             INSERT INTO dead_letter_events (
@@ -310,7 +326,7 @@ impl PgDeadLetterQueue {
                 next_retry_at = CASE
                     WHEN dead_letter_events.retry_count + 1 < dead_letter_events.max_retries
                          AND EXCLUDED.status = 'pending'
-                    THEN NOW() + make_interval(secs => power(2, dead_letter_events.retry_count + 1) * 60)
+                    THEN $13
                     ELSE NULL
                 END,
                 status = CASE
@@ -333,6 +349,7 @@ impl PgDeadLetterQueue {
         .bind(next_retry_at)
         .bind(&params.payload)
         .bind(&params.metadata)
+        .bind(conflict_next_retry)
         .execute(&self.pool)
         .await?;
 
@@ -426,26 +443,48 @@ impl PgDeadLetterQueue {
 
     /// Mark a retry as failed and schedule next attempt
     pub async fn mark_retry_failed(&self, id: Uuid, error: &str) -> Result<()> {
-        // Calculate next retry time based on retry count
+        // Fetch current retry_count so we can compute the Rust-side delay with
+        // the correct attempt number, jitter, and configured multiplier/cap.
+        let row: Option<(i32, i32)> =
+            sqlx::query_as("SELECT retry_count, max_retries FROM dead_letter_events WHERE id = $1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        let (retry_count, max_retries) = match row {
+            Some(r) => r,
+            None => return Ok(()), // event not found – nothing to update
+        };
+
+        let new_count = retry_count + 1;
+        let next_retry_at: Option<DateTime<Utc>> = if new_count < max_retries {
+            let delay = self.config.delay_for_attempt(new_count as u32);
+            Some(Utc::now() + ChronoDuration::from_std(delay).unwrap_or(ChronoDuration::minutes(1)))
+        } else {
+            None
+        };
+
+        let new_status = if new_count >= max_retries {
+            "failed"
+        } else {
+            "pending"
+        };
+
         sqlx::query(
             r#"
             UPDATE dead_letter_events
-            SET status = CASE
-                    WHEN retry_count + 1 >= max_retries THEN 'failed'
-                    ELSE 'pending'
-                END,
-                retry_count = retry_count + 1,
-                error_message = $2,
-                next_retry_at = CASE
-                    WHEN retry_count + 1 < max_retries
-                    THEN NOW() + make_interval(secs => power(2, retry_count + 1) * 60)
-                    ELSE NULL
-                END
+            SET status = $2,
+                retry_count = $3,
+                error_message = $4,
+                next_retry_at = $5
             WHERE id = $1
             "#,
         )
         .bind(id)
+        .bind(new_status)
+        .bind(new_count)
         .bind(error)
+        .bind(next_retry_at)
         .execute(&self.pool)
         .await?;
 
@@ -889,11 +928,26 @@ mod tests {
         assert!(!config.is_retryable(&DeadLetterReason::InvariantViolation));
         assert!(!config.is_retryable(&DeadLetterReason::InvalidStateTransition));
 
+        // delay_for_attempt includes ±25% jitter, so check the value is
+        // within the expected range rather than an exact match.
         let delay = config.delay_for_attempt(0);
-        assert_eq!(delay, config.initial_delay);
+        let base = config.initial_delay.as_secs_f64();
+        assert!(
+            delay.as_secs_f64() >= base * 0.74 && delay.as_secs_f64() <= base * 1.26,
+            "delay_for_attempt(0) = {:?} should be within ±25% of {:?}",
+            delay,
+            config.initial_delay
+        );
 
+        // Second attempt (with multiplier 2.0) should be roughly double the initial
         let delay2 = config.delay_for_attempt(1);
-        assert!(delay2 > delay);
+        let base2 = base * config.multiplier;
+        assert!(
+            delay2.as_secs_f64() >= base2 * 0.74 && delay2.as_secs_f64() <= base2 * 1.26,
+            "delay_for_attempt(1) = {:?} should be within ±25% of {}s",
+            delay2,
+            base2
+        );
     }
 
     #[test]

@@ -1147,7 +1147,14 @@ pub async fn run() -> anyhow::Result<()> {
             auth_state.rate_limiter.clone(),
         );
 
+        let grpc_timeout = Duration::from_secs(
+            std::env::var("GRPC_REQUEST_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
+        );
         let grpc_server = TonicServer::builder()
+            .timeout(grpc_timeout)
             .add_service(SequencerServerV1::with_interceptor(
                 sequencer_v1_service,
                 grpc_auth_interceptor.clone(),
