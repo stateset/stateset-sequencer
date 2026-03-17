@@ -150,6 +150,7 @@ fn create_test_router(state: AppState, require_auth: bool) -> axum::Router<()> {
         authenticator,
         require_auth,
         rate_limiter: None,
+        credential_rate_limiter: Arc::new(RateLimiter::new(1000)),
         pool_monitor: None,
     };
 
@@ -1698,6 +1699,7 @@ fn create_tenant_scoped_router(
         authenticator,
         require_auth: true,
         rate_limiter: None,
+        credential_rate_limiter: Arc::new(RateLimiter::new(1000)),
         pool_monitor: None,
     };
 
@@ -1841,6 +1843,7 @@ async fn test_cross_tenant_schema_delete_denied() {
         authenticator,
         require_auth: true,
         rate_limiter: None,
+        credential_rate_limiter: Arc::new(RateLimiter::new(1000)),
         pool_monitor: None,
     };
 
@@ -1974,6 +1977,58 @@ async fn test_agent_scoped_ingest_denies_mismatched_agent() {
             .map(|s| s.contains("Agent mismatch"))
             .unwrap_or(false),
         "Expected 'Agent mismatch' error, got: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_agent_scoped_ingest_rejects_event_source_agent_mismatch() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let request_agent = Uuid::new_v4();
+    let forged_agent = Uuid::new_v4();
+
+    let state = create_test_state(pool).await;
+    let (app, api_key) =
+        create_tenant_scoped_router(state, tenant_id, vec![store_id], Some(request_agent));
+
+    let event = TestEventBuilder::new()
+        .tenant_id(tenant_id)
+        .store_id(store_id)
+        .source_agent(forged_agent)
+        .build_json();
+
+    let request_body = json!({
+        "agent_id": request_agent,
+        "events": [event]
+    });
+
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/events/ingest",
+        Some(request_body),
+        Some(&api_key),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {:?}", body);
+    assert!(
+        body["error"]
+            .as_str()
+            .map(|s| s.contains("source_agent"))
+            .unwrap_or(false),
+        "Expected source_agent validation error, got: {:?}",
         body
     );
 }

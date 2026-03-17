@@ -419,6 +419,25 @@ impl PgSequencer {
         .await?;
         Ok(())
     }
+
+    fn validate_single_stream(events: &[EventEnvelope]) -> Result<Option<(TenantId, StoreId)>> {
+        let Some(first) = events.first() else {
+            return Ok(None);
+        };
+
+        let tenant_id = first.tenant_id.clone();
+        let store_id = first.store_id.clone();
+
+        for event in events.iter().skip(1) {
+            if event.tenant_id.0 != tenant_id.0 || event.store_id.0 != store_id.0 {
+                return Err(SequencerError::SchemaValidation(
+                    "All events in a batch must share the same tenant_id and store_id".to_string(),
+                ));
+            }
+        }
+
+        Ok(Some((tenant_id, store_id)))
+    }
 }
 
 #[async_trait]
@@ -429,13 +448,13 @@ impl Sequencer for PgSequencer {
             return Ok(Vec::new());
         }
 
-        // All events should be for the same tenant/store
-        let tenant_id = &events[0].tenant_id;
-        let store_id = &events[0].store_id;
+        let Some((tenant_id, store_id)) = Self::validate_single_stream(&events)? else {
+            return Ok(Vec::new());
+        };
 
         // Get sequence range
         let (start, _end) = self
-            .get_sequence_range(tenant_id, store_id, events.len() as u32)
+            .get_sequence_range(&tenant_id, &store_id, events.len() as u32)
             .await?;
 
         // Assign sequence numbers
@@ -492,17 +511,9 @@ impl IngestService for PgSequencer {
         }
 
         let batch_id = Uuid::new_v4();
-        let tenant_id = batch.events[0].tenant_id.clone();
-        let store_id = batch.events[0].store_id.clone();
-
-        // Enforce single-tenant/store batches at the sequencer boundary.
-        for e in &batch.events {
-            if e.tenant_id.0 != tenant_id.0 || e.store_id.0 != store_id.0 {
-                return Err(SequencerError::SchemaValidation(
-                    "All events in a batch must share the same tenant_id and store_id".to_string(),
-                ));
-            }
-        }
+        let (tenant_id, store_id) = Self::validate_single_stream(&batch.events)?
+            .expect("non-empty batch already handled above");
+        let batch_agent_id = batch.agent_id;
 
         let mut tx = self.pool.begin().await?;
 
@@ -518,6 +529,18 @@ impl IngestService for PgSequencer {
 
         // Validate each event (schema + payload hash + duplicates).
         for event in batch.events {
+            if event.source_agent.0 != batch_agent_id.0 {
+                rejected.push(RejectedEvent {
+                    event_id: event.event_id,
+                    reason: RejectionReason::SchemaValidation,
+                    message: format!(
+                        "event source_agent {} does not match batch agent_id {}",
+                        event.source_agent.0, batch_agent_id.0
+                    ),
+                });
+                continue;
+            }
+
             if !seen_event_ids.insert(event.event_id) {
                 rejected.push(RejectedEvent {
                     event_id: event.event_id,
@@ -946,6 +969,8 @@ impl PgSequencer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{EventType, StoreId, TenantId};
+    use serde_json::json;
 
     #[test]
     fn decode_sequence_rejects_negative() {
@@ -967,5 +992,34 @@ mod tests {
     #[test]
     fn ensure_sequence_capacity_rejects_overflow() {
         assert!(PgSequencer::ensure_sequence_capacity(PgSequencer::MAX_SEQUENCE, 1).is_err());
+    }
+
+    #[test]
+    fn validate_single_stream_rejects_mixed_tenant_or_store() {
+        let tenant_a = TenantId::new();
+        let tenant_b = TenantId::new();
+        let store = StoreId::new();
+        let agent = AgentId::new();
+
+        let first = EventEnvelope::new(
+            tenant_a.clone(),
+            store.clone(),
+            EntityType::order(),
+            "order-1",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({}),
+            agent.clone(),
+        );
+        let second = EventEnvelope::new(
+            tenant_b,
+            store,
+            EntityType::order(),
+            "order-2",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({}),
+            agent,
+        );
+
+        assert!(PgSequencer::validate_single_stream(&[first, second]).is_err());
     }
 }

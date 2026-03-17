@@ -735,6 +735,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     let rate_limiter = parse_optional_positive_u32("RATE_LIMIT_PER_MINUTE")?
         .map(|rpm| Arc::new(RateLimiter::new(rpm)));
+    let credential_rate_limiter = Arc::new(RateLimiter::with_config(RateLimiterConfig::from_env()));
 
     let public_registration_enabled = parse_bool_env("PUBLIC_AGENT_REGISTRATION_ENABLED", false)?;
 
@@ -1074,6 +1075,7 @@ pub async fn run() -> anyhow::Result<()> {
         authenticator,
         require_auth,
         rate_limiter,
+        credential_rate_limiter: credential_rate_limiter.clone(),
         pool_monitor: Some(pool_monitor.clone()),
     };
 
@@ -1145,6 +1147,7 @@ pub async fn run() -> anyhow::Result<()> {
             auth_state.authenticator.clone(),
             auth_state.require_auth,
             auth_state.rate_limiter.clone(),
+            auth_state.credential_rate_limiter.clone(),
         );
 
         let grpc_timeout = Duration::from_secs(

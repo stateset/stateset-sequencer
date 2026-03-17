@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tonic::{Request, Status};
 use tracing::{debug, warn};
 
-use crate::auth::{AuthContext, AuthError, Authenticator, RateLimiter};
+use crate::auth::{credential_rate_limit_key, AuthContext, AuthError, Authenticator, RateLimiter};
 
 /// gRPC authentication interceptor with optional rate limiting
 ///
@@ -24,6 +24,7 @@ pub struct GrpcAuthInterceptor {
     authenticator: Arc<Authenticator>,
     require_auth: bool,
     rate_limiter: Option<Arc<RateLimiter>>,
+    credential_rate_limiter: Arc<RateLimiter>,
 }
 
 impl GrpcAuthInterceptor {
@@ -31,11 +32,13 @@ impl GrpcAuthInterceptor {
         authenticator: Arc<Authenticator>,
         require_auth: bool,
         rate_limiter: Option<Arc<RateLimiter>>,
+        credential_rate_limiter: Arc<RateLimiter>,
     ) -> Self {
         Self {
             authenticator,
             require_auth,
             rate_limiter,
+            credential_rate_limiter,
         }
     }
 
@@ -43,6 +46,7 @@ impl GrpcAuthInterceptor {
     pub fn authenticate<T>(&self, request: &Request<T>) -> Result<Option<AuthContext>, Status> {
         let metadata = request.metadata();
         let bootstrap_ctx = AuthContext::bootstrap_admin();
+        let mut credential_key = None;
 
         // Try Authorization header first (Bearer token or raw API key)
         let auth_ctx = if let Some(auth_value) = metadata.get("authorization") {
@@ -58,6 +62,7 @@ impl GrpcAuthInterceptor {
                     return Ok(Some(bootstrap_ctx));
                 }
             };
+            credential_key = credential_rate_limit_key(auth_str);
 
             match self.authenticate_header(auth_str) {
                 Ok(ctx) => ctx,
@@ -79,6 +84,7 @@ impl GrpcAuthInterceptor {
                     return Ok(Some(bootstrap_ctx));
                 }
             };
+            credential_key = credential_rate_limit_key(key_str);
 
             match self.authenticate_header(key_str) {
                 Ok(ctx) => ctx,
@@ -101,6 +107,19 @@ impl GrpcAuthInterceptor {
             let key = format!("grpc:tenant:{}", ctx.tenant_id);
             if let Err(AuthError::RateLimited) = limiter.check(&key) {
                 warn!(tenant_id = %ctx.tenant_id, "gRPC rate limit exceeded");
+                return Err(Status::resource_exhausted("rate limit exceeded"));
+            }
+        }
+
+        if let (Some(ctx), Some(limit), Some(key)) = (
+            &auth_ctx,
+            auth_ctx.as_ref().and_then(|ctx| ctx.rate_limit),
+            credential_key.as_ref(),
+        ) {
+            if let Err(AuthError::RateLimited) =
+                self.credential_rate_limiter.check_with_limit(key, limit)
+            {
+                warn!(tenant_id = %ctx.tenant_id, "gRPC credential rate limit exceeded");
                 return Err(Status::resource_exhausted("rate limit exceeded"));
             }
         }
@@ -171,5 +190,50 @@ pub trait AuthContextExt {
 impl<T> AuthContextExt for Request<T> {
     fn auth_context(&self) -> Option<&AuthContext> {
         self.extensions().get::<AuthContext>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tonic::Code;
+
+    use crate::auth::{ApiKeyRecord, ApiKeyValidator, Permissions};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn grpc_interceptor_enforces_per_credential_rate_limit() {
+        let api_key = "ss_test_grpc_limit_12345";
+        let validator = Arc::new(ApiKeyValidator::new());
+        validator.register_key(ApiKeyRecord {
+            key_hash: ApiKeyValidator::hash_key(api_key),
+            tenant_id: uuid::Uuid::new_v4(),
+            store_ids: Vec::new(),
+            permissions: Permissions::read_only(),
+            agent_id: None,
+            active: true,
+            rate_limit: Some(1),
+        });
+
+        let interceptor = GrpcAuthInterceptor::new(
+            Arc::new(Authenticator::new(validator)),
+            true,
+            None,
+            Arc::new(RateLimiter::new(100)),
+        );
+
+        let mut first = Request::new(());
+        first.metadata_mut().insert(
+            "authorization",
+            format!("ApiKey {api_key}").parse().unwrap(),
+        );
+        assert!(interceptor.authenticate(&first).is_ok());
+
+        let mut second = Request::new(());
+        second.metadata_mut().insert(
+            "authorization",
+            format!("ApiKey {api_key}").parse().unwrap(),
+        );
+        let err = interceptor.authenticate(&second).unwrap_err();
+        assert_eq!(err.code(), Code::ResourceExhausted);
     }
 }

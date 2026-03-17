@@ -150,8 +150,16 @@ impl JwtValidator {
                 .collect::<Result<Vec<_>, _>>()?
         };
 
-        // Parse agent ID
-        let agent_id = claims.agent.as_ref().and_then(|s| Uuid::parse_str(s).ok());
+        // Parse agent ID - fail closed on malformed values so agent-scoped
+        // authorization cannot silently degrade to an unscoped principal.
+        let agent_id = claims
+            .agent
+            .as_ref()
+            .map(|s| {
+                Uuid::parse_str(s)
+                    .map_err(|_| AuthError::InvalidJwt(format!("invalid agent ID: {}", s)))
+            })
+            .transpose()?;
 
         // Parse permissions
         let perms_list: Vec<&str> = claims.perms.split(',').collect();
@@ -308,6 +316,42 @@ mod tests {
         assert!(
             matches!(&result, Err(AuthError::InvalidJwt(msg)) if msg.contains("invalid store ID")),
             "Expected InvalidJwt error for invalid store IDs, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_invalid_agent_id_fails_validation() {
+        let validator = create_validator();
+        let tenant_id = Uuid::new_v4();
+
+        let now = Utc::now();
+        let exp = now + Duration::hours(1);
+
+        let claims = Claims {
+            sub: tenant_id.to_string(),
+            iss: "stateset-sequencer".to_string(),
+            aud: "stateset-api".to_string(),
+            exp: exp.timestamp(),
+            iat: now.timestamp(),
+            nbf: now.timestamp(),
+            jti: Uuid::new_v4().to_string(),
+            stores: String::new(),
+            agent: Some("not-a-valid-agent-uuid".to_string()),
+            perms: "read,write".to_string(),
+        };
+
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret(b"test-secret-key-for-testing-only"),
+        )
+        .unwrap();
+
+        let result = validator.validate(&token);
+        assert!(
+            matches!(&result, Err(AuthError::InvalidJwt(msg)) if msg.contains("invalid agent ID")),
+            "Expected InvalidJwt error for invalid agent ID, got: {:?}",
             result
         );
     }

@@ -3,6 +3,7 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use std::collections::HashSet;
 use tracing::instrument;
 use uuid::Uuid;
 
@@ -13,8 +14,25 @@ use crate::api::types::{
 };
 use crate::api::utils::internal_error;
 use crate::auth::AuthContextExt;
-use crate::domain::{Hash256, StoreId, TenantId};
+use crate::domain::{Hash256, StoreId, TenantId, VesBatchCommitment};
 use crate::server::AppState;
+
+fn merge_unique_ves_commitments(
+    replica_commitments: Vec<VesBatchCommitment>,
+    primary_commitments: Vec<VesBatchCommitment>,
+) -> Vec<VesBatchCommitment> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+
+    for commitment in replica_commitments.into_iter().chain(primary_commitments) {
+        if seen.insert(commitment.batch_id) {
+            merged.push(commitment);
+        }
+    }
+
+    merged.sort_by_key(|commitment| (commitment.committed_at, commitment.batch_id));
+    merged
+}
 
 /// GET /api/v1/ves/commitments - List VES commitments.
 #[instrument(skip(state, auth, query))]
@@ -28,11 +46,21 @@ pub async fn list_ves_commitments(
     let tenant_id = TenantId::from_uuid(query.tenant_id);
     let store_id = StoreId::from_uuid(query.store_id);
 
-    let commitments = state
+    let replica_commitments = state
         .ves_commitment_reader
         .list_unanchored(&tenant_id, &store_id)
-        .await
-        .map_err(internal_error)?;
+        .await;
+    let primary_commitments = state
+        .ves_commitment_engine
+        .list_unanchored(&tenant_id, &store_id)
+        .await;
+
+    let commitments = match (replica_commitments, primary_commitments) {
+        (Ok(replica), Ok(primary)) => merge_unique_ves_commitments(replica, primary),
+        (Ok(replica), Err(_)) => replica,
+        (Err(_), Ok(primary)) => primary,
+        (Err(err), Err(_)) => return Err(internal_error(err)),
+    };
 
     let response: Vec<serde_json::Value> = commitments
         .iter()
@@ -392,4 +420,34 @@ pub async fn notify_ves_commitment_anchored(
         "chain_id": chain_id,
         "block_number": request.block_number,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_unique_ves_commitments_dedupes_and_sorts() {
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+        let first = VesBatchCommitment::new(
+            tenant_id.clone(),
+            store_id.clone(),
+            1,
+            1,
+            1,
+            [1u8; 32],
+            (1, 1),
+        );
+        let second = VesBatchCommitment::new(tenant_id, store_id, 1, 1, 1, [2u8; 32], (2, 2));
+
+        let merged = merge_unique_ves_commitments(
+            vec![second.clone(), first.clone()],
+            vec![first.clone(), second.clone()],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].batch_id, first.batch_id);
+        assert_eq!(merged[1].batch_id, second.batch_id);
+    }
 }

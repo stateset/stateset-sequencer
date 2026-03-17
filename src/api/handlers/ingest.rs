@@ -157,8 +157,16 @@ async fn validate_events_against_schemas(
         {
             Ok(result) => result,
             Err(e) => {
-                match handle_schema_store_error(event.event_id, event.event_type.as_str(), &e, validation_mode) {
-                    Ok(()) => { valid_events.push(event); continue; }
+                match handle_schema_store_error(
+                    event.event_id,
+                    event.event_type.as_str(),
+                    &e,
+                    validation_mode,
+                ) {
+                    Ok(()) => {
+                        valid_events.push(event);
+                        continue;
+                    }
                     Err(msg) => {
                         rejected_events.push(RejectedEvent {
                             event_id: event.event_id,
@@ -171,7 +179,12 @@ async fn validate_events_against_schemas(
             }
         };
 
-        match evaluate_validation_result(event.event_id, event.event_type.as_str(), &validation_result, validation_mode) {
+        match evaluate_validation_result(
+            event.event_id,
+            event.event_type.as_str(),
+            &validation_result,
+            validation_mode,
+        ) {
             Ok(()) => valid_events.push(event),
             Err(msg) => rejected_events.push(RejectedEvent {
                 event_id: event.event_id,
@@ -237,7 +250,12 @@ async fn validate_ves_events_against_schemas(
                         );
                     }
                     Err(e) => {
-                        match handle_schema_store_error(event.event_id, event.event_type.as_str(), &e, validation_mode) {
+                        match handle_schema_store_error(
+                            event.event_id,
+                            event.event_type.as_str(),
+                            &e,
+                            validation_mode,
+                        ) {
                             Ok(()) => {}
                             Err(msg) => {
                                 rejected_events.push(RejectionInfo {
@@ -279,8 +297,16 @@ async fn validate_ves_events_against_schemas(
         {
             Ok(result) => result,
             Err(e) => {
-                match handle_schema_store_error(event.event_id, event.event_type.as_str(), &e, validation_mode) {
-                    Ok(()) => { valid_events.push(event); continue; }
+                match handle_schema_store_error(
+                    event.event_id,
+                    event.event_type.as_str(),
+                    &e,
+                    validation_mode,
+                ) {
+                    Ok(()) => {
+                        valid_events.push(event);
+                        continue;
+                    }
                     Err(msg) => {
                         rejected_events.push(RejectionInfo {
                             event_id: event.event_id,
@@ -293,7 +319,12 @@ async fn validate_ves_events_against_schemas(
             }
         };
 
-        match evaluate_validation_result(event.event_id, event.event_type.as_str(), &validation_result, validation_mode) {
+        match evaluate_validation_result(
+            event.event_id,
+            event.event_type.as_str(),
+            &validation_result,
+            validation_mode,
+        ) {
             Ok(()) => valid_events.push(event),
             Err(msg) => rejected_events.push(RejectionInfo {
                 event_id: event.event_id,
@@ -476,6 +507,38 @@ fn enforce_ves_limits(
     Ok(())
 }
 
+fn ensure_legacy_source_agents_match_request_agent(
+    events: &[EventEnvelope],
+    request_agent_id: Uuid,
+) -> Result<(), (StatusCode, String)> {
+    for event in events {
+        if event.source_agent.0 != request_agent_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "event source_agent must match request agent_id".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_ves_source_agents_match_request_agent(
+    events: &[VesEventEnvelope],
+    request_agent_id: Uuid,
+) -> Result<(), (StatusCode, String)> {
+    for event in events {
+        if event.source_agent_id.0 != request_agent_id {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "event source_agent_id must match request agent_id".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// POST /api/v1/events/ingest - Ingest events (legacy API).
 #[instrument(skip(state, auth, request), fields(
     event_count = request.events.len(),
@@ -515,6 +578,8 @@ pub async fn ingest_events(
                 return Err((StatusCode::FORBIDDEN, "Agent mismatch".to_string()));
             }
         }
+
+        ensure_legacy_source_agents_match_request_agent(&request.events, request.agent_id)?;
 
         ensure_write(&auth, tenant_id, store_id)?;
     }
@@ -696,6 +761,8 @@ pub async fn ingest_ves_events(
         }
     }
 
+    ensure_ves_source_agents_match_request_agent(&request.events, request.agent_id)?;
+
     ensure_write(&auth, tenant_id, store_id)?;
 
     enforce_ves_limits(&state.request_limits, &request.events)?;
@@ -838,8 +905,8 @@ mod tests {
         TAG_SIZE,
     };
     use crate::domain::{
-        AgentId, AgentKeyId, EntityType, EventType, PayloadKind, SchemaId, SchemaValidationError,
-        SchemaValidationResult, StoreId, TenantId, VesEventEnvelope,
+        AgentId, AgentKeyId, EntityType, EventEnvelope, EventType, PayloadKind, SchemaId,
+        SchemaValidationError, SchemaValidationResult, StoreId, TenantId, VesEventEnvelope,
     };
     use crate::infra::{MockSchemaStore, SchemaValidationMode};
     use serde_json::json;
@@ -1012,5 +1079,36 @@ mod tests {
 
         assert_eq!(valid.len(), 1);
         assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn legacy_source_agent_must_match_request_agent() {
+        let request_agent_id = Uuid::new_v4();
+        let event = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({ "amount": 100 }),
+            AgentId::new(),
+        );
+
+        let err = ensure_legacy_source_agents_match_request_agent(&[event], request_agent_id)
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("source_agent"));
+    }
+
+    #[test]
+    fn ves_source_agent_must_match_request_agent() {
+        let request_agent_id = Uuid::new_v4();
+        let signing_key = AgentSigningKey::generate();
+        let event = build_plaintext_event(&signing_key);
+
+        let err =
+            ensure_ves_source_agents_match_request_agent(&[event], request_agent_id).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("source_agent_id"));
     }
 }

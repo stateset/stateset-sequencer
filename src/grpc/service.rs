@@ -131,6 +131,19 @@ impl SequencerService {
         Ok(())
     }
 
+    fn ensure_source_agent_matches_request_agent(
+        event: &crate::domain::EventEnvelope,
+        request_agent_id: Uuid,
+    ) -> Result<(), Status> {
+        if event.source_agent.0 != request_agent_id {
+            return Err(Status::invalid_argument(
+                "event source_agent must match push request agent_id",
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Convert domain event to proto event
     fn to_proto_event(event: &crate::domain::SequencedEvent) -> SequencedEvent {
         SequencedEvent {
@@ -478,6 +491,7 @@ impl SequencerTrait for SequencerService {
         for proto_event in &req.events {
             let event = Self::from_proto_event(proto_event)?;
             Self::authorize_tenant_store(&auth_ctx, &event.tenant_id, &event.store_id)?;
+            Self::ensure_source_agent_matches_request_agent(&event, agent_id)?;
             events.push(event);
         }
 

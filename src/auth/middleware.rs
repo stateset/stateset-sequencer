@@ -116,8 +116,29 @@ pub struct AuthMiddlewareState {
     pub require_auth: bool,
     /// Optional global rate limiter.
     pub rate_limiter: Option<Arc<RateLimiter>>,
+    /// Per-credential rate limiter for principals with explicit key-level limits.
+    pub credential_rate_limiter: Arc<RateLimiter>,
     /// Optional connection pool health monitor for load-shedding.
     pub pool_monitor: Option<Arc<crate::infra::PoolMonitor>>,
+}
+
+/// Derive a stable key for per-credential throttling from the presented auth
+/// header value.
+pub fn credential_rate_limit_key(auth_header: &str) -> Option<String> {
+    let normalized = if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        format!("bearer:{token}")
+    } else if let Some(key) = auth_header.strip_prefix("ApiKey ") {
+        format!("api_key:{key}")
+    } else if auth_header.starts_with(API_KEY_PREFIX) {
+        format!("api_key:{auth_header}")
+    } else {
+        return None;
+    };
+
+    Some(format!(
+        "credential:{}",
+        ApiKeyValidator::hash_key(&normalized)
+    ))
 }
 
 /// Authentication middleware
@@ -149,12 +170,10 @@ pub async fn auth_middleware(
         .headers()
         .get("x-api-key")
         .and_then(|v| v.to_str().ok());
+    let credential_header = auth_header.or(api_key_header);
+    let credential_key = credential_header.and_then(credential_rate_limit_key);
 
-    let context = match state
-        .authenticator
-        .authenticate(auth_header.or(api_key_header))
-        .await
-    {
+    let context = match state.authenticator.authenticate(credential_header).await {
         Ok(context) => context,
         Err(error) if state.require_auth => return auth_error_response(error),
         Err(error) => {
@@ -173,6 +192,12 @@ pub async fn auth_middleware(
             format!("tenant:{}", context.tenant_id)
         };
         if let Err(e) = limiter.check(&key) {
+            return auth_error_response(e);
+        }
+    }
+
+    if let (Some(limit), Some(key)) = (context.rate_limit, credential_key.as_ref()) {
+        if let Err(e) = state.credential_rate_limiter.check_with_limit(key, limit) {
             return auth_error_response(e);
         }
     }
@@ -327,9 +352,15 @@ impl RateLimiter {
 
     /// Check if request is allowed
     pub fn check(&self, key: &str) -> Result<(), AuthError> {
+        self.check_with_limit(key, self.config.requests_per_minute)
+    }
+
+    /// Check if request is allowed with a caller-provided request budget.
+    pub fn check_with_limit(&self, key: &str, requests_per_minute: u32) -> Result<(), AuthError> {
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let window_duration = std::time::Duration::from_secs(self.config.window_seconds);
+        let requests_per_minute = requests_per_minute.max(1);
 
         // Evict expired entries and enforce max_entries limit
         if entries.len() >= self.config.max_entries {
@@ -354,7 +385,7 @@ impl RateLimiter {
         }
 
         // Check limit
-        if entry.count >= self.config.requests_per_minute {
+        if entry.count >= requests_per_minute {
             self.requests_rejected
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Err(AuthError::RateLimited);
@@ -412,19 +443,25 @@ impl RateLimiter {
 
     /// Get remaining requests for a key
     pub fn remaining(&self, key: &str) -> u32 {
+        self.remaining_with_limit(key, self.config.requests_per_minute)
+    }
+
+    /// Get remaining requests for a key with a caller-provided request budget.
+    pub fn remaining_with_limit(&self, key: &str, requests_per_minute: u32) -> u32 {
         let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let window_duration = std::time::Duration::from_secs(self.config.window_seconds);
+        let requests_per_minute = requests_per_minute.max(1);
 
         match entries.get(key) {
             Some(entry) => {
                 if now.duration_since(entry.window_start) >= window_duration {
-                    self.config.requests_per_minute
+                    requests_per_minute
                 } else {
-                    self.config.requests_per_minute.saturating_sub(entry.count)
+                    requests_per_minute.saturating_sub(entry.count)
                 }
             }
-            None => self.config.requests_per_minute,
+            None => requests_per_minute,
         }
     }
 
@@ -538,6 +575,12 @@ impl RequestLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{routing::get, Router};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use crate::auth::{ApiKeyRecord, Permissions};
 
     #[test]
     fn test_rate_limiter() {
@@ -642,6 +685,19 @@ mod tests {
     }
 
     #[test]
+    fn test_rate_limiter_custom_limit() {
+        let limiter = RateLimiter::new(100);
+
+        assert!(limiter.check_with_limit("credential-key", 2).is_ok());
+        assert!(limiter.check_with_limit("credential-key", 2).is_ok());
+        assert!(matches!(
+            limiter.check_with_limit("credential-key", 2),
+            Err(AuthError::RateLimited)
+        ));
+        assert_eq!(limiter.remaining_with_limit("credential-key", 2), 0);
+    }
+
+    #[test]
     fn test_rate_limiter_config_from_default() {
         let config = RateLimiterConfig::default();
         assert_eq!(config.requests_per_minute, 100);
@@ -670,5 +726,58 @@ mod tests {
             )),
             "auth_backend_unavailable"
         );
+    }
+
+    #[tokio::test]
+    async fn middleware_enforces_per_credential_rate_limit() {
+        async fn ok() -> &'static str {
+            "ok"
+        }
+
+        let api_key = "ss_test_credential_limit_12345";
+        let validator = Arc::new(ApiKeyValidator::new());
+        validator.register_key(ApiKeyRecord {
+            key_hash: ApiKeyValidator::hash_key(api_key),
+            tenant_id: Uuid::new_v4(),
+            store_ids: Vec::new(),
+            permissions: Permissions::read_only(),
+            agent_id: None,
+            active: true,
+            rate_limit: Some(1),
+        });
+
+        let app =
+            Router::new()
+                .route("/protected", get(ok))
+                .layer(axum::middleware::from_fn_with_state(
+                    AuthMiddlewareState {
+                        authenticator: Arc::new(Authenticator::new(validator)),
+                        require_auth: true,
+                        rate_limiter: None,
+                        credential_rate_limiter: Arc::new(RateLimiter::new(100)),
+                        pool_monitor: None,
+                    },
+                    auth_middleware,
+                ));
+
+        let first = axum::http::Request::builder()
+            .uri("/protected")
+            .header(AUTHORIZATION, format!("ApiKey {api_key}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let first = app.clone().oneshot(first).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let second = axum::http::Request::builder()
+            .uri("/protected")
+            .header(AUTHORIZATION, format!("ApiKey {api_key}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let second = app.oneshot(second).await.unwrap();
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        let body = second.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], "rate_limited");
     }
 }

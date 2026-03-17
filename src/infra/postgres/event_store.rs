@@ -187,7 +187,7 @@ impl EventStore for PgEventStore {
                 .encrypt_payload(&env.tenant_id.0, &aad, &payload_bytes)
                 .await?;
 
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 INSERT INTO events (
                     event_id, command_id, sequence_number,
@@ -217,6 +217,10 @@ impl EventStore for PgEventStore {
             .bind(event.sequenced_at)
             .execute(&mut *tx)
             .await?;
+
+            if result.rows_affected() != 1 {
+                return Err(SequencerError::DuplicateEvent(env.event_id));
+            }
         }
 
         tx.commit().await?;

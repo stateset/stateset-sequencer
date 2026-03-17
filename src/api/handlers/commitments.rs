@@ -3,6 +3,7 @@
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use std::collections::HashSet;
 use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
@@ -12,9 +13,26 @@ use crate::api::auth_helpers::{ensure_read, ensure_write};
 use crate::api::types::{CreateCommitmentRequest, HeadQuery};
 use crate::api::utils::internal_error;
 use crate::auth::AuthContextExt;
-use crate::domain::{StoreId, TenantId};
+use crate::domain::{BatchCommitment, StoreId, TenantId};
 use crate::infra::CommitmentEngine;
 use crate::server::AppState;
+
+fn merge_unique_commitments(
+    replica_commitments: Vec<BatchCommitment>,
+    primary_commitments: Vec<BatchCommitment>,
+) -> Vec<BatchCommitment> {
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+
+    for commitment in replica_commitments.into_iter().chain(primary_commitments) {
+        if seen.insert(commitment.batch_id) {
+            merged.push(commitment);
+        }
+    }
+
+    merged.sort_by_key(|commitment| (commitment.committed_at, commitment.batch_id));
+    merged
+}
 
 /// GET /api/v1/commitments/:batch_id - Get a commitment by ID.
 #[instrument(skip(state, auth), fields(batch_id = %batch_id))]
@@ -166,15 +184,24 @@ pub async fn list_commitments(
     ensure_read(&auth, query.tenant_id, query.store_id)?;
 
     // List all unanchored commitments for now, then filter by tenant/store.
-    let commitments = state
+    let tenant_id = TenantId::from_uuid(query.tenant_id);
+    let store_id = StoreId::from_uuid(query.store_id);
+
+    let replica_commitments = state
         .commitment_reader
-        .list_unanchored_by_stream(
-            &TenantId::from_uuid(query.tenant_id),
-            &StoreId::from_uuid(query.store_id),
-            None,
-        )
-        .await
-        .map_err(internal_error)?;
+        .list_unanchored_by_stream(&tenant_id, &store_id, None)
+        .await;
+    let primary_commitments = state
+        .commitment_engine
+        .list_unanchored_by_stream(&tenant_id, &store_id, None)
+        .await;
+
+    let commitments = match (replica_commitments, primary_commitments) {
+        (Ok(replica), Ok(primary)) => merge_unique_commitments(replica, primary),
+        (Ok(replica), Err(_)) => replica,
+        (Err(_), Ok(primary)) => primary,
+        (Err(err), Err(_)) => return Err(internal_error(err)),
+    };
 
     let response: Vec<serde_json::Value> = commitments
         .iter()
@@ -197,4 +224,42 @@ pub async fn list_commitments(
         "commitments": response,
         "count": response.len(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_unique_commitments_dedupes_and_sorts() {
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+        let first = BatchCommitment::new(
+            tenant_id.clone(),
+            store_id.clone(),
+            [0u8; 32],
+            [1u8; 32],
+            [2u8; 32],
+            1,
+            (1, 1),
+        );
+        let second = BatchCommitment::new(
+            tenant_id,
+            store_id,
+            [0u8; 32],
+            [1u8; 32],
+            [3u8; 32],
+            1,
+            (2, 2),
+        );
+
+        let merged = merge_unique_commitments(
+            vec![second.clone(), first.clone()],
+            vec![first.clone(), second.clone()],
+        );
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].batch_id, first.batch_id);
+        assert_eq!(merged[1].batch_id, second.batch_id);
+    }
 }

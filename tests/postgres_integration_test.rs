@@ -17,7 +17,7 @@ use tower::ServiceExt;
 
 use stateset_sequencer::auth::{
     AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, ApiKeyValidator, AuthMiddlewareState,
-    Authenticator, RequestLimits,
+    Authenticator, RateLimiter, RequestLimits,
 };
 use stateset_sequencer::crypto::{is_payload_at_rest_encrypted, AgentSigningKey, StaticKeyManager};
 use stateset_sequencer::domain::{
@@ -596,6 +596,7 @@ async fn postgres_ves_validity_proofs_rest_flow() {
         authenticator,
         require_auth: false,
         rate_limiter: None,
+        credential_rate_limiter: Arc::new(RateLimiter::new(1000)),
         pool_monitor: None,
     };
 
@@ -1074,6 +1075,7 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
         authenticator,
         require_auth: false,
         rate_limiter: None,
+        credential_rate_limiter: Arc::new(RateLimiter::new(1000)),
         pool_monitor: None,
     };
 
