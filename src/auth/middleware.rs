@@ -193,13 +193,18 @@ fn auth_error_response(error: AuthError) -> Response {
         AuthError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"),
         AuthError::TenantNotFound => (StatusCode::NOT_FOUND, "Tenant not found"),
         AuthError::StoreAccessDenied => (StatusCode::FORBIDDEN, "Store access denied"),
+        AuthError::BackendUnavailable(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Authentication backend unavailable",
+        ),
     };
+    let code = auth_error_code(&error);
 
     let mut response = (
         status,
         axum::Json(serde_json::json!({
             "error": message,
-            "code": format!("{:?}", error).to_lowercase()
+            "code": code
         })),
     )
         .into_response();
@@ -212,6 +217,20 @@ fn auth_error_response(error: AuthError) -> Response {
     }
 
     response
+}
+
+fn auth_error_code(error: &AuthError) -> &'static str {
+    match error {
+        AuthError::MissingAuth => "missing_auth",
+        AuthError::InvalidApiKey => "invalid_api_key",
+        AuthError::InvalidJwt(_) => "invalid_jwt",
+        AuthError::TokenExpired => "token_expired",
+        AuthError::InsufficientPermissions => "insufficient_permissions",
+        AuthError::RateLimited => "rate_limited",
+        AuthError::TenantNotFound => "tenant_not_found",
+        AuthError::StoreAccessDenied => "store_access_denied",
+        AuthError::BackendUnavailable(_) => "auth_backend_unavailable",
+    }
 }
 
 /// Rate limiter configuration
@@ -636,5 +655,20 @@ mod tests {
         assert_eq!(limits.max_body_size, 10 * 1024 * 1024);
         assert_eq!(limits.max_events_per_batch, 1000);
         assert_eq!(limits.max_event_payload_size, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_auth_error_response_for_backend_unavailable() {
+        let response = auth_error_response(AuthError::BackendUnavailable(
+            "database offline".to_string(),
+        ));
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            auth_error_code(&AuthError::BackendUnavailable(
+                "database offline".to_string()
+            )),
+            "auth_backend_unavailable"
+        );
     }
 }

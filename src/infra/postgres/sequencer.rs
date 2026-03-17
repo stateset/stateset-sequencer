@@ -833,6 +833,16 @@ impl PgSequencer {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query(
+            r#"
+            ALTER TABLE events
+                ALTER COLUMN entity_type TYPE VARCHAR(128),
+                ALTER COLUMN entity_id TYPE VARCHAR(512),
+                ALTER COLUMN event_type TYPE VARCHAR(256)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Create indexes
         sqlx::query(
@@ -849,6 +859,11 @@ impl PgSequencer {
 
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS idx_events_command ON events (command_id) WHERE command_id IS NOT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_events_type ON events (tenant_id, store_id, event_type, sequence_number)",
         )
         .execute(&self.pool)
         .await?;
@@ -910,6 +925,15 @@ impl PgSequencer {
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 PRIMARY KEY (tenant_id, store_id, entity_type, entity_id)
             )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            r#"
+            ALTER TABLE entity_versions
+                ALTER COLUMN entity_type TYPE VARCHAR(128),
+                ALTER COLUMN entity_id TYPE VARCHAR(512)
             "#,
         )
         .execute(&self.pool)

@@ -1,0 +1,1979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StateSet Sequencer — Verifiable Event Infrastructure for Autonomous Commerce</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,500;0,600;0,700;0,800;0,900;1,400;1,500;1,600;1,700&family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400;1,500&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+/* ═══════════════════════════════════════════════════
+   RESET & BASE
+   ═══════════════════════════════════════════════════ */
+*, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+:root {
+  --navy: #0a1628;
+  --navy-soft: #0f1d32;
+  --navy-light: #162340;
+  --navy-muted: #1e2d4a;
+  --paper: #faf8f5;
+  --paper-warm: #f5f2ed;
+  --paper-dark: #ebe7e0;
+  --blue: #2563eb;
+  --blue-light: #3b82f6;
+  --blue-pale: #dbeafe;
+  --gold: #c9a84c;
+  --gold-light: #d4b96a;
+  --gold-dark: #a88a3a;
+  --gold-pale: #f9f3e3;
+  --text-primary: #1a1a1a;
+  --text-secondary: #4a4a4a;
+  --text-tertiary: #7a7a7a;
+  --text-inverse: #e8e4de;
+  --rule: #d4d0c8;
+  --rule-dark: #2a3a56;
+}
+
+html {
+  font-size: 17px;
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  color: var(--text-primary);
+  background: var(--paper);
+  line-height: 1.7;
+  overflow-x: hidden;
+}
+
+/* Paper grain texture overlay */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  opacity: 0.025;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='1'/%3E%3C/svg%3E");
+  background-repeat: repeat;
+  background-size: 256px 256px;
+}
+
+/* ═══════════════════════════════════════════════════
+   TYPOGRAPHY
+   ═══════════════════════════════════════════════════ */
+h1, h2, h3, h4, h5 {
+  font-family: 'Playfair Display', Georgia, 'Times New Roman', serif;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+.mono {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+/* ═══════════════════════════════════════════════════
+   COVER PAGE
+   ═══════════════════════════════════════════════════ */
+.cover {
+  min-height: 100vh;
+  background: var(--navy);
+  color: var(--text-inverse);
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow: hidden;
+}
+
+.cover::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 80% 60% at 70% 40%, rgba(37, 99, 235, 0.08) 0%, transparent 70%),
+    radial-gradient(ellipse 50% 50% at 20% 80%, rgba(201, 168, 76, 0.05) 0%, transparent 60%);
+  pointer-events: none;
+}
+
+/* Subtle grid pattern */
+.cover::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  opacity: 0.03;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.1) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.1) 1px, transparent 1px);
+  background-size: 60px 60px;
+  pointer-events: none;
+}
+
+.cover-top {
+  padding: 2.5rem 4rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  position: relative;
+  z-index: 1;
+}
+
+.cover-logo {
+  font-family: 'DM Sans', sans-serif;
+  font-weight: 700;
+  font-size: 0.85rem;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--gold);
+}
+
+.cover-date {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.8rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: rgba(232, 228, 222, 0.5);
+}
+
+.cover-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 4rem 4rem 2rem;
+  max-width: 900px;
+  position: relative;
+  z-index: 1;
+}
+
+.cover-eyebrow {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--gold);
+  margin-bottom: 2rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.cover-eyebrow::before {
+  content: '';
+  width: 40px;
+  height: 1px;
+  background: var(--gold);
+}
+
+.cover-title {
+  font-size: clamp(2.8rem, 5.5vw, 4.2rem);
+  font-weight: 800;
+  line-height: 1.08;
+  margin-bottom: 1.5rem;
+  color: #fff;
+}
+
+.cover-title em {
+  font-style: italic;
+  color: var(--gold-light);
+}
+
+.cover-subtitle {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 1.15rem;
+  font-weight: 300;
+  line-height: 1.7;
+  color: rgba(232, 228, 222, 0.7);
+  max-width: 640px;
+}
+
+.cover-footer {
+  padding: 2rem 4rem 3rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  position: relative;
+  z-index: 1;
+  border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+.cover-meta {
+  display: flex;
+  gap: 3rem;
+}
+
+.cover-meta-item {
+  font-size: 0.72rem;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: rgba(232, 228, 222, 0.35);
+}
+
+.cover-meta-item span {
+  display: block;
+  font-size: 0.85rem;
+  color: rgba(232, 228, 222, 0.65);
+  letter-spacing: 0.02em;
+  text-transform: none;
+  margin-top: 0.25rem;
+}
+
+.cover-version {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: rgba(232, 228, 222, 0.3);
+  letter-spacing: 0.05em;
+}
+
+/* ═══════════════════════════════════════════════════
+   LAYOUT CONTAINER
+   ═══════════════════════════════════════════════════ */
+.page {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 4rem;
+}
+
+.page-narrow {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 0 4rem;
+}
+
+/* ═══════════════════════════════════════════════════
+   EXECUTIVE SUMMARY BAR
+   ═══════════════════════════════════════════════════ */
+.exec-bar {
+  background: var(--navy);
+  color: var(--text-inverse);
+  padding: 5rem 0;
+}
+
+.exec-bar-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 4rem;
+}
+
+.exec-label {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--gold);
+  margin-bottom: 2rem;
+}
+
+.exec-text {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.6rem;
+  font-weight: 400;
+  line-height: 1.55;
+  color: rgba(255,255,255,0.9);
+  max-width: 900px;
+}
+
+.exec-text strong {
+  color: var(--gold-light);
+  font-weight: 600;
+}
+
+/* ═══════════════════════════════════════════════════
+   TABLE OF CONTENTS
+   ═══════════════════════════════════════════════════ */
+.toc-section {
+  padding: 5rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.toc-grid {
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 0;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 4rem;
+}
+
+.toc-label {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  padding-top: 0.15rem;
+}
+
+.toc-list {
+  list-style: none;
+}
+
+.toc-list li {
+  border-bottom: 1px solid var(--rule);
+  padding: 0.65rem 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.toc-list li:last-child { border-bottom: none; }
+
+.toc-list a {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--text-primary);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.toc-list a:hover { color: var(--blue); }
+
+.toc-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+}
+
+/* ═══════════════════════════════════════════════════
+   SECTION STYLING
+   ═══════════════════════════════════════════════════ */
+.section {
+  padding: 5rem 0 4rem;
+  border-bottom: 1px solid var(--rule);
+}
+
+.section:last-child { border-bottom: none; }
+
+.section-grid {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 4rem;
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: 0 3rem;
+}
+
+.section-num {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  letter-spacing: 0.1em;
+  color: var(--text-tertiary);
+  padding-top: 0.6rem;
+}
+
+.section-content { max-width: 100%; overflow: hidden; }
+
+.section-title {
+  font-size: 2.2rem;
+  margin-bottom: 0.4rem;
+  color: var(--navy);
+}
+
+.section-subtitle {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.95rem;
+  font-weight: 400;
+  color: var(--text-tertiary);
+  margin-bottom: 2.5rem;
+  font-style: italic;
+}
+
+.section-content p {
+  margin-bottom: 1.3rem;
+  color: var(--text-secondary);
+  max-width: 680px;
+}
+
+.section-content p:last-child { margin-bottom: 0; }
+
+/* ═══════════════════════════════════════════════════
+   TWO-COLUMN BODY TEXT
+   ═══════════════════════════════════════════════════ */
+.cols-2 {
+  column-count: 2;
+  column-gap: 2.5rem;
+  column-rule: 1px solid var(--rule);
+  max-width: 100%;
+}
+
+.cols-2 p {
+  max-width: 100%;
+  break-inside: avoid;
+}
+
+/* ═══════════════════════════════════════════════════
+   PULL QUOTES
+   ═══════════════════════════════════════════════════ */
+.pull-quote {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.45rem;
+  font-weight: 500;
+  font-style: italic;
+  line-height: 1.5;
+  color: var(--navy);
+  padding: 2.5rem 0;
+  margin: 2rem 0;
+  border-top: 2px solid var(--gold);
+  border-bottom: 1px solid var(--rule);
+  break-inside: avoid;
+  max-width: 100%;
+}
+
+.pull-quote-attr {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-style: normal;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--gold-dark);
+  margin-top: 1rem;
+  display: block;
+}
+
+/* Break-grid pull quote */
+.pull-quote-break {
+  grid-column: 1 / -1;
+  max-width: 1200px;
+  margin: 3rem auto;
+  padding: 3rem 4rem;
+  background: var(--navy);
+  color: #fff;
+  position: relative;
+}
+
+.pull-quote-break::before {
+  content: '\201C';
+  font-family: 'Playfair Display', serif;
+  font-size: 6rem;
+  color: var(--gold);
+  position: absolute;
+  top: 0.5rem;
+  left: 2rem;
+  line-height: 1;
+  opacity: 0.4;
+}
+
+.pull-quote-break blockquote {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.6rem;
+  font-weight: 500;
+  font-style: italic;
+  line-height: 1.5;
+  padding-left: 1rem;
+  max-width: 800px;
+}
+
+.pull-quote-break cite {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.75rem;
+  font-weight: 600;
+  font-style: normal;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--gold);
+  display: block;
+  margin-top: 1.5rem;
+  padding-left: 1rem;
+}
+
+/* ═══════════════════════════════════════════════════
+   CALLOUT BOXES
+   ═══════════════════════════════════════════════════ */
+.callout {
+  background: var(--gold-pale);
+  border-left: 3px solid var(--gold);
+  padding: 1.5rem 2rem;
+  margin: 2rem 0;
+  break-inside: avoid;
+}
+
+.callout-label {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--gold-dark);
+  margin-bottom: 0.5rem;
+}
+
+.callout p {
+  font-size: 0.9rem;
+  color: var(--text-primary) !important;
+  max-width: 100% !important;
+  margin-bottom: 0 !important;
+}
+
+.callout-blue {
+  background: var(--blue-pale);
+  border-left-color: var(--blue);
+}
+
+.callout-blue .callout-label { color: var(--blue); }
+
+/* ═══════════════════════════════════════════════════
+   DATA FIGURES
+   ═══════════════════════════════════════════════════ */
+.figure {
+  margin: 2.5rem 0;
+  break-inside: avoid;
+}
+
+.figure-label {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  margin-bottom: 1rem;
+}
+
+/* ═══════════════════════════════════════════════════
+   KPI CARDS
+   ═══════════════════════════════════════════════════ */
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--rule);
+  margin: 2rem 0;
+  break-inside: avoid;
+}
+
+.kpi {
+  background: var(--paper);
+  padding: 1.5rem;
+  text-align: center;
+}
+
+.kpi-value {
+  font-family: 'Playfair Display', serif;
+  font-size: 2.2rem;
+  font-weight: 700;
+  color: var(--navy);
+  line-height: 1.1;
+}
+
+.kpi-unit {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.7rem;
+  font-weight: 500;
+  color: var(--blue);
+}
+
+.kpi-label {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.7rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  margin-top: 0.5rem;
+}
+
+/* ═══════════════════════════════════════════════════
+   TABLES
+   ═══════════════════════════════════════════════════ */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1.5rem 0;
+  font-size: 0.85rem;
+}
+
+.data-table thead th {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  text-align: left;
+  padding: 0.75rem 1rem;
+  border-bottom: 2px solid var(--navy);
+}
+
+.data-table tbody td {
+  padding: 0.65rem 1rem;
+  border-bottom: 1px solid var(--rule);
+  color: var(--text-secondary);
+  vertical-align: top;
+}
+
+.data-table tbody tr:last-child td { border-bottom: none; }
+
+.data-table .col-highlight {
+  font-weight: 600;
+  color: var(--navy);
+}
+
+.data-table .mono-cell {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+}
+
+/* ═══════════════════════════════════════════════════
+   CODE BLOCKS
+   ═══════════════════════════════════════════════════ */
+.code-block {
+  background: var(--navy);
+  color: #c8d6e5;
+  padding: 1.5rem 2rem;
+  margin: 1.5rem 0;
+  overflow-x: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.78rem;
+  line-height: 1.7;
+  border-left: 3px solid var(--blue);
+  break-inside: avoid;
+}
+
+.code-block .kw { color: #7c98b3; }
+.code-block .fn { color: #64b5f6; }
+.code-block .str { color: #81c784; }
+.code-block .cm { color: #546e7a; font-style: italic; }
+.code-block .ty { color: #ce93d8; }
+.code-block .num { color: #f48fb1; }
+
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82em;
+  background: rgba(37, 99, 235, 0.07);
+  padding: 0.1em 0.35em;
+  border-radius: 2px;
+  color: var(--navy);
+}
+
+/* ═══════════════════════════════════════════════════
+   DIAGRAMS (ASCII-LIKE)
+   ═══════════════════════════════════════════════════ */
+.diagram {
+  background: var(--paper-warm);
+  border: 1px solid var(--rule);
+  padding: 2rem;
+  margin: 2rem 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem;
+  line-height: 1.6;
+  white-space: pre;
+  overflow-x: auto;
+  break-inside: avoid;
+  color: var(--navy);
+}
+
+/* ═══════════════════════════════════════════════════
+   FULL-WIDTH NAVY SECTIONS
+   ═══════════════════════════════════════════════════ */
+.dark-section {
+  background: var(--navy);
+  color: var(--text-inverse);
+  padding: 5rem 0;
+}
+
+.dark-section .section-grid {
+  color: var(--text-inverse);
+}
+
+.dark-section .section-num { color: rgba(232, 228, 222, 0.3); }
+
+.dark-section .section-title { color: #fff; }
+
+.dark-section .section-subtitle { color: rgba(232, 228, 222, 0.5); }
+
+.dark-section p { color: rgba(232, 228, 222, 0.75); }
+
+.dark-section .data-table thead th {
+  color: rgba(232, 228, 222, 0.4);
+  border-bottom-color: rgba(255,255,255,0.2);
+}
+
+.dark-section .data-table tbody td {
+  color: rgba(232, 228, 222, 0.7);
+  border-bottom-color: rgba(255,255,255,0.06);
+}
+
+.dark-section .data-table .col-highlight { color: #fff; }
+
+.dark-section .kpi-row { background: rgba(255,255,255,0.08); }
+.dark-section .kpi { background: var(--navy); }
+.dark-section .kpi-value { color: #fff; }
+.dark-section .kpi-label { color: rgba(232, 228, 222, 0.45); }
+
+.dark-section code {
+  background: rgba(255,255,255,0.08);
+  color: var(--gold-light);
+}
+
+/* ═══════════════════════════════════════════════════
+   TIMELINE / PROCESS FLOW
+   ═══════════════════════════════════════════════════ */
+.process-flow {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0;
+  margin: 2.5rem 0;
+  break-inside: avoid;
+}
+
+.process-step {
+  padding: 1.5rem;
+  border-left: 1px solid var(--rule);
+  position: relative;
+}
+
+.process-step:first-child { border-left: none; }
+
+.process-step-num {
+  font-family: 'Playfair Display', serif;
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--gold);
+  opacity: 0.5;
+  line-height: 1;
+  margin-bottom: 0.75rem;
+}
+
+.process-step h4 {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--navy);
+  margin-bottom: 0.5rem;
+}
+
+.process-step p {
+  font-size: 0.85rem !important;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+/* ═══════════════════════════════════════════════════
+   FEATURE GRID
+   ═══════════════════════════════════════════════════ */
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--rule);
+  margin: 2.5rem 0;
+  break-inside: avoid;
+}
+
+.feature-card {
+  background: var(--paper);
+  padding: 2rem;
+}
+
+.feature-card-icon {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem;
+  font-weight: 500;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+  color: var(--blue);
+  margin-bottom: 0.75rem;
+}
+
+.feature-card h4 {
+  font-size: 1.05rem;
+  margin-bottom: 0.5rem;
+  color: var(--navy);
+}
+
+.feature-card p {
+  font-size: 0.85rem !important;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  max-width: 100% !important;
+}
+
+.dark-section .feature-grid { background: rgba(255,255,255,0.08); }
+.dark-section .feature-card { background: var(--navy); }
+.dark-section .feature-card h4 { color: #fff; }
+.dark-section .feature-card p { color: rgba(232, 228, 222, 0.65); }
+
+/* ═══════════════════════════════════════════════════
+   NUMBERED LIST
+   ═══════════════════════════════════════════════════ */
+.numbered-list {
+  list-style: none;
+  counter-reset: num-list;
+  margin: 1.5rem 0;
+}
+
+.numbered-list li {
+  counter-increment: num-list;
+  padding: 0.85rem 0 0.85rem 3rem;
+  border-bottom: 1px solid var(--rule);
+  position: relative;
+  color: var(--text-secondary);
+  font-size: 0.95rem;
+}
+
+.numbered-list li::before {
+  content: counter(num-list, decimal-leading-zero);
+  position: absolute;
+  left: 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--gold);
+  font-weight: 500;
+}
+
+.numbered-list li strong {
+  color: var(--navy);
+}
+
+/* ═══════════════════════════════════════════════════
+   SECTION DIVIDER
+   ═══════════════════════════════════════════════════ */
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 3rem 0;
+  max-width: 1200px;
+  margin: 0 auto;
+  padding-left: 4rem;
+  padding-right: 4rem;
+}
+
+.divider::before,
+.divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--rule);
+}
+
+.divider-diamond {
+  width: 6px;
+  height: 6px;
+  background: var(--gold);
+  transform: rotate(45deg);
+  flex-shrink: 0;
+}
+
+/* ═══════════════════════════════════════════════════
+   FINALITY MODEL VISUAL
+   ═══════════════════════════════════════════════════ */
+.finality-track {
+  display: flex;
+  align-items: stretch;
+  margin: 2.5rem 0;
+  height: 120px;
+  break-inside: avoid;
+}
+
+.finality-phase {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  padding: 1.5rem;
+  position: relative;
+}
+
+.finality-phase:first-child {
+  background: var(--blue-pale);
+  border: 1px solid rgba(37, 99, 235, 0.15);
+}
+
+.finality-phase:last-child {
+  background: var(--gold-pale);
+  border: 1px solid rgba(201, 168, 76, 0.2);
+}
+
+.finality-phase h5 {
+  font-family: 'DM Sans', sans-serif;
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  margin-bottom: 0.3rem;
+}
+
+.finality-phase:first-child h5 { color: var(--blue); }
+.finality-phase:last-child h5 { color: var(--gold-dark); }
+
+.finality-phase .val {
+  font-family: 'Playfair Display', serif;
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--navy);
+}
+
+.finality-phase .desc {
+  font-size: 0.78rem;
+  color: var(--text-tertiary);
+  margin-top: 0.25rem;
+}
+
+.finality-arrow {
+  width: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  font-size: 1.2rem;
+}
+
+/* ═══════════════════════════════════════════════════
+   FOOTER
+   ═══════════════════════════════════════════════════ */
+.footer {
+  background: var(--navy);
+  color: var(--text-inverse);
+  padding: 4rem 0 3rem;
+}
+
+.footer-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 0 4rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+}
+
+.footer-logo {
+  font-family: 'DM Sans', sans-serif;
+  font-weight: 700;
+  font-size: 0.8rem;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--gold);
+  margin-bottom: 0.5rem;
+}
+
+.footer-text {
+  font-size: 0.8rem;
+  color: rgba(232, 228, 222, 0.4);
+  line-height: 1.6;
+}
+
+.footer-legal {
+  font-size: 0.7rem;
+  color: rgba(232, 228, 222, 0.25);
+  text-align: right;
+  max-width: 300px;
+  line-height: 1.6;
+}
+
+/* ═══════════════════════════════════════════════════
+   RESPONSIVE
+   ═══════════════════════════════════════════════════ */
+@media (max-width: 900px) {
+  html { font-size: 15px; }
+  .cover-top, .cover-body, .cover-footer { padding-left: 2rem; padding-right: 2rem; }
+  .page, .page-narrow, .exec-bar-inner, .section-grid, .toc-grid, .divider, .footer-inner { padding-left: 2rem; padding-right: 2rem; }
+  .section-grid, .toc-grid { grid-template-columns: 1fr; }
+  .section-num, .toc-label { margin-bottom: 0.5rem; }
+  .cols-2 { column-count: 1; }
+  .kpi-row { grid-template-columns: repeat(2, 1fr); }
+  .feature-grid { grid-template-columns: 1fr; }
+  .process-flow { grid-template-columns: 1fr; }
+  .process-step { border-left: none; border-top: 1px solid var(--rule); }
+  .process-step:first-child { border-top: none; }
+  .footer-inner { flex-direction: column; gap: 2rem; align-items: flex-start; }
+  .footer-legal { text-align: left; }
+  .pull-quote-break { padding: 2rem; margin: 2rem 0; }
+}
+
+@media print {
+  body::before { display: none; }
+  .cover { break-after: page; }
+  .section { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════════════════════════════════════
+     COVER
+     ═══════════════════════════════════════════════════ -->
+<header class="cover">
+  <div class="cover-top">
+    <div class="cover-logo">StateSet</div>
+    <div class="cover-date">March 2026</div>
+  </div>
+  <div class="cover-body">
+    <div class="cover-eyebrow">Technical Whitepaper</div>
+    <h1 class="cover-title">Verifiable Event Infrastructure for <em>Autonomous Commerce</em></h1>
+    <p class="cover-subtitle">
+      A cryptographically anchored sequencing layer that gives AI agents a shared,
+      tamper-evident source of truth&thinsp;&mdash;&thinsp;enabling trustless ordering, Merkle-provable
+      audit trails, and on-chain settlement without requiring trust in any single operator.
+    </p>
+  </div>
+  <div class="cover-footer">
+    <div class="cover-meta">
+      <div class="cover-meta-item">
+        Protocol
+        <span>VES v1.0</span>
+      </div>
+      <div class="cover-meta-item">
+        Runtime
+        <span>Rust / Tokio</span>
+      </div>
+      <div class="cover-meta-item">
+        Settlement
+        <span>Set Chain L2</span>
+      </div>
+      <div class="cover-meta-item">
+        License
+        <span>MIT</span>
+      </div>
+    </div>
+    <div class="cover-version">v0.2.6</div>
+  </div>
+</header>
+
+<!-- ═══════════════════════════════════════════════════
+     EXECUTIVE SUMMARY
+     ═══════════════════════════════════════════════════ -->
+<section class="exec-bar">
+  <div class="exec-bar-inner">
+    <div class="exec-label">Executive Summary</div>
+    <p class="exec-text">
+      The StateSet Sequencer is a <strong>production-grade event ordering service</strong> that implements the
+      Verifiable Event Sync (VES) v1.0 protocol. It assigns gap-free, cryptographically signed sequence
+      numbers to events produced by autonomous commerce agents&thinsp;&mdash;&thinsp;then anchors batch
+      Merkle commitments to an Ethereum L2 for <strong>independently verifiable finality</strong>. The result
+      is an infrastructure primitive that makes multi-agent commerce auditable, non-repudiable, and
+      settlement-ready without trusting any single party.
+    </p>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     TABLE OF CONTENTS
+     ═══════════════════════════════════════════════════ -->
+<nav class="toc-section">
+  <div class="toc-grid">
+    <div class="toc-label">Contents</div>
+    <ol class="toc-list">
+      <li><a href="#problem">The Ordering Problem in Agent Commerce</a> <span class="toc-num">01</span></li>
+      <li><a href="#architecture">System Architecture</a> <span class="toc-num">02</span></li>
+      <li><a href="#protocol">The VES v1.0 Protocol</a> <span class="toc-num">03</span></li>
+      <li><a href="#ordering">Ordering Semantics &amp; Finality</a> <span class="toc-num">04</span></li>
+      <li><a href="#merkle">Merkle Commitments &amp; Inclusion Proofs</a> <span class="toc-num">05</span></li>
+      <li><a href="#anchoring">On-Chain Anchoring &amp; Anti-Equivocation</a> <span class="toc-num">06</span></li>
+      <li><a href="#encryption">End-to-End Encryption</a> <span class="toc-num">07</span></li>
+      <li><a href="#compliance">Zero-Knowledge Compliance</a> <span class="toc-num">08</span></li>
+      <li><a href="#payments">The x402 Payment Protocol</a> <span class="toc-num">09</span></li>
+      <li><a href="#performance">Performance &amp; Resilience</a> <span class="toc-num">10</span></li>
+      <li><a href="#security">Security Model</a> <span class="toc-num">11</span></li>
+      <li><a href="#roadmap">Roadmap</a> <span class="toc-num">12</span></li>
+    </ol>
+  </div>
+</nav>
+
+<!-- ═══════════════════════════════════════════════════
+     01 — THE PROBLEM
+     ═══════════════════════════════════════════════════ -->
+<section class="section" id="problem">
+  <div class="section-grid">
+    <div class="section-num">01</div>
+    <div class="section-content">
+      <h2 class="section-title">The Ordering Problem in Agent Commerce</h2>
+      <p class="section-subtitle">Why wall clocks fail and databases lie</p>
+
+      <div class="cols-2">
+        <p>
+          Modern commerce is rapidly becoming multi-agent and offline-first. Autonomous AI agents manage
+          inventory, process orders, handle returns, and negotiate pricing&thinsp;&mdash;&thinsp;often
+          concurrently and without human oversight. When Agent A modifies inventory at the same moment Agent B
+          processes a purchase against that same stock, a fundamental question arises: <em>whose operation
+          takes precedence?</em>
+        </p>
+        <p>
+          Wall-clock timestamps are unreliable across distributed systems. Clock skew, NTP drift, and timezone
+          ambiguity make temporal ordering non-deterministic. Traditional databases provide ordering within a
+          single node but are opaque to external auditors&thinsp;&mdash;&thinsp;an administrator can silently
+          reorder, modify, or drop events without detection.
+        </p>
+        <p>
+          In a world where commercial disputes involve autonomous agents operating across organizational
+          boundaries, the infrastructure itself must provide verifiable guarantees. Three capabilities are
+          non-negotiable:
+        </p>
+
+        <div class="callout">
+          <div class="callout-label">The Three Requirements</div>
+          <p>
+            <strong>Deterministic ordering</strong>&thinsp;&mdash;&thinsp;a single canonical sequence that all
+            participants agree on, independent of wall clocks.<br><br>
+            <strong>Non-repudiation</strong>&thinsp;&mdash;&thinsp;cryptographic proof that an event was accepted,
+            which the sequencer cannot later deny.<br><br>
+            <strong>Independent auditability</strong>&thinsp;&mdash;&thinsp;any third party can verify the
+            complete history without trusting the operator.
+          </p>
+        </div>
+
+        <p>
+          The StateSet Sequencer was built to satisfy all three. It is the canonical clock for
+          distributed autonomous commerce&thinsp;&mdash;&thinsp;a cryptographic notary that assigns
+          tamper-evident sequence numbers, issues signed receipts, and periodically anchors batch Merkle
+          commitments on-chain for independently verifiable finality.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     02 — ARCHITECTURE
+     ═══════════════════════════════════════════════════ -->
+<section class="section" id="architecture">
+  <div class="section-grid">
+    <div class="section-num">02</div>
+    <div class="section-content">
+      <h2 class="section-title">System Architecture</h2>
+      <p class="section-subtitle">Layered design for production durability</p>
+
+      <p>
+        The sequencer is implemented in Rust on the Tokio async runtime, chosen for memory safety without
+        garbage collection pauses and predictable tail latencies. The architecture follows a strict layered
+        separation: domain types, infrastructure traits with pluggable backends, API surface, and
+        cross-cutting concerns.
+      </p>
+
+      <div class="diagram">
+ ┌─────────────────────────────────────────────────────────────────┐
+ │                         API Surface                             │
+ │   HTTP/REST (Axum)                    gRPC v1/v2 (Tonic)       │
+ │   POST /api/v1/ves/events/ingest      IngestVesEvents()        │
+ │   GET  /api/v1/ves/commitments        StreamEvents()           │
+ │   POST /api/v1/ves/proofs             SubscribeEntity()        │
+ └───────────────────────────┬─────────────────────────────────────┘
+                             │
+ ┌───────────────────────────┴─────────────────────────────────────┐
+ │                      Service Layer                              │
+ │  VesSequencer  │  CommitmentEngine  │  AgentKeyRegistry         │
+ │  Projector     │  SchemaValidator   │  PayloadEncryption        │
+ │  RateLimiter   │  CircuitBreaker    │  AuditLogger              │
+ └───────────────────────────┬─────────────────────────────────────┘
+                             │
+ ┌───────────────────────────┴─────────────────────────────────────┐
+ │               PostgreSQL  (Source of Truth)                     │
+ │  ves_events  │  sequence_counters  │  batch_commitments         │
+ │  agent_keys  │  api_keys  │  schemas  │  vault  │  audit_log   │
+ └───────────────────────────┬─────────────────────────────────────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          ▼                  ▼                  ▼
+    STARK Prover       Set Chain L2       Anchor Worker
+    (ZK Proofs)      (Commitments)     (Gas Optimization)</div>
+
+      <div class="feature-grid">
+        <div class="feature-card">
+          <div class="feature-card-icon">Domain</div>
+          <h4>Pure Types</h4>
+          <p>Event envelopes, commitments, proofs, and payment intents defined as framework-agnostic Rust types with serde serialization.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-card-icon">Infrastructure</div>
+          <h4>Trait-Driven Storage</h4>
+          <p>PostgreSQL for production, SQLite for testing. Connection pooling, read/write splitting, and session-level timeout guarantees.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-card-icon">Crypto</div>
+          <h4>Hermetic Signing</h4>
+          <p>Domain-separated SHA-256 hashing, Ed25519 signatures, AES-256-GCM encryption, and HPKE key wrapping&thinsp;&mdash;&thinsp;all spec'd to the byte.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-card-icon">API</div>
+          <h4>Dual Interface</h4>
+          <p>REST via Axum for simplicity, gRPC via Tonic for streaming. Both enforce identical validation, rate limiting, and timeout semantics.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-card-icon">Auth</div>
+          <h4>Layered Security</h4>
+          <p>API key and JWT authentication, per-tenant rate limiting, pool health-aware load shedding, and security headers on every response.</p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-card-icon">Anchor</div>
+          <h4>L2 Settlement</h4>
+          <p>Two-phase anchoring to Set Chain via Alloy, with circuit breaker protection and exponential backoff for blockchain reliability.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     BREAK-GRID PULL QUOTE
+     ═══════════════════════════════════════════════════ -->
+<div class="pull-quote-break">
+  <blockquote>
+    Auditors don't need to trust the sequencer operator, the database, or any single
+    party. They only need to verify the math&thinsp;&mdash;&thinsp;and the math is public.
+  </blockquote>
+  <cite>Design Principle &mdash; VES v1.0 Specification</cite>
+</div>
+
+<!-- ═══════════════════════════════════════════════════
+     03 — THE VES PROTOCOL
+     ═══════════════════════════════════════════════════ -->
+<section class="dark-section" id="protocol">
+  <div class="section-grid">
+    <div class="section-num">03</div>
+    <div class="section-content">
+      <h2 class="section-title">The VES v1.0 Protocol</h2>
+      <p class="section-subtitle">Verifiable Event Sync&thinsp;&mdash;&thinsp;a cryptographic contract between agents and the sequencer</p>
+
+      <p>
+        At the heart of the StateSet Sequencer is the Verifiable Event Sync protocol, a specification
+        that defines exactly how events are hashed, signed, sequenced, receipted, and committed. Every
+        byte of every hash is deterministic and reproducible across any language implementation.
+      </p>
+
+      <h3 style="font-size:1.25rem; margin: 2.5rem 0 1rem; color: #fff;">The Event Envelope</h3>
+
+      <p>
+        Every event entering the system is wrapped in a <code>VesEventEnvelope</code>&thinsp;&mdash;&thinsp;a
+        structure containing both agent-provided fields (identity, payload, signature) and sequencer-assigned
+        fields (sequence number, acceptance timestamp). The agent signs a deterministic binary encoding of its
+        fields before submission; the sequencer verifies this signature before assigning ordering.
+      </p>
+
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Field</th>
+            <th>Source</th>
+            <th>Purpose</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="col-highlight mono-cell">event_id</td>
+            <td>Agent</td>
+            <td>Globally unique identifier (UUID v4)</td>
+          </tr>
+          <tr>
+            <td class="col-highlight mono-cell">tenant_id / store_id</td>
+            <td>Agent</td>
+            <td>Stream identity &amp; isolation boundary</td>
+          </tr>
+          <tr>
+            <td class="col-highlight mono-cell">entity_type / entity_id</td>
+            <td>Agent</td>
+            <td>Domain aggregate (order, inventory, product)</td>
+          </tr>
+          <tr>
+            <td class="col-highlight mono-cell">payload_plain_hash</td>
+            <td>Agent</td>
+            <td>SHA-256 of JCS-canonicalized payload with domain prefix</td>
+          </tr>
+          <tr>
+            <td class="col-highlight mono-cell">agent_signature</td>
+            <td>Agent</td>
+            <td>Ed25519 over deterministic binary encoding</td>
+          </tr>
+          <tr>
+            <td class="col-highlight mono-cell">sequence_number</td>
+            <td style="color: var(--gold);">Sequencer</td>
+            <td>Canonical ordering position (gap-free, monotonic)</td>
+          </tr>
+          <tr>
+            <td class="col-highlight mono-cell">sequenced_at</td>
+            <td style="color: var(--gold);">Sequencer</td>
+            <td>Acceptance timestamp (observational, not authoritative)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 style="font-size:1.25rem; margin: 2.5rem 0 1rem; color: #fff;">Domain-Separated Hashing</h3>
+
+      <p>
+        All cryptographic operations use domain-prefixed hashing to prevent cross-protocol collision.
+        The payload hash, for instance, prepends <code>VES_PAYLOAD_PLAIN_V1</code> before hashing the
+        RFC 8785 JSON Canonicalization Scheme output. Ten distinct domain prefixes cover payloads,
+        signatures, Merkle leaves, Merkle nodes, receipts, stream identifiers, encryption AAD, and more.
+      </p>
+
+      <div class="callout" style="background: rgba(201,168,76,0.08); border-left-color: var(--gold);">
+        <div class="callout-label" style="color: var(--gold);">Why JCS (RFC 8785)?</div>
+        <p style="color: rgba(232,228,222,0.8) !important;">
+          JSON Canonicalization eliminates the "same data, different bytes" problem. Two implementations
+          in different languages producing semantically identical JSON will compute bit-identical hashes.
+          This is essential for cross-platform signature verification.
+        </p>
+      </div>
+
+      <h3 style="font-size:1.25rem; margin: 2.5rem 0 1rem; color: #fff;">Sequencer Receipts</h3>
+
+      <p>
+        Upon accepting an event, the sequencer returns a signed receipt binding the event identity to its
+        assigned sequence number. This receipt is non-repudiable: an agent can prove acceptance even if the
+        sequencer later attempts censorship. The receipt preimage includes <code>VES_RECEIPT_V1</code>,
+        the tenant and store identifiers, the event ID, sequence number, and the original event signing hash.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     04 — ORDERING SEMANTICS
+     ═══════════════════════════════════════════════════ -->
+<section class="section" id="ordering">
+  <div class="section-grid">
+    <div class="section-num">04</div>
+    <div class="section-content">
+      <h2 class="section-title">Ordering Semantics &amp; Finality</h2>
+      <p class="section-subtitle">One number to rule them all</p>
+
+      <div class="cols-2">
+        <p>
+          The <code>sequence_number</code> is the single canonical ordering primitive. Agent-provided
+          <code>created_at</code> timestamps are signed but never used for ordering. The sequencer's own
+          <code>sequenced_at</code> is observational metadata useful for monitoring but not authoritative
+          for replay or state reconstruction.
+        </p>
+        <p>
+          For each stream (identified by the <code>tenant_id</code> and <code>store_id</code> pair), sequence
+          numbers are strictly increasing by one with no gaps. This invariant is enforced atomically via
+          PostgreSQL <code>SELECT ... FOR UPDATE</code> on per-stream counters, guaranteeing linearizable
+          ordering even under concurrent ingestion from multiple agents.
+        </p>
+
+        <div class="pull-quote">
+          The only authority on what happened and in what order is the sequence number. Everything
+          else&thinsp;&mdash;&thinsp;timestamps, wall clocks, network arrival order&thinsp;&mdash;&thinsp;is
+          advisory.
+          <span class="pull-quote-attr">Ordering Invariant</span>
+        </div>
+
+        <p>
+          Events are idempotent by <code>event_id</code>: resubmitting an identical event returns the same
+          sequence number, while resubmitting the same ID with different content is rejected. An optional
+          <code>command_id</code> field provides intent-level deduplication for higher-level workflows.
+        </p>
+      </div>
+
+      <h3 style="font-size:1.25rem; margin: 2.5rem 0 1rem;">The Two-Phase Finality Model</h3>
+
+      <div class="finality-track">
+        <div class="finality-phase">
+          <h5>Soft Finality</h5>
+          <div class="val">&lt; 100ms</div>
+          <div class="desc">Signed receipt returned to agent. Non-repudiable proof of acceptance.</div>
+        </div>
+        <div class="finality-arrow">&rarr;</div>
+        <div class="finality-phase">
+          <h5>Hard Finality</h5>
+          <div class="val">1&ndash;5 min</div>
+          <div class="desc">Batch Merkle root anchored on L2. Independently verifiable by any auditor.</div>
+        </div>
+      </div>
+
+      <table class="data-table" style="margin-top: 2rem;">
+        <thead>
+          <tr>
+            <th>Use Case</th>
+            <th>Required Finality</th>
+            <th>Rationale</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="col-highlight">Order confirmation display</td>
+            <td>Soft</td>
+            <td>Receipt provides instant, signed acknowledgement</td>
+          </tr>
+          <tr>
+            <td class="col-highlight">Inventory reservation</td>
+            <td>Soft</td>
+            <td>Sequence number establishes priority; optimistic concurrency handles conflicts</td>
+          </tr>
+          <tr>
+            <td class="col-highlight">Trade finance settlement</td>
+            <td>Hard</td>
+            <td>On-chain anchor provides tamper-evident proof for multi-party agreements</td>
+          </tr>
+          <tr>
+            <td class="col-highlight">Regulatory audit trail</td>
+            <td>Hard</td>
+            <td>Merkle proofs against on-chain roots enable independent verification by auditors</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     05 — MERKLE COMMITMENTS
+     ═══════════════════════════════════════════════════ -->
+<section class="section" id="merkle">
+  <div class="section-grid">
+    <div class="section-num">05</div>
+    <div class="section-content">
+      <h2 class="section-title">Merkle Commitments &amp; Inclusion Proofs</h2>
+      <p class="section-subtitle">Compact, verifiable batch integrity</p>
+
+      <p>
+        The sequencer periodically constructs Merkle trees over contiguous ranges of events, producing a
+        single 32-byte root hash that commits to the entire batch. This root is the anchor point for both
+        on-chain settlement and independent audit.
+      </p>
+
+      <h3 style="font-size:1.15rem; margin: 2rem 0 1rem;">Batch Commitment Structure</h3>
+
+      <p>
+        Each <code>VesBatchCommitment</code> covers a contiguous sequence range and includes the Merkle root,
+        sequence boundaries, event count, and a reference to the previous batch's root. This chaining
+        creates an append-only commitment log that prevents retroactive modification.
+      </p>
+
+      <h3 style="font-size:1.15rem; margin: 2rem 0 1rem;">Leaf Construction</h3>
+
+      <p>
+        Each leaf in the Merkle tree is computed from a domain-separated hash over the event's stream
+        identity, canonical sequence position, event signing hash, and actual signature bytes. This binds
+        every leaf to its position, content, and authorship&thinsp;&mdash;&thinsp;preventing reordering,
+        content modification, and signature substitution.
+      </p>
+
+      <div class="process-flow">
+        <div class="process-step">
+          <div class="process-step-num">1</div>
+          <h4>Leaf Hash</h4>
+          <p>SHA-256 over domain prefix, stream ID, sequence number, signing hash, and signature bytes</p>
+        </div>
+        <div class="process-step">
+          <div class="process-step-num">2</div>
+          <h4>Tree Build</h4>
+          <p>Pad to power-of-two with domain-separated padding leaves. Internal nodes use <code>VES_NODE_V1</code> prefix.</p>
+        </div>
+        <div class="process-step">
+          <div class="process-step-num">3</div>
+          <h4>Root</h4>
+          <p>Single 32-byte hash at tree apex. Commits to every event in the batch.</p>
+        </div>
+        <div class="process-step">
+          <div class="process-step-num">4</div>
+          <h4>Proof</h4>
+          <p>O(log n) sibling hashes from leaf to root. Any verifier recomputes and compares.</p>
+        </div>
+      </div>
+
+      <div class="callout-blue callout">
+        <div class="callout-label">Verifier Independence</div>
+        <p>
+          Any third party can verify event inclusion: fetch the event data, recompute the leaf hash,
+          walk the proof path with provided siblings, and confirm the result matches the on-chain
+          Merkle root. No trust in the sequencer required.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     06 — ON-CHAIN ANCHORING
+     ═══════════════════════════════════════════════════ -->
+<section class="dark-section" id="anchoring">
+  <div class="section-grid">
+    <div class="section-num">06</div>
+    <div class="section-content">
+      <h2 class="section-title">On-Chain Anchoring &amp; Anti-Equivocation</h2>
+      <p class="section-subtitle">Blockchain-verifiable settlement on Set Chain L2</p>
+
+      <p>
+        The final trust anchor is the blockchain. Batch Merkle roots are submitted to the
+        <code>StateSetAnchor</code> smart contract on Set Chain L2 (EVM-compatible), creating an
+        immutable, publicly queryable record that any auditor can verify without the sequencer's
+        cooperation.
+      </p>
+
+      <h3 style="font-size:1.15rem; margin: 2rem 0 1rem; color: #fff;">The Fork Problem &amp; Commitment Chaining</h3>
+
+      <p>
+        A dishonest sequencer could potentially anchor two conflicting Merkle roots for the same
+        stream&thinsp;&mdash;&thinsp;presenting one history to auditors and another to merchants. VES prevents
+        this through <strong style="color: var(--gold-light);">commitment chaining</strong>: each new batch
+        includes the previous batch's root hash, and the smart contract enforces continuity.
+      </p>
+
+      <ol class="numbered-list" style="color: rgba(232,228,222,0.7);">
+        <li><strong style="color:#fff;">Chain rule</strong>&thinsp;&mdash;&thinsp;<code>prev_events_root</code> must match the current on-chain head for that stream</li>
+        <li><strong style="color:#fff;">Continuity rule</strong>&thinsp;&mdash;&thinsp;<code>sequence_start</code> must equal the previous batch's <code>sequence_end + 1</code></li>
+        <li><strong style="color:#fff;">Non-empty rule</strong>&thinsp;&mdash;&thinsp;<code>sequence_end</code> must be greater than or equal to <code>sequence_start</code></li>
+        <li><strong style="color:#fff;">Genesis rule</strong>&thinsp;&mdash;&thinsp;First commitment uses <code>prev_events_root = 0x000...000</code> and <code>sequence_start = 0</code></li>
+      </ol>
+
+      <p style="margin-top: 2rem;">
+        Any fork attempt is rejected by the contract and publicly detectable. The result is a single,
+        append-only commitment chain per stream&thinsp;&mdash;&thinsp;the on-chain equivalent of a
+        tamper-evident seal.
+      </p>
+
+      <h3 style="font-size:1.15rem; margin: 2.5rem 0 1rem; color: #fff;">Resilient Submission</h3>
+
+      <p>
+        On-chain submission is protected by a circuit breaker (opens after 5 failures, 60-second cooldown)
+        and exponential backoff retry (up to 10 attempts, 1 second to 5 minute delay range with 50% jitter).
+        The anchor service supports multiple L2 targets: Set Chain, Arbitrum, Optimism, and Base.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     07 — ENCRYPTION
+     ═══════════════════════════════════════════════════ -->
+<section class="section" id="encryption">
+  <div class="section-grid">
+    <div class="section-num">07</div>
+    <div class="section-content">
+      <h2 class="section-title">End-to-End Encryption</h2>
+      <p class="section-subtitle">Sequencer-blind ordering for sensitive payloads</p>
+
+      <div class="cols-2">
+        <p>
+          For privacy-sensitive events&thinsp;&mdash;&thinsp;payment details, customer PII, trade
+          terms&thinsp;&mdash;&thinsp;VES supports the VES-ENC-1 encryption scheme. Agents encrypt payloads
+          locally with AES-256-GCM before submission. The sequencer orders and commits encrypted events
+          without ever accessing plaintext.
+        </p>
+        <p>
+          A per-event random Data Encryption Key (DEK) is generated, the payload is encrypted with a
+          16-byte random salt prepended, and the DEK is wrapped for each authorized recipient using HPKE
+          (Hybrid Public Key Encryption) with X25519 key agreement. The sequencer sees only ciphertext.
+        </p>
+
+        <div class="callout">
+          <div class="callout-label">Security Properties</div>
+          <p>
+            <strong>Sequencer-blind:</strong> Cannot access plaintext.<br>
+            <strong>Context-bound:</strong> AAD prevents ciphertext swapping between events.<br>
+            <strong>Salt-protected:</strong> Prevents dictionary attacks on low-entropy payloads.<br>
+            <strong>Forward-secret:</strong> Per-event random DEKs; compromise of one key does not expose others.<br>
+            <strong>Dual-hash binding:</strong> Both plain and cipher hashes are signed, preventing substitution.
+          </p>
+        </div>
+
+        <p>
+          Critically, both <code>payload_plain_hash</code> and <code>payload_cipher_hash</code> are bound
+          to the agent's signature. For plaintext events, the cipher hash is 32 zero bytes. This prevents
+          an attacker from replacing an encrypted payload with a different ciphertext while keeping a valid
+          signature.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     08 — COMPLIANCE
+     ═══════════════════════════════════════════════════ -->
+<section class="section" id="compliance">
+  <div class="section-grid">
+    <div class="section-num">08</div>
+    <div class="section-content">
+      <h2 class="section-title">Zero-Knowledge Compliance</h2>
+      <p class="section-subtitle">Proving correctness without revealing data</p>
+
+      <p>
+        Regulators need proof of compliance&thinsp;&mdash;&thinsp;correct VAT calculation, AML screening,
+        export control adherence&thinsp;&mdash;&thinsp;but revealing the underlying transaction data creates
+        privacy and competitive risks. STARK proofs resolve this paradox.
+      </p>
+
+      <div class="feature-grid" style="grid-template-columns: repeat(2, 1fr); margin-top: 2rem;">
+        <div class="feature-card">
+          <div class="feature-card-icon">Batch Level</div>
+          <h4>Validity Proofs</h4>
+          <p>
+            STARK proofs over entire batches demonstrating that all events in a commitment satisfy specified
+            policy constraints. Submitted via <code>/api/v1/ves/validity-proofs</code> and anchorable on-chain
+            alongside batch commitments.
+          </p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-card-icon">Per Event</div>
+          <h4>Compliance Proofs</h4>
+          <p>
+            Individual event proofs for targeted regulatory queries. An auditor can verify that a specific
+            transaction complied with rules without the sequencer or merchant revealing the transaction
+            amount, counterparty, or terms.
+          </p>
+        </div>
+      </div>
+
+      <div class="callout" style="margin-top: 2rem;">
+        <div class="callout-label">Why STARKs over SNARKs?</div>
+        <p>
+          STARKs require no trusted setup ceremony, provide 128-bit conjectured security, offer
+          post-quantum resistance through hash-based cryptography, and verify in O(log&sup2; N)
+          time. Proof sizes of 100&ndash;200 KB are acceptable for batch-level compliance
+          attestation.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     09 — x402 PAYMENTS
+     ═══════════════════════════════════════════════════ -->
+<section class="dark-section" id="payments">
+  <div class="section-grid">
+    <div class="section-num">09</div>
+    <div class="section-content">
+      <h2 class="section-title">The x402 Payment Protocol</h2>
+      <p class="section-subtitle">Agent-to-agent settlement with gas-optimized batching</p>
+
+      <p>
+        When autonomous agents transact, payment settlement must be as programmable as the commerce itself.
+        The x402 protocol integrates payment intent sequencing directly into the event stream, enabling
+        batched, gas-efficient settlement on-chain.
+      </p>
+
+      <div class="process-flow" style="margin: 2.5rem 0;">
+        <div class="process-step">
+          <div class="process-step-num">1</div>
+          <h4 style="color: #fff;">Intent</h4>
+          <p style="color: rgba(232,228,222,0.65);">Agent creates Ed25519-signed <code>X402PaymentIntent</code> specifying amount, asset, network, and recipient</p>
+        </div>
+        <div class="process-step" style="border-left-color: rgba(255,255,255,0.08);">
+          <div class="process-step-num">2</div>
+          <h4 style="color: #fff;">Sequence</h4>
+          <p style="color: rgba(232,228,222,0.65);">Sequencer validates signature and assigns canonical sequence number to the payment event</p>
+        </div>
+        <div class="process-step" style="border-left-color: rgba(255,255,255,0.08);">
+          <div class="process-step-num">3</div>
+          <h4 style="color: #fff;">Batch</h4>
+          <p style="color: rgba(232,228,222,0.65);">Background worker assembles 100&ndash;1,000 payment intents into a single L2 transaction</p>
+        </div>
+        <div class="process-step" style="border-left-color: rgba(255,255,255,0.08);">
+          <div class="process-step-num">4</div>
+          <h4 style="color: #fff;">Settle</h4>
+          <p style="color: rgba(232,228,222,0.65);"><code>SetPaymentBatch</code> contract executes aggregated ERC-20 transfers on Set Chain</p>
+        </div>
+      </div>
+
+      <div class="kpi-row">
+        <div class="kpi">
+          <div class="kpi-value">6</div>
+          <div class="kpi-label">Supported Networks</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-value">6</div>
+          <div class="kpi-label">Supported Assets</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-value">1,000</div>
+          <div class="kpi-label">Max Batch Size</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-value">~5x</div>
+          <div class="kpi-label">Gas Savings per Payment</div>
+        </div>
+      </div>
+
+      <p style="margin-top: 2rem;">
+        The protocol supports USDC, USDT, DAI, ETH, StateSet USD (ssUSD), and Wrapped ssUSD (ERC-4626
+        yield-bearing) across Set Chain, Base, Arbitrum, Optimism, Arc, and Ethereum mainnet. Payment
+        intents carry the same cryptographic guarantees as commerce events: signed, sequenced, and
+        anchorable.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     10 — PERFORMANCE
+     ═══════════════════════════════════════════════════ -->
+<section class="section" id="performance">
+  <div class="section-grid">
+    <div class="section-num">10</div>
+    <div class="section-content">
+      <h2 class="section-title">Performance &amp; Resilience</h2>
+      <p class="section-subtitle">Engineering for production durability</p>
+
+      <div class="kpi-row">
+        <div class="kpi">
+          <div class="kpi-value">5K<span class="kpi-unit"> evt/s</span></div>
+          <div class="kpi-label">Peak Throughput</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-value">8<span class="kpi-unit"> ms</span></div>
+          <div class="kpi-label">P50 Latency</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-value">45<span class="kpi-unit"> ms</span></div>
+          <div class="kpi-label">P95 Latency</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-value">95<span class="kpi-unit"> ms</span></div>
+          <div class="kpi-label">P99 Latency</div>
+        </div>
+      </div>
+
+      <div class="cols-2" style="margin-top: 2.5rem;">
+        <p>
+          The system achieves 2,500&ndash;5,000 events per second with sub-10ms median latency and sub-100ms
+          P99 through careful engineering of the hot path: connection pooling with separate read/write pools,
+          LRU caching with stale-while-revalidate refresh, and session-level database timeouts (30s statement,
+          60s idle-in-transaction, 10s lock).
+        </p>
+
+        <p>
+          <strong>Caching architecture:</strong> Six specialized LRU caches (commitments, proofs, VES
+          commitments, VES proofs, agent keys, and schemas) serve read-heavy workloads from memory. The
+          read path uses a fast RwLock read-lock for fresh hits, escalating to a write-lock only for stale
+          entries or evictions. A stampede delay prevents thundering-herd refresh patterns.
+        </p>
+
+        <p>
+          <strong>Circuit breaker:</strong> External service calls (particularly L2 anchoring) are protected
+          by a circuit breaker that opens after 5 failures, transitions to half-open after a 60-second
+          cooldown, and requires 2 consecutive successes to close. Exponential backoff with jitter prevents
+          retry storms.
+        </p>
+
+        <p>
+          <strong>Graceful shutdown:</strong> A <code>ShutdownCoordinator</code> distributes signals to all
+          background tasks (pool monitor, metrics collector, anchor worker, DLQ cleanup). Both HTTP and gRPC
+          servers use graceful shutdown hooks to drain in-flight requests before exiting.
+        </p>
+
+        <p>
+          <strong>Observability:</strong> Prometheus metrics at <code>/metrics</code>, structured JSON logging,
+          OpenTelemetry distributed tracing, and <code>#[instrument]</code> spans on every API handler provide
+          full operational visibility.
+        </p>
+      </div>
+
+      <div class="figure" style="margin-top: 2.5rem;">
+        <div class="figure-label">Exhibit A &mdash; Resilience Strategy by Failure Domain</div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Failure Domain</th>
+              <th>Strategy</th>
+              <th>Configuration</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="col-highlight">Database (transient)</td>
+              <td>Exponential backoff retry</td>
+              <td class="mono-cell">5 retries, 50ms&ndash;5s, decorrelated jitter</td>
+            </tr>
+            <tr>
+              <td class="col-highlight">Database (sustained)</td>
+              <td>Pool health load-shedding</td>
+              <td>503 with Retry-After when pool health is critical</td>
+            </tr>
+            <tr>
+              <td class="col-highlight">L2 anchor (transient)</td>
+              <td>Retry with exponential backoff</td>
+              <td class="mono-cell">10 retries, 1s&ndash;5min, 50% jitter</td>
+            </tr>
+            <tr>
+              <td class="col-highlight">L2 anchor (sustained)</td>
+              <td>Circuit breaker + DLQ</td>
+              <td>Open after 5 failures, dead-letter with background cleanup</td>
+            </tr>
+            <tr>
+              <td class="col-highlight">Client overload</td>
+              <td>Per-tenant rate limiting</td>
+              <td>429 with Retry-After header (configurable per-minute limit)</td>
+            </tr>
+            <tr>
+              <td class="col-highlight">Request timeout</td>
+              <td>Tower middleware</td>
+              <td class="mono-cell">HTTP: 30s, gRPC: 30s (configurable)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     BREAK-GRID PULL QUOTE
+     ═══════════════════════════════════════════════════ -->
+<div class="pull-quote-break">
+  <blockquote>
+    Every byte of every hash is deterministic and reproducible across any language
+    implementation. Cross-platform test vectors ensure identical results in JavaScript,
+    Rust, Python, Go, and any future client.
+  </blockquote>
+  <cite>Protocol Interoperability Guarantee</cite>
+</div>
+
+<!-- ═══════════════════════════════════════════════════
+     11 — SECURITY
+     ═══════════════════════════════════════════════════ -->
+<section class="dark-section" id="security">
+  <div class="section-grid">
+    <div class="section-num">11</div>
+    <div class="section-content">
+      <h2 class="section-title">Security Model</h2>
+      <p class="section-subtitle">Defense in depth from the application boundary to the database session</p>
+
+      <div class="feature-grid" style="grid-template-columns: repeat(2, 1fr);">
+        <div class="feature-card">
+          <div class="feature-card-icon">Authentication</div>
+          <h4>Layered Auth</h4>
+          <p>
+            API key (SHA-256 hashed at rest) and JWT (HMAC-SHA256 with issuer/audience validation) authentication.
+            Rate limiting per tenant with bounded LRU memory. Pool-aware load shedding returns 503 before
+            database pressure cascades.
+          </p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-card-icon">Validation</div>
+          <h4>Input Boundaries</h4>
+          <p>
+            All string fields validated at ingestion: entity_type (128 chars), entity_id (512), event_type (256).
+            Request bodies capped at 10MB, batches at 1,000 events, individual payloads at 1MB. SQL queries
+            carry safety-cap LIMIT clauses throughout.
+          </p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-card-icon">Error Handling</div>
+          <h4>Information Discipline</h4>
+          <p>
+            Zero production <code>unwrap()</code> calls. All 500 responses use generic messages via
+            <code>internal_error()</code> and <code>grpc_internal_error()</code> helpers that log real errors
+            server-side. No stack traces, query details, or internal state leak to clients.
+          </p>
+        </div>
+        <div class="feature-card">
+          <div class="feature-card-icon">Headers</div>
+          <h4>Response Hardening</h4>
+          <p>
+            Security headers on every response: <code>X-Content-Type-Options: nosniff</code>,
+            <code>X-Frame-Options: DENY</code>, <code>Cache-Control: no-store</code>. CORS exposes
+            <code>x-request-id</code>, <code>x-error-code</code>, and <code>Retry-After</code>
+            for SPA clients.
+          </p>
+        </div>
+      </div>
+
+      <div class="callout" style="background: rgba(201,168,76,0.08); border-left-color: var(--gold); margin-top: 2rem;">
+        <div class="callout-label" style="color: var(--gold);">Audit Trail</div>
+        <p style="color: rgba(232,228,222,0.8) !important;">
+          Schema mutations (register, update, delete), agent key operations, and administrative actions are
+          audit-logged via <code>AuditLogBuilder</code> with actor identity, timestamp, and operation details.
+          Write failures are logged at WARN level&thinsp;&mdash;&thinsp;never silently swallowed.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     12 — ROADMAP
+     ═══════════════════════════════════════════════════ -->
+<section class="section" id="roadmap">
+  <div class="section-grid">
+    <div class="section-num">12</div>
+    <div class="section-content">
+      <h2 class="section-title">Roadmap</h2>
+      <p class="section-subtitle">From centralized sequencing to permissionless verification</p>
+
+      <p>
+        The current architecture positions the sequencer as a trusted-but-verifiable operator. The roadmap
+        progressively removes trust assumptions while expanding capability.
+      </p>
+
+      <div class="figure" style="margin-top: 2rem;">
+        <div class="figure-label">Exhibit B &mdash; Development Trajectory</div>
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Phase</th>
+              <th>Horizon</th>
+              <th>Capabilities</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="col-highlight" style="white-space: nowrap;">Near-Term</td>
+              <td style="white-space: nowrap;">Q1&ndash;Q2 2026</td>
+              <td>Multi-sequencer consensus for fault tolerance. HSM integration for hardware-backed key storage. Real-time WebSocket/SSE streaming push.</td>
+            </tr>
+            <tr>
+              <td class="col-highlight" style="white-space: nowrap;">Mid-Term</td>
+              <td style="white-space: nowrap;">Q3&ndash;Q4 2026</td>
+              <td>Decentralized on-chain key registry. Cross-stream platform-level Merkle commitments. Automated STARK compliance proof generation.</td>
+            </tr>
+            <tr>
+              <td class="col-highlight" style="white-space: nowrap;">Long-Term</td>
+              <td style="white-space: nowrap;">2027+</td>
+              <td>Permissionless sequencing with economic incentives (staking, slashing). Cross-chain anchoring to multiple L2s simultaneously. Formal verification of protocol properties.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="pull-quote" style="margin-top: 3rem;">
+        The endgame is infrastructure that requires no trust at all&thinsp;&mdash;&thinsp;where
+        sequencing is permissionless, verification is automatic, and the protocol's correctness
+        is machine-checked.
+        <span class="pull-quote-attr">Long-term vision</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     CLOSING
+     ═══════════════════════════════════════════════════ -->
+<section class="exec-bar" style="padding: 5rem 0;">
+  <div class="exec-bar-inner">
+    <div class="exec-label">Conclusion</div>
+    <p class="exec-text">
+      The StateSet Sequencer is not simply a database with an API. It is a
+      <strong>cryptographic notary for autonomous commerce</strong>&thinsp;&mdash;&thinsp;an infrastructure
+      primitive that makes multi-agent transactions auditable, non-repudiable, and settlement-ready.
+      By combining deterministic event ordering, Ed25519 signed receipts, Merkle-committed batch proofs,
+      STARK compliance attestation, and on-chain anchoring, it creates a system where
+      <strong>trust is replaced by verification</strong>. And verification is available to everyone.
+    </p>
+  </div>
+</section>
+
+<!-- ═══════════════════════════════════════════════════
+     FOOTER
+     ═══════════════════════════════════════════════════ -->
+<footer class="footer">
+  <div class="footer-inner">
+    <div>
+      <div class="footer-logo">StateSet</div>
+      <p class="footer-text">
+        Verifiable infrastructure for autonomous commerce.<br>
+        VES v1.0 &middot; Sequencer v0.2.6 &middot; MIT License
+      </p>
+    </div>
+    <div class="footer-legal">
+      This document describes the StateSet Sequencer architecture and VES v1.0 protocol as of March 2026.
+      Specifications and implementation details are subject to change.
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

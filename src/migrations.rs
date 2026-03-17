@@ -8,6 +8,11 @@ static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("migrations/p
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("migrations/sqlite");
 
 pub async fn run_postgres(pool: &PgPool) -> anyhow::Result<()> {
+    // Migrations 006/007 and some runtime-only tables rely on gen_random_uuid().
+    // Ensure pgcrypto is available before SQLx applies those migrations.
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        .execute(pool)
+        .await?;
     POSTGRES_MIGRATOR.run(pool).await?;
     Ok(())
 }

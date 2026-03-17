@@ -49,7 +49,9 @@ impl GrpcAuthInterceptor {
             let auth_str = match auth_value.to_str() {
                 Ok(value) => value,
                 Err(_) if self.require_auth => {
-                    return Err(Status::unauthenticated("invalid authorization header encoding"));
+                    return Err(Status::unauthenticated(
+                        "invalid authorization header encoding",
+                    ));
                 }
                 Err(_) => {
                     debug!("Invalid authorization metadata encoding, auth not required; injecting bootstrap context");
@@ -127,6 +129,10 @@ impl GrpcAuthInterceptor {
             Err(AuthError::RateLimited) => {
                 warn!("Rate limit exceeded");
                 Err(Status::resource_exhausted("rate limit exceeded"))
+            }
+            Err(AuthError::BackendUnavailable(_)) => {
+                warn!("Authentication backend unavailable");
+                Err(Status::unavailable("authentication backend unavailable"))
             }
             Err(AuthError::MissingAuth) => Err(Status::unauthenticated("authentication required")),
             Err(e) => {

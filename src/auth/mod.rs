@@ -159,4 +159,7 @@ pub enum AuthError {
 
     #[error("store access denied")]
     StoreAccessDenied,
+
+    #[error("authentication backend unavailable: {0}")]
+    BackendUnavailable(String),
 }

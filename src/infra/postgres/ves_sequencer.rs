@@ -61,6 +61,13 @@ struct ExistingReceiptRow {
     sequencer_key_version: i32,
 }
 
+enum ReplayLookup {
+    Missing,
+    DifferentContents,
+    ExactReplayMissingReceipt,
+    ExactReplay(VesSequencerReceipt),
+}
+
 /// Rejection reason for VES events
 #[derive(Debug, Clone)]
 pub enum VesRejectionReason {
@@ -541,6 +548,25 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             sequencer_signature,
             sequencer_key_version: row.sequencer_key_version as u32,
         }))
+    }
+
+    async fn classify_replay(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        incoming: &VesEventEnvelope,
+    ) -> Result<ReplayLookup> {
+        let Some(existing) = self.get_existing_event(tx, incoming.event_id).await? else {
+            return Ok(ReplayLookup::Missing);
+        };
+
+        if !Self::is_exact_replay(&existing, incoming) {
+            return Ok(ReplayLookup::DifferentContents);
+        }
+
+        match self.get_existing_receipt(tx, incoming.event_id).await? {
+            Some(receipt) => Ok(ReplayLookup::ExactReplay(receipt)),
+            None => Ok(ReplayLookup::ExactReplayMissingReceipt),
+        }
     }
 
     fn payloads_match(left: Option<&PayloadEncrypted>, right: Option<&PayloadEncrypted>) -> bool {
@@ -1325,11 +1351,25 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         for event in candidates {
             if let Some(cmd_id) = event.command_id {
                 if duplicate_command_ids.contains(&cmd_id) {
-                    rejected.push(VesRejectedEvent {
-                        event_id: event.event_id,
-                        reason: VesRejectionReason::DuplicateCommandId,
-                        message: format!("Command {} already processed", cmd_id),
-                    });
+                    match self.classify_replay(&mut tx, &event).await? {
+                        ReplayLookup::ExactReplay(receipt) => {
+                            receipts.push(receipt);
+                        }
+                        ReplayLookup::ExactReplayMissingReceipt => {
+                            rejected.push(VesRejectedEvent {
+                                event_id: event.event_id,
+                                reason: VesRejectionReason::DuplicateEventId,
+                                message: "Event already exists but receipt not found".to_string(),
+                            });
+                        }
+                        ReplayLookup::Missing | ReplayLookup::DifferentContents => {
+                            rejected.push(VesRejectedEvent {
+                                event_id: event.event_id,
+                                reason: VesRejectionReason::DuplicateCommandId,
+                                message: format!("Command {} already processed", cmd_id),
+                            });
+                        }
+                    }
                     continue;
                 }
             }
@@ -1396,6 +1436,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
             let inserted = self.store_event_tx(&mut tx, &sequenced).await?;
             if !inserted {
+                let replay = self.classify_replay(&mut tx, &sequenced.envelope).await?;
                 if let Some(cmd_id) = sequenced.envelope.command_id {
                     if reserved_command_ids.contains(&cmd_id) {
                         let existing_cmd_id = self
@@ -1407,11 +1448,21 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                         }
                     }
                 }
-                rejected.push(VesRejectedEvent {
-                    event_id: sequenced.event_id(),
-                    reason: VesRejectionReason::DuplicateEventId,
-                    message: format!("Event {} already exists", sequenced.event_id()),
-                });
+                match replay {
+                    ReplayLookup::ExactReplay(receipt) => receipts.push(receipt),
+                    ReplayLookup::ExactReplayMissingReceipt => rejected.push(VesRejectedEvent {
+                        event_id: sequenced.event_id(),
+                        reason: VesRejectionReason::DuplicateEventId,
+                        message: "Event already exists but receipt not found".to_string(),
+                    }),
+                    ReplayLookup::Missing | ReplayLookup::DifferentContents => {
+                        rejected.push(VesRejectedEvent {
+                            event_id: sequenced.event_id(),
+                            reason: VesRejectionReason::DuplicateEventId,
+                            message: format!("Event {} already exists", sequenced.event_id()),
+                        });
+                    }
+                }
                 continue;
             }
 
@@ -1458,9 +1509,9 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 store_id UUID NOT NULL,
                 source_agent_id UUID NOT NULL,
                 agent_key_id INTEGER NOT NULL,
-                entity_type VARCHAR(64) NOT NULL,
-                entity_id VARCHAR(256) NOT NULL,
-                event_type VARCHAR(64) NOT NULL,
+                entity_type VARCHAR(128) NOT NULL,
+                entity_id VARCHAR(512) NOT NULL,
+                event_type VARCHAR(256) NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 created_at_str TEXT NOT NULL,
                 sequenced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -1487,6 +1538,16 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         sqlx::query("ALTER TABLE ves_events ADD COLUMN IF NOT EXISTS event_signing_hash BYTEA")
             .execute(&self.pool)
             .await?;
+        sqlx::query(
+            r#"
+            ALTER TABLE ves_events
+                ALTER COLUMN entity_type TYPE VARCHAR(128),
+                ALTER COLUMN entity_id TYPE VARCHAR(512),
+                ALTER COLUMN event_type TYPE VARCHAR(256)
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         // Create indexes
         sqlx::query(
@@ -1550,9 +1611,15 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 sequence_number BIGINT NOT NULL,
                 sequenced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 receipt_hash BYTEA NOT NULL,
-                sequencer_signature BYTEA
+                sequencer_signature BYTEA,
+                sequencer_key_version INTEGER NOT NULL DEFAULT 0
             )
             "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE ves_sequencer_receipts ADD COLUMN IF NOT EXISTS sequencer_key_version INTEGER NOT NULL DEFAULT 0",
         )
         .execute(&self.pool)
         .await?;

@@ -10,6 +10,10 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use uuid::Uuid;
 
+fn backend_unavailable(op: &'static str, error: sqlx::Error) -> AuthError {
+    AuthError::BackendUnavailable(format!("{op}: {error}"))
+}
+
 /// API key prefix
 pub const API_KEY_PREFIX: &str = "ss_";
 
@@ -216,7 +220,7 @@ impl ApiKeyStore for PgApiKeyStore {
         .bind(key_hash)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|_| AuthError::InvalidApiKey)?;
+        .map_err(|e| backend_unavailable("failed to query api key store", e))?;
 
         Ok(row.map(ApiKeyRow::into_record))
     }
@@ -258,7 +262,7 @@ impl ApiKeyStore for PgApiKeyStore {
         .bind(record.rate_limit.map(|v| v as i32))
         .execute(&self.pool)
         .await
-        .map_err(|_| AuthError::InvalidApiKey)?;
+        .map_err(|e| backend_unavailable("failed to store api key", e))?;
 
         Ok(())
     }
@@ -275,7 +279,7 @@ impl ApiKeyStore for PgApiKeyStore {
         .bind(key_hash)
         .execute(&self.pool)
         .await
-        .map_err(|_| AuthError::InvalidApiKey)?;
+        .map_err(|e| backend_unavailable("failed to revoke api key", e))?;
 
         Ok(())
     }
@@ -293,7 +297,7 @@ impl ApiKeyStore for PgApiKeyStore {
         .bind(tenant_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| AuthError::InvalidApiKey)?;
+        .map_err(|e| backend_unavailable("failed to list tenant api keys", e))?;
 
         Ok(rows.into_iter().map(ApiKeyRow::into_record).collect())
     }
@@ -311,7 +315,7 @@ impl ApiKeyStore for PgApiKeyStore {
         .bind(agent_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|_| AuthError::InvalidApiKey)?;
+        .map_err(|e| backend_unavailable("failed to list agent api keys", e))?;
 
         Ok(rows.into_iter().map(ApiKeyRow::into_record).collect())
     }
@@ -321,7 +325,7 @@ impl ApiKeyStore for PgApiKeyStore {
             sqlx::query_as("SELECT 1 FROM api_keys WHERE active = TRUE LIMIT 1")
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|_| AuthError::InvalidApiKey)?;
+                .map_err(|e| backend_unavailable("failed to check active api keys", e))?;
 
         Ok(row.is_some())
     }

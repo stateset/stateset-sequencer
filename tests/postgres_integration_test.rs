@@ -6,6 +6,7 @@
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 use axum::body::Body;
@@ -15,18 +16,19 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use stateset_sequencer::auth::{
-    ApiKeyValidator, AuthMiddlewareState, Authenticator, RequestLimits,
+    AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, ApiKeyValidator, AuthMiddlewareState,
+    Authenticator, RequestLimits,
 };
-use stateset_sequencer::crypto::{is_payload_at_rest_encrypted, StaticKeyManager};
+use stateset_sequencer::crypto::{is_payload_at_rest_encrypted, AgentSigningKey, StaticKeyManager};
 use stateset_sequencer::domain::{
-    AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
+    AgentId, AgentKeyId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
+    VesEventEnvelope,
 };
 use stateset_sequencer::infra::{
     EventStore, IngestService, PayloadEncryption, PayloadEncryptionMode, PgAgentKeyRegistry,
     PgCommitmentEngine, PgEventStore, PgSequencer, PgVesCommitmentEngine,
     PgVesComplianceProofStore, PgVesValidityProofStore, SchemaValidationMode, Sequencer,
-    SequencerError,
-    VesSequencer,
+    SequencerError, VesSequencer,
 };
 use stateset_sequencer::server::AppState;
 
@@ -760,6 +762,169 @@ async fn postgres_ves_validity_proofs_rest_flow() {
         "body={}",
         String::from_utf8_lossy(&body)
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn postgres_migrations_accept_max_length_identifiers() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let entity_type = "t".repeat(128);
+    let entity_id = "i".repeat(512);
+    let event_type = "e".repeat(256);
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption.clone());
+    let event_store = PgEventStore::new(pool.clone(), payload_encryption);
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+
+    let event = EventEnvelope::new(
+        tenant_id.clone(),
+        store_id.clone(),
+        EntityType::new(entity_type.clone()),
+        entity_id.clone(),
+        EventType::new(event_type.clone()),
+        json!({ "kind": "legacy" }),
+        agent_id.clone(),
+    );
+
+    let receipt = sequencer
+        .ingest(EventBatch::new(agent_id.clone(), vec![event]))
+        .await
+        .unwrap();
+    assert_eq!(receipt.events_accepted, 1);
+
+    let stored = event_store
+        .read_range(&tenant_id, &store_id, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].envelope.entity_type.as_str(), entity_type);
+    assert_eq!(stored[0].envelope.entity_id, entity_id);
+    assert_eq!(stored[0].envelope.event_type.as_str(), event_type);
+
+    let ves_tenant_id = TenantId::new();
+    let ves_store_id = StoreId::new();
+    let ves_agent_id = AgentId::new();
+    let signing_key = AgentSigningKey::generate();
+    let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    let lookup = AgentKeyLookup::new(&ves_tenant_id, &ves_agent_id, AgentKeyId::default());
+    agent_key_registry
+        .register_key(&lookup, AgentKeyEntry::new(signing_key.public_key_bytes()))
+        .await
+        .unwrap();
+    let ves_sequencer = VesSequencer::new(pool, agent_key_registry);
+
+    let ves_event = VesEventEnvelope::new_plaintext(
+        ves_tenant_id.clone(),
+        ves_store_id.clone(),
+        ves_agent_id,
+        AgentKeyId::default(),
+        EntityType::new(entity_type.clone()),
+        entity_id.clone(),
+        EventType::new(event_type.clone()),
+        json!({ "kind": "ves" }),
+        &signing_key,
+    );
+
+    let ves_receipt = ves_sequencer.ingest(vec![ves_event]).await.unwrap();
+    assert_eq!(ves_receipt.events_accepted, 1);
+
+    let ves_events = ves_sequencer
+        .read_range(&ves_tenant_id, &ves_store_id, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(ves_events.len(), 1);
+    assert_eq!(ves_events[0].envelope.entity_type.as_str(), entity_type);
+    assert_eq!(ves_events[0].envelope.entity_id, entity_id);
+    assert_eq!(ves_events[0].envelope.event_type.as_str(), event_type);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn postgres_ves_sequencer_concurrent_exact_replay_returns_existing_receipt() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let signing_key = AgentSigningKey::generate();
+
+    let agent_key_registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    let lookup = AgentKeyLookup::new(&tenant_id, &agent_id, AgentKeyId::default());
+    agent_key_registry
+        .register_key(&lookup, AgentKeyEntry::new(signing_key.public_key_bytes()))
+        .await
+        .unwrap();
+
+    let ves_sequencer = Arc::new(VesSequencer::new(pool, agent_key_registry));
+    let event = VesEventEnvelope::new_plaintext(
+        tenant_id.clone(),
+        store_id.clone(),
+        agent_id,
+        AgentKeyId::default(),
+        EntityType::order(),
+        "ord-replay",
+        EventType::new("order.updated"),
+        json!({ "replayed": true }),
+        &signing_key,
+    )
+    .with_command_id(Uuid::new_v4());
+    let event_id = event.event_id;
+
+    let barrier = Arc::new(Barrier::new(2));
+    let mut handles = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let sequencer = ves_sequencer.clone();
+        let barrier = barrier.clone();
+        let event = event.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            sequencer.ingest(vec![event]).await.unwrap()
+        }));
+    }
+
+    let mut receipts = Vec::new();
+    let mut accepted_total = 0u32;
+    let mut rejected_total = 0usize;
+    for handle in handles {
+        let result = handle.await.unwrap();
+        accepted_total += result.events_accepted;
+        rejected_total += result.events_rejected.len();
+        receipts.extend(result.receipts);
+    }
+
+    assert_eq!(accepted_total, 1);
+    assert_eq!(rejected_total, 0);
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0].event_id, event_id);
+    assert_eq!(receipts[1].event_id, event_id);
+    assert_eq!(receipts[0].sequence_number, receipts[1].sequence_number);
+    assert_eq!(receipts[0].receipt_hash, receipts[1].receipt_hash);
+
+    let stored = ves_sequencer
+        .read_range(&tenant_id, &store_id, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].event_id(), event_id);
 }
 
 #[tokio::test]

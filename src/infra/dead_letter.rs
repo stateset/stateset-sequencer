@@ -214,6 +214,10 @@ impl PgDeadLetterQueue {
 
     /// Initialize the dead letter queue table
     pub async fn initialize(&self) -> Result<()> {
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            .execute(&self.pool)
+            .await?;
+
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS dead_letter_events (
