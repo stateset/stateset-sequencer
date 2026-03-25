@@ -186,6 +186,7 @@ pub struct EventSigningParams<'a> {
 ///
 /// event_signing_hash = SHA256(eventsig_preimage)
 /// ```
+#[inline]
 pub fn compute_event_signing_hash(params: &EventSigningParams) -> Hash256 {
     let mut hasher = Sha256::new();
 
@@ -204,11 +205,12 @@ pub fn compute_event_signing_hash(params: &EventSigningParams) -> Hash256 {
     // Agent key ID
     hasher.update(u32_be(params.agent_key_id));
 
-    // Length-prefixed strings
-    hasher.update(encode_string(params.entity_type));
-    hasher.update(encode_string(params.entity_id));
-    hasher.update(encode_string(params.event_type));
-    hasher.update(encode_string(params.created_at));
+    // Length-prefixed strings — write directly to hasher instead of allocating
+    // Vec per string via encode_string()
+    hash_length_prefixed_str(&mut hasher, params.entity_type);
+    hash_length_prefixed_str(&mut hasher, params.entity_id);
+    hash_length_prefixed_str(&mut hasher, params.event_type);
+    hash_length_prefixed_str(&mut hasher, params.created_at);
 
     // Payload kind
     hasher.update(u32_be(params.payload_kind));
@@ -218,6 +220,15 @@ pub fn compute_event_signing_hash(params: &EventSigningParams) -> Hash256 {
     hasher.update(params.payload_cipher_hash);
 
     hasher.finalize().into()
+}
+
+/// Write a length-prefixed string directly into a hasher without allocating.
+/// Format: U32_BE(len) || UTF8_bytes
+#[inline]
+fn hash_length_prefixed_str(hasher: &mut Sha256, s: &str) {
+    let bytes = s.as_bytes();
+    hasher.update(u32_be(bytes.len() as u32));
+    hasher.update(bytes);
 }
 
 // ============================================================================
@@ -246,6 +257,7 @@ pub struct LeafHashParams<'a> {
 ///
 /// leaf_hash = SHA256(leaf_preimage)
 /// ```
+#[inline]
 pub fn compute_leaf_hash(params: &LeafHashParams) -> Hash256 {
     let mut hasher = Sha256::new();
 
@@ -287,6 +299,7 @@ pub fn pad_leaf() -> Hash256 {
 /// Compute Merkle internal node hash per VES v1.0 Section 11.4
 ///
 /// node_hash = SHA256(b"VES_NODE_V1" || left(32) || right(32))
+#[inline]
 pub fn compute_node_hash(left: &Hash256, right: &Hash256) -> Hash256 {
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_NODE);
