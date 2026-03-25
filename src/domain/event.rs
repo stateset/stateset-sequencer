@@ -79,6 +79,7 @@ pub struct EventEnvelope {
 
 impl EventEnvelope {
     /// Create a new event envelope with automatic payload hashing
+    #[inline]
     pub fn new(
         tenant_id: TenantId,
         store_id: StoreId,
@@ -110,6 +111,7 @@ impl EventEnvelope {
     }
 
     /// Compute SHA-256 hash of payload using canonical JSON encoding
+    #[inline]
     pub fn compute_payload_hash(payload: &serde_json::Value) -> Hash256 {
         canonical_json_hash(payload)
     }
@@ -130,26 +132,38 @@ impl EventEnvelope {
     /// Signature covers: envelope_version | event_id | command_id | tenant_id | store_id |
     /// entity_type | entity_id | event_type | payload_hash | base_version | created_at
     pub fn signing_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend(&self.envelope_version.to_be_bytes());
-        bytes.extend(self.event_id.as_bytes());
+        // Pre-calculate capacity to avoid reallocations:
+        // envelope_version(4) + event_id(16) + tenant_id(16) + store_id(16)
+        // + payload_hash(32) + created_at(8) = 92 fixed bytes
+        // + optional command_id(16) + optional base_version(8)
+        // + variable entity_type + entity_id + event_type strings
+        let capacity = 92
+            + if self.command_id.is_some() { 16 } else { 0 }
+            + if self.base_version.is_some() { 8 } else { 0 }
+            + self.entity_type.as_str().len()
+            + self.entity_id.len()
+            + self.event_type.as_str().len();
+        let mut bytes = Vec::with_capacity(capacity);
+        bytes.extend_from_slice(&self.envelope_version.to_be_bytes());
+        bytes.extend_from_slice(self.event_id.as_bytes());
         if let Some(cmd_id) = &self.command_id {
-            bytes.extend(cmd_id.as_bytes());
+            bytes.extend_from_slice(cmd_id.as_bytes());
         }
-        bytes.extend(self.tenant_id.0.as_bytes());
-        bytes.extend(self.store_id.0.as_bytes());
-        bytes.extend(self.entity_type.as_str().as_bytes());
-        bytes.extend(self.entity_id.as_bytes());
-        bytes.extend(self.event_type.as_str().as_bytes());
-        bytes.extend(&self.payload_hash);
+        bytes.extend_from_slice(self.tenant_id.0.as_bytes());
+        bytes.extend_from_slice(self.store_id.0.as_bytes());
+        bytes.extend_from_slice(self.entity_type.as_str().as_bytes());
+        bytes.extend_from_slice(self.entity_id.as_bytes());
+        bytes.extend_from_slice(self.event_type.as_str().as_bytes());
+        bytes.extend_from_slice(&self.payload_hash);
         if let Some(v) = self.base_version {
-            bytes.extend(&v.to_le_bytes());
+            bytes.extend_from_slice(&v.to_le_bytes());
         }
-        bytes.extend(self.created_at.timestamp_millis().to_le_bytes());
+        bytes.extend_from_slice(&self.created_at.timestamp_millis().to_le_bytes());
         bytes
     }
 
     /// Verify the payload hash matches the payload
+    #[inline]
     pub fn verify_payload_hash(&self) -> bool {
         let computed = Self::compute_payload_hash(&self.payload);
         computed == self.payload_hash

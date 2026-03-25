@@ -138,6 +138,42 @@ path = "src/bin/admin.rs"
 lto = true
 codegen-units = 1
 
+[profile.bench]
+inherits = "release"
+opt-level = 2
+lto = false
+codegen-units = 16
+
+[profile.bench.package.ves-stark-batch]
+opt-level = 0
+
+[profile.bench.package.ves-stark-prover]
+opt-level = 0
+
+[profile.bench.package.ves-stark-verifier]
+opt-level = 0
+
+[profile.bench.package.ves-stark-air]
+opt-level = 0
+
+[profile.bench.package.ves-stark-primitives]
+opt-level = 0
+
+[profile.bench.package.winter-prover]
+opt-level = 0
+
+[profile.bench.package.winter-math]
+opt-level = 0
+
+[profile.bench.package.winter-air]
+opt-level = 0
+
+[profile.bench.package.winter-crypto]
+opt-level = 0
+
+[profile.bench.package.winter-verifier]
+opt-level = 0
+
 [[bench]]
 name = "sequencer_bench"
 harness = false

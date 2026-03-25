@@ -317,7 +317,7 @@ pub mod pubkey32_hex_0x {
 }
 
 /// Tenant identifier (organization/account level)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TenantId(pub uuid::Uuid);
 
 impl TenantId {
@@ -343,7 +343,7 @@ impl fmt::Display for TenantId {
 }
 
 /// Store identifier (within a tenant)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StoreId(pub uuid::Uuid);
 
 impl StoreId {
@@ -369,7 +369,7 @@ impl fmt::Display for StoreId {
 }
 
 /// Agent identifier (source of events)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId(pub uuid::Uuid);
 
 impl AgentId {

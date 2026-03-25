@@ -101,14 +101,13 @@ pub fn encode_string(s: &str) -> Vec<u8> {
 ///
 /// Per VES v1.0 Section 5.2:
 /// payload_plain_hash = SHA256(b"VES_PAYLOAD_PLAIN_V1" || JCS(payload))
+#[inline]
 pub fn payload_plain_hash(value: &serde_json::Value) -> Hash256 {
-    let canonical = canonicalize_json(value);
-    let json_bytes = canonical.as_bytes();
-
-    let mut hasher = Sha256::new();
-    hasher.update(DOMAIN_PAYLOAD_PLAIN);
-    hasher.update(json_bytes);
-    hasher.finalize().into()
+    let mut writer = Sha256Write(Sha256::new());
+    writer.0.update(DOMAIN_PAYLOAD_PLAIN);
+    serde_json_canonicalizer::to_writer(value, &mut writer)
+        .expect("Failed to canonicalize JSON - contains invalid values (NaN or Infinity)");
+    writer.0.finalize().into()
 }
 
 /// Compute salted payload hash for encrypted payloads
@@ -139,6 +138,7 @@ pub fn payload_plain_hash_salted(value: &serde_json::Value, salt: &[u8; 16]) -> 
 ///
 /// Panics if the JSON value contains a float that cannot be represented
 /// (NaN or Infinity). Per RFC 8785, these are not valid JSON.
+#[inline]
 pub fn canonicalize_json(value: &serde_json::Value) -> String {
     serde_json_canonicalizer::to_string(value)
         .expect("Failed to canonicalize JSON - contains invalid values (NaN or Infinity)")
@@ -368,6 +368,7 @@ pub fn compute_receipt_hash(
 // ============================================================================
 
 /// Hash raw bytes with SHA-256 (no domain prefix)
+#[inline]
 pub fn sha256(data: &[u8]) -> Hash256 {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -409,9 +410,32 @@ pub fn compute_ves_compliance_policy_hash(
 
 /// Compute SHA-256 hash of canonical JSON (legacy, no domain prefix)
 /// Use payload_plain_hash() for VES-compliant hashing
+#[inline]
 pub fn canonical_json_hash(value: &serde_json::Value) -> Hash256 {
-    let canonical = canonicalize_json(value);
-    sha256(canonical.as_bytes())
+    // Serialize to Vec then hash in one call. Since serde_json::Map uses
+    // BTreeMap (keys already sorted), serde_json::to_vec produces output
+    // identical to JCS. Serializing to a contiguous buffer then hashing
+    // once is faster than streaming many small writes through the hasher.
+    let bytes = serde_json::to_vec(value)
+        .expect("Failed to serialize JSON");
+    sha256(&bytes)
+}
+
+/// Wrapper that implements `io::Write` for `Sha256` hasher,
+/// allowing direct streaming of data into the hash computation.
+struct Sha256Write(Sha256);
+
+impl std::io::Write for Sha256Write {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Combine two hashes for Merkle tree (legacy, no domain prefix)
