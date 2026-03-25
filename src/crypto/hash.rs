@@ -186,12 +186,19 @@ pub struct EventSigningParams<'a> {
 ///
 /// event_signing_hash = SHA256(eventsig_preimage)
 /// ```
+/// Pre-computed SHA-256 hasher state after ingesting the eventsig domain prefix.
+fn eventsig_hasher_prefix() -> &'static Sha256 {
+    static PREFIX: std::sync::OnceLock<Sha256> = std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| {
+        let mut h = Sha256::new();
+        h.update(DOMAIN_EVENTSIG);
+        h
+    })
+}
+
 #[inline]
 pub fn compute_event_signing_hash(params: &EventSigningParams) -> Hash256 {
-    let mut hasher = Sha256::new();
-
-    // Domain prefix
-    hasher.update(DOMAIN_EVENTSIG);
+    let mut hasher = eventsig_hasher_prefix().clone();
 
     // VES version
     hasher.update(u32_be(params.ves_version));
@@ -257,12 +264,19 @@ pub struct LeafHashParams<'a> {
 ///
 /// leaf_hash = SHA256(leaf_preimage)
 /// ```
+/// Pre-computed SHA-256 hasher state after ingesting the leaf domain prefix.
+fn leaf_hasher_prefix() -> &'static Sha256 {
+    static PREFIX: std::sync::OnceLock<Sha256> = std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| {
+        let mut h = Sha256::new();
+        h.update(DOMAIN_LEAF);
+        h
+    })
+}
+
 #[inline]
 pub fn compute_leaf_hash(params: &LeafHashParams) -> Hash256 {
-    let mut hasher = Sha256::new();
-
-    // Domain prefix
-    hasher.update(DOMAIN_LEAF);
+    let mut hasher = leaf_hasher_prefix().clone();
 
     // Stream identity
     hasher.update(params.tenant_id.as_bytes());
@@ -296,13 +310,23 @@ pub fn pad_leaf() -> Hash256 {
     *PAD_LEAF.get_or_init(compute_pad_leaf)
 }
 
+/// Pre-computed SHA-256 hasher state after ingesting the node domain prefix.
+/// Cloning this is cheaper than creating a new hasher + updating with the prefix.
+fn node_hasher_prefix() -> &'static Sha256 {
+    static PREFIX: std::sync::OnceLock<Sha256> = std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| {
+        let mut h = Sha256::new();
+        h.update(DOMAIN_NODE);
+        h
+    })
+}
+
 /// Compute Merkle internal node hash per VES v1.0 Section 11.4
 ///
 /// node_hash = SHA256(b"VES_NODE_V1" || left(32) || right(32))
 #[inline]
 pub fn compute_node_hash(left: &Hash256, right: &Hash256) -> Hash256 {
-    let mut hasher = Sha256::new();
-    hasher.update(DOMAIN_NODE);
+    let mut hasher = node_hasher_prefix().clone();
     hasher.update(left);
     hasher.update(right);
     hasher.finalize().into()
