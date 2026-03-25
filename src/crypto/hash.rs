@@ -101,6 +101,7 @@ pub fn encode_string(s: &str) -> Vec<u8> {
 ///
 /// Per VES v1.0 Section 5.2:
 /// payload_plain_hash = SHA256(b"VES_PAYLOAD_PLAIN_V1" || JCS(payload))
+#[inline]
 pub fn payload_plain_hash(value: &serde_json::Value) -> Hash256 {
     let canonical = canonicalize_json(value);
     let json_bytes = canonical.as_bytes();
@@ -139,6 +140,7 @@ pub fn payload_plain_hash_salted(value: &serde_json::Value, salt: &[u8; 16]) -> 
 ///
 /// Panics if the JSON value contains a float that cannot be represented
 /// (NaN or Infinity). Per RFC 8785, these are not valid JSON.
+#[inline]
 pub fn canonicalize_json(value: &serde_json::Value) -> String {
     serde_json_canonicalizer::to_string(value)
         .expect("Failed to canonicalize JSON - contains invalid values (NaN or Infinity)")
@@ -368,6 +370,7 @@ pub fn compute_receipt_hash(
 // ============================================================================
 
 /// Hash raw bytes with SHA-256 (no domain prefix)
+#[inline]
 pub fn sha256(data: &[u8]) -> Hash256 {
     let mut hasher = Sha256::new();
     hasher.update(data);
@@ -409,6 +412,7 @@ pub fn compute_ves_compliance_policy_hash(
 
 /// Compute SHA-256 hash of canonical JSON (legacy, no domain prefix)
 /// Use payload_plain_hash() for VES-compliant hashing
+#[inline]
 pub fn canonical_json_hash(value: &serde_json::Value) -> Hash256 {
     let canonical = canonicalize_json(value);
     sha256(canonical.as_bytes())
