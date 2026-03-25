@@ -103,13 +103,11 @@ pub fn encode_string(s: &str) -> Vec<u8> {
 /// payload_plain_hash = SHA256(b"VES_PAYLOAD_PLAIN_V1" || JCS(payload))
 #[inline]
 pub fn payload_plain_hash(value: &serde_json::Value) -> Hash256 {
-    let canonical = canonicalize_json(value);
-    let json_bytes = canonical.as_bytes();
-
-    let mut hasher = Sha256::new();
-    hasher.update(DOMAIN_PAYLOAD_PLAIN);
-    hasher.update(json_bytes);
-    hasher.finalize().into()
+    let mut writer = Sha256Write(Sha256::new());
+    writer.0.update(DOMAIN_PAYLOAD_PLAIN);
+    serde_json_canonicalizer::to_writer(value, &mut writer)
+        .expect("Failed to canonicalize JSON - contains invalid values (NaN or Infinity)");
+    writer.0.finalize().into()
 }
 
 /// Compute salted payload hash for encrypted payloads
@@ -414,8 +412,29 @@ pub fn compute_ves_compliance_policy_hash(
 /// Use payload_plain_hash() for VES-compliant hashing
 #[inline]
 pub fn canonical_json_hash(value: &serde_json::Value) -> Hash256 {
-    let canonical = canonicalize_json(value);
-    sha256(canonical.as_bytes())
+    // Stream canonical JSON directly into SHA-256 hasher to avoid intermediate
+    // String allocation. The Sha256Write wrapper implements io::Write.
+    let mut writer = Sha256Write(Sha256::new());
+    serde_json_canonicalizer::to_writer(value, &mut writer)
+        .expect("Failed to canonicalize JSON - contains invalid values (NaN or Infinity)");
+    writer.0.finalize().into()
+}
+
+/// Wrapper that implements `io::Write` for `Sha256` hasher,
+/// allowing direct streaming of data into the hash computation.
+struct Sha256Write(Sha256);
+
+impl std::io::Write for Sha256Write {
+    #[inline]
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    #[inline]
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Combine two hashes for Merkle tree (legacy, no domain prefix)
