@@ -412,15 +412,13 @@ pub fn compute_ves_compliance_policy_hash(
 /// Use payload_plain_hash() for VES-compliant hashing
 #[inline]
 pub fn canonical_json_hash(value: &serde_json::Value) -> Hash256 {
-    // Stream JSON directly into SHA-256 hasher. Since serde_json::Map uses
-    // BTreeMap (keys already sorted) and we only hash serde_json::Value
-    // (numbers already in canonical form), serde_json::to_writer produces
-    // output identical to JCS for our use case — but ~2x faster since it
-    // skips the JCS serializer's extra key-sorting pass.
-    let mut writer = Sha256Write(Sha256::new());
-    serde_json::to_writer(&mut writer, value)
+    // Serialize to Vec then hash in one call. Since serde_json::Map uses
+    // BTreeMap (keys already sorted), serde_json::to_vec produces output
+    // identical to JCS. Serializing to a contiguous buffer then hashing
+    // once is faster than streaming many small writes through the hasher.
+    let bytes = serde_json::to_vec(value)
         .expect("Failed to serialize JSON");
-    writer.0.finalize().into()
+    sha256(&bytes)
 }
 
 /// Wrapper that implements `io::Write` for `Sha256` hasher,
