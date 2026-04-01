@@ -34,6 +34,12 @@ pub trait SecretsProvider: Send + Sync {
     /// Pinned VES sequencer UUID (optional)
     fn ves_sequencer_id(&self) -> Result<Option<String>, SecretsError>;
 
+    /// ML-DSA-65 seed for hybrid/strict receipt signing (hex, 32 bytes)
+    fn ves_sequencer_ml_dsa_seed(&self) -> Result<Option<String>, SecretsError>;
+
+    /// Security profile for sequencer receipts: "legacy", "hybrid", or "pqc-strict"
+    fn ves_sequencer_security_profile(&self) -> Result<Option<String>, SecretsError>;
+
     // ── Payload encryption ───────────────────────────────────────────
     /// AES-256 key(s) for payload encryption at rest
     fn payload_encryption_keys(&self) -> Result<Option<Vec<String>>, SecretsError>;
@@ -96,6 +102,14 @@ impl SecretsProvider for EnvSecretsProvider {
 
     fn ves_sequencer_signing_key(&self) -> Result<Option<String>, SecretsError> {
         Ok(Self::get_opt("VES_SEQUENCER_SIGNING_KEY"))
+    }
+
+    fn ves_sequencer_ml_dsa_seed(&self) -> Result<Option<String>, SecretsError> {
+        Ok(Self::get_opt("VES_SEQUENCER_ML_DSA_SEED"))
+    }
+
+    fn ves_sequencer_security_profile(&self) -> Result<Option<String>, SecretsError> {
+        Ok(Self::get_opt("VES_SEQUENCER_SECURITY_PROFILE"))
     }
 
     fn ves_sequencer_id(&self) -> Result<Option<String>, SecretsError> {

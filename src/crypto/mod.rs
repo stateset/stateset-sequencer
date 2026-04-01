@@ -8,6 +8,8 @@
 
 mod encrypt;
 mod hash;
+pub mod pqc_encrypt;
+pub mod pqc_signing;
 mod signing;
 
 #[cfg(test)]
@@ -15,4 +17,6 @@ mod tests;
 
 pub use encrypt::*;
 pub use hash::*;
+pub use pqc_encrypt::*;
+pub use pqc_signing::*;
 pub use signing::*;

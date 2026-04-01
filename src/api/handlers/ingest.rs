@@ -873,6 +873,14 @@ pub async fn ingest_ves_events(
                         .map(hex::encode)
                         .unwrap_or_default(),
                     sequencer_key_version: r.sequencer_key_version,
+                    receipt_signature_scheme: if r.receipt_signature_scheme != 0 {
+                        Some(r.receipt_signature_scheme)
+                    } else {
+                        None
+                    },
+                    receipt_signature_bundle: r.receipt_signature_bundle.as_ref().map(|b| {
+                        serde_json::to_value(b).unwrap_or_default()
+                    }),
                 })
                 .collect();
 

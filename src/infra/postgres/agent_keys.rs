@@ -87,6 +87,8 @@ impl PgAgentKeyRegistry {
         revoked_at: Option<DateTime<Utc>>,
         metadata: Option<String>,
         created_at: DateTime<Utc>,
+        key_algorithm: Option<i16>,
+        public_key_bundle_bytes: Option<Vec<u8>>,
     ) -> Result<AgentKeyEntry, AgentKeyError> {
         let public_key: PublicKey32 = public_key
             .try_into()
@@ -99,8 +101,17 @@ impl PgAgentKeyRegistry {
             _ => KeyStatus::Active,
         };
 
+        let algorithm = crate::crypto::pqc_signing::KeyAlgorithm::from_i32(
+            i32::from(key_algorithm.unwrap_or(1)),
+        );
+
+        let public_key_bundle: Option<crate::crypto::pqc_signing::PublicKeyBundle> =
+            public_key_bundle_bytes.and_then(|bytes| serde_json::from_slice(&bytes).ok());
+
         Ok(AgentKeyEntry {
             public_key,
+            key_algorithm: algorithm,
+            public_key_bundle,
             status,
             valid_from,
             valid_to,
@@ -142,9 +153,12 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
             Option<DateTime<Utc>>,
             Option<String>,
             DateTime<Utc>,
+            Option<i16>,
+            Option<Vec<u8>>,
         )> = match sqlx::query_as(
             r#"
-            SELECT public_key, status, valid_from, valid_to, revoked_at, metadata, created_at
+            SELECT public_key, status, valid_from, valid_to, revoked_at, metadata, created_at,
+                   key_algorithm, public_key_bundle
             FROM agent_signing_keys
             WHERE tenant_id = $1 AND agent_id = $2 AND key_id = $3
             "#,
@@ -169,9 +183,9 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
         };
 
         match row {
-            Some((pk, status, valid_from, valid_to, revoked_at, metadata, created_at)) => {
+            Some((pk, status, valid_from, valid_to, revoked_at, metadata, created_at, key_alg, pk_bundle)) => {
                 let entry = match Self::row_to_entry(
-                    pk, status, valid_from, valid_to, revoked_at, metadata, created_at,
+                    pk, status, valid_from, valid_to, revoked_at, metadata, created_at, key_alg, pk_bundle,
                 ) {
                     Ok(entry) => entry,
                     Err(err) => {
@@ -250,11 +264,18 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
             KeyStatus::NotYetValid => "active", // Will be determined by valid_from
         };
 
+        // Serialize PQC key bundle as JSON if present
+        let public_key_bundle_bytes: Option<Vec<u8>> = entry
+            .public_key_bundle
+            .as_ref()
+            .map(|b| serde_json::to_vec(b).unwrap_or_default());
+
         let result = sqlx::query(
             r#"
             INSERT INTO agent_signing_keys
-                (tenant_id, agent_id, key_id, public_key, status, valid_from, valid_to, metadata, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                (tenant_id, agent_id, key_id, public_key, status, valid_from, valid_to, metadata, created_at,
+                 key_algorithm, public_key_bundle)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
         )
         .bind(lookup.tenant_id)
@@ -266,6 +287,8 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
         .bind(entry.valid_to)
         .bind(&entry.metadata)
         .bind(entry.created_at)
+        .bind(entry.key_algorithm as i16)
+        .bind(public_key_bundle_bytes.as_deref())
         .execute(&self.pool)
         .await;
 
@@ -336,9 +359,12 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
             Option<DateTime<Utc>>,
             Option<String>,
             DateTime<Utc>,
+            Option<i16>,
+            Option<Vec<u8>>,
         )> = sqlx::query_as(
             r#"
-            SELECT key_id, public_key, status, valid_from, valid_to, revoked_at, metadata, created_at
+            SELECT key_id, public_key, status, valid_from, valid_to, revoked_at, metadata, created_at,
+                   key_algorithm, public_key_bundle
             FROM agent_signing_keys
             WHERE tenant_id = $1 AND agent_id = $2
             ORDER BY key_id ASC
@@ -352,9 +378,9 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
         .map_err(|e| AgentKeyError::Internal(e.to_string()))?;
 
         let mut result = Vec::with_capacity(rows.len());
-        for (key_id, pk, status, valid_from, valid_to, revoked_at, metadata, created_at) in rows {
+        for (key_id, pk, status, valid_from, valid_to, revoked_at, metadata, created_at, key_algorithm, public_key_bundle_bytes) in rows {
             let entry = Self::row_to_entry(
-                pk, status, valid_from, valid_to, revoked_at, metadata, created_at,
+                pk, status, valid_from, valid_to, revoked_at, metadata, created_at, key_algorithm, public_key_bundle_bytes,
             )?;
             result.push((key_id as u32, entry));
         }

@@ -58,6 +58,12 @@ pub struct VesReceiptResponse {
     pub signature_alg: String,
     pub sequencer_signature: String,
     pub sequencer_key_version: u32,
+    /// PQC receipt signature scheme (0 = legacy, 1 = Ed25519, 2 = ML-DSA-65, 3 = hybrid).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_signature_scheme: Option<i32>,
+    /// PQC receipt signature bundle (hex-encoded Ed25519 + ML-DSA-65 material).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_signature_bundle: Option<serde_json::Value>,
 }
 
 /// Response for VES event ingestion.
@@ -182,12 +188,42 @@ pub struct RegisterAgentKeyRequest {
     pub tenant_id: Uuid,
     pub agent_id: Uuid,
     pub key_id: u32,
-    /// Hex-encoded Ed25519 public key.
+    /// Hex-encoded Ed25519 public key (legacy, or Ed25519 component of hybrid).
     pub public_key: String,
     /// ISO timestamp.
     pub valid_from: Option<String>,
     /// ISO timestamp.
     pub valid_to: Option<String>,
+    /// Key algorithm identifier (VES-PQC-1). 0 or absent = legacy Ed25519.
+    pub key_algorithm: Option<i32>,
+    /// PQC public key bundle with hex-encoded key fields.
+    pub public_key_bundle: Option<PublicKeyBundleRequest>,
+    /// PQC proof-of-possession bundle with hex-encoded PoP fields.
+    pub proof_of_possession_bundle: Option<ProofOfPossessionBundleRequest>,
+}
+
+/// Hex-encoded public key bundle for PQC key registration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicKeyBundleRequest {
+    /// Hex-encoded Ed25519 public key (32 bytes).
+    pub ed25519_public_key: Option<String>,
+    /// Hex-encoded ML-DSA-65 public key.
+    pub ml_dsa_65_public_key: Option<String>,
+    /// Hex-encoded X25519 public key.
+    pub x25519_public_key: Option<String>,
+    /// Hex-encoded ML-KEM-768 public key.
+    pub ml_kem_768_public_key: Option<String>,
+}
+
+/// Hex-encoded proof-of-possession bundle for PQC key registration.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProofOfPossessionBundleRequest {
+    /// Hex-encoded Ed25519 proof-of-possession signature (64 bytes).
+    pub ed25519_pop: Option<String>,
+    /// Hex-encoded ML-DSA-65 proof-of-possession signature.
+    pub ml_dsa_65_pop: Option<String>,
 }
 
 // ============================================================================

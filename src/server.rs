@@ -969,6 +969,18 @@ pub async fn run() -> anyhow::Result<()> {
     }
     if let Some(signing_key) = load_ves_sequencer_signing_key(secrets.as_ref())? {
         info!("VES sequencer receipt signing enabled");
+
+        // Build PQC-aware signing config if ML-DSA seed is available
+        let signing_config = load_ves_signing_config(secrets.as_ref(), &signing_key)?;
+        if let Some(ref config) = signing_config {
+            info!(
+                receipt_scheme = ?config.receipt_scheme,
+                "VES PQC receipt signing configured"
+            );
+            ves_sequencer = ves_sequencer.with_signing_config(config.clone());
+            ves_sequencer_reader = ves_sequencer_reader.with_signing_config(config.clone());
+        }
+
         ves_sequencer = ves_sequencer.with_signing_key(signing_key.clone());
         ves_sequencer_reader = ves_sequencer_reader.with_signing_key(signing_key);
     } else {
@@ -1309,6 +1321,54 @@ fn load_ves_sequencer_signing_key(
         .map_err(|e| anyhow::anyhow!("invalid VES_SEQUENCER_SIGNING_KEY: {e}"))?;
 
     Ok(Some(signing_key))
+}
+
+/// Load the PQC-aware signing configuration from env vars.
+///
+/// Uses `VES_SEQUENCER_ML_DSA_SEED` (hex, 32 bytes) and
+/// `VES_SEQUENCER_SECURITY_PROFILE` ("legacy", "hybrid", "pqc-strict").
+fn load_ves_signing_config(
+    secrets: &dyn SecretsProvider,
+    ed25519_key: &AgentSigningKey,
+) -> anyhow::Result<Option<crate::crypto::pqc_signing::SequencerSigningConfig>> {
+    use crate::crypto::pqc_signing::{SequencerSigningConfig, SignatureScheme};
+
+    let profile = secrets
+        .ves_sequencer_security_profile()
+        .map_err(|e| anyhow::anyhow!("failed to load VES_SEQUENCER_SECURITY_PROFILE: {e}"))?
+        .unwrap_or_else(|| "legacy".to_string());
+
+    let receipt_scheme = match profile.to_lowercase().as_str() {
+        "hybrid" => SignatureScheme::Ed25519MlDsa65,
+        "pqc-strict" => SignatureScheme::MlDsa65,
+        _ => return Ok(None), // Legacy doesn't need signing config
+    };
+
+    // Load ML-DSA-65 seed
+    let ml_dsa_seed_hex = secrets
+        .ves_sequencer_ml_dsa_seed()
+        .map_err(|e| anyhow::anyhow!("failed to load VES_SEQUENCER_ML_DSA_SEED: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!(
+            "VES_SEQUENCER_ML_DSA_SEED is required when security profile is {profile}"
+        ))?;
+
+    let seed_bytes = hex::decode(ml_dsa_seed_hex.strip_prefix("0x").unwrap_or(&ml_dsa_seed_hex))
+        .map_err(|e| anyhow::anyhow!("invalid VES_SEQUENCER_ML_DSA_SEED hex: {e}"))?;
+    if seed_bytes.len() != 32 {
+        return Err(anyhow::anyhow!(
+            "VES_SEQUENCER_ML_DSA_SEED must be 32 bytes, got {}",
+            seed_bytes.len()
+        ));
+    }
+    let mut ml_dsa_seed = [0u8; 32];
+    ml_dsa_seed.copy_from_slice(&seed_bytes);
+
+    Ok(Some(SequencerSigningConfig {
+        ed25519_key: Some(ed25519_key.clone()),
+        #[cfg(feature = "pqc")]
+        ml_dsa_65_seed: Some(ml_dsa_seed),
+        receipt_scheme,
+    }))
 }
 
 fn load_ves_sequencer_id(secrets: &dyn SecretsProvider) -> anyhow::Result<Option<Uuid>> {

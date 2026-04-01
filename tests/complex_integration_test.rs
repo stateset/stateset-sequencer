@@ -526,6 +526,8 @@ async fn create_encrypted_event(
         payload_plain_hash: payload_plain_hash(&payload),
         payload_cipher_hash: [0u8; 32],
         agent_signature: [0u8; 64],
+        agent_signature_scheme: None,
+        agent_signature_bundle: None,
         sequence_number: None,
         sequenced_at: None,
         command_id: None,

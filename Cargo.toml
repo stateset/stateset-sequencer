@@ -9,7 +9,7 @@ repository = "https://github.com/stateset/stateset-sequencer"
 
 [features]
 default = ["full"]
-full = ["grpc", "telemetry", "anchoring", "schema-validation"]
+full = ["grpc", "telemetry", "anchoring", "schema-validation", "pqc"]
 
 # Enable gRPC service (adds tonic/prost dependencies)
 grpc = []
@@ -28,6 +28,9 @@ sqlite = []
 
 # Enable payload encryption at rest
 encryption = []
+
+# Enable post-quantum cryptography (ML-DSA-65, ML-KEM-768)
+pqc = ["dep:ml-kem", "dep:ml-dsa", "dep:zeroize", "dep:subtle", "dep:hkdf"]
 
 # Integration-only toggles for test modules
 integration = []
@@ -61,6 +64,11 @@ rs_merkle = "1"
 ed25519-dalek = { version = "2", features = ["rand_core", "serde"] }
 hpke = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+ml-dsa = { version = "0.1.0-rc.8", features = ["zeroize"], optional = true }
+ml-kem = { version = "0.3.0-rc.1", features = ["zeroize"], optional = true }
+zeroize = { version = "1", features = ["derive"], optional = true }
+subtle = { version = "2", optional = true }
+hkdf = { version = "0.12", optional = true }
 
 # Authentication
 jsonwebtoken = "9"

@@ -14,6 +14,7 @@ use std::sync::RwLock;
 use uuid::Uuid;
 
 use crate::crypto::{AgentVerifyingKey, PublicKey32, SigningError};
+use crate::crypto::pqc_signing::{KeyAlgorithm, PublicKeyBundle, VerificationKey};
 use crate::domain::{AgentId, AgentKeyId, TenantId};
 
 /// Status of an agent signing key
@@ -32,8 +33,14 @@ pub enum KeyStatus {
 /// Agent key entry in the registry
 #[derive(Debug, Clone)]
 pub struct AgentKeyEntry {
-    /// The Ed25519 public key bytes
+    /// The Ed25519 public key bytes (legacy, or Ed25519 component of hybrid)
     pub public_key: PublicKey32,
+
+    /// Key algorithm identifier (VES-PQC-1).
+    pub key_algorithm: KeyAlgorithm,
+
+    /// Algorithm-aware public key bundle (hybrid and strict keys).
+    pub public_key_bundle: Option<PublicKeyBundle>,
 
     /// Current status of the key
     pub status: KeyStatus,
@@ -59,6 +66,27 @@ impl AgentKeyEntry {
     pub fn new(public_key: PublicKey32) -> Self {
         Self {
             public_key,
+            key_algorithm: KeyAlgorithm::Ed25519,
+            public_key_bundle: None,
+            status: KeyStatus::Active,
+            valid_from: None,
+            valid_to: None,
+            revoked_at: None,
+            metadata: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Create a new PQC-aware key entry.
+    pub fn new_with_algorithm(
+        public_key: PublicKey32,
+        algorithm: KeyAlgorithm,
+        bundle: Option<PublicKeyBundle>,
+    ) -> Self {
+        Self {
+            public_key,
+            key_algorithm: algorithm,
+            public_key_bundle: bundle,
             status: KeyStatus::Active,
             valid_from: None,
             valid_to: None,
@@ -76,6 +104,8 @@ impl AgentKeyEntry {
     ) -> Self {
         Self {
             public_key,
+            key_algorithm: KeyAlgorithm::Ed25519,
+            public_key_bundle: None,
             status: KeyStatus::Active,
             valid_from: Some(valid_from),
             valid_to: Some(valid_to),
@@ -83,6 +113,15 @@ impl AgentKeyEntry {
             metadata: None,
             created_at: Utc::now(),
         }
+    }
+
+    /// Build a [`VerificationKey`] from this entry's algorithm and key material.
+    pub fn to_verification_key(&self) -> Result<VerificationKey, SigningError> {
+        VerificationKey::from_key_entry(
+            self.key_algorithm,
+            &self.public_key,
+            self.public_key_bundle.as_ref(),
+        )
     }
 
     /// Check if the key is valid at the given time
@@ -247,6 +286,21 @@ pub trait AgentKeyRegistry: Send + Sync {
     ) -> Result<AgentVerifyingKey, AgentKeyError> {
         let entry = self.get_valid_key_at(lookup, at).await?;
         AgentVerifyingKey::from_bytes(&entry.public_key)
+            .map_err(AgentKeyError::SignatureVerificationFailed)
+    }
+
+    /// Get an algorithm-aware verification key valid at a specific time.
+    ///
+    /// Returns a [`VerificationKey`] that can verify legacy, hybrid, or strict
+    /// signatures depending on the registered key algorithm.
+    async fn get_pqc_verifying_key_at(
+        &self,
+        lookup: &AgentKeyLookup,
+        at: DateTime<Utc>,
+    ) -> Result<VerificationKey, AgentKeyError> {
+        let entry = self.get_valid_key_at(lookup, at).await?;
+        entry
+            .to_verification_key()
             .map_err(AgentKeyError::SignatureVerificationFailed)
     }
 }

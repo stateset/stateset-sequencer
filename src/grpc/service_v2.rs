@@ -31,6 +31,13 @@ use crate::infra::{
     postgres::VesRejectionReason, CacheManager, PgAgentKeyRegistry, PgVesCommitmentEngine,
     VesSequencer, CACHE_STAMPEDE_DELAY,
 };
+use crate::crypto::pqc_signing::{
+    KeyAlgorithm as DomainKeyAlgorithm,
+    ParsedSignatureBundle,
+    PublicKeyBundle as DomainPublicKeyBundle,
+    SignatureScheme as DomainSignatureScheme,
+    verify_proof_of_possession,
+};
 use crate::proto::v2::{
     self,
     key_management_server::KeyManagement as KeyManagementTrait,
@@ -49,6 +56,9 @@ use crate::proto::v2::{
     HealthResponse,
     InclusionProof,
     KeyType,
+    // PQC types
+    PublicKeyBundle as ProtoPublicKeyBundle,
+    SignatureBundle,
     PullEventsRequest,
     PullEventsResponse,
     PushRequest,
@@ -279,6 +289,8 @@ impl SequencerServiceV2 {
                 aead: payload.hpke.aead.clone(),
             }),
             recipients,
+            key_wrap_params: None,
+            recipient_wraps: Vec::new(),
         })
     }
 
@@ -320,6 +332,25 @@ impl SequencerServiceV2 {
             &event.compute_signing_hash(),
         );
 
+        // Serialize PQC signature bundle for the EventEnvelope
+        let agent_signature_scheme = envelope.agent_signature_scheme.unwrap_or(0);
+        let agent_signature_bundle = envelope.agent_signature_bundle.as_ref().map(|bundle| {
+            SignatureBundle {
+                ed25519_signature: bundle
+                    .ed25519_signature
+                    .clone()
+                    .unwrap_or_default(),
+                ml_dsa_65_signature: bundle
+                    .ml_dsa_65_signature
+                    .clone()
+                    .unwrap_or_default(),
+            }
+        });
+
+        // Receipt PQC signature fields — populated when apply_receipt_signature is called
+        let receipt_sig_scheme = 0i32;
+        let receipt_sig_bundle = None::<SignatureBundle>;
+
         Ok(SequencedEvent {
             envelope: Some(EventEnvelope {
                 event_id: envelope.event_id.to_string(),
@@ -343,6 +374,8 @@ impl SequencerServiceV2 {
                 agent_signature: envelope.agent_signature.to_vec(),
                 base_version: envelope.base_version.unwrap_or(0),
                 created_at: Some(created_at),
+                agent_signature_scheme,
+                agent_signature_bundle,
             }),
             sequence_number: event.sequence_number(),
             sequenced_at: Some(prost_types::Timestamp {
@@ -350,7 +383,34 @@ impl SequencerServiceV2 {
                 nanos: sequenced_at.timestamp_subsec_nanos() as i32,
             }),
             receipt_hash: receipt_hash.to_vec(),
+            receipt_signature_scheme: receipt_sig_scheme,
+            receipt_signature_bundle: receipt_sig_bundle,
         })
+    }
+
+    /// Apply PQC receipt signature fields to a proto SequencedEvent.
+    ///
+    /// Called when a receipt with PQC signature data is available (e.g., after
+    /// ingestion). For pull/stream paths, receipt signatures are stored separately
+    /// and applied when the receipt is joined with the event.
+    #[allow(dead_code)]
+    pub fn apply_receipt_signature(
+        event: &mut SequencedEvent,
+        receipt: &crate::infra::postgres::VesSequencerReceipt,
+    ) {
+        event.receipt_signature_scheme = receipt.receipt_signature_scheme;
+        if let Some(ref bundle) = receipt.receipt_signature_bundle {
+            event.receipt_signature_bundle = Some(SignatureBundle {
+                ed25519_signature: bundle
+                    .ed25519_signature
+                    .clone()
+                    .unwrap_or_default(),
+                ml_dsa_65_signature: bundle
+                    .ml_dsa_65_signature
+                    .clone()
+                    .unwrap_or_default(),
+            });
+        }
     }
 
     /// Convert v2 proto event to VES event envelope
@@ -500,11 +560,48 @@ impl SequencerServiceV2 {
             }
         };
 
-        let agent_signature: [u8; 64] = proto
-            .agent_signature
-            .as_slice()
-            .try_into()
-            .map_err(|_| Status::invalid_argument("agent_signature must be 64 bytes"))?;
+        // Parse PQC signature scheme and bundle
+        let sig_scheme = DomainSignatureScheme::from_i32(proto.agent_signature_scheme);
+
+        let agent_signature: [u8; 64] = match sig_scheme {
+            // For PQC-strict (ML-DSA-65 only), the legacy field may be empty
+            DomainSignatureScheme::MlDsa65 => {
+                if proto.agent_signature.is_empty() {
+                    [0u8; 64]
+                } else {
+                    proto.agent_signature.as_slice().try_into().map_err(|_| {
+                        Status::invalid_argument("agent_signature must be 64 bytes when present")
+                    })?
+                }
+            }
+            // Legacy and hybrid: Ed25519 signature is required in the legacy field
+            _ => proto
+                .agent_signature
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("agent_signature must be 64 bytes"))?,
+        };
+
+        let agent_signature_scheme = if proto.agent_signature_scheme != 0 {
+            Some(proto.agent_signature_scheme)
+        } else {
+            None
+        };
+
+        let agent_signature_bundle = proto.agent_signature_bundle.as_ref().map(|bundle| {
+            ParsedSignatureBundle {
+                ed25519_signature: if bundle.ed25519_signature.is_empty() {
+                    None
+                } else {
+                    Some(bundle.ed25519_signature.clone())
+                },
+                ml_dsa_65_signature: if bundle.ml_dsa_65_signature.is_empty() {
+                    None
+                } else {
+                    Some(bundle.ml_dsa_65_signature.clone())
+                },
+            }
+        });
 
         Ok(VesEventEnvelope {
             ves_version,
@@ -523,6 +620,8 @@ impl SequencerServiceV2 {
             payload_plain_hash,
             payload_cipher_hash,
             agent_signature,
+            agent_signature_scheme,
+            agent_signature_bundle,
             sequence_number: None,
             sequenced_at: None,
             command_id,
@@ -2146,11 +2245,88 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
             return Err(Status::unimplemented("only signing keys are supported"));
         }
 
-        if req.public_key.len() != 32 {
+        // Parse key algorithm (VES-PQC-1)
+        let key_algorithm = DomainKeyAlgorithm::from_i32(req.key_algorithm);
+
+        // Parse public key (legacy Ed25519 field)
+        let public_key: [u8; 32] = if req.public_key.len() == 32 {
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&req.public_key);
+            pk
+        } else if key_algorithm.has_ml_dsa() && !key_algorithm.has_ed25519() {
+            // PQC-strict (ML-DSA-65 only): legacy field may be empty
+            [0u8; 32]
+        } else {
             return Err(Status::invalid_argument("public_key must be 32 bytes"));
+        };
+
+        // Parse PQC public key bundle
+        let public_key_bundle = req.public_key_bundle.as_ref().map(|bundle| {
+            DomainPublicKeyBundle {
+                ed25519_public_key: if bundle.ed25519_public_key.len() == 32 {
+                    let mut pk = [0u8; 32];
+                    pk.copy_from_slice(&bundle.ed25519_public_key);
+                    Some(pk)
+                } else {
+                    None
+                },
+                ml_dsa_65_public_key: if bundle.ml_dsa_65_public_key.is_empty() {
+                    None
+                } else {
+                    Some(bundle.ml_dsa_65_public_key.clone())
+                },
+                x25519_public_key: if bundle.x25519_public_key.is_empty() {
+                    None
+                } else {
+                    Some(bundle.x25519_public_key.clone())
+                },
+                ml_kem_768_public_key: if bundle.ml_kem_768_public_key.is_empty() {
+                    None
+                } else {
+                    Some(bundle.ml_kem_768_public_key.clone())
+                },
+            }
+        });
+
+        // Parse PQC proof-of-possession bundle
+        let pop_bundle = req.proof_of_possession_bundle.as_ref().map(|bundle| {
+            ParsedSignatureBundle {
+                ed25519_signature: if bundle.ed25519_pop.is_empty() {
+                    None
+                } else {
+                    Some(bundle.ed25519_pop.clone())
+                },
+                ml_dsa_65_signature: if bundle.ml_dsa_65_pop.is_empty() {
+                    None
+                } else {
+                    Some(bundle.ml_dsa_65_pop.clone())
+                },
+            }
+        });
+
+        // SECURITY: PoP is MANDATORY for hybrid and strict key algorithms.
+        let pop_required = matches!(
+            key_algorithm,
+            DomainKeyAlgorithm::Ed25519MlDsa65 | DomainKeyAlgorithm::MlDsa65
+        );
+        if pop_required && pop_bundle.is_none() && req.proof_of_possession.is_empty() {
+            return Err(Status::invalid_argument(
+                "proof_of_possession_bundle is required for hybrid and pqc-strict key registrations",
+            ));
         }
-        let mut public_key = [0u8; 32];
-        public_key.copy_from_slice(&req.public_key);
+
+        if pop_bundle.is_some() || !req.proof_of_possession.is_empty() {
+            verify_proof_of_possession(
+                key_algorithm,
+                &public_key,
+                public_key_bundle.as_ref(),
+                &req.proof_of_possession,
+                pop_bundle.as_ref(),
+            )
+            .map_err(|e| {
+                Status::invalid_argument(format!("proof of possession verification failed: {e}"))
+            })?;
+        }
 
         let valid_from = match req.valid_from.as_ref() {
             Some(ts) => Some(Self::timestamp_to_datetime(ts, "valid_from")?),
@@ -2168,7 +2344,12 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
             }
         }
 
-        let mut entry = AgentKeyEntry::new(public_key);
+        // Create key entry — PQC-aware when algorithm is specified
+        let mut entry = if key_algorithm != DomainKeyAlgorithm::Unspecified {
+            AgentKeyEntry::new_with_algorithm(public_key, key_algorithm, public_key_bundle)
+        } else {
+            AgentKeyEntry::new(public_key)
+        };
         entry.valid_from = valid_from;
         entry.valid_to = valid_to;
 
@@ -2244,6 +2425,29 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
                 DomainKeyStatus::NotYetValid => v2::KeyStatus::Unspecified,
             };
 
+            // Serialize PQC key metadata
+            let proto_key_algorithm = entry.key_algorithm as i32;
+            let proto_public_key_bundle = entry.public_key_bundle.as_ref().map(|bundle| {
+                ProtoPublicKeyBundle {
+                    ed25519_public_key: bundle
+                        .ed25519_public_key
+                        .map(|pk| pk.to_vec())
+                        .unwrap_or_default(),
+                    ml_dsa_65_public_key: bundle
+                        .ml_dsa_65_public_key
+                        .clone()
+                        .unwrap_or_default(),
+                    x25519_public_key: bundle
+                        .x25519_public_key
+                        .clone()
+                        .unwrap_or_default(),
+                    ml_kem_768_public_key: bundle
+                        .ml_kem_768_public_key
+                        .clone()
+                        .unwrap_or_default(),
+                }
+            });
+
             keys.push(v2::AgentKey {
                 key_id,
                 key_type: KeyType::Signing as i32,
@@ -2253,6 +2457,8 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
                 valid_from: entry.valid_from.as_ref().map(Self::datetime_to_timestamp),
                 valid_to: entry.valid_to.as_ref().map(Self::datetime_to_timestamp),
                 revoked_at: entry.revoked_at.as_ref().map(Self::datetime_to_timestamp),
+                key_algorithm: proto_key_algorithm,
+                public_key_bundle: proto_public_key_bundle,
             });
         }
 

@@ -12,7 +12,7 @@
     "status",
     "created_at"
   ],
-  "additionalProperties": false,
+  "additionalProperties": true,
   "properties": {
     "tenant_id": {
       "type": "string",
@@ -75,6 +75,29 @@
         "policy_change"
       ],
       "description": "Reason for key rotation/revocation"
+    },
+    "key_algorithm": {
+      "type": "integer",
+      "enum": [0, 1, 2, 3, 4, 5, 6],
+      "description": "KeyAlgorithm: 0=unspecified, 1=ED25519, 2=X25519, 3=ML_DSA_65, 4=ML_KEM_768, 5=ED25519_ML_DSA_65, 6=X25519_ML_KEM_768"
+    },
+    "public_key_bundle": {
+      "type": "object",
+      "description": "Algorithm-aware public key material for hybrid/strict profiles",
+      "properties": {
+        "ed25519_public_key": { "type": "string", "pattern": "^0x[a-f0-9]{64}$" },
+        "ml_dsa_65_public_key": { "type": "string" },
+        "x25519_public_key": { "type": "string", "pattern": "^0x[a-f0-9]{64}$" },
+        "ml_kem_768_public_key": { "type": "string" }
+      }
+    },
+    "proof_of_possession_bundle": {
+      "type": "object",
+      "description": "Proof-of-possession signatures for hybrid/strict key registration",
+      "properties": {
+        "ed25519_pop": { "type": "string" },
+        "ml_dsa_65_pop": { "type": "string" }
+      }
     },
     "metadata": {
       "type": "string",

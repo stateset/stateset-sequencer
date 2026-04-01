@@ -97,9 +97,17 @@ pub struct VesEventEnvelope {
     // ========================================================================
     // Agent Signature
     // ========================================================================
-    /// Ed25519 signature over event_signing_hash
+    /// Ed25519 signature over event_signing_hash (legacy)
     #[serde(with = "signature64_hex_0x")]
     pub agent_signature: Signature64,
+
+    /// PQC signature scheme identifier (0 = legacy Ed25519).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_signature_scheme: Option<i32>,
+
+    /// PQC signature bundle (hybrid or strict ML-DSA-65 material).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_signature_bundle: Option<crate::crypto::pqc_signing::ParsedSignatureBundle>,
 
     // ========================================================================
     // Sequencer-Assigned Fields (not agent-signed)
@@ -188,6 +196,8 @@ impl VesEventEnvelope {
             payload_plain_hash,
             payload_cipher_hash,
             agent_signature,
+            agent_signature_scheme: None,
+            agent_signature_bundle: None,
             sequence_number: None,
             sequenced_at: None,
             command_id: None,
@@ -256,6 +266,8 @@ impl VesEventEnvelope {
             payload_plain_hash,
             payload_cipher_hash,
             agent_signature,
+            agent_signature_scheme: None,
+            agent_signature_bundle: None,
             sequence_number: None,
             sequenced_at: None,
             command_id: None,

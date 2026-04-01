@@ -48,6 +48,8 @@ struct VesEventRow {
     agent_signature: Vec<u8>,
     sequence_number: i64,
     base_version: Option<i64>,
+    agent_signature_scheme: Option<i16>,
+    agent_signature_bundle: Option<Vec<u8>>,
 }
 
 /// Row data for an existing sequencer receipt
@@ -59,6 +61,8 @@ struct ExistingReceiptRow {
     receipt_hash: Vec<u8>,
     sequencer_signature: Option<Vec<u8>>,
     sequencer_key_version: i32,
+    receipt_signature_scheme: Option<i16>,
+    receipt_signature_bundle: Option<Vec<u8>>,
 }
 
 enum ReplayLookup {
@@ -136,10 +140,14 @@ pub struct VesSequencerReceipt {
     pub receipt_hash: Hash256,
     /// Signature algorithm
     pub signature_alg: String,
-    /// Sequencer signature over receipt_hash
+    /// Sequencer signature over receipt_hash (legacy Ed25519)
     pub sequencer_signature: Option<Signature64>,
     /// Key rotation index for the signing key (Section 10.5)
     pub sequencer_key_version: u32,
+    /// PQC receipt signature scheme (VES-RECEIPT-2)
+    pub receipt_signature_scheme: i32,
+    /// PQC receipt signature bundle (hybrid or strict ML-DSA-65 material)
+    pub receipt_signature_bundle: Option<crate::crypto::pqc_signing::ParsedSignatureBundle>,
 }
 
 /// VES ingest receipt
@@ -160,8 +168,10 @@ pub struct VesSequencer<R: AgentKeyRegistry> {
     pool: PgPool,
     key_registry: Arc<R>,
     sequencer_id: Uuid,
-    /// Optional sequencer signing key for receipts
+    /// Optional sequencer signing key for receipts (legacy Ed25519)
     sequencer_signing_key: Option<AgentSigningKey>,
+    /// PQC-aware signing configuration for receipts (VES-RECEIPT-2)
+    signing_config: Option<crate::crypto::pqc_signing::SequencerSigningConfig>,
     /// Key rotation index for the signing key (monotonic)
     sequencer_key_version: u32,
     /// Enforce strict formatting for VES hex/base64url fields
@@ -265,6 +275,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             payload_plain_hash: plain_hash,
             payload_cipher_hash: cipher_hash,
             agent_signature: signature,
+            agent_signature_scheme: row.agent_signature_scheme.map(i32::from),
+            agent_signature_bundle: row
+                .agent_signature_bundle
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
             sequence_number: Some(Self::decode_sequence(row.sequence_number)?),
             sequenced_at: Some(row.sequenced_at),
             command_id: row.command_id,
@@ -343,6 +357,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             key_registry,
             sequencer_id: Uuid::new_v4(),
             sequencer_signing_key: None,
+            signing_config: None,
             sequencer_key_version: 0,
             strict_format_validation: Self::strict_format_from_env(),
         }
@@ -354,9 +369,18 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         self
     }
 
-    /// Set the sequencer signing key for receipts
+    /// Set the sequencer signing key for receipts (legacy Ed25519)
     pub fn with_signing_key(mut self, key: AgentSigningKey) -> Self {
         self.sequencer_signing_key = Some(key);
+        self
+    }
+
+    /// Set the PQC-aware signing configuration for receipts (VES-RECEIPT-2).
+    ///
+    /// When set, receipts will be signed with the configured profile
+    /// (hybrid Ed25519+ML-DSA-65 or PQC-strict ML-DSA-65).
+    pub fn with_signing_config(mut self, config: crate::crypto::pqc_signing::SequencerSigningConfig) -> Self {
+        self.signing_config = Some(config);
         self
     }
 
@@ -482,7 +506,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 payload_kind, payload, payload_encrypted,
                 payload_plain_hash, payload_cipher_hash,
                 agent_signature,
-                sequence_number, base_version
+                sequence_number, base_version,
+                agent_signature_scheme, agent_signature_bundle
             FROM ves_events
             WHERE event_id = $1
             "#,
@@ -501,7 +526,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     ) -> Result<Option<VesSequencerReceipt>> {
         let row: Option<ExistingReceiptRow> = sqlx::query_as(
             r#"
-            SELECT sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature, sequencer_key_version
+            SELECT sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature, sequencer_key_version,
+                   receipt_signature_scheme, receipt_signature_bundle
             FROM ves_sequencer_receipts
             WHERE event_id = $1
             "#,
@@ -547,6 +573,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             signature_alg,
             sequencer_signature,
             sequencer_key_version: row.sequencer_key_version as u32,
+            receipt_signature_scheme: row.receipt_signature_scheme.map(i32::from).unwrap_or(0),
+            receipt_signature_bundle: row
+                .receipt_signature_bundle
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
         }))
     }
 
@@ -627,8 +657,14 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         encrypted: &PayloadEncrypted,
     ) -> Option<VesRejectedEvent> {
         const EXPECTED_AEAD: &str = "AES-256-GCM";
-        const EXPECTED_HPKE_MODE: &str = "base";
-        const EXPECTED_HPKE_KEM: &str = "X25519-HKDF-SHA256";
+        // Accepted HPKE modes: legacy "base" and PQC "hybrid-base" / "pqc-base"
+        const ACCEPTED_HPKE_MODES: &[&str] = &["base", "hybrid-base", "pqc-base"];
+        // Accepted KEM algorithms: legacy X25519, hybrid, and PQC-strict
+        const ACCEPTED_HPKE_KEMS: &[&str] = &[
+            "X25519-HKDF-SHA256",
+            "x25519+mlkem768",
+            "mlkem768",
+        ];
         const EXPECTED_HPKE_KDF: &str = "HKDF-SHA256";
         const RECIPIENT_ENC_SIZE: usize = 32;
         const RECIPIENT_CT_SIZE: usize = 48;
@@ -653,10 +689,11 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 Ok(bytes)
             };
 
-        if encrypted.enc_version != 1 {
+        // Accept enc_version 1 (legacy), 2 (hybrid), 3 (strict)
+        if encrypted.enc_version == 0 || encrypted.enc_version > 3 {
             return Some(reject(
                 "payload_encrypted.enc_version",
-                "enc_version must be 1".to_string(),
+                "enc_version must be 1, 2, or 3".to_string(),
             ));
         }
 
@@ -667,17 +704,17 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             ));
         }
 
-        if encrypted.hpke.mode != EXPECTED_HPKE_MODE {
+        if !ACCEPTED_HPKE_MODES.contains(&encrypted.hpke.mode.as_str()) {
             return Some(reject(
                 "payload_encrypted.hpke.mode",
-                format!("hpke.mode must be {}", EXPECTED_HPKE_MODE),
+                format!("hpke.mode must be one of: {}", ACCEPTED_HPKE_MODES.join(", ")),
             ));
         }
 
-        if encrypted.hpke.kem != EXPECTED_HPKE_KEM {
+        if !ACCEPTED_HPKE_KEMS.contains(&encrypted.hpke.kem.as_str()) {
             return Some(reject(
                 "payload_encrypted.hpke.kem",
-                format!("hpke.kem must be {}", EXPECTED_HPKE_KEM),
+                format!("hpke.kem must be one of: {}", ACCEPTED_HPKE_KEMS.join(", ")),
             ));
         }
 
@@ -909,9 +946,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         // Per VES v1.0 Section 9.2: evaluate against sequenced_at time
         let validation_time = Utc::now();
 
-        let verifying_key = match self
+        // Use PQC-aware key lookup for algorithm-aware verification
+        let verification_key = match self
             .key_registry
-            .get_verifying_key_at(&lookup, validation_time)
+            .get_pqc_verifying_key_at(&lookup, validation_time)
             .await
         {
             Ok(key) => key,
@@ -931,9 +969,12 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             }
         };
 
-        // 4. Verify agent signature
-        // Debug: Log the signing hash and signature for debugging
+        // 4. Verify agent signature (PQC-aware dispatch)
         let signing_hash = event.compute_signing_hash();
+        let signature_scheme = crate::crypto::pqc_signing::SignatureScheme::from_i32(
+            event.agent_signature_scheme.unwrap_or(0),
+        );
+
         tracing::debug!(
             event_id = %event.event_id,
             tenant_id = %event.tenant_id,
@@ -949,13 +990,21 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             payload_cipher_hash = %hex::encode(event.payload_cipher_hash),
             computed_signing_hash = %hex::encode(signing_hash),
             agent_signature = %hex::encode(event.agent_signature),
+            ?signature_scheme,
             "VES signature verification"
         );
 
-        if let Err(e) = event.verify_signature(&verifying_key) {
+        if let Err(e) = crate::crypto::pqc_signing::verify_with_key(
+            &signing_hash,
+            signature_scheme,
+            &event.agent_signature,
+            event.agent_signature_bundle.as_ref(),
+            &verification_key,
+        ) {
             tracing::warn!(
                 event_id = %event.event_id,
                 error = ?e,
+                ?signature_scheme,
                 "VES signature verification failed"
             );
             return Some(VesRejectedEvent {
@@ -1015,7 +1064,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 payload_kind, payload, payload_encrypted,
                 payload_plain_hash, payload_cipher_hash, event_signing_hash,
                 agent_signature,
-                sequence_number, base_version
+                sequence_number, base_version,
+                agent_signature_scheme, agent_signature_bundle
             ) VALUES (
                 $1, $2, $3,
                 $4, $5,
@@ -1025,7 +1075,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 $14, $15, $16,
                 $17, $18, $19,
                 $20,
-                $21, $22
+                $21, $22,
+                $23, $24
             )
             ON CONFLICT (event_id) DO NOTHING
             "#,
@@ -1052,6 +1103,12 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         .bind(env.agent_signature.as_slice())
         .bind(sequence_number)
         .bind(base_version)
+        .bind(env.agent_signature_scheme.unwrap_or(0) as i16)
+        .bind(
+            env.agent_signature_bundle
+                .as_ref()
+                .and_then(|b| serde_json::to_vec(b).ok()),
+        )
         .execute(&mut **tx)
         .await?;
 
@@ -1067,9 +1124,11 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         sqlx::query(
             r#"
             INSERT INTO ves_sequencer_receipts (
-                event_id, sequencer_id, sequence_number, sequenced_at, receipt_hash, sequencer_signature, sequencer_key_version
+                event_id, sequencer_id, sequence_number, sequenced_at, receipt_hash,
+                sequencer_signature, sequencer_key_version,
+                receipt_signature_scheme, receipt_signature_bundle
             )
-            SELECT $1, $2, $3, $4, $5, $6, $7
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
             WHERE NOT EXISTS (
                 SELECT 1 FROM ves_sequencer_receipts WHERE event_id = $1
             )
@@ -1087,6 +1146,13 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 .map(|sig| sig.as_slice()),
         )
         .bind(receipt.sequencer_key_version as i32)
+        .bind(receipt.receipt_signature_scheme as i16)
+        .bind(
+            receipt
+                .receipt_signature_bundle
+                .as_ref()
+                .and_then(|b| serde_json::to_vec(b).ok()),
+        )
         .execute(&mut **tx)
         .await?;
 
@@ -1199,13 +1265,42 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             &event_signing_hash,
         );
 
-        // Sign the receipt if we have a signing key
-        let (signature_alg, sequencer_signature) = if let Some(ref key) = self.sequencer_signing_key
-        {
-            ("ed25519".to_string(), Some(key.sign(&receipt_hash)))
-        } else {
-            ("none".to_string(), None)
-        };
+        // Sign the receipt — prefer PQC signing config, fall back to legacy Ed25519
+        let (signature_alg, sequencer_signature, receipt_signature_scheme, receipt_signature_bundle) =
+            if let Some(ref config) = self.signing_config {
+                match config.sign_receipt(&receipt_hash) {
+                    Ok((scheme, legacy_sig, bundle)) => {
+                        let ed_sig = if legacy_sig.len() == 64 {
+                            let mut arr = [0u8; 64];
+                            arr.copy_from_slice(&legacy_sig);
+                            Some(arr)
+                        } else {
+                            None
+                        };
+                        (
+                            format!("{:?}", scheme),
+                            ed_sig,
+                            scheme as i32,
+                            bundle,
+                        )
+                    }
+                    Err(e) => {
+                        // SECURITY: Do not silently downgrade to unsigned receipts.
+                        // If PQC signing is configured but fails, this is a operational error
+                        // that must be visible. Fall back to Ed25519-only if available.
+                        tracing::error!(error = ?e, "PQC receipt signing failed");
+                        if let Some(ref key) = self.sequencer_signing_key {
+                            ("ed25519-fallback".to_string(), Some(key.sign(&receipt_hash)), 1, None)
+                        } else {
+                            ("none".to_string(), None, 0, None)
+                        }
+                    }
+                }
+            } else if let Some(ref key) = self.sequencer_signing_key {
+                ("ed25519".to_string(), Some(key.sign(&receipt_hash)), 1, None)
+            } else {
+                ("none".to_string(), None, 0, None)
+            };
 
         VesSequencerReceipt {
             sequencer_id: self.sequencer_id,
@@ -1216,6 +1311,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             signature_alg,
             sequencer_signature,
             sequencer_key_version: self.sequencer_key_version,
+            receipt_signature_scheme,
+            receipt_signature_bundle,
         }
     }
 
@@ -1524,6 +1621,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 agent_signature BYTEA NOT NULL,
                 sequence_number BIGINT NOT NULL,
                 base_version BIGINT,
+                agent_signature_scheme SMALLINT NOT NULL DEFAULT 0,
+                agent_signature_bundle BYTEA,
                 CONSTRAINT uq_ves_events_sequence UNIQUE (tenant_id, store_id, sequence_number)
             )
             "#,
@@ -1612,7 +1711,9 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 sequenced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 receipt_hash BYTEA NOT NULL,
                 sequencer_signature BYTEA,
-                sequencer_key_version INTEGER NOT NULL DEFAULT 0
+                sequencer_key_version INTEGER NOT NULL DEFAULT 0,
+                receipt_signature_scheme SMALLINT NOT NULL DEFAULT 0,
+                receipt_signature_bundle BYTEA
             )
             "#,
         )
@@ -1652,7 +1753,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 payload_kind, payload, payload_encrypted,
                 payload_plain_hash, payload_cipher_hash,
                 agent_signature,
-                sequence_number, base_version
+                sequence_number, base_version,
+                agent_signature_scheme, agent_signature_bundle
             FROM ves_events
             WHERE tenant_id = $1 AND store_id = $2 AND sequence_number > $3
             ORDER BY sequence_number ASC
@@ -1701,7 +1803,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 payload_kind, payload, payload_encrypted,
                 payload_plain_hash, payload_cipher_hash,
                 agent_signature,
-                sequence_number, base_version
+                sequence_number, base_version,
+                agent_signature_scheme, agent_signature_bundle
             FROM ves_events
             WHERE tenant_id = $1 AND store_id = $2
               AND sequence_number >= $3 AND sequence_number <= $4
@@ -1763,7 +1866,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 payload_kind, payload, payload_encrypted,
                 payload_plain_hash, payload_cipher_hash,
                 agent_signature,
-                sequence_number, base_version
+                sequence_number, base_version,
+                agent_signature_scheme, agent_signature_bundle
             FROM ves_events
             WHERE tenant_id = $1 AND store_id = $2
               AND entity_type = $3 AND entity_id = $4
@@ -1798,7 +1902,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 payload_kind, payload, payload_encrypted,
                 payload_plain_hash, payload_cipher_hash,
                 agent_signature,
-                sequence_number, base_version
+                sequence_number, base_version,
+                agent_signature_scheme, agent_signature_bundle
             FROM ves_events
             WHERE event_id = $1
             "#,
@@ -1839,6 +1944,7 @@ mod tests {
             key_registry: registry,
             sequencer_id: Uuid::new_v4(),
             sequencer_signing_key: None,
+            signing_config: None,
             sequencer_key_version: 0,
             strict_format_validation: strict_format,
         }
@@ -1963,6 +2069,8 @@ mod tests {
             payload_plain_hash,
             payload_cipher_hash,
             agent_signature,
+            agent_signature_scheme: None,
+            agent_signature_bundle: None,
             sequence_number: None,
             sequenced_at: None,
             command_id: None,
