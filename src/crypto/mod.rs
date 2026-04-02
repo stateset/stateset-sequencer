@@ -8,6 +8,8 @@
 
 mod encrypt;
 mod hash;
+#[cfg(feature = "pqc")]
+mod pqc_backend;
 pub mod pqc_encrypt;
 pub mod pqc_signing;
 mod signing;

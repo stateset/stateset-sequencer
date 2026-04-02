@@ -662,13 +662,13 @@ mod tests {
     fn test_tenant_id_hash() {
         use std::collections::HashSet;
         let id1 = TenantId::new();
-        let id2 = id1.clone();
+        let id2 = id1;
         let id3 = TenantId::new();
 
         let mut set = HashSet::new();
-        set.insert(id1.clone());
-        set.insert(id2.clone());
-        set.insert(id3.clone());
+        set.insert(id1);
+        set.insert(id2);
+        set.insert(id3);
 
         assert_eq!(set.len(), 2); // id1 and id2 are equal
         assert!(set.contains(&id1));

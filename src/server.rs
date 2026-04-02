@@ -8,6 +8,7 @@
 //! - the Tonic gRPC server (v1 and v2 APIs)
 
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use ipnet::IpNet;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions, PgSslMode};
 use sqlx::PgPool;
 use tonic::transport::Server as TonicServer;
 use tower_http::cors::AllowOrigin;
@@ -455,6 +456,7 @@ async fn build_pg_pool(
     }
 
     let session_config = session_config.clone();
+    let connect_options = parse_secure_pg_connect_options(url)?;
     options = options.after_connect(move |conn, _meta| {
         let session_config = session_config.clone();
         Box::pin(async move {
@@ -488,7 +490,55 @@ async fn build_pg_pool(
         })
     });
 
-    Ok(options.connect(url).await?)
+    Ok(options.connect_with(connect_options).await?)
+}
+
+fn parse_secure_pg_connect_options(url: &str) -> anyhow::Result<PgConnectOptions> {
+    let options = PgConnectOptions::from_str(url)?;
+
+    match options.get_ssl_mode() {
+        PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer
+            if allow_insecure_local_db(&options)? =>
+        {
+            Ok(options)
+        }
+        PgSslMode::Disable | PgSslMode::Allow | PgSslMode::Prefer => Err(anyhow::anyhow!(
+            "PostgreSQL sslmode must be require, verify-ca, or verify-full (or set ALLOW_INSECURE_LOCAL_DB=true for localhost/dev Docker)"
+        )),
+        PgSslMode::Require | PgSslMode::VerifyCa | PgSslMode::VerifyFull => Ok(options),
+    }
+}
+
+fn allow_insecure_local_db(options: &PgConnectOptions) -> anyhow::Result<bool> {
+    if !parse_bool_env("ALLOW_INSECURE_LOCAL_DB", false)? {
+        return Ok(false);
+    }
+
+    Ok(is_local_db_target(options))
+}
+
+fn is_local_db_target(options: &PgConnectOptions) -> bool {
+    if options.get_socket().is_some() {
+        return true;
+    }
+
+    matches!(
+        options.get_host(),
+        "localhost" | "127.0.0.1" | "::1" | "postgres" | "host.docker.internal"
+    )
+}
+
+fn load_ves_security_profile(secrets: &dyn SecretsProvider) -> anyhow::Result<String> {
+    let profile = secrets
+        .ves_sequencer_security_profile()?
+        .unwrap_or_else(|| "legacy".to_string());
+    let profile = profile.trim().to_ascii_lowercase();
+    match profile.as_str() {
+        "legacy" | "hybrid" | "pqc-strict" => Ok(profile),
+        _ => Err(anyhow::anyhow!(
+            "invalid VES_SEQUENCER_SECURITY_PROFILE: {profile}"
+        )),
+    }
 }
 
 /// Connect to PostgreSQL with retry logic for startup resilience.
@@ -958,8 +1008,12 @@ pub async fn run() -> anyhow::Result<()> {
     let agent_key_registry = Arc::new(
         PgAgentKeyRegistry::new(pool.clone()).with_cache(cache_manager.agent_keys.clone()),
     );
+    let security_profile = load_ves_security_profile(secrets.as_ref())?;
+    info!(security_profile = %security_profile, "VES security profile configured");
     let mut ves_sequencer = VesSequencer::new(pool.clone(), agent_key_registry.clone());
     let mut ves_sequencer_reader = VesSequencer::new(pool.clone(), agent_key_registry.clone());
+    ves_sequencer = ves_sequencer.with_security_profile(security_profile.clone());
+    ves_sequencer_reader = ves_sequencer_reader.with_security_profile(security_profile.clone());
     if let Some(sequencer_id) = load_ves_sequencer_id(secrets.as_ref())? {
         info!("VES sequencer id configured: {}", sequencer_id);
         ves_sequencer = ves_sequencer.with_sequencer_id(sequencer_id);
@@ -1333,11 +1387,7 @@ fn load_ves_signing_config(
 ) -> anyhow::Result<Option<crate::crypto::pqc_signing::SequencerSigningConfig>> {
     use crate::crypto::pqc_signing::{SequencerSigningConfig, SignatureScheme};
 
-    let profile = secrets
-        .ves_sequencer_security_profile()
-        .map_err(|e| anyhow::anyhow!("failed to load VES_SEQUENCER_SECURITY_PROFILE: {e}"))?
-        .unwrap_or_else(|| "legacy".to_string());
-
+    let profile = load_ves_security_profile(secrets)?;
     let receipt_scheme = match profile.to_lowercase().as_str() {
         "hybrid" => SignatureScheme::Ed25519MlDsa65,
         "pqc-strict" => SignatureScheme::MlDsa65,
@@ -1348,12 +1398,18 @@ fn load_ves_signing_config(
     let ml_dsa_seed_hex = secrets
         .ves_sequencer_ml_dsa_seed()
         .map_err(|e| anyhow::anyhow!("failed to load VES_SEQUENCER_ML_DSA_SEED: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!(
-            "VES_SEQUENCER_ML_DSA_SEED is required when security profile is {profile}"
-        ))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "VES_SEQUENCER_ML_DSA_SEED is required when security profile is {profile}"
+            )
+        })?;
 
-    let seed_bytes = hex::decode(ml_dsa_seed_hex.strip_prefix("0x").unwrap_or(&ml_dsa_seed_hex))
-        .map_err(|e| anyhow::anyhow!("invalid VES_SEQUENCER_ML_DSA_SEED hex: {e}"))?;
+    let seed_bytes = hex::decode(
+        ml_dsa_seed_hex
+            .strip_prefix("0x")
+            .unwrap_or(&ml_dsa_seed_hex),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid VES_SEQUENCER_ML_DSA_SEED hex: {e}"))?;
     if seed_bytes.len() != 32 {
         return Err(anyhow::anyhow!(
             "VES_SEQUENCER_ML_DSA_SEED must be 32 bytes, got {}",
@@ -1782,6 +1838,40 @@ mod tests {
         assert!(allowlist.iter().any(|entry| entry.matches(cidr_match)));
 
         std::env::remove_var("ADMIN_IP_ALLOWLIST");
+    }
+
+    #[test]
+    #[serial]
+    fn parse_secure_pg_connect_options_rejects_local_insecure_db_by_default() {
+        std::env::remove_var("ALLOW_INSECURE_LOCAL_DB");
+
+        let err = parse_secure_pg_connect_options("postgres://localhost/stateset_sequencer")
+            .expect_err("localhost without SSL should be rejected by default");
+        assert!(err.to_string().contains("ALLOW_INSECURE_LOCAL_DB"));
+    }
+
+    #[test]
+    #[serial]
+    fn parse_secure_pg_connect_options_allows_local_insecure_db_with_opt_in() {
+        std::env::set_var("ALLOW_INSECURE_LOCAL_DB", "true");
+
+        let options = parse_secure_pg_connect_options("postgres://localhost/stateset_sequencer")
+            .expect("localhost without SSL should be allowed with explicit opt-in");
+        assert_eq!(options.get_host(), "localhost");
+
+        std::env::remove_var("ALLOW_INSECURE_LOCAL_DB");
+    }
+
+    #[test]
+    #[serial]
+    fn parse_secure_pg_connect_options_still_rejects_remote_insecure_db_with_opt_in() {
+        std::env::set_var("ALLOW_INSECURE_LOCAL_DB", "true");
+
+        let err = parse_secure_pg_connect_options("postgres://db.example.com/stateset_sequencer")
+            .expect_err("remote hosts should still require SSL");
+        assert!(err.to_string().contains("sslmode must be require"));
+
+        std::env::remove_var("ALLOW_INSECURE_LOCAL_DB");
     }
 
     #[tokio::test]

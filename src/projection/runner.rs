@@ -669,8 +669,8 @@ impl CheckpointStore for InMemoryCheckpointStore {
         checkpoints.insert(
             key,
             ProjectionCheckpoint {
-                tenant_id: tenant_id.clone(),
-                store_id: store_id.clone(),
+                tenant_id: *tenant_id,
+                store_id: *store_id,
                 last_sequence: sequence,
                 updated_at: chrono::Utc::now(),
             },

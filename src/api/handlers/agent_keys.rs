@@ -11,7 +11,8 @@ use crate::api::types::RegisterAgentKeyRequest;
 use crate::api::utils::internal_error;
 use crate::auth::{AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, AuthContextExt};
 use crate::crypto::pqc_signing::{
-    KeyAlgorithm, ParsedSignatureBundle, PublicKeyBundle, verify_proof_of_possession,
+    validate_key_algorithm_for_profile, verify_proof_of_possession, KeyAlgorithm,
+    ParsedSignatureBundle, PublicKeyBundle,
 };
 use crate::server::AppState;
 
@@ -43,6 +44,16 @@ pub async fn register_agent_key(
 
     // Parse key algorithm (VES-PQC-1)
     let key_algorithm = KeyAlgorithm::from_i32(request.key_algorithm.unwrap_or(0));
+    let security_profile = state.ves_sequencer.security_profile();
+    validate_key_algorithm_for_profile(key_algorithm, security_profile).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "key_algorithm {:?} is not allowed under the {} profile",
+                key_algorithm, security_profile
+            ),
+        )
+    })?;
 
     // Parse the hex-encoded public key (legacy Ed25519 field)
     let public_key_bytes = decode_hex(&request.public_key, "public_key")?;
@@ -139,7 +150,8 @@ pub async fn register_agent_key(
     if pop_required && pop_bundle.is_none() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "Proof of possession is required for hybrid and pqc-strict key registrations".to_string(),
+            "Proof of possession is required for hybrid and pqc-strict key registrations"
+                .to_string(),
         ));
     }
 

@@ -235,8 +235,8 @@ mod tests {
         let tenant_id = TenantId::new();
         let store_id = StoreId::new();
         let first = BatchCommitment::new(
-            tenant_id.clone(),
-            store_id.clone(),
+            tenant_id,
+            store_id,
             [0u8; 32],
             [1u8; 32],
             [2u8; 32],

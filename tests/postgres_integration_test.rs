@@ -3,6 +3,8 @@
 //! These are ignored by default and are intended to run in CI (or locally)
 //! with `DATABASE_URL` set.
 
+#![allow(clippy::clone_on_copy)]
+
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;

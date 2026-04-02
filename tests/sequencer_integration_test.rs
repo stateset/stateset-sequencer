@@ -6,6 +6,8 @@
 //! - Event storage and retrieval
 //! - Commitment creation
 
+#![allow(clippy::clone_on_copy)]
+
 mod common;
 
 use chrono::Utc;

@@ -430,15 +430,7 @@ mod tests {
     fn merge_unique_ves_commitments_dedupes_and_sorts() {
         let tenant_id = TenantId::new();
         let store_id = StoreId::new();
-        let first = VesBatchCommitment::new(
-            tenant_id.clone(),
-            store_id.clone(),
-            1,
-            1,
-            1,
-            [1u8; 32],
-            (1, 1),
-        );
+        let first = VesBatchCommitment::new(tenant_id, store_id, 1, 1, 1, [1u8; 32], (1, 1));
         let second = VesBatchCommitment::new(tenant_id, store_id, 1, 1, 1, [2u8; 32], (2, 2));
 
         let merged = merge_unique_ves_commitments(

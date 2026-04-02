@@ -35,6 +35,7 @@ mod ves_compliance;
 mod ves_validity;
 mod x402_batch_worker;
 
+pub use anchor_worker::{spawn_anchor_worker, AnchorWorkerConfig, AnchorWorkerMessage};
 pub use audit::{AuditAction, AuditLogBuilder, AuditLogEntry, AuditQueryFilters, PgAuditLogger};
 pub use batch::{
     batch_check_existing_command_ids, batch_check_existing_event_ids, batch_reserve_command_ids,
@@ -73,7 +74,6 @@ pub use traits::*;
 pub use ves_commitment::PgVesCommitmentEngine;
 pub use ves_compliance::{PgVesComplianceProofStore, VesComplianceEventInputs};
 pub use ves_validity::PgVesValidityProofStore;
-pub use anchor_worker::{spawn_anchor_worker, AnchorWorkerConfig, AnchorWorkerMessage};
 pub use x402_batch_worker::{
     spawn_batch_worker, BatchWorkerMessage, X402BatchWorker, X402BatchWorkerConfig,
 };

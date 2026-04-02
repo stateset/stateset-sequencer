@@ -11,6 +11,7 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - DATABASE_URL=postgres://sequencer:sequencer@postgres:5432/stateset_sequencer
+      - ALLOW_INSECURE_LOCAL_DB=true
       - RUST_LOG=info
       - HOST=0.0.0.0
       - PORT=8080

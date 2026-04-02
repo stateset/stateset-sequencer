@@ -878,9 +878,10 @@ pub async fn ingest_ves_events(
                     } else {
                         None
                     },
-                    receipt_signature_bundle: r.receipt_signature_bundle.as_ref().map(|b| {
-                        serde_json::to_value(b).unwrap_or_default()
-                    }),
+                    receipt_signature_bundle: r
+                        .receipt_signature_bundle
+                        .as_ref()
+                        .map(|b| serde_json::to_value(b).unwrap_or_default()),
                 })
                 .collect();
 

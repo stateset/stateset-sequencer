@@ -69,7 +69,7 @@ enum ReplayLookup {
     Missing,
     DifferentContents,
     ExactReplayMissingReceipt,
-    ExactReplay(VesSequencerReceipt),
+    ExactReplay(Box<VesSequencerReceipt>),
 }
 
 /// Rejection reason for VES events
@@ -174,6 +174,8 @@ pub struct VesSequencer<R: AgentKeyRegistry> {
     signing_config: Option<crate::crypto::pqc_signing::SequencerSigningConfig>,
     /// Key rotation index for the signing key (monotonic)
     sequencer_key_version: u32,
+    /// Effective runtime security profile for ingest and receipt validation.
+    security_profile: String,
     /// Enforce strict formatting for VES hex/base64url fields
     strict_format_validation: bool,
 }
@@ -359,6 +361,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             sequencer_signing_key: None,
             signing_config: None,
             sequencer_key_version: 0,
+            security_profile: "legacy".to_string(),
             strict_format_validation: Self::strict_format_from_env(),
         }
     }
@@ -379,9 +382,23 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     ///
     /// When set, receipts will be signed with the configured profile
     /// (hybrid Ed25519+ML-DSA-65 or PQC-strict ML-DSA-65).
-    pub fn with_signing_config(mut self, config: crate::crypto::pqc_signing::SequencerSigningConfig) -> Self {
+    pub fn with_signing_config(
+        mut self,
+        config: crate::crypto::pqc_signing::SequencerSigningConfig,
+    ) -> Self {
         self.signing_config = Some(config);
         self
+    }
+
+    /// Set the runtime security profile used to validate ingest payloads.
+    pub fn with_security_profile(mut self, profile: impl Into<String>) -> Self {
+        self.security_profile = profile.into().trim().to_ascii_lowercase();
+        self
+    }
+
+    /// Return the active runtime security profile.
+    pub fn security_profile(&self) -> &str {
+        &self.security_profile
     }
 
     /// Set the signing key version (monotonic rotation index, Section 10.5)
@@ -594,7 +611,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         }
 
         match self.get_existing_receipt(tx, incoming.event_id).await? {
-            Some(receipt) => Ok(ReplayLookup::ExactReplay(receipt)),
+            Some(receipt) => Ok(ReplayLookup::ExactReplay(Box::new(receipt))),
             None => Ok(ReplayLookup::ExactReplayMissingReceipt),
         }
     }
@@ -660,11 +677,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         // Accepted HPKE modes: legacy "base" and PQC "hybrid-base" / "pqc-base"
         const ACCEPTED_HPKE_MODES: &[&str] = &["base", "hybrid-base", "pqc-base"];
         // Accepted KEM algorithms: legacy X25519, hybrid, and PQC-strict
-        const ACCEPTED_HPKE_KEMS: &[&str] = &[
-            "X25519-HKDF-SHA256",
-            "x25519+mlkem768",
-            "mlkem768",
-        ];
+        const ACCEPTED_HPKE_KEMS: &[&str] = &["X25519-HKDF-SHA256", "x25519+mlkem768", "mlkem768"];
         const EXPECTED_HPKE_KDF: &str = "HKDF-SHA256";
         const RECIPIENT_ENC_SIZE: usize = 32;
         const RECIPIENT_CT_SIZE: usize = 48;
@@ -707,7 +720,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         if !ACCEPTED_HPKE_MODES.contains(&encrypted.hpke.mode.as_str()) {
             return Some(reject(
                 "payload_encrypted.hpke.mode",
-                format!("hpke.mode must be one of: {}", ACCEPTED_HPKE_MODES.join(", ")),
+                format!(
+                    "hpke.mode must be one of: {}",
+                    ACCEPTED_HPKE_MODES.join(", ")
+                ),
             ));
         }
 
@@ -730,6 +746,22 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 "payload_encrypted.hpke.aead",
                 format!("hpke.aead must be {}", EXPECTED_AEAD),
             ));
+        }
+
+        let encrypted_value = match serde_json::to_value(encrypted) {
+            Ok(value) => value,
+            Err(error) => {
+                return Some(reject(
+                    "payload_encrypted",
+                    format!("failed to encode encrypted payload metadata: {error}"),
+                ))
+            }
+        };
+        if let Err(error) = crate::crypto::pqc_encrypt::validate_wrap_scheme_for_profile(
+            &encrypted_value,
+            &self.security_profile,
+        ) {
+            return Some(reject("payload_encrypted", error.to_string()));
         }
 
         let nonce = match decode_base64("payload_encrypted.nonce_b64u", &encrypted.nonce_b64u) {
@@ -974,6 +1006,19 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         let signature_scheme = crate::crypto::pqc_signing::SignatureScheme::from_i32(
             event.agent_signature_scheme.unwrap_or(0),
         );
+        if let Err(_error) = crate::crypto::pqc_signing::validate_signature_scheme_for_profile(
+            signature_scheme,
+            &self.security_profile,
+        ) {
+            return Some(VesRejectedEvent {
+                event_id: event.event_id,
+                reason: VesRejectionReason::InvalidSignature,
+                message: format!(
+                    "Agent signature scheme {:?} is not allowed under the {} profile",
+                    signature_scheme, self.security_profile
+                ),
+            });
+        }
 
         tracing::debug!(
             event_id = %event.event_id,
@@ -1266,41 +1311,50 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         );
 
         // Sign the receipt — prefer PQC signing config, fall back to legacy Ed25519
-        let (signature_alg, sequencer_signature, receipt_signature_scheme, receipt_signature_bundle) =
-            if let Some(ref config) = self.signing_config {
-                match config.sign_receipt(&receipt_hash) {
-                    Ok((scheme, legacy_sig, bundle)) => {
-                        let ed_sig = if legacy_sig.len() == 64 {
-                            let mut arr = [0u8; 64];
-                            arr.copy_from_slice(&legacy_sig);
-                            Some(arr)
-                        } else {
-                            None
-                        };
+        let (
+            signature_alg,
+            sequencer_signature,
+            receipt_signature_scheme,
+            receipt_signature_bundle,
+        ) = if let Some(ref config) = self.signing_config {
+            match config.sign_receipt(&receipt_hash) {
+                Ok((scheme, legacy_sig, bundle)) => {
+                    let ed_sig = if legacy_sig.len() == 64 {
+                        let mut arr = [0u8; 64];
+                        arr.copy_from_slice(&legacy_sig);
+                        Some(arr)
+                    } else {
+                        None
+                    };
+                    (format!("{:?}", scheme), ed_sig, scheme as i32, bundle)
+                }
+                Err(e) => {
+                    // SECURITY: Do not silently downgrade to unsigned receipts.
+                    // If PQC signing is configured but fails, this is a operational error
+                    // that must be visible. Fall back to Ed25519-only if available.
+                    tracing::error!(error = ?e, "PQC receipt signing failed");
+                    if let Some(ref key) = self.sequencer_signing_key {
                         (
-                            format!("{:?}", scheme),
-                            ed_sig,
-                            scheme as i32,
-                            bundle,
+                            "ed25519-fallback".to_string(),
+                            Some(key.sign(&receipt_hash)),
+                            1,
+                            None,
                         )
-                    }
-                    Err(e) => {
-                        // SECURITY: Do not silently downgrade to unsigned receipts.
-                        // If PQC signing is configured but fails, this is a operational error
-                        // that must be visible. Fall back to Ed25519-only if available.
-                        tracing::error!(error = ?e, "PQC receipt signing failed");
-                        if let Some(ref key) = self.sequencer_signing_key {
-                            ("ed25519-fallback".to_string(), Some(key.sign(&receipt_hash)), 1, None)
-                        } else {
-                            ("none".to_string(), None, 0, None)
-                        }
+                    } else {
+                        ("none".to_string(), None, 0, None)
                     }
                 }
-            } else if let Some(ref key) = self.sequencer_signing_key {
-                ("ed25519".to_string(), Some(key.sign(&receipt_hash)), 1, None)
-            } else {
-                ("none".to_string(), None, 0, None)
-            };
+            }
+        } else if let Some(ref key) = self.sequencer_signing_key {
+            (
+                "ed25519".to_string(),
+                Some(key.sign(&receipt_hash)),
+                1,
+                None,
+            )
+        } else {
+            ("none".to_string(), None, 0, None)
+        };
 
         VesSequencerReceipt {
             sequencer_id: self.sequencer_id,
@@ -1325,8 +1379,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         }
 
         let batch_id = Uuid::new_v4();
-        let tenant_id = events[0].tenant_id.clone();
-        let store_id = events[0].store_id.clone();
+        let tenant_id = events[0].tenant_id;
+        let store_id = events[0].store_id;
 
         // Enforce single-tenant/store batches.
         for e in &events {
@@ -1449,9 +1503,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             if let Some(cmd_id) = event.command_id {
                 if duplicate_command_ids.contains(&cmd_id) {
                     match self.classify_replay(&mut tx, &event).await? {
-                        ReplayLookup::ExactReplay(receipt) => {
-                            receipts.push(receipt);
-                        }
+                        ReplayLookup::ExactReplay(receipt) => receipts.push(*receipt),
                         ReplayLookup::ExactReplayMissingReceipt => {
                             rejected.push(VesRejectedEvent {
                                 event_id: event.event_id,
@@ -1546,7 +1598,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                     }
                 }
                 match replay {
-                    ReplayLookup::ExactReplay(receipt) => receipts.push(receipt),
+                    ReplayLookup::ExactReplay(receipt) => receipts.push(*receipt),
                     ReplayLookup::ExactReplayMissingReceipt => rejected.push(VesRejectedEvent {
                         event_id: sequenced.event_id(),
                         reason: VesRejectionReason::DuplicateEventId,
@@ -1946,6 +1998,7 @@ mod tests {
             sequencer_signing_key: None,
             signing_config: None,
             sequencer_key_version: 0,
+            security_profile: "legacy".to_string(),
             strict_format_validation: strict_format,
         }
     }
@@ -2281,6 +2334,56 @@ mod tests {
             }
             other => panic!("unexpected rejection: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_legacy_signature_under_hybrid_profile() {
+        let signing_key = AgentSigningKey::generate();
+        let event = VesEventEnvelope::new_plaintext(
+            TenantId::new(),
+            StoreId::new(),
+            AgentId::new(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({"amount": 100}),
+            &signing_key,
+        );
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, false).with_security_profile("hybrid");
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+        assert!(matches!(
+            rejection.reason,
+            VesRejectionReason::InvalidSignature
+        ));
+        assert!(rejection.message.contains("hybrid profile"));
+    }
+
+    #[tokio::test]
+    async fn validate_event_rejects_legacy_wrap_under_hybrid_profile() {
+        let signing_key = AgentSigningKey::generate();
+        let event = build_encrypted_event(&signing_key, valid_payload_encrypted());
+
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        register_key(&registry, &event, &signing_key).await;
+        let sequencer = sequencer(registry, false).with_security_profile("hybrid");
+
+        let rejection = sequencer
+            .validate_event(&event)
+            .await
+            .expect("expected rejection");
+        match rejection.reason {
+            VesRejectionReason::SchemaValidation(field) => assert_eq!(field, "payload_encrypted"),
+            other => panic!("unexpected rejection: {:?}", other),
+        }
+        assert!(rejection.message.contains("hybrid profile"));
     }
 
     #[tokio::test]

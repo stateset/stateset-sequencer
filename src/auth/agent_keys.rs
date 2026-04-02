@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use uuid::Uuid;
 
-use crate::crypto::{AgentVerifyingKey, PublicKey32, SigningError};
 use crate::crypto::pqc_signing::{KeyAlgorithm, PublicKeyBundle, VerificationKey};
+use crate::crypto::{AgentVerifyingKey, PublicKey32, SigningError};
 use crate::domain::{AgentId, AgentKeyId, TenantId};
 
 /// Status of an agent signing key

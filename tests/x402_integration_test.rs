@@ -6,6 +6,8 @@
 //! 3. Batch creation and Merkle root computation
 //! 4. Receipt generation with inclusion proofs
 
+#![allow(clippy::clone_on_copy)]
+
 mod common;
 
 use chrono::Utc;

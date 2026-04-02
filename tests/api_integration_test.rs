@@ -3,6 +3,8 @@
 //! These tests verify the HTTP endpoints work correctly with the full application stack.
 //! They require DATABASE_URL to be set and run with `cargo test -- --ignored`.
 
+#![allow(clippy::clone_on_copy)]
+
 mod common;
 
 use axum::body::Body;

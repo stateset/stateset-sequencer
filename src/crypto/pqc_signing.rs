@@ -10,10 +10,7 @@ use crate::crypto::hash::Hash256;
 use crate::crypto::signing::{AgentVerifyingKey, PublicKey32, Signature64, SigningError};
 
 #[cfg(feature = "pqc")]
-use ml_dsa::{
-    signature::Verifier as MlDsaVerifier, EncodedVerifyingKey as MlDsaEncodedVerifyingKey,
-    MlDsa65, Signature as MlDsaSignature, VerifyingKey as MlDsaVerifyingKey,
-};
+use crate::crypto::pqc_backend::{sign_ml_dsa_65, verify_ml_dsa_65};
 
 /// Signature scheme identifier matching the proto `SignatureScheme` enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,6 +35,10 @@ impl SignatureScheme {
             3 => Self::Ed25519MlDsa65,
             _ => Self::Unspecified,
         }
+    }
+
+    pub fn is_pqc(&self) -> bool {
+        matches!(self, Self::MlDsa65 | Self::Ed25519MlDsa65)
     }
 }
 
@@ -76,6 +77,37 @@ impl KeyAlgorithm {
     pub fn has_ed25519(&self) -> bool {
         matches!(self, Self::Ed25519 | Self::Ed25519MlDsa65)
     }
+
+    pub fn is_pqc(&self) -> bool {
+        matches!(
+            self,
+            Self::MlDsa65 | Self::MlKem768 | Self::Ed25519MlDsa65 | Self::X25519MlKem768
+        )
+    }
+}
+
+pub fn validate_signature_scheme_for_profile(
+    scheme: SignatureScheme,
+    profile: &str,
+) -> Result<(), SigningError> {
+    match profile {
+        "pqc-strict" if scheme != SignatureScheme::MlDsa65 => Err(SigningError::VerificationFailed),
+        "hybrid" if !scheme.is_pqc() => Err(SigningError::VerificationFailed),
+        _ => Ok(()),
+    }
+}
+
+pub fn validate_key_algorithm_for_profile(
+    algorithm: KeyAlgorithm,
+    profile: &str,
+) -> Result<(), SigningError> {
+    match profile {
+        "pqc-strict" if !matches!(algorithm, KeyAlgorithm::MlDsa65 | KeyAlgorithm::MlKem768) => {
+            Err(SigningError::VerificationFailed)
+        }
+        "hybrid" if !algorithm.is_pqc() => Err(SigningError::VerificationFailed),
+        _ => Ok(()),
+    }
 }
 
 /// Parsed public key bundle for algorithm-aware verification.
@@ -101,9 +133,7 @@ pub enum VerificationKey {
         ml_dsa_65_public_key: Vec<u8>,
     },
     /// PQC-strict ML-DSA-65 only.
-    Strict {
-        ml_dsa_65_public_key: Vec<u8>,
-    },
+    Strict { ml_dsa_65_public_key: Vec<u8> },
 }
 
 impl VerificationKey {
@@ -123,8 +153,7 @@ impl VerificationKey {
                 Ok(Self::Legacy(AgentVerifyingKey::from_bytes(&pk)?))
             }
             KeyAlgorithm::Ed25519MlDsa65 => {
-                let bundle = public_key_bundle
-                    .ok_or(SigningError::InvalidPublicKeyFormat)?;
+                let bundle = public_key_bundle.ok_or(SigningError::InvalidPublicKeyFormat)?;
                 let ed25519_pk = bundle
                     .ed25519_public_key
                     .ok_or(SigningError::InvalidPublicKeyFormat)?;
@@ -198,7 +227,10 @@ pub fn verify_with_key(
         // Hybrid: both Ed25519 and ML-DSA-65 must verify
         (
             SignatureScheme::Ed25519MlDsa65,
-            VerificationKey::Hybrid { ed25519, ml_dsa_65_public_key },
+            VerificationKey::Hybrid {
+                ed25519,
+                ml_dsa_65_public_key,
+            },
         ) => {
             let sig_bundle = bundle.ok_or(SigningError::InvalidSignatureFormat)?;
 
@@ -231,7 +263,9 @@ pub fn verify_with_key(
         // PQC-strict: ML-DSA-65 only
         (
             SignatureScheme::MlDsa65,
-            VerificationKey::Strict { ml_dsa_65_public_key },
+            VerificationKey::Strict {
+                ml_dsa_65_public_key,
+            },
         ) => {
             let sig_bundle = bundle.ok_or(SigningError::InvalidSignatureFormat)?;
 
@@ -266,24 +300,6 @@ pub fn verify_with_key(
 
         _ => Err(SigningError::VerificationFailed),
     }
-}
-
-/// Verify an ML-DSA-65 signature.
-#[cfg(feature = "pqc")]
-fn verify_ml_dsa_65(
-    message: &[u8; 32],
-    signature: &[u8],
-    public_key: &[u8],
-) -> Result<(), SigningError> {
-    let encoded_vk = MlDsaEncodedVerifyingKey::<MlDsa65>::try_from(public_key)
-        .map_err(|_| SigningError::InvalidPublicKeyFormat)?;
-    let vk = MlDsaVerifyingKey::decode(&encoded_vk);
-
-    let sig = MlDsaSignature::<MlDsa65>::try_from(signature)
-        .map_err(|_| SigningError::InvalidSignatureFormat)?;
-
-    vk.verify(message, &sig)
-        .map_err(|_| SigningError::VerificationFailed)
 }
 
 // ===========================================================================
@@ -326,33 +342,37 @@ impl SequencerSigningConfig {
     ) -> Result<(SignatureScheme, Vec<u8>, Option<ParsedSignatureBundle>), SigningError> {
         match self.receipt_scheme {
             SignatureScheme::Unspecified | SignatureScheme::Ed25519 => {
-                let key = self.ed25519_key.as_ref().ok_or(SigningError::SigningFailed(
-                    "No Ed25519 signing key configured".to_string(),
-                ))?;
+                let key = self
+                    .ed25519_key
+                    .as_ref()
+                    .ok_or(SigningError::SigningFailed(
+                        "No Ed25519 signing key configured".to_string(),
+                    ))?;
                 let sig = key.sign(receipt_hash);
                 Ok((SignatureScheme::Ed25519, sig.to_vec(), None))
             }
 
             #[cfg(feature = "pqc")]
             SignatureScheme::Ed25519MlDsa65 => {
-                let ed_key = self.ed25519_key.as_ref().ok_or(SigningError::SigningFailed(
-                    "No Ed25519 signing key configured".to_string(),
-                ))?;
+                let ed_key = self
+                    .ed25519_key
+                    .as_ref()
+                    .ok_or(SigningError::SigningFailed(
+                        "No Ed25519 signing key configured".to_string(),
+                    ))?;
                 let ed_sig = ed_key.sign(receipt_hash);
 
                 let ml_seed = self.ml_dsa_65_seed.ok_or(SigningError::SigningFailed(
                     "No ML-DSA-65 seed configured".to_string(),
                 ))?;
-                let ml_sk = <MlDsa65 as ml_dsa::KeyGen>::from_seed(&ml_seed.into());
-                let ml_sig: MlDsaSignature<MlDsa65> = ml_dsa::signature::Signer::try_sign(&ml_sk, receipt_hash)
-                    .map_err(|e| SigningError::SigningFailed(e.to_string()))?;
+                let ml_sig = sign_ml_dsa_65(&ml_seed, receipt_hash)?;
 
                 Ok((
                     SignatureScheme::Ed25519MlDsa65,
                     ed_sig.to_vec(),
                     Some(ParsedSignatureBundle {
                         ed25519_signature: Some(ed_sig.to_vec()),
-                        ml_dsa_65_signature: Some(ml_sig.encode().as_slice().to_vec()),
+                        ml_dsa_65_signature: Some(ml_sig),
                     }),
                 ))
             }
@@ -362,16 +382,14 @@ impl SequencerSigningConfig {
                 let ml_seed = self.ml_dsa_65_seed.ok_or(SigningError::SigningFailed(
                     "No ML-DSA-65 seed configured".to_string(),
                 ))?;
-                let ml_sk = <MlDsa65 as ml_dsa::KeyGen>::from_seed(&ml_seed.into());
-                let ml_sig: MlDsaSignature<MlDsa65> = ml_dsa::signature::Signer::try_sign(&ml_sk, receipt_hash)
-                    .map_err(|e| SigningError::SigningFailed(e.to_string()))?;
+                let ml_sig = sign_ml_dsa_65(&ml_seed, receipt_hash)?;
 
                 Ok((
                     SignatureScheme::MlDsa65,
                     Vec::new(),
                     Some(ParsedSignatureBundle {
                         ed25519_signature: None,
-                        ml_dsa_65_signature: Some(ml_sig.encode().as_slice().to_vec()),
+                        ml_dsa_65_signature: Some(ml_sig),
                     }),
                 ))
             }
@@ -424,8 +442,13 @@ pub fn verify_proof_of_possession(
             let bundle = public_key_bundle.ok_or(SigningError::InvalidPublicKeyFormat)?;
             let pop_b = pop_bundle.ok_or(SigningError::InvalidSignatureFormat)?;
 
-            let ed_pk = bundle.ed25519_public_key.ok_or(SigningError::InvalidPublicKeyFormat)?;
-            let ml_pk = bundle.ml_dsa_65_public_key.as_ref().ok_or(SigningError::InvalidPublicKeyFormat)?;
+            let ed_pk = bundle
+                .ed25519_public_key
+                .ok_or(SigningError::InvalidPublicKeyFormat)?;
+            let ml_pk = bundle
+                .ml_dsa_65_public_key
+                .as_ref()
+                .ok_or(SigningError::InvalidPublicKeyFormat)?;
 
             // Challenge = SHA-256("VES_POP_V1" || ed25519_pk || ml_dsa_65_pk)
             let mut pk_bytes = Vec::with_capacity(32 + ml_pk.len());
@@ -434,12 +457,17 @@ pub fn verify_proof_of_possession(
             let challenge = compute_pop_challenge(&pk_bytes);
 
             // Verify Ed25519 component
-            let ed_sig = pop_b.ed25519_sig_64().ok_or(SigningError::InvalidSignatureFormat)?;
+            let ed_sig = pop_b
+                .ed25519_sig_64()
+                .ok_or(SigningError::InvalidSignatureFormat)?;
             let ed_vk = AgentVerifyingKey::from_bytes(&ed_pk)?;
             ed_vk.verify(&challenge, &ed_sig)?;
 
             // Verify ML-DSA-65 component
-            let ml_sig = pop_b.ml_dsa_65_signature.as_ref().ok_or(SigningError::InvalidSignatureFormat)?;
+            let ml_sig = pop_b
+                .ml_dsa_65_signature
+                .as_ref()
+                .ok_or(SigningError::InvalidSignatureFormat)?;
             verify_ml_dsa_65(&challenge, ml_sig, ml_pk)?;
 
             Ok(())
@@ -453,7 +481,13 @@ pub fn verify_proof_of_possession(
             let challenge = compute_pop_challenge(ml_pk);
             let ml_sig_from_bundle = pop_bundle.and_then(|b| b.ml_dsa_65_signature.clone());
             let ml_sig = ml_sig_from_bundle
-                .or_else(|| if pop.is_empty() { None } else { Some(pop.to_vec()) })
+                .or_else(|| {
+                    if pop.is_empty() {
+                        None
+                    } else {
+                        Some(pop.to_vec())
+                    }
+                })
                 .ok_or(SigningError::InvalidSignatureFormat)?;
             verify_ml_dsa_65(&challenge, &ml_sig, ml_pk)
         }
@@ -500,7 +534,10 @@ mod tests {
         assert_eq!(SignatureScheme::from_i32(0), SignatureScheme::Unspecified);
         assert_eq!(SignatureScheme::from_i32(1), SignatureScheme::Ed25519);
         assert_eq!(SignatureScheme::from_i32(2), SignatureScheme::MlDsa65);
-        assert_eq!(SignatureScheme::from_i32(3), SignatureScheme::Ed25519MlDsa65);
+        assert_eq!(
+            SignatureScheme::from_i32(3),
+            SignatureScheme::Ed25519MlDsa65
+        );
         assert_eq!(SignatureScheme::from_i32(99), SignatureScheme::Unspecified);
     }
 
@@ -537,29 +574,35 @@ mod tests {
     #[cfg(feature = "pqc")]
     mod pqc_tests {
         use super::*;
+        use crate::crypto::pqc_backend::ml_dsa_65_public_key_from_seed;
         use crate::crypto::signing::AgentSigningKey;
-        use ml_dsa::{KeyGen, MlDsa65, signature::Signer as MlDsaSigner};
+        use sha2::{Digest, Sha256};
+
+        const TEST_VECTOR_SIGNING_SEED: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
 
         fn generate_hybrid_keypair() -> (AgentSigningKey, [u8; 32], Vec<u8>) {
             let ed_key = AgentSigningKey::generate();
             let mut ml_seed = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut ml_seed);
-            let ml_sk = <MlDsa65 as KeyGen>::from_seed(&ml_seed.into());
-            let ml_pk = ml_dsa::signature::Keypair::verifying_key(&ml_sk)
-                .encode()
-                .as_slice()
-                .to_vec();
+            let ml_pk = ml_dsa_65_public_key_from_seed(&ml_seed);
             (ed_key, ml_seed, ml_pk)
         }
 
-        fn hybrid_sign(hash: &[u8; 32], ed_key: &AgentSigningKey, ml_seed: &[u8; 32]) -> (Vec<u8>, ParsedSignatureBundle) {
+        fn hybrid_sign(
+            hash: &[u8; 32],
+            ed_key: &AgentSigningKey,
+            ml_seed: &[u8; 32],
+        ) -> (Vec<u8>, ParsedSignatureBundle) {
             let ed_sig = ed_key.sign(hash);
-            let ml_sk = <MlDsa65 as KeyGen>::from_seed(&(*ml_seed).into());
-            let ml_sig: ml_dsa::Signature<MlDsa65> = ml_sk.try_sign(hash).unwrap();
+            let ml_sig = sign_ml_dsa_65(ml_seed, hash).unwrap();
             let legacy = ed_sig.to_vec();
             let bundle = ParsedSignatureBundle {
                 ed25519_signature: Some(ed_sig.to_vec()),
-                ml_dsa_65_signature: Some(ml_sig.encode().as_slice().to_vec()),
+                ml_dsa_65_signature: Some(ml_sig),
             };
             (legacy, bundle)
         }
@@ -628,11 +671,7 @@ mod tests {
         fn strict_verify_with_key_roundtrip() {
             let mut ml_seed = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut ml_seed);
-            let ml_sk = <MlDsa65 as KeyGen>::from_seed(&ml_seed.into());
-            let ml_pk = ml_dsa::signature::Keypair::verifying_key(&ml_sk)
-                .encode()
-                .as_slice()
-                .to_vec();
+            let ml_pk = ml_dsa_65_public_key_from_seed(&ml_seed);
 
             let bundle = PublicKeyBundle {
                 ed25519_public_key: None,
@@ -640,28 +679,20 @@ mod tests {
                 x25519_public_key: None,
                 ml_kem_768_public_key: None,
             };
-            let vk = VerificationKey::from_key_entry(
-                KeyAlgorithm::MlDsa65,
-                &[0u8; 32],
-                Some(&bundle),
-            )
-            .unwrap();
+            let vk =
+                VerificationKey::from_key_entry(KeyAlgorithm::MlDsa65, &[0u8; 32], Some(&bundle))
+                    .unwrap();
 
             let hash = [0xCCu8; 32];
-            let ml_sig: ml_dsa::Signature<MlDsa65> = ml_sk.try_sign(&hash).unwrap();
             let sig_bundle = ParsedSignatureBundle {
                 ed25519_signature: None,
-                ml_dsa_65_signature: Some(ml_sig.encode().as_slice().to_vec()),
+                ml_dsa_65_signature: Some(sign_ml_dsa_65(&ml_seed, &hash).unwrap()),
             };
 
-            assert!(verify_with_key(
-                &hash,
-                SignatureScheme::MlDsa65,
-                &[],
-                Some(&sig_bundle),
-                &vk,
-            )
-            .is_ok());
+            assert!(
+                verify_with_key(&hash, SignatureScheme::MlDsa65, &[], Some(&sig_bundle), &vk,)
+                    .is_ok()
+            );
         }
 
         #[test]
@@ -670,12 +701,7 @@ mod tests {
             let mut ml_seed2 = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut ml_seed1);
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut ml_seed2);
-            let ml_sk = <MlDsa65 as KeyGen>::from_seed(&ml_seed1.into());
-            let ml_sk2 = <MlDsa65 as KeyGen>::from_seed(&ml_seed2.into());
-            let wrong_pk = ml_dsa::signature::Keypair::verifying_key(&ml_sk2)
-                .encode()
-                .as_slice()
-                .to_vec();
+            let wrong_pk = ml_dsa_65_public_key_from_seed(&ml_seed2);
 
             let bundle = PublicKeyBundle {
                 ed25519_public_key: None,
@@ -683,28 +709,20 @@ mod tests {
                 x25519_public_key: None,
                 ml_kem_768_public_key: None,
             };
-            let vk = VerificationKey::from_key_entry(
-                KeyAlgorithm::MlDsa65,
-                &[0u8; 32],
-                Some(&bundle),
-            )
-            .unwrap();
+            let vk =
+                VerificationKey::from_key_entry(KeyAlgorithm::MlDsa65, &[0u8; 32], Some(&bundle))
+                    .unwrap();
 
             let hash = [0xDDu8; 32];
-            let ml_sig: ml_dsa::Signature<MlDsa65> = ml_sk.try_sign(&hash).unwrap();
             let sig_bundle = ParsedSignatureBundle {
                 ed25519_signature: None,
-                ml_dsa_65_signature: Some(ml_sig.encode().as_slice().to_vec()),
+                ml_dsa_65_signature: Some(sign_ml_dsa_65(&ml_seed1, &hash).unwrap()),
             };
 
-            assert!(verify_with_key(
-                &hash,
-                SignatureScheme::MlDsa65,
-                &[],
-                Some(&sig_bundle),
-                &vk,
-            )
-            .is_err());
+            assert!(
+                verify_with_key(&hash, SignatureScheme::MlDsa65, &[], Some(&sig_bundle), &vk,)
+                    .is_err()
+            );
         }
 
         #[test]
@@ -729,23 +747,17 @@ mod tests {
             let hash = [0xEEu8; 32];
             let ed_sig = ed_key.sign(&hash);
 
-            assert!(verify_with_key(
-                &hash,
-                SignatureScheme::Ed25519,
-                &ed_sig,
-                None,
-                &vk,
-            )
-            .is_err(), "Hybrid key must reject legacy Ed25519-only signatures");
+            assert!(
+                verify_with_key(&hash, SignatureScheme::Ed25519, &ed_sig, None, &vk,).is_err(),
+                "Hybrid key must reject legacy Ed25519-only signatures"
+            );
         }
 
         #[test]
         fn strict_key_rejects_legacy_signature_scheme() {
             let mut ml_seed = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut ml_seed);
-            let ml_sk = <MlDsa65 as KeyGen>::from_seed(&ml_seed.into());
-            let ml_pk = ml_dsa::signature::Keypair::verifying_key(&ml_sk)
-                .encode().as_slice().to_vec();
+            let ml_pk = ml_dsa_65_public_key_from_seed(&ml_seed);
 
             let bundle = PublicKeyBundle {
                 ed25519_public_key: None,
@@ -753,24 +765,39 @@ mod tests {
                 x25519_public_key: None,
                 ml_kem_768_public_key: None,
             };
-            let vk = VerificationKey::from_key_entry(
-                KeyAlgorithm::MlDsa65,
-                &[0u8; 32],
-                Some(&bundle),
-            ).unwrap();
+            let vk =
+                VerificationKey::from_key_entry(KeyAlgorithm::MlDsa65, &[0u8; 32], Some(&bundle))
+                    .unwrap();
 
             // Strict key must reject Ed25519-only scheme
             let ed_key = AgentSigningKey::generate();
             let hash = [0xFFu8; 32];
             let ed_sig = ed_key.sign(&hash);
 
-            assert!(verify_with_key(
-                &hash,
-                SignatureScheme::Ed25519,
-                &ed_sig,
-                None,
-                &vk,
-            ).is_err(), "Strict key must reject Ed25519-only signatures");
+            assert!(
+                verify_with_key(&hash, SignatureScheme::Ed25519, &ed_sig, None, &vk,).is_err(),
+                "Strict key must reject Ed25519-only signatures"
+            );
+        }
+
+        #[test]
+        fn fixed_seed_public_key_is_deterministic() {
+            let pk1 = ml_dsa_65_public_key_from_seed(&TEST_VECTOR_SIGNING_SEED);
+            let pk2 = ml_dsa_65_public_key_from_seed(&TEST_VECTOR_SIGNING_SEED);
+            assert_eq!(pk1, pk2);
+            assert!(!pk1.is_empty());
+        }
+
+        #[test]
+        fn fixed_seed_public_key_matches_known_vector_digest() {
+            let public_key = ml_dsa_65_public_key_from_seed(&TEST_VECTOR_SIGNING_SEED);
+            assert_eq!(public_key.len(), 1952);
+
+            let digest = Sha256::digest(&public_key);
+            assert_eq!(
+                format!("0x{}", hex::encode(digest)),
+                "0xe933697f7a3d671b8c294452465230d4d433d337afd25b99dba884175541a855"
+            );
         }
 
         #[test]
@@ -817,7 +844,7 @@ mod tests {
                 KeyAlgorithm::Ed25519MlDsa65,
                 &ed_pk,
                 Some(&bundle),
-                &pop_bundle.ed25519_signature.as_ref().unwrap(),
+                pop_bundle.ed25519_signature.as_ref().unwrap(),
                 Some(&pop_bundle),
             )
             .is_ok());

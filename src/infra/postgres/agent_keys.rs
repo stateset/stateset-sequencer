@@ -19,6 +19,18 @@ pub struct PgAgentKeyRegistry {
     cache: Option<Arc<AgentKeyCache>>,
 }
 
+struct AgentKeyEntryFields {
+    public_key: Vec<u8>,
+    status: String,
+    valid_from: Option<DateTime<Utc>>,
+    valid_to: Option<DateTime<Utc>>,
+    revoked_at: Option<DateTime<Utc>>,
+    metadata: Option<String>,
+    created_at: DateTime<Utc>,
+    key_algorithm: Option<i16>,
+    public_key_bundle_bytes: Option<Vec<u8>>,
+}
+
 impl PgAgentKeyRegistry {
     /// Create a new PostgreSQL agent key registry
     pub fn new(pool: PgPool) -> Self {
@@ -79,45 +91,37 @@ impl PgAgentKeyRegistry {
     }
 
     /// Convert database row to AgentKeyEntry
-    fn row_to_entry(
-        public_key: Vec<u8>,
-        status: String,
-        valid_from: Option<DateTime<Utc>>,
-        valid_to: Option<DateTime<Utc>>,
-        revoked_at: Option<DateTime<Utc>>,
-        metadata: Option<String>,
-        created_at: DateTime<Utc>,
-        key_algorithm: Option<i16>,
-        public_key_bundle_bytes: Option<Vec<u8>>,
-    ) -> Result<AgentKeyEntry, AgentKeyError> {
-        let public_key: PublicKey32 = public_key
+    fn row_to_entry(row: AgentKeyEntryFields) -> Result<AgentKeyEntry, AgentKeyError> {
+        let public_key: PublicKey32 = row
+            .public_key
             .try_into()
             .map_err(|_| AgentKeyError::Internal("invalid public key length".into()))?;
 
-        let status = match status.as_str() {
+        let status = match row.status.as_str() {
             "active" => KeyStatus::Active,
             "revoked" => KeyStatus::Revoked,
             "expired" => KeyStatus::Expired,
             _ => KeyStatus::Active,
         };
 
-        let algorithm = crate::crypto::pqc_signing::KeyAlgorithm::from_i32(
-            i32::from(key_algorithm.unwrap_or(1)),
-        );
+        let algorithm = crate::crypto::pqc_signing::KeyAlgorithm::from_i32(i32::from(
+            row.key_algorithm.unwrap_or(1),
+        ));
 
-        let public_key_bundle: Option<crate::crypto::pqc_signing::PublicKeyBundle> =
-            public_key_bundle_bytes.and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let public_key_bundle: Option<crate::crypto::pqc_signing::PublicKeyBundle> = row
+            .public_key_bundle_bytes
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
 
         Ok(AgentKeyEntry {
             public_key,
             key_algorithm: algorithm,
             public_key_bundle,
             status,
-            valid_from,
-            valid_to,
-            revoked_at,
-            metadata,
-            created_at,
+            valid_from: row.valid_from,
+            valid_to: row.valid_to,
+            revoked_at: row.revoked_at,
+            metadata: row.metadata,
+            created_at: row.created_at,
         })
     }
 }
@@ -183,10 +187,28 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
         };
 
         match row {
-            Some((pk, status, valid_from, valid_to, revoked_at, metadata, created_at, key_alg, pk_bundle)) => {
-                let entry = match Self::row_to_entry(
-                    pk, status, valid_from, valid_to, revoked_at, metadata, created_at, key_alg, pk_bundle,
-                ) {
+            Some((
+                pk,
+                status,
+                valid_from,
+                valid_to,
+                revoked_at,
+                metadata,
+                created_at,
+                key_alg,
+                pk_bundle,
+            )) => {
+                let entry = match Self::row_to_entry(AgentKeyEntryFields {
+                    public_key: pk,
+                    status,
+                    valid_from,
+                    valid_to,
+                    revoked_at,
+                    metadata,
+                    created_at,
+                    key_algorithm: key_alg,
+                    public_key_bundle_bytes: pk_bundle,
+                }) {
                     Ok(entry) => entry,
                     Err(err) => {
                         if let Some(cache) = &self.cache {
@@ -378,10 +400,30 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
         .map_err(|e| AgentKeyError::Internal(e.to_string()))?;
 
         let mut result = Vec::with_capacity(rows.len());
-        for (key_id, pk, status, valid_from, valid_to, revoked_at, metadata, created_at, key_algorithm, public_key_bundle_bytes) in rows {
-            let entry = Self::row_to_entry(
-                pk, status, valid_from, valid_to, revoked_at, metadata, created_at, key_algorithm, public_key_bundle_bytes,
-            )?;
+        for (
+            key_id,
+            pk,
+            status,
+            valid_from,
+            valid_to,
+            revoked_at,
+            metadata,
+            created_at,
+            key_algorithm,
+            public_key_bundle_bytes,
+        ) in rows
+        {
+            let entry = Self::row_to_entry(AgentKeyEntryFields {
+                public_key: pk,
+                status,
+                valid_from,
+                valid_to,
+                revoked_at,
+                metadata,
+                created_at,
+                key_algorithm,
+                public_key_bundle_bytes,
+            })?;
             result.push((key_id as u32, entry));
         }
 

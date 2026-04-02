@@ -377,7 +377,7 @@ impl X402BatchWorker {
         );
 
         // Create batch
-        let mut batch = X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), network);
+        let mut batch = X402PaymentBatch::new(*tenant_id, *store_id, network);
 
         for intent in &intents {
             batch.add_payment(intent);

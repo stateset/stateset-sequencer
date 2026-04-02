@@ -319,8 +319,8 @@ pub async fn submit_payment_intent(
         intent_id,
         x402_version: 1,
         status: X402IntentStatus::Pending,
-        tenant_id: tenant_id.clone(),
-        store_id: store_id.clone(),
+        tenant_id,
+        store_id,
         source_agent_id: AgentId::from_uuid(payload.agent_id),
         agent_key_id: AgentKeyId::new(payload.agent_key_id.unwrap_or(1)),
         payer_address: payload.payer_address,
@@ -998,7 +998,7 @@ pub async fn create_batch(
     }
 
     // Create new batch
-    let mut batch = X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), payload.network);
+    let mut batch = X402PaymentBatch::new(tenant_id, store_id, payload.network);
 
     // Add intents to batch
     for intent in &intents {

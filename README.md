@@ -96,6 +96,7 @@ cargo build
 # Set required environment variables
 export DATABASE_URL="postgres://sequencer:sequencer@localhost:5433/stateset_sequencer"
 export BOOTSTRAP_ADMIN_API_KEY="dev_admin_key"
+export ALLOW_INSECURE_LOCAL_DB=true
 
 # Run the server (migrations run automatically)
 cargo run

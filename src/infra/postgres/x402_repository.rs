@@ -148,11 +148,7 @@ impl PgX402Repository {
     }
 
     /// Update multiple intent batch assignments atomically
-    pub async fn assign_intents_to_batch(
-        &self,
-        batch_id: Uuid,
-        intent_ids: &[Uuid],
-    ) -> Result<()> {
+    pub async fn assign_intents_to_batch(&self, batch_id: Uuid, intent_ids: &[Uuid]) -> Result<()> {
         if intent_ids.is_empty() {
             return Ok(());
         }
@@ -590,7 +586,11 @@ impl PgX402Repository {
         .bind(filter.payee_address.as_deref())
         .bind(filter.status.map(|s| s.to_string()))
         .bind(filter.network.map(|network| network.to_string()))
-        .bind(filter.asset.map(|asset| format!("{:?}", asset).to_lowercase()))
+        .bind(
+            filter
+                .asset
+                .map(|asset| format!("{:?}", asset).to_lowercase()),
+        )
         .bind(filter.batch_id)
         .bind(filter.from_date)
         .bind(filter.to_date)

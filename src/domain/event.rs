@@ -559,7 +559,7 @@ mod tests {
                 "order-1",
                 EventType::from(EventType::ORDER_CREATED),
                 serde_json::json!({}),
-                agent_id.clone(),
+                agent_id,
             ),
             EventEnvelope::new(
                 TenantId::new(),
@@ -568,7 +568,7 @@ mod tests {
                 "order-2",
                 EventType::from(EventType::ORDER_CREATED),
                 serde_json::json!({}),
-                agent_id.clone(),
+                agent_id,
             ),
         ];
 
@@ -594,8 +594,8 @@ mod tests {
         let payload = serde_json::json!({"amount": 100});
 
         let envelope = EventEnvelope::new(
-            tenant_id.clone(),
-            store_id.clone(),
+            tenant_id,
+            store_id,
             entity_type.clone(),
             entity_id,
             event_type.clone(),
@@ -620,7 +620,7 @@ mod tests {
         let tenant_id = TenantId::new();
         let store_id = StoreId::new();
 
-        let state = SyncState::new(agent_id.clone(), tenant_id.clone(), store_id.clone());
+        let state = SyncState::new(agent_id, tenant_id, store_id);
 
         assert_eq!(state.agent_id, agent_id);
         assert_eq!(state.tenant_id, tenant_id);

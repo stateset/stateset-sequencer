@@ -325,8 +325,8 @@ impl PgCommitmentEngine {
         let new_state_root = self.compute_state_root(tenant_id, store_id).await?;
 
         let commitment = BatchCommitment::new(
-            tenant_id.clone(),
-            store_id.clone(),
+            *tenant_id,
+            *store_id,
             prev_state_root,
             new_state_root,
             events_root,
@@ -503,8 +503,8 @@ impl CommitmentEngine for PgCommitmentEngine {
         let new_state_root = self.compute_state_root(tenant_id, store_id).await?;
 
         Ok(BatchCommitment::new(
-            tenant_id.clone(),
-            store_id.clone(),
+            *tenant_id,
+            *store_id,
             prev_state_root,
             new_state_root,
             events_root,

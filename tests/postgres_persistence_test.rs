@@ -7,6 +7,8 @@
 //!
 //! Run with: `cargo test -- --ignored`
 
+#![allow(clippy::clone_on_copy)]
+
 mod common;
 
 use serde_json::json;

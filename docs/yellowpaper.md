@@ -1,6 +1,6 @@
 # StateSet Sequencer: Technical Specification
 
-**Yellow Paper v0.2.6 | March 2026**
+**Yellow Paper v0.2.7 | April 2026**
 
 ---
 
@@ -2248,4 +2248,4 @@ The censorship resistance roadmap progresses through three phases:
 
 ---
 
-*This specification is derived from the StateSet Sequencer v0.2.6 implementation. Cross-language test vectors are published and verified in CI to ensure byte-level compatibility between the Rust sequencer and JavaScript client agents.*
+*This specification is derived from the StateSet Sequencer v0.2.7 implementation. Cross-language test vectors are published and verified in CI to ensure byte-level compatibility between the Rust sequencer and JavaScript client agents.*

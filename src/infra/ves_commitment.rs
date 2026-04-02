@@ -488,8 +488,8 @@ impl PgVesCommitmentEngine {
         );
 
         Ok(VesBatchCommitment::new_with_state_roots(
-            tenant_id.clone(),
-            store_id.clone(),
+            *tenant_id,
+            *store_id,
             tree_depth,
             leaves.len() as u32,
             padded_leaf_count as u32,
@@ -621,8 +621,8 @@ impl PgVesCommitmentEngine {
         );
 
         let commitment = VesBatchCommitment::new_with_state_roots(
-            tenant_id.clone(),
-            store_id.clone(),
+            *tenant_id,
+            *store_id,
             tree_depth,
             leaves.len() as u32,
             padded_leaf_count as u32,
@@ -993,10 +993,7 @@ impl PgVesCommitmentEngine {
 
     /// List commitments that have been submitted (chain_tx_hash set) but not
     /// yet finalized (anchored_at is NULL).
-    pub async fn list_pending_finality(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<VesBatchCommitment>> {
+    pub async fn list_pending_finality(&self, limit: usize) -> Result<Vec<VesBatchCommitment>> {
         if limit == 0 {
             return Ok(Vec::new());
         }

@@ -1,5 +1,7 @@
 // Complex integration tests for production scenarios
 
+#![allow(clippy::clone_on_copy)]
+
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde_json::json;
@@ -14,7 +16,6 @@ use stateset_sequencer::domain::{
 };
 use tokio::time::{sleep, Duration};
 
-#[tokio::test]
 #[sqlx::test]
 #[ignore]
 async fn test_concurrent_event_ingestion_from_multiple_tenants(
@@ -58,7 +59,6 @@ async fn test_concurrent_event_ingestion_from_multiple_tenants(
     Ok(())
 }
 
-#[tokio::test]
 #[sqlx::test]
 #[ignore]
 async fn test_commitment_chain_verification(
@@ -112,7 +112,6 @@ async fn test_commitment_chain_verification(
     Ok(())
 }
 
-#[tokio::test]
 #[sqlx::test]
 #[ignore]
 async fn test_database_failover_and_recovery(
@@ -164,7 +163,6 @@ async fn test_database_failover_and_recovery(
     Ok(())
 }
 
-#[tokio::test]
 #[sqlx::test]
 #[ignore]
 async fn test_x402_batch_settlement_flow(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
@@ -213,7 +211,6 @@ async fn test_x402_batch_settlement_flow(pool: PgPool) -> Result<(), Box<dyn std
     Ok(())
 }
 
-#[tokio::test]
 #[sqlx::test]
 #[ignore]
 async fn test_schema_validation_modes(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
@@ -279,7 +276,6 @@ async fn test_schema_validation_modes(pool: PgPool) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-#[tokio::test]
 #[sqlx::test]
 #[ignore]
 async fn test_rate_limiting_enforcement(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
@@ -306,7 +302,6 @@ async fn test_rate_limiting_enforcement(pool: PgPool) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[tokio::test]
 #[sqlx::test]
 #[ignore]
 async fn test_compliance_proof_workflow(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {

@@ -453,8 +453,7 @@ pub fn canonical_json_hash(value: &serde_json::Value) -> Hash256 {
     // BTreeMap (keys already sorted), serde_json::to_vec produces output
     // identical to JCS. Serializing to a contiguous buffer then hashing
     // once is faster than streaming many small writes through the hasher.
-    let bytes = serde_json::to_vec(value)
-        .expect("Failed to serialize JSON");
+    let bytes = serde_json::to_vec(value).expect("Failed to serialize JSON");
     sha256(&bytes)
 }
 

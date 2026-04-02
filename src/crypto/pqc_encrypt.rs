@@ -43,7 +43,10 @@ impl KeyWrapScheme {
 
     /// Whether this scheme uses classical X25519 ECDH.
     pub fn is_classical(&self) -> bool {
-        matches!(self, Self::Unspecified | Self::X25519HkdfSha256 | Self::X25519MlKem768)
+        matches!(
+            self,
+            Self::Unspecified | Self::X25519HkdfSha256 | Self::X25519MlKem768
+        )
     }
 }
 
@@ -85,7 +88,10 @@ pub struct KeyWrapParams {
 /// `recipient_wraps` for PQC material, then defaults to legacy HPKE.
 pub fn detect_wrap_scheme(payload: &serde_json::Value) -> KeyWrapScheme {
     // Check explicit key_wrap_params
-    if let Some(params) = payload.get("key_wrap_params").or(payload.get("keyWrapParams")) {
+    if let Some(params) = payload
+        .get("key_wrap_params")
+        .or(payload.get("keyWrapParams"))
+    {
         if let Some(scheme) = params.get("scheme").and_then(serde_json::Value::as_i64) {
             let parsed = KeyWrapScheme::from_i32(scheme as i32);
             if parsed != KeyWrapScheme::Unspecified {
@@ -118,8 +124,33 @@ pub fn detect_wrap_scheme(payload: &serde_json::Value) -> KeyWrapScheme {
         }
     }
 
+    if let Some(hpke) = payload.get("hpke") {
+        let mode = hpke
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.to_ascii_lowercase());
+        let kem = hpke
+            .get("kem")
+            .and_then(serde_json::Value::as_str)
+            .map(|value| value.to_ascii_lowercase());
+
+        if matches!(mode.as_deref(), Some("pqc-base")) || matches!(kem.as_deref(), Some("mlkem768"))
+        {
+            return KeyWrapScheme::MlKem768;
+        }
+        if matches!(mode.as_deref(), Some("hybrid-base"))
+            || matches!(kem.as_deref(), Some("x25519+mlkem768"))
+        {
+            return KeyWrapScheme::X25519MlKem768;
+        }
+    }
+
     // Check legacy recipients
-    if payload.get("recipients").and_then(serde_json::Value::as_array).map_or(false, |r| !r.is_empty()) {
+    if payload
+        .get("recipients")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|r| !r.is_empty())
+    {
         return KeyWrapScheme::X25519HkdfSha256;
     }
 
@@ -149,7 +180,8 @@ pub fn validate_wrap_scheme_for_profile(
         "hybrid" => {
             if !scheme.is_pqc() {
                 return Err(EncryptionError::EncryptionFailed(
-                    "hybrid profile requires X25519+ML-KEM-768 or ML-KEM-768 key wrapping".to_string(),
+                    "hybrid profile requires X25519+ML-KEM-768 or ML-KEM-768 key wrapping"
+                        .to_string(),
                 ));
             }
         }
@@ -169,7 +201,10 @@ mod tests {
         let payload = json!({
             "recipients": [{"recipient_kid": 1, "enc_b64u": "abc", "ct_b64u": "def"}]
         });
-        assert_eq!(detect_wrap_scheme(&payload), KeyWrapScheme::X25519HkdfSha256);
+        assert_eq!(
+            detect_wrap_scheme(&payload),
+            KeyWrapScheme::X25519HkdfSha256
+        );
     }
 
     #[test]
@@ -200,6 +235,22 @@ mod tests {
     }
 
     #[test]
+    fn detect_hybrid_from_hpke_metadata() {
+        let payload = json!({
+            "hpke": {"mode": "hybrid-base", "kem": "x25519+mlkem768"}
+        });
+        assert_eq!(detect_wrap_scheme(&payload), KeyWrapScheme::X25519MlKem768);
+    }
+
+    #[test]
+    fn detect_strict_from_hpke_metadata() {
+        let payload = json!({
+            "hpke": {"mode": "pqc-base", "kem": "mlkem768"}
+        });
+        assert_eq!(detect_wrap_scheme(&payload), KeyWrapScheme::MlKem768);
+    }
+
+    #[test]
     fn detect_empty_payload_returns_unspecified() {
         assert_eq!(detect_wrap_scheme(&json!({})), KeyWrapScheme::Unspecified);
     }
@@ -212,7 +263,8 @@ mod tests {
 
     #[test]
     fn validate_hybrid_rejects_legacy_wraps() {
-        let payload = json!({"recipients": [{"recipient_kid": 1, "enc_b64u": "a", "ct_b64u": "b"}]});
+        let payload =
+            json!({"recipients": [{"recipient_kid": 1, "enc_b64u": "a", "ct_b64u": "b"}]});
         assert!(validate_wrap_scheme_for_profile(&payload, "hybrid").is_err());
     }
 

@@ -299,12 +299,7 @@ mod tests {
             }
         });
 
-        let schema = Schema::new(
-            tenant_id.clone(),
-            event_type.clone(),
-            1,
-            schema_json.clone(),
-        );
+        let schema = Schema::new(tenant_id, event_type.clone(), 1, schema_json.clone());
 
         assert_eq!(schema.tenant_id, tenant_id);
         assert_eq!(schema.event_type, event_type);

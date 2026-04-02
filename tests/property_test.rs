@@ -2,6 +2,8 @@
 //!
 //! These tests verify invariants that should hold for any valid input.
 
+#![allow(clippy::clone_on_copy)]
+
 use proptest::prelude::*;
 use serde_json::json;
 use uuid::Uuid;

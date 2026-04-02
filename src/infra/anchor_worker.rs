@@ -228,11 +228,7 @@ impl AnchorWorker {
                 continue;
             }
 
-            match self
-                .anchor_service
-                .anchor_ves_commitment(commitment)
-                .await
-            {
+            match self.anchor_service.anchor_ves_commitment(commitment).await {
                 Ok((tx_hash, block_number)) => {
                     info!(
                         batch_id = %commitment.batch_id,
@@ -283,7 +279,10 @@ impl AnchorWorker {
             return Ok(());
         }
 
-        debug!(count = pending.len(), "Checking finality for pending commitments");
+        debug!(
+            count = pending.len(),
+            "Checking finality for pending commitments"
+        );
 
         for commitment in &pending {
             let block_number = match commitment.chain_block_number {
@@ -320,8 +319,7 @@ impl AnchorWorker {
                                 .num_seconds();
 
                             // ~2s block time * finality_confirmations
-                            let finality_secs =
-                                (self.config.finality_confirmations * 2) as i64;
+                            let finality_secs = (self.config.finality_confirmations * 2) as i64;
 
                             if elapsed >= finality_secs {
                                 info!(

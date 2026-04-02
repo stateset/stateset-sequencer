@@ -5,6 +5,34 @@ All notable changes to stateset-sequencer will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7] - 2026-04-02
+
+### Security
+
+- Enforce VES security profiles during agent key registration, signature validation, and encrypted payload checks
+- Keep PostgreSQL SSL required by default while allowing explicit local-only development opt-in with `ALLOW_INSECURE_LOCAL_DB=true`
+
+### Added
+
+- ML-DSA helper backend wiring for PQC signing and verification paths
+- Server tests covering the local database SSL override policy
+
+### Changed
+
+- Align README and Docker Compose local bootstrap instructions with server startup requirements
+- Clear the remaining `clippy` warning backlog across core handlers, persistence, and projection code
+
+### Fixed
+
+- Remove duplicate `#[tokio::test]` and `#[sqlx::test]` registration in complex integration coverage
+- Normalize touched Rust sources so the repo passes the release lint and test gates cleanly
+
+### Validation
+
+- `cargo clippy --locked --all-targets -- -D warnings`
+- `cargo test --locked --lib --bins`
+- `cargo test --locked --tests`
+
 ## [0.2.5] - 2026-02-02
 
 ### Security

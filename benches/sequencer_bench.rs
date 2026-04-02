@@ -2,11 +2,13 @@
 //!
 //! Run with: cargo bench
 
+#![allow(clippy::clone_on_copy)]
+
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use serde_json::json;
 use stateset_sequencer::crypto::{
-    compute_event_signing_hash, compute_leaf_hash, compute_node_hash, pad_leaf,
-    EventSigningParams, LeafHashParams,
+    compute_event_signing_hash, compute_leaf_hash, compute_node_hash, pad_leaf, EventSigningParams,
+    LeafHashParams,
 };
 use stateset_sequencer::domain::{
     AgentId, EntityType, EventBatch, EventEnvelope, EventType, Hash256, StoreId, TenantId,

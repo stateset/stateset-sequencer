@@ -18,6 +18,10 @@ use crate::auth::{
     AgentKeyEntry, AgentKeyError, AgentKeyLookup, AgentKeyRegistry, AuthContext,
     KeyStatus as DomainKeyStatus,
 };
+use crate::crypto::pqc_signing::{
+    verify_proof_of_possession, KeyAlgorithm as DomainKeyAlgorithm, ParsedSignatureBundle,
+    PublicKeyBundle as DomainPublicKeyBundle, SignatureScheme as DomainSignatureScheme,
+};
 use crate::crypto::{
     base64_url_decode, base64_url_encode, compute_cipher_hash_from_encrypted, compute_payload_aad,
     compute_receipt_hash, payload_plain_hash, HpkeParams, PayloadAadParams, PayloadEncrypted,
@@ -30,13 +34,6 @@ use crate::domain::{
 use crate::infra::{
     postgres::VesRejectionReason, CacheManager, PgAgentKeyRegistry, PgVesCommitmentEngine,
     VesSequencer, CACHE_STAMPEDE_DELAY,
-};
-use crate::crypto::pqc_signing::{
-    KeyAlgorithm as DomainKeyAlgorithm,
-    ParsedSignatureBundle,
-    PublicKeyBundle as DomainPublicKeyBundle,
-    SignatureScheme as DomainSignatureScheme,
-    verify_proof_of_possession,
 };
 use crate::proto::v2::{
     self,
@@ -58,7 +55,6 @@ use crate::proto::v2::{
     KeyType,
     // PQC types
     PublicKeyBundle as ProtoPublicKeyBundle,
-    SignatureBundle,
     PullEventsRequest,
     PullEventsResponse,
     PushRequest,
@@ -70,6 +66,7 @@ use crate::proto::v2::{
     RevokeKeyRequest,
     RevokeKeyResponse,
     SequencedEvent,
+    SignatureBundle,
     StreamEventsRequest,
     SubscribeEntityRequest,
     SyncMessage,
@@ -334,18 +331,14 @@ impl SequencerServiceV2 {
 
         // Serialize PQC signature bundle for the EventEnvelope
         let agent_signature_scheme = envelope.agent_signature_scheme.unwrap_or(0);
-        let agent_signature_bundle = envelope.agent_signature_bundle.as_ref().map(|bundle| {
-            SignatureBundle {
-                ed25519_signature: bundle
-                    .ed25519_signature
-                    .clone()
-                    .unwrap_or_default(),
-                ml_dsa_65_signature: bundle
-                    .ml_dsa_65_signature
-                    .clone()
-                    .unwrap_or_default(),
-            }
-        });
+        let agent_signature_bundle =
+            envelope
+                .agent_signature_bundle
+                .as_ref()
+                .map(|bundle| SignatureBundle {
+                    ed25519_signature: bundle.ed25519_signature.clone().unwrap_or_default(),
+                    ml_dsa_65_signature: bundle.ml_dsa_65_signature.clone().unwrap_or_default(),
+                });
 
         // Receipt PQC signature fields — populated when apply_receipt_signature is called
         let receipt_sig_scheme = 0i32;
@@ -401,14 +394,8 @@ impl SequencerServiceV2 {
         event.receipt_signature_scheme = receipt.receipt_signature_scheme;
         if let Some(ref bundle) = receipt.receipt_signature_bundle {
             event.receipt_signature_bundle = Some(SignatureBundle {
-                ed25519_signature: bundle
-                    .ed25519_signature
-                    .clone()
-                    .unwrap_or_default(),
-                ml_dsa_65_signature: bundle
-                    .ml_dsa_65_signature
-                    .clone()
-                    .unwrap_or_default(),
+                ed25519_signature: bundle.ed25519_signature.clone().unwrap_or_default(),
+                ml_dsa_65_signature: bundle.ml_dsa_65_signature.clone().unwrap_or_default(),
             });
         }
     }
@@ -588,20 +575,22 @@ impl SequencerServiceV2 {
             None
         };
 
-        let agent_signature_bundle = proto.agent_signature_bundle.as_ref().map(|bundle| {
-            ParsedSignatureBundle {
-                ed25519_signature: if bundle.ed25519_signature.is_empty() {
-                    None
-                } else {
-                    Some(bundle.ed25519_signature.clone())
-                },
-                ml_dsa_65_signature: if bundle.ml_dsa_65_signature.is_empty() {
-                    None
-                } else {
-                    Some(bundle.ml_dsa_65_signature.clone())
-                },
-            }
-        });
+        let agent_signature_bundle =
+            proto
+                .agent_signature_bundle
+                .as_ref()
+                .map(|bundle| ParsedSignatureBundle {
+                    ed25519_signature: if bundle.ed25519_signature.is_empty() {
+                        None
+                    } else {
+                        Some(bundle.ed25519_signature.clone())
+                    },
+                    ml_dsa_65_signature: if bundle.ml_dsa_65_signature.is_empty() {
+                        None
+                    } else {
+                        Some(bundle.ml_dsa_65_signature.clone())
+                    },
+                });
 
         Ok(VesEventEnvelope {
             ves_version,
@@ -2261,48 +2250,50 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
         };
 
         // Parse PQC public key bundle
-        let public_key_bundle = req.public_key_bundle.as_ref().map(|bundle| {
-            DomainPublicKeyBundle {
-                ed25519_public_key: if bundle.ed25519_public_key.len() == 32 {
-                    let mut pk = [0u8; 32];
-                    pk.copy_from_slice(&bundle.ed25519_public_key);
-                    Some(pk)
-                } else {
-                    None
-                },
-                ml_dsa_65_public_key: if bundle.ml_dsa_65_public_key.is_empty() {
-                    None
-                } else {
-                    Some(bundle.ml_dsa_65_public_key.clone())
-                },
-                x25519_public_key: if bundle.x25519_public_key.is_empty() {
-                    None
-                } else {
-                    Some(bundle.x25519_public_key.clone())
-                },
-                ml_kem_768_public_key: if bundle.ml_kem_768_public_key.is_empty() {
-                    None
-                } else {
-                    Some(bundle.ml_kem_768_public_key.clone())
-                },
-            }
-        });
+        let public_key_bundle =
+            req.public_key_bundle
+                .as_ref()
+                .map(|bundle| DomainPublicKeyBundle {
+                    ed25519_public_key: if bundle.ed25519_public_key.len() == 32 {
+                        let mut pk = [0u8; 32];
+                        pk.copy_from_slice(&bundle.ed25519_public_key);
+                        Some(pk)
+                    } else {
+                        None
+                    },
+                    ml_dsa_65_public_key: if bundle.ml_dsa_65_public_key.is_empty() {
+                        None
+                    } else {
+                        Some(bundle.ml_dsa_65_public_key.clone())
+                    },
+                    x25519_public_key: if bundle.x25519_public_key.is_empty() {
+                        None
+                    } else {
+                        Some(bundle.x25519_public_key.clone())
+                    },
+                    ml_kem_768_public_key: if bundle.ml_kem_768_public_key.is_empty() {
+                        None
+                    } else {
+                        Some(bundle.ml_kem_768_public_key.clone())
+                    },
+                });
 
         // Parse PQC proof-of-possession bundle
-        let pop_bundle = req.proof_of_possession_bundle.as_ref().map(|bundle| {
-            ParsedSignatureBundle {
-                ed25519_signature: if bundle.ed25519_pop.is_empty() {
-                    None
-                } else {
-                    Some(bundle.ed25519_pop.clone())
-                },
-                ml_dsa_65_signature: if bundle.ml_dsa_65_pop.is_empty() {
-                    None
-                } else {
-                    Some(bundle.ml_dsa_65_pop.clone())
-                },
-            }
-        });
+        let pop_bundle =
+            req.proof_of_possession_bundle
+                .as_ref()
+                .map(|bundle| ParsedSignatureBundle {
+                    ed25519_signature: if bundle.ed25519_pop.is_empty() {
+                        None
+                    } else {
+                        Some(bundle.ed25519_pop.clone())
+                    },
+                    ml_dsa_65_signature: if bundle.ml_dsa_65_pop.is_empty() {
+                        None
+                    } else {
+                        Some(bundle.ml_dsa_65_pop.clone())
+                    },
+                });
 
         // SECURITY: PoP is MANDATORY for hybrid and strict key algorithms.
         let pop_required = matches!(
@@ -2427,26 +2418,25 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
 
             // Serialize PQC key metadata
             let proto_key_algorithm = entry.key_algorithm as i32;
-            let proto_public_key_bundle = entry.public_key_bundle.as_ref().map(|bundle| {
-                ProtoPublicKeyBundle {
-                    ed25519_public_key: bundle
-                        .ed25519_public_key
-                        .map(|pk| pk.to_vec())
-                        .unwrap_or_default(),
-                    ml_dsa_65_public_key: bundle
-                        .ml_dsa_65_public_key
-                        .clone()
-                        .unwrap_or_default(),
-                    x25519_public_key: bundle
-                        .x25519_public_key
-                        .clone()
-                        .unwrap_or_default(),
-                    ml_kem_768_public_key: bundle
-                        .ml_kem_768_public_key
-                        .clone()
-                        .unwrap_or_default(),
-                }
-            });
+            let proto_public_key_bundle =
+                entry
+                    .public_key_bundle
+                    .as_ref()
+                    .map(|bundle| ProtoPublicKeyBundle {
+                        ed25519_public_key: bundle
+                            .ed25519_public_key
+                            .map(|pk| pk.to_vec())
+                            .unwrap_or_default(),
+                        ml_dsa_65_public_key: bundle
+                            .ml_dsa_65_public_key
+                            .clone()
+                            .unwrap_or_default(),
+                        x25519_public_key: bundle.x25519_public_key.clone().unwrap_or_default(),
+                        ml_kem_768_public_key: bundle
+                            .ml_kem_768_public_key
+                            .clone()
+                            .unwrap_or_default(),
+                    });
 
             keys.push(v2::AgentKey {
                 key_id,

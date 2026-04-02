@@ -425,8 +425,8 @@ impl PgSequencer {
             return Ok(None);
         };
 
-        let tenant_id = first.tenant_id.clone();
-        let store_id = first.store_id.clone();
+        let tenant_id = first.tenant_id;
+        let store_id = first.store_id;
 
         for event in events.iter().skip(1) {
             if event.tenant_id.0 != tenant_id.0 || event.store_id.0 != store_id.0 {
@@ -727,7 +727,7 @@ impl IngestService for PgSequencer {
                     )
                     .await?;
                 Ok(SyncState {
-                    agent_id: agent_id.clone(),
+                    agent_id: *agent_id,
                     tenant_id: TenantId::from_uuid(tenant_id),
                     store_id: StoreId::from_uuid(store_id),
                     last_pushed_sequence,
@@ -737,7 +737,7 @@ impl IngestService for PgSequencer {
                 })
             }
             None => Ok(SyncState::new(
-                agent_id.clone(),
+                *agent_id,
                 TenantId::from_uuid(Uuid::nil()),
                 StoreId::from_uuid(Uuid::nil()),
             )),
@@ -1002,13 +1002,13 @@ mod tests {
         let agent = AgentId::new();
 
         let first = EventEnvelope::new(
-            tenant_a.clone(),
-            store.clone(),
+            tenant_a,
+            store,
             EntityType::order(),
             "order-1",
             EventType::from(EventType::ORDER_CREATED),
             json!({}),
-            agent.clone(),
+            agent,
         );
         let second = EventEnvelope::new(
             tenant_b,
