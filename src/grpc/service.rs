@@ -1070,6 +1070,16 @@ impl SequencerTrait for SequencerService {
             req.to_version
         };
 
+        // Validate the requested range *before* the empty-result shortcut below:
+        // a from > to range is malformed input and must be rejected regardless
+        // of the entity's current version (otherwise a from_version beyond
+        // current_version masks the invalid range as an empty Ok result).
+        if req.to_version != 0 && requested_from_version > req.to_version {
+            return Err(Status::invalid_argument(
+                "from_version must be less than or equal to to_version",
+            ));
+        }
+
         if current_version == 0 || requested_from_version > current_version {
             return Ok(Response::new(GetEntityHistoryResponse {
                 events: Vec::new(),
@@ -1078,11 +1088,6 @@ impl SequencerTrait for SequencerService {
         }
 
         let to_version = requested_to_version.min(current_version);
-        if req.to_version != 0 && requested_from_version > req.to_version {
-            return Err(Status::invalid_argument(
-                "from_version must be less than or equal to to_version",
-            ));
-        }
 
         // Cap the response window at MAX_ENTITY_HISTORY, matching the HTTP and v2
         // gRPC paths. Without this an authenticated reader could request the full
