@@ -5,14 +5,26 @@
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-vulnerability = "deny"
-unmaintained = "warn"
+# cargo-deny 0.16+ removed the per-class severity keys (vulnerability/notice
+# default to errors; unmaintained/yanked default to warnings). `unmaintained`
+# now selects *which* advisories to check, not a severity.
 yanked = "warn"
-notice = "warn"
+# Only fail on unmaintained *workspace/first-party* crates. Deep transitive
+# build-time proc-macro deps (e.g. paste, proc-macro-error2) are unmaintained
+# but have no available fix and are not exploitable; failing CI on them is
+# noise. This preserves the original config's intent (the old `unmaintained =
+# "warn"`, which did not fail the build).
+unmaintained = "workspace"
+# Note: RUSTSEC-2023-0071 (rsa "Marvin Attack") is NOT listed here because
+# cargo-deny analyzes the resolved dependency graph, which does not include
+# `rsa` (it is only pulled by the disabled sqlx `mysql` feature). It is ignored
+# in `.cargo/audit.toml` instead, since `cargo audit` scans the full lockfile.
 ignore = []
 
 [licenses]
-unlicensed = "deny"
+# cargo-deny 0.16+ uses an allowlist model: any license not in `allow` is
+# denied (the old `unlicensed`/`copyleft`/`default`/`allow-osi-fsf-free` keys
+# were removed — see cargo-deny PR #611).
 allow = [
     "MIT",
     "Apache-2.0",
@@ -22,13 +34,14 @@ allow = [
     "ISC",
     "Zlib",
     "MPL-2.0",
-    "Unicode-DFS-2016",
+    "Unicode-3.0",
     "CC0-1.0",
     "BSL-1.0",
+    "Unlicense",
+    "MIT-0",
+    "0BSD",
+    "CDLA-Permissive-2.0",
 ]
-copyleft = "warn"
-allow-osi-fsf-free = "either"
-default = "deny"
 confidence-threshold = 0.8
 exceptions = []
 
