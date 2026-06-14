@@ -167,8 +167,11 @@ impl SqliteOutbox {
 
         let now = Utc::now().to_rfc3339();
         let placeholders: Vec<&str> = event_ids.iter().map(|_| "?").collect();
+        // Only stamp rows that have not already been pushed, so a retried or
+        // duplicate `mark_pushed` cannot reset an already-pushed event's
+        // `pushed_at` timestamp (which would perturb age-based reconciliation).
         let query = format!(
-            "UPDATE outbox SET pushed_at = ? WHERE event_id IN ({})",
+            "UPDATE outbox SET pushed_at = ? WHERE pushed_at IS NULL AND event_id IN ({})",
             placeholders.join(", ")
         );
 
@@ -359,8 +362,29 @@ impl SqliteOutbox {
         Ok(())
     }
 
+    /// Extract the sequence number for a pulled event, erroring if it is absent.
+    ///
+    /// It is the `pulled_events` PRIMARY KEY; a missing value must be rejected
+    /// rather than defaulted to 0 (which would alias distinct events).
+    fn pulled_event_sequence(event: &SequencedEvent) -> Result<i64> {
+        let seq = event.envelope.sequence_number.ok_or_else(|| {
+            SequencerError::Internal(
+                "cannot store pulled event without a sequence number".to_string(),
+            )
+        })?;
+        i64::try_from(seq).map_err(|_| {
+            SequencerError::Internal("pulled event sequence number exceeds i64 range".to_string())
+        })
+    }
+
     /// Store a pulled event (from remote)
     pub async fn store_pulled_event(&self, event: &SequencedEvent) -> Result<()> {
+        // `sequence_number` is the PRIMARY KEY of `pulled_events` and the insert
+        // is `INSERT OR REPLACE`. A pulled event has, by definition, been
+        // sequenced remotely, so it must carry a sequence number — defaulting a
+        // missing one to 0 would let two un-sequenced events collide at PK 0 and
+        // silently overwrite each other.
+        let sequence_number = Self::pulled_event_sequence(event)?;
         let payload_json = serde_json::to_string(&event.envelope.payload)
             .map_err(|e| SequencerError::Internal(e.to_string()))?;
         let payload_hash_hex = hex::encode(event.envelope.payload_hash);
@@ -376,7 +400,7 @@ impl SqliteOutbox {
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(event.envelope.sequence_number.unwrap_or(0) as i64)
+        .bind(sequence_number)
         .bind(event.envelope.event_id.to_string())
         .bind(event.envelope.command_id.map(|id| id.to_string()))
         .bind(event.envelope.tenant_id.0.to_string())
@@ -401,6 +425,7 @@ impl SqliteOutbox {
         let mut tx = self.pool.begin().await?;
 
         for event in events {
+            let sequence_number = Self::pulled_event_sequence(event)?;
             let payload_json = serde_json::to_string(&event.envelope.payload)
                 .map_err(|e| SequencerError::Internal(e.to_string()))?;
             let payload_hash_hex = hex::encode(event.envelope.payload_hash);
@@ -416,7 +441,7 @@ impl SqliteOutbox {
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
             )
-            .bind(event.envelope.sequence_number.unwrap_or(0) as i64)
+            .bind(sequence_number)
             .bind(event.envelope.event_id.to_string())
             .bind(event.envelope.command_id.map(|id| id.to_string()))
             .bind(event.envelope.tenant_id.0.to_string())
