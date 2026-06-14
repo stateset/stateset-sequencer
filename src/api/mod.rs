@@ -40,48 +40,8 @@ pub fn router() -> Router<AppState> {
             "/v1/ves/commitments/:batch_id",
             get(handlers::ves::get_ves_commitment),
         )
-        // VES validity proofs (externally generated)
-        .route(
-            "/v1/ves/validity/:batch_id/inputs",
-            get(handlers::ves::get_ves_validity_public_inputs),
-        )
-        .route(
-            "/v1/ves/validity/:batch_id/proofs",
-            get(handlers::ves::list_ves_validity_proofs),
-        )
-        .route(
-            "/v1/ves/validity/:batch_id/proofs",
-            post(handlers::ves::submit_ves_validity_proof),
-        )
-        .route(
-            "/v1/ves/validity/proofs/:proof_id",
-            get(handlers::ves::get_ves_validity_proof),
-        )
-        .route(
-            "/v1/ves/validity/proofs/:proof_id/verify",
-            get(handlers::ves::verify_ves_validity_proof),
-        )
-        // VES compliance proofs (per-event, encrypted payloads)
-        .route(
-            "/v1/ves/compliance/:event_id/inputs",
-            post(handlers::ves::get_ves_compliance_public_inputs),
-        )
-        .route(
-            "/v1/ves/compliance/:event_id/proofs",
-            get(handlers::ves::list_ves_compliance_proofs),
-        )
-        .route(
-            "/v1/ves/compliance/:event_id/proofs",
-            post(handlers::ves::submit_ves_compliance_proof),
-        )
-        .route(
-            "/v1/ves/compliance/proofs/:proof_id",
-            get(handlers::ves::get_ves_compliance_proof),
-        )
-        .route(
-            "/v1/ves/compliance/proofs/:proof_id/verify",
-            get(handlers::ves::verify_ves_compliance_proof),
-        )
+        // VES validity + compliance proofs (STARK-verified; gated by `stark`)
+        .merge(ves_proof_routes())
         .route(
             "/v1/ves/proofs/:sequence_number",
             get(handlers::ves::get_ves_inclusion_proof),
@@ -160,6 +120,65 @@ pub fn router() -> Router<AppState> {
         )
         // x402 payment protocol
         .nest("/v1/x402", handlers::x402_router())
+}
+
+/// VES validity + compliance proof routes (STARK-verified).
+///
+/// These handlers depend on the `ves-stark-*` crates from the separate, private
+/// `stateset-stark` workspace, so they are gated behind the `stark` feature.
+/// Without it the core sequencer still builds and is testable; the proof
+/// submit/verify endpoints are simply not mounted.
+#[cfg(feature = "stark")]
+fn ves_proof_routes() -> Router<AppState> {
+    Router::new()
+        // VES validity proofs (externally generated)
+        .route(
+            "/v1/ves/validity/:batch_id/inputs",
+            get(handlers::ves::get_ves_validity_public_inputs),
+        )
+        .route(
+            "/v1/ves/validity/:batch_id/proofs",
+            get(handlers::ves::list_ves_validity_proofs),
+        )
+        .route(
+            "/v1/ves/validity/:batch_id/proofs",
+            post(handlers::ves::submit_ves_validity_proof),
+        )
+        .route(
+            "/v1/ves/validity/proofs/:proof_id",
+            get(handlers::ves::get_ves_validity_proof),
+        )
+        .route(
+            "/v1/ves/validity/proofs/:proof_id/verify",
+            get(handlers::ves::verify_ves_validity_proof),
+        )
+        // VES compliance proofs (per-event, encrypted payloads)
+        .route(
+            "/v1/ves/compliance/:event_id/inputs",
+            post(handlers::ves::get_ves_compliance_public_inputs),
+        )
+        .route(
+            "/v1/ves/compliance/:event_id/proofs",
+            get(handlers::ves::list_ves_compliance_proofs),
+        )
+        .route(
+            "/v1/ves/compliance/:event_id/proofs",
+            post(handlers::ves::submit_ves_compliance_proof),
+        )
+        .route(
+            "/v1/ves/compliance/proofs/:proof_id",
+            get(handlers::ves::get_ves_compliance_proof),
+        )
+        .route(
+            "/v1/ves/compliance/proofs/:proof_id/verify",
+            get(handlers::ves::verify_ves_compliance_proof),
+        )
+}
+
+/// No-op proof routes when the `stark` feature is disabled.
+#[cfg(not(feature = "stark"))]
+fn ves_proof_routes() -> Router<AppState> {
+    Router::new()
 }
 
 /// Router for admin-only endpoints.

@@ -4,6 +4,10 @@
 //! with `DATABASE_URL` set.
 
 #![allow(clippy::clone_on_copy)]
+// Several imports are used only by the STARK-gated proof-flow tests below; when
+// the `stark` feature is off those tests are compiled out, leaving the imports
+// unused. The imports are genuinely used when the feature is on.
+#![cfg_attr(not(feature = "stark"), allow(unused_imports))]
 
 use serde_json::json;
 use sqlx::postgres::PgPoolOptions;
@@ -451,6 +455,7 @@ async fn postgres_sequencer_scopes_sequences_by_tenant_and_store() {
     }
 }
 
+#[cfg(feature = "stark")]
 #[tokio::test]
 #[ignore]
 async fn postgres_ves_validity_proofs_rest_flow() {
@@ -930,6 +935,7 @@ async fn postgres_ves_sequencer_concurrent_exact_replay_returns_existing_receipt
     assert_eq!(stored[0].event_id(), event_id);
 }
 
+#[cfg(feature = "stark")]
 #[tokio::test]
 #[ignore]
 async fn postgres_ves_compliance_proofs_rest_flow() {
