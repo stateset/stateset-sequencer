@@ -108,6 +108,40 @@ cargo run --bin stateset-sequencer-admin -- migrate
 cargo run --bin stateset-sequencer-admin -- backfill-ves-state-roots
 ```
 
+### Cargo features
+
+The default build enables `full`. Notable feature flags:
+
+| Feature | Enables |
+|---------|---------|
+| `grpc` | gRPC service (tonic/prost) |
+| `telemetry` | OpenTelemetry tracing / OTLP export |
+| `anchoring` | L2 blockchain anchoring (alloy) |
+| `schema-validation` | JSON Schema payload validation |
+| `pqc` | Post-quantum crypto (ML-DSA-65, ML-KEM-768) |
+| `sqlite` | SQLite backend for embedded/local agents |
+| `stark` | STARK validity/compliance proof verification |
+
+**The `stark` feature** depends on the `ves-stark-*` crates in the separate
+[`stateset-stark`](https://github.com/stateset/stateset-stark) workspace, expected
+at `../stateset-stark`. They are **path dependencies that cargo must resolve even
+when the feature is off**, so that checkout must be present to build at all.
+
+To build/test the core sequencer **without** the STARK proof endpoints (e.g. if
+you don't have `stateset-stark` checked out alongside this repo, the proof
+endpoints are simply not mounted):
+
+```bash
+cargo build --no-default-features \
+  --features grpc,telemetry,anchoring,schema-validation,pqc,sqlite
+```
+
+> **CI note:** because the `ves-stark-*` crates live in a private repo, CI fetches
+> `stateset-stark` using a `STARK_REPO_TOKEN` repository secret (a token with read
+> access to `stateset/stateset-stark`). Add it under **Settings → Secrets and
+> variables → Actions**. The lint/test/coverage jobs build with the core feature
+> set (no `stark`) so they don't compile the private crates.
+
 ## API Endpoints
 
 ### VES Event Ingestion
