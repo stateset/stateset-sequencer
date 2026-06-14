@@ -33,6 +33,7 @@ use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::api::auth_helpers::ensure_write;
+use crate::api::utils::map_sequencer_error;
 use crate::api::types::{
     IngestRequest, IngestResponse, RejectionInfo, VesIngestRequest, VesIngestResponse,
     VesReceiptResponse,
@@ -705,7 +706,7 @@ pub async fn ingest_events(
                 .metrics
                 .inc_counter(metric_names::DATABASE_ERRORS)
                 .await;
-            Err((StatusCode::BAD_REQUEST, e.to_string()))
+            Err(map_sequencer_error(e))
         }
     }
 }
@@ -901,7 +902,7 @@ pub async fn ingest_ves_events(
                 .metrics
                 .inc_counter(metric_names::DATABASE_ERRORS)
                 .await;
-            Err((StatusCode::BAD_REQUEST, e.to_string()))
+            Err(map_sequencer_error(e))
         }
     }
 }

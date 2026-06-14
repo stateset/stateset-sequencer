@@ -10,6 +10,12 @@ use crate::server::AppState;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+
+/// Maximum number of sibling hashes in a submitted Merkle inclusion proof.
+///
+/// A proof path length equals the tree depth, so 64 admits trees of up to 2^64
+/// leaves while bounding the work a verify request can force before decoding.
+const MAX_PROOF_PATH_LEN: usize = 64;
 use tracing::instrument;
 
 /// GET /api/v1/ves/proofs/:sequence_number - Get VES inclusion proof.
@@ -252,6 +258,16 @@ pub async fn verify_ves_proof(
                 "merkle_root must be 32 bytes".to_string(),
             )
         })?;
+
+    // Reject an over-long proof path before decoding (see MAX_PROOF_PATH_LEN):
+    // its length is bounded by tree depth, so anything larger cannot be a real
+    // proof and would only force a large allocation + verification walk.
+    if request.proof_path.len() > MAX_PROOF_PATH_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("proof_path exceeds maximum length of {MAX_PROOF_PATH_LEN}"),
+        ));
+    }
 
     let proof_path: Vec<[u8; 32]> = request
         .proof_path

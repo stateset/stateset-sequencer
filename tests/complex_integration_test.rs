@@ -16,7 +16,7 @@ use stateset_sequencer::domain::{
 };
 use tokio::time::{sleep, Duration};
 
-#[sqlx::test]
+#[sqlx::test(migrations = "migrations/postgres")]
 #[ignore]
 async fn test_concurrent_event_ingestion_from_multiple_tenants(
     pool: PgPool,
@@ -59,7 +59,7 @@ async fn test_concurrent_event_ingestion_from_multiple_tenants(
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "migrations/postgres")]
 #[ignore]
 async fn test_commitment_chain_verification(
     pool: PgPool,
@@ -112,7 +112,7 @@ async fn test_commitment_chain_verification(
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "migrations/postgres")]
 #[ignore]
 async fn test_database_failover_and_recovery(
     pool: PgPool,
@@ -163,7 +163,7 @@ async fn test_database_failover_and_recovery(
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "migrations/postgres")]
 #[ignore]
 async fn test_x402_batch_settlement_flow(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let payer_address = "0x1234567890123456789012345678901234567890";
@@ -211,7 +211,7 @@ async fn test_x402_batch_settlement_flow(pool: PgPool) -> Result<(), Box<dyn std
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "migrations/postgres")]
 #[ignore]
 async fn test_schema_validation_modes(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let tenant_id = TenantId::new();
@@ -276,7 +276,7 @@ async fn test_schema_validation_modes(pool: PgPool) -> Result<(), Box<dyn std::e
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "migrations/postgres")]
 #[ignore]
 async fn test_rate_limiting_enforcement(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let tenant_id = TenantId::new();
@@ -302,7 +302,7 @@ async fn test_rate_limiting_enforcement(pool: PgPool) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "migrations/postgres")]
 #[ignore]
 async fn test_compliance_proof_workflow(pool: PgPool) -> Result<(), Box<dyn std::error::Error>> {
     let tenant_id = TenantId::new();

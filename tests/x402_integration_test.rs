@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use stateset_sequencer::domain::{
     AgentId, AgentKeyId, StoreId, TenantId, X402Asset, X402IntentStatus, X402Network,
-    X402PaymentBatch, X402PaymentIntent, X402_DOMAIN_SEPARATOR,
+    X402PaymentBatch, X402PaymentIntent, X402_DOMAIN_SEPARATOR, X402_MAX_AMOUNT,
 };
 use stateset_sequencer::infra::PgX402Repository;
 
@@ -414,6 +414,37 @@ fn test_asset_decimals() {
 }
 
 #[test]
+fn test_batch_total_saturates_instead_of_wrapping() {
+    // Two near-ceiling amounts in the same asset would overflow u64 on a naive
+    // `+=`. add_payment must saturate so a batch total can never wrap to a small
+    // value (which would corrupt settlement accounting).
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let payee = "0x742d35Cc6634C0532925a3b844Bc9e7595f12345";
+
+    let mut batch = X402PaymentBatch::new(tenant_id, store_id, X402Network::SetChain);
+    let big = X402_MAX_AMOUNT; // i64::MAX, the per-intent ceiling
+
+    // Three near-ceiling amounts: big + big = u64::MAX - 1 (fits), then + big
+    // overflows and must clamp to u64::MAX rather than wrapping to a small value.
+    for _ in 0..3 {
+        let intent = create_test_intent(&signing_key, tenant_id, store_id, payee, big);
+        batch.add_payment(&intent);
+    }
+
+    let total = batch
+        .total_amounts
+        .iter()
+        .find(|t| t.asset == X402Asset::Usdc)
+        .expect("usdc total present");
+    assert_eq!(total.payment_count, 3);
+    // 3 * i64::MAX overflows u64; must saturate to u64::MAX, never wrap small.
+    assert_eq!(total.total_amount, u64::MAX);
+    assert!(total.total_amount >= big);
+}
+
+#[test]
 fn test_intent_status_transitions() {
     assert_eq!(X402IntentStatus::Pending.to_string(), "pending");
     assert_eq!(X402IntentStatus::Sequenced.to_string(), "sequenced");
@@ -579,9 +610,12 @@ mod integration {
             .await
             .expect("Failed to insert batch");
 
-        // Commit batch with Merkle root
+        // Commit batch with Merkle root. commit_batch_with_merkle claims the
+        // given intents into the batch (sequenced -> batched), computes the root,
+        // and marks the batch committed — all atomically.
+        let intent_ids: Vec<_> = pending.iter().map(|i| i.intent_id).collect();
         let (merkle_root, state_root) = repo
-            .commit_batch_with_merkle(batch.batch_id, &tenant_id, &store_id)
+            .commit_batch_with_merkle(batch.batch_id, &intent_ids, &tenant_id, &store_id)
             .await
             .expect("Failed to commit batch");
 

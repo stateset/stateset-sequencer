@@ -241,7 +241,12 @@ impl PoolMonitor {
         let size = pool.size();
         let num_idle = pool.num_idle();
 
-        let active = size - num_idle as u32;
+        // `size` and `num_idle` are sampled non-atomically from sqlx, so under
+        // churn `num_idle` can momentarily exceed `size`. A plain subtraction
+        // would then underflow to a huge `u32` (release) or panic (debug),
+        // spuriously reporting Critical utilization and tripping the auth
+        // middleware load-shedder into 503-ing all traffic until the next sample.
+        let active = size.saturating_sub(num_idle as u32);
         let utilization = if self.max_connections > 0 {
             active as f64 / self.max_connections as f64
         } else {

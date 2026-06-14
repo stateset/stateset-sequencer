@@ -503,7 +503,7 @@ async fn postgres_ves_validity_proofs_rest_flow() {
                 sequence_number,
                 base_version
             ) VALUES (
-                $1,NULL,1,$2,$3,$4,1,'order',$5,'order.created',$6,$7,0,$8,NULL,$9,$10,$11,$12,$13,$14,NULL
+                $1,NULL,1,$2,$3,$4,1,'order',$5,'order.created',$6,$7,0,$8,NULL,$9,$10,$11,$12,$13,NULL
             )
             "#,
         )

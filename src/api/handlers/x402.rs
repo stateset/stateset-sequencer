@@ -35,7 +35,7 @@ use crate::domain::{
     AgentId, AgentKeyId, GetX402BatchResponse, GetX402ReceiptResponse, Hash256, Signature64,
     StoreId, SubmitX402PaymentRequest, SubmitX402PaymentResponse, TenantId, X402BatchStatus,
     X402IntentStatus, X402Network, X402PaymentBatch, X402PaymentIntent, X402PaymentIntentFilter,
-    X402_DEFAULT_BATCH_SIZE, X402_MAX_BATCH_SIZE, X402_MAX_VALIDITY_SECS,
+    X402_DEFAULT_BATCH_SIZE, X402_MAX_AMOUNT, X402_MAX_BATCH_SIZE, X402_MAX_VALIDITY_SECS,
 };
 use crate::infra::PgX402Repository;
 use crate::server::AppState;
@@ -129,6 +129,13 @@ pub async fn submit_payment_intent(
         return Err(ApiError::new(
             ErrorCode::InvalidFieldValue,
             "amount must be greater than 0",
+        ));
+    }
+
+    if amount > X402_MAX_AMOUNT {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "amount exceeds maximum representable value",
         ));
     }
 
@@ -399,17 +406,16 @@ pub async fn submit_payment_intent(
         ));
     }
 
-    tx.commit().await.map_err(|e| {
-        ApiError::new(
-            ErrorCode::InternalError,
-            format!("Failed to commit payment intent: {}", e),
-        )
-    })?;
-
-    // Assign sequence number atomically
+    // Assign the sequence number inside the SAME transaction as the intent
+    // insert + nonce reservation. Committing the intent first and sequencing in
+    // a separate transaction left a crash window in which the nonce was burned
+    // but the intent was stranded as `pending` with no sequence number, with no
+    // recovery path (idempotency resubmit would keep returning the stranded
+    // intent). Doing it atomically means the intent only ever becomes durable in
+    // the `sequenced` state.
     let sequence_number = state
         .x402_repository
-        .assign_sequence_number(intent_id, &tenant_id, &store_id)
+        .assign_sequence_number_tx(&mut tx, intent_id, &tenant_id, &store_id)
         .await
         .map_err(|e| {
             ApiError::new(
@@ -417,6 +423,13 @@ pub async fn submit_payment_intent(
                 format!("Failed to assign sequence number: {}", e),
             )
         })?;
+
+    tx.commit().await.map_err(|e| {
+        ApiError::new(
+            ErrorCode::InternalError,
+            format!("Failed to commit payment intent: {}", e),
+        )
+    })?;
 
     let sequenced_at = Utc::now();
 
@@ -1018,9 +1031,10 @@ pub async fn create_batch(
         })?;
 
     // Compute Merkle root + commit batch
+    let intent_ids: Vec<_> = intents.iter().map(|i| i.intent_id).collect();
     let (merkle_root, _state_root) = match state
         .x402_repository
-        .commit_batch_with_merkle(batch.batch_id, &tenant_id, &store_id)
+        .commit_batch_with_merkle(batch.batch_id, &intent_ids, &tenant_id, &store_id)
         .await
     {
         Ok(result) => result,

@@ -131,8 +131,13 @@ impl RetryConfig {
             if self.decorrelated_jitter {
                 // Decorrelated jitter: delay = random(initial_delay, previous_delay * 3)
                 // This provides better spread for high-concurrency scenarios
-                let min_delay = self.initial_delay.as_secs_f64();
                 let max_delay = (capped_delay * 3.0).min(self.max_delay.as_secs_f64());
+                // Clamp the lower bound to the upper bound. If the config has
+                // `initial_delay > max_delay` (or a sub-1.0 multiplier shrinks
+                // the capped delay below initial_delay), an unclamped
+                // `gen_range(min..=max)` with min > max panics with "empty
+                // range", killing the retrying task mid-backoff.
+                let min_delay = self.initial_delay.as_secs_f64().min(max_delay);
                 let mut rng = rand::thread_rng();
                 rng.gen_range(min_delay..=max_delay)
             } else {
@@ -506,5 +511,34 @@ mod tests {
     async fn test_convenience_function() {
         let result = retry(|| async { Ok::<_, &str>(123) }).await;
         assert_eq!(result.unwrap(), 123);
+    }
+
+    #[test]
+    fn test_delay_does_not_panic_when_initial_exceeds_max() {
+        // Regression: with decorrelated jitter and a misconfigured
+        // `initial_delay > max_delay`, the lower bound of the random range
+        // exceeded the upper bound and `gen_range(min..=max)` panicked with
+        // "empty range", killing the retrying task. The bound is now clamped.
+        let config = RetryConfig::database()
+            .with_initial_delay(Duration::from_secs(10))
+            .with_max_delay(Duration::from_secs(1));
+        assert!(config.decorrelated_jitter);
+        for attempt in 0..6 {
+            let delay = config.delay_for_attempt(attempt);
+            assert!(delay <= Duration::from_secs(1), "delay exceeded max_delay");
+        }
+    }
+
+    #[test]
+    fn test_delay_does_not_panic_with_sub_one_multiplier() {
+        // A sub-1.0 multiplier shrinks the capped delay below initial_delay,
+        // which also used to invert the decorrelated-jitter range.
+        let config = RetryConfig::database()
+            .with_initial_delay(Duration::from_secs(10))
+            .with_max_delay(Duration::from_secs(30))
+            .with_multiplier(0.1);
+        for attempt in 0..6 {
+            let _ = config.delay_for_attempt(attempt);
+        }
     }
 }

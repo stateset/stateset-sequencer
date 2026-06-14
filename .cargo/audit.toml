@@ -1,0 +1,14 @@
+# cargo-audit configuration (https://docs.rs/cargo-audit)
+# Read automatically by `cargo audit` from `.cargo/audit.toml`.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 (rsa "Marvin Attack" timing sidechannel): no fixed
+    # version is available upstream. `rsa` is NOT in our build graph — it is
+    # only pulled by `sqlx-mysql`, and we build sqlx with the `postgres` and
+    # `sqlite` features only (no `mysql`). `cargo tree -i rsa` is empty; the
+    # crate appears in Cargo.lock solely as a record of sqlx's optional MySQL
+    # dependency and is never compiled or linked.
+    # RE-EVALUATE if the sqlx `mysql` feature is ever enabled.
+    "RUSTSEC-2023-0071",
+]

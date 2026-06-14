@@ -14,6 +14,13 @@ use crate::domain::{BatchCommitment, MerkleProof, StoreId, TenantId};
 use crate::infra::{CommitmentEngine, CACHE_STAMPEDE_DELAY};
 use crate::server::AppState;
 
+/// Maximum number of sibling hashes in a submitted Merkle inclusion proof.
+///
+/// A proof path length equals the tree depth, so 64 admits trees of up to 2^64
+/// leaves — far beyond any real commitment — while bounding the work an
+/// unauthenticated-shaped verify request can force.
+const MAX_PROOF_PATH_LEN: usize = 64;
+
 /// GET /api/v1/proofs/:sequence_number - Get inclusion proof for an event.
 #[instrument(skip(state, auth), fields(
     sequence_number = sequence_number,
@@ -471,6 +478,17 @@ pub async fn verify_proof(
                 "events_root must be 32 bytes".to_string(),
             )
         })?;
+
+    // A Merkle proof path is bounded by tree depth (log2 of the leaf count), so
+    // a path longer than MAX_PROOF_PATH_LEN cannot correspond to any real tree.
+    // Reject before decoding so a caller cannot post a multi-megabyte array and
+    // force a large allocation plus a long verification walk.
+    if request.proof_path.len() > MAX_PROOF_PATH_LEN {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("proof_path exceeds maximum length of {MAX_PROOF_PATH_LEN}"),
+        ));
+    }
 
     let proof_path: Vec<[u8; 32]> = request
         .proof_path

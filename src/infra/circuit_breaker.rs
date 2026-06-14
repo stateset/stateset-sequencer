@@ -240,6 +240,17 @@ impl CircuitBreaker {
                 state.success_count += 1;
                 if state.success_count >= self.config.success_threshold {
                     self.transition_to_closed(&mut state);
+                } else {
+                    // Free the in-flight probe slot so the next probe can be
+                    // admitted. `half_open_requests` is an admission gate for
+                    // *concurrent* probes; without this decrement it instead
+                    // counts total probes per half-open episode, so with the
+                    // default config (half_open_max_requests == success_threshold)
+                    // a single probe that is admitted but never records a result
+                    // (cancelled future, shutdown, timeout) would permanently
+                    // wedge the circuit in half-open — never closing, never
+                    // re-probing.
+                    state.half_open_requests = state.half_open_requests.saturating_sub(1);
                 }
             }
             CircuitState::Open => {
@@ -730,5 +741,40 @@ mod tests {
 
         let status = registry.status().await;
         assert!(status.get("anchor").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_half_open_frees_probe_slot_and_can_close() {
+        // Regression: `half_open_requests` must track *in-flight* probes, not
+        // total probes per half-open episode. Here success_threshold (3) exceeds
+        // half_open_max_requests (1), so a recorded probe must free its slot for
+        // the next probe; otherwise the circuit can never accumulate enough
+        // successes to close and is wedged in half-open forever.
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 3,
+            half_open_max_requests: 1,
+            open_timeout: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let cb = CircuitBreaker::with_config("test_free_slot", config);
+
+        cb.record_failure().await;
+        cb.record_failure().await;
+        assert_eq!(cb.state().await, CircuitState::Open);
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_eq!(cb.state().await, CircuitState::HalfOpen);
+
+        // Drive three successful probes through the single admission slot.
+        for _ in 0..3 {
+            assert!(
+                cb.is_allowed().await,
+                "probe slot should free up after the prior probe records its result"
+            );
+            cb.record_success().await;
+        }
+
+        assert_eq!(cb.state().await, CircuitState::Closed);
     }
 }

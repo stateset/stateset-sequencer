@@ -424,15 +424,21 @@ impl PgX402Repository {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Assign sequence number atomically
-    pub async fn assign_sequence_number(
+    /// Assign sequence number within an existing transaction.
+    ///
+    /// Folding sequence assignment into the same transaction as the intent
+    /// insert + nonce reservation makes the three operations atomic: there is no
+    /// window in which an intent is durably persisted as `pending` with a burned
+    /// nonce but no sequence number (which would be unrecoverable, since the
+    /// nonce can never be reused and the idempotency path would keep returning
+    /// the stranded `pending` intent).
+    pub async fn assign_sequence_number_tx(
         &self,
+        tx: &mut Transaction<'_, Postgres>,
         intent_id: Uuid,
         tenant_id: &TenantId,
         store_id: &StoreId,
     ) -> Result<u64> {
-        let mut tx = self.pool.begin().await?;
-
         // Lock and get current sequence
         sqlx::query(
             r#"
@@ -443,7 +449,7 @@ impl PgX402Repository {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         let row: (i64,) = sqlx::query_as(
@@ -456,10 +462,19 @@ impl PgX402Repository {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
 
-        let next_seq = (row.0 as u64).saturating_add(1);
+        // Reject overflow rather than saturating: a saturating counter would
+        // hand the same sequence number to every subsequent intent, breaking the
+        // per-(tenant,store) monotonic-unique invariant and corrupting the
+        // Merkle leaf ordering. Mirrors the VES/legacy sequencer counters.
+        let next_seq = row.0.checked_add(1).ok_or_else(|| {
+            SequencerError::Internal(format!(
+                "x402 sequence counter overflow for tenant={} store={}",
+                tenant_id.0, store_id.0
+            ))
+        })?;
         let now = Utc::now();
 
         // Update counter
@@ -472,8 +487,8 @@ impl PgX402Repository {
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
-        .bind(next_seq as i64)
-        .execute(&mut *tx)
+        .bind(next_seq)
+        .execute(&mut **tx)
         .await?;
 
         // Update intent
@@ -485,11 +500,28 @@ impl PgX402Repository {
             "#,
         )
         .bind(intent_id)
-        .bind(next_seq as i64)
+        .bind(next_seq)
         .bind(now)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
+        Ok(next_seq as u64)
+    }
+
+    /// Assign sequence number atomically in its own transaction.
+    ///
+    /// Convenience wrapper around [`Self::assign_sequence_number_tx`] for callers
+    /// that are not already inside a transaction.
+    pub async fn assign_sequence_number(
+        &self,
+        intent_id: Uuid,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+    ) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let next_seq = self
+            .assign_sequence_number_tx(&mut tx, intent_id, tenant_id, store_id)
+            .await?;
         tx.commit().await?;
         Ok(next_seq)
     }
@@ -985,30 +1017,50 @@ impl PgX402Repository {
     }
 
     /// Commit a batch with Merkle root computation
+    /// Commit a batch: claim its intents, compute the Merkle root, and mark the
+    /// batch committed — atomically.
+    ///
+    /// `intent_ids` is the set of sequenced intents that make up the batch (the
+    /// caller already selected them via `get_pending_intents_for_batch`). The
+    /// previous implementation read intents `WHERE batch_id = $1` *before*
+    /// anything had set `batch_id`, so it always found an empty set and failed
+    /// with "No intents in batch" — the x402 auto-commit and manual-commit
+    /// paths were both non-functional. Assignment, read, and commit now happen
+    /// in one transaction, so a crash can't strand intents as `batched` under an
+    /// uncommitted batch.
     pub async fn commit_batch_with_merkle(
         &self,
         batch_id: Uuid,
+        intent_ids: &[Uuid],
         tenant_id: &TenantId,
         store_id: &StoreId,
     ) -> Result<(Hash256, Hash256)> {
-        // Fetch all intents for this batch
-        let intent_ids: Vec<(Uuid,)> = sqlx::query_as(
+        let mut tx = self.pool.begin().await?;
+
+        // Claim the intents into this batch (sequenced -> batched, sets batch_id).
+        // Errors with an invariant violation if any intent is missing or no
+        // longer in the sequenced state.
+        self.assign_intents_to_batch_tx(&mut tx, batch_id, intent_ids)
+            .await?;
+
+        // Read the batch's members back within the same transaction, ordered by
+        // sequence number so the Merkle leaf order is deterministic and matches
+        // inclusion-proof generation.
+        let rows: Vec<X402IntentRow> = sqlx::query_as(
             r#"
-            SELECT intent_id FROM x402_payment_intents
+            SELECT * FROM x402_payment_intents
             WHERE batch_id = $1
             ORDER BY sequence_number ASC
             LIMIT 10000
             "#,
         )
         .bind(batch_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
-        let mut intents = Vec::with_capacity(intent_ids.len());
-        for (id,) in intent_ids {
-            if let Some(intent) = self.get_intent(id).await? {
-                intents.push(intent);
-            }
+        let mut intents = Vec::with_capacity(rows.len());
+        for row in rows {
+            intents.push(Self::row_to_intent(row)?);
         }
 
         // Compute Merkle root
@@ -1028,11 +1080,34 @@ impl PgX402Repository {
             hash
         };
 
-        // Update batch in database
-        let intent_ids_only: Vec<Uuid> = intents.iter().map(|i| i.intent_id).collect();
-        self.commit_batch(batch_id, merkle_root, new_state_root, &intent_ids_only)
-            .await?;
+        // Mark the batch committed (pending -> committed) within the same tx.
+        let batch_result = sqlx::query(
+            r#"
+            UPDATE x402_payment_batches
+            SET status = 'committed',
+                merkle_root = $2,
+                new_state_root = $3,
+                committed_at = NOW()
+            WHERE batch_id = $1
+              AND status = 'pending'
+            "#,
+        )
+        .bind(batch_id)
+        .bind(merkle_root.as_slice())
+        .bind(new_state_root.as_slice())
+        .execute(&mut *tx)
+        .await?;
 
+        if batch_result.rows_affected() == 0 {
+            return Err(SequencerError::InvalidStateTransition {
+                entity_type: "x402_payment_batch".into(),
+                entity_id: batch_id.to_string(),
+                from: "not pending".into(),
+                to: "committed".into(),
+            });
+        }
+
+        tx.commit().await?;
         Ok((merkle_root, new_state_root))
     }
 
@@ -1073,15 +1148,26 @@ impl PgX402Repository {
 
         let total_leaves = batch_intents.len() as u32;
 
-        // Find leaf index for this intent
+        // Find leaf index for this intent. If the intent is not actually a
+        // member of the batch, error rather than defaulting to leaf 0 — a
+        // receipt is a verifiable artifact, and returning a valid-looking proof
+        // for the *wrong* leaf is worse than returning no receipt.
         let leaf_index = batch_intents
             .iter()
             .position(|i| i.intent_id == intent_id)
-            .unwrap_or(0);
+            .ok_or_else(|| {
+                SequencerError::Internal(
+                    "intent is not a member of its referenced batch".to_string(),
+                )
+            })?;
 
-        // Generate Merkle proof
+        // Generate Merkle proof. Error rather than substituting an empty (and
+        // therefore non-verifying / misleading) proof. `leaf_index` is in-bounds
+        // by construction above, so `None` here is an internal inconsistency.
         let inclusion_proof = Self::prove_inclusion(&batch_intents, leaf_index)
-            .unwrap_or_default()
+            .ok_or_else(|| {
+                SequencerError::Internal("failed to generate inclusion proof".to_string())
+            })?
             .iter()
             .map(|h| format!("0x{}", hex::encode(h)))
             .collect();

@@ -328,6 +328,35 @@ impl InventoryProjector {
     pub fn new(store: Arc<dyn InventoryProjectionStore>) -> Self {
         Self { store }
     }
+
+    /// Reject an inventory mutation whose `i64` arithmetic overflowed.
+    ///
+    /// Quantities come from agent-controlled payloads, so an adversarial value
+    /// near `i64::MAX`/`MIN` could otherwise wrap silently (corrupting the
+    /// projection and even flipping the `< 0` invariant check) in release builds,
+    /// or panic and take down the projection task in debug builds.
+    fn overflow_rejected(field: &str) -> ApplyResult {
+        ApplyResult::Rejected {
+            reason: RejectionReason::InvariantViolation {
+                invariant: format!("{field} arithmetic within i64 range"),
+            },
+            message: format!("inventory {field} adjustment overflowed i64 range"),
+        }
+    }
+
+    /// Reject a reserve/release/fulfill with a negative quantity, which is
+    /// meaningless and would otherwise run the arithmetic in reverse (e.g. a
+    /// negative reserve quantity passes the availability check and *decreases*
+    /// reserved stock).
+    fn negative_quantity_rejected(quantity: i64) -> ApplyResult {
+        ApplyResult::Rejected {
+            reason: RejectionReason::PayloadInvalid {
+                field: "quantity".to_string(),
+                error: format!("quantity must be non-negative, got {quantity}"),
+            },
+            message: format!("inventory quantity must be non-negative, got {quantity}"),
+        }
+    }
 }
 
 #[async_trait]
@@ -405,9 +434,17 @@ impl DomainProjector for InventoryProjector {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
 
-                inventory.quantity_on_hand += adjustment;
-                inventory.quantity_available =
-                    inventory.quantity_on_hand - inventory.quantity_reserved;
+                let Some(new_on_hand) = inventory.quantity_on_hand.checked_add(adjustment) else {
+                    return Ok(Self::overflow_rejected("quantity_on_hand"));
+                };
+                inventory.quantity_on_hand = new_on_hand;
+                let Some(available) = inventory
+                    .quantity_on_hand
+                    .checked_sub(inventory.quantity_reserved)
+                else {
+                    return Ok(Self::overflow_rejected("quantity_available"));
+                };
+                inventory.quantity_available = available;
                 inventory.version += 1;
                 inventory.updated_at = event.created_at();
 
@@ -446,6 +483,10 @@ impl DomainProjector for InventoryProjector {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
 
+                if quantity < 0 {
+                    return Ok(Self::negative_quantity_rejected(quantity));
+                }
+
                 // Check if we have enough available
                 if quantity > inventory.quantity_available {
                     return Ok(ApplyResult::Rejected {
@@ -459,9 +500,17 @@ impl DomainProjector for InventoryProjector {
                     });
                 }
 
-                inventory.quantity_reserved += quantity;
-                inventory.quantity_available =
-                    inventory.quantity_on_hand - inventory.quantity_reserved;
+                let Some(reserved) = inventory.quantity_reserved.checked_add(quantity) else {
+                    return Ok(Self::overflow_rejected("quantity_reserved"));
+                };
+                inventory.quantity_reserved = reserved;
+                let Some(available) = inventory
+                    .quantity_on_hand
+                    .checked_sub(inventory.quantity_reserved)
+                else {
+                    return Ok(Self::overflow_rejected("quantity_available"));
+                };
+                inventory.quantity_available = available;
                 inventory.version += 1;
                 inventory.updated_at = event.created_at();
 
@@ -487,9 +536,22 @@ impl DomainProjector for InventoryProjector {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
 
-                inventory.quantity_reserved = (inventory.quantity_reserved - quantity).max(0);
-                inventory.quantity_available =
-                    inventory.quantity_on_hand - inventory.quantity_reserved;
+                if quantity < 0 {
+                    return Ok(Self::negative_quantity_rejected(quantity));
+                }
+
+                inventory.quantity_reserved = inventory
+                    .quantity_reserved
+                    .checked_sub(quantity)
+                    .unwrap_or(0)
+                    .max(0);
+                let Some(available) = inventory
+                    .quantity_on_hand
+                    .checked_sub(inventory.quantity_reserved)
+                else {
+                    return Ok(Self::overflow_rejected("quantity_available"));
+                };
+                inventory.quantity_available = available;
                 inventory.version += 1;
                 inventory.updated_at = event.created_at();
 
@@ -515,11 +577,27 @@ impl DomainProjector for InventoryProjector {
                     .and_then(|v| v.as_i64())
                     .unwrap_or(0);
 
+                if quantity < 0 {
+                    return Ok(Self::negative_quantity_rejected(quantity));
+                }
+
                 // Fulfillment reduces both on-hand and reserved
-                inventory.quantity_on_hand -= quantity;
-                inventory.quantity_reserved = (inventory.quantity_reserved - quantity).max(0);
-                inventory.quantity_available =
-                    inventory.quantity_on_hand - inventory.quantity_reserved;
+                let Some(new_on_hand) = inventory.quantity_on_hand.checked_sub(quantity) else {
+                    return Ok(Self::overflow_rejected("quantity_on_hand"));
+                };
+                inventory.quantity_on_hand = new_on_hand;
+                inventory.quantity_reserved = inventory
+                    .quantity_reserved
+                    .checked_sub(quantity)
+                    .unwrap_or(0)
+                    .max(0);
+                let Some(available) = inventory
+                    .quantity_on_hand
+                    .checked_sub(inventory.quantity_reserved)
+                else {
+                    return Ok(Self::overflow_rejected("quantity_available"));
+                };
+                inventory.quantity_available = available;
                 inventory.version += 1;
                 inventory.updated_at = event.created_at();
 

@@ -32,7 +32,6 @@ use stateset_sequencer::proto::{
 };
 
 use tonic::Code;
-use tonic::Request;
 
 // Note: common module provides test helpers but not all are used here
 #[allow(unused_imports)]
@@ -41,6 +40,22 @@ use common::*;
 // ============================================================================
 // Test Helpers
 // ============================================================================
+
+/// Build a tonic Request carrying the bootstrap-admin auth context.
+///
+/// In production the gRPC auth interceptor injects an `AuthContext` into the
+/// request extensions before the service method runs; these tests call the
+/// service methods directly, so they must inject it themselves or every call
+/// fails with `Unauthenticated: "missing auth context"`. The bootstrap-admin
+/// context (nil tenant, all stores, admin) passes `authorize_tenant_store` for
+/// any tenant/store via the nil-tenant bypass.
+fn authed<T>(message: T) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(message);
+    request
+        .extensions_mut()
+        .insert(stateset_sequencer::auth::AuthContext::bootstrap_admin());
+    request
+}
 
 async fn connect_db() -> Option<sqlx::PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
@@ -190,7 +205,7 @@ async fn test_grpc_push_events_success() {
     let payload_bytes = serde_json::to_vec(&payload).unwrap();
     let payload_hash = stateset_sequencer::crypto::canonical_json_hash(&payload);
 
-    let request = Request::new(PushRequest {
+    let request = authed(PushRequest {
         agent_id: agent_id.to_string(),
         events: vec![stateset_sequencer::proto::EventEnvelope {
             event_id: Uuid::new_v4().to_string(),
@@ -267,7 +282,7 @@ async fn test_grpc_push_batch_success() {
         })
         .collect();
 
-    let request = Request::new(PushRequest {
+    let request = authed(PushRequest {
         agent_id: agent_id.to_string(),
         events,
     });
@@ -324,7 +339,7 @@ async fn test_grpc_push_rejects_duplicate() {
     };
 
     // First push
-    let request = Request::new(PushRequest {
+    let request = authed(PushRequest {
         agent_id: agent_id.to_string(),
         events: vec![event.clone()],
     });
@@ -332,7 +347,7 @@ async fn test_grpc_push_rejects_duplicate() {
     assert_eq!(response.events_accepted, 1);
 
     // Second push (duplicate)
-    let request = Request::new(PushRequest {
+    let request = authed(PushRequest {
         agent_id: agent_id.to_string(),
         events: vec![event],
     });
@@ -371,7 +386,7 @@ async fn test_grpc_get_head_success() {
 
     let service = create_grpc_service(pool).await;
 
-    let request = Request::new(GetHeadRequest {
+    let request = authed(GetHeadRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
     });
@@ -395,7 +410,7 @@ async fn test_grpc_get_head_empty_store() {
 
     let service = create_grpc_service(pool).await;
 
-    let request = Request::new(GetHeadRequest {
+    let request = authed(GetHeadRequest {
         tenant_id: Uuid::new_v4().to_string(),
         store_id: Uuid::new_v4().to_string(),
     });
@@ -466,7 +481,7 @@ async fn test_grpc_get_entity_history_success() {
 
     let service = create_grpc_service(pool).await;
 
-    let request = Request::new(GetEntityHistoryRequest {
+    let request = authed(GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -535,7 +550,7 @@ async fn test_grpc_get_entity_history_from_zero_equals_one() {
 
     let service = create_grpc_service(pool).await;
 
-    let request_zero = Request::new(GetEntityHistoryRequest {
+    let request_zero = authed(GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -543,7 +558,7 @@ async fn test_grpc_get_entity_history_from_zero_equals_one() {
         from_version: 0,
         to_version: 0,
     });
-    let request_one = Request::new(GetEntityHistoryRequest {
+    let request_one = authed(GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -612,7 +627,7 @@ async fn test_grpc_get_entity_history_invalid_version_range() {
 
     let service = create_grpc_service(pool).await;
 
-    let request = Request::new(GetEntityHistoryRequest {
+    let request = authed(GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -654,7 +669,7 @@ async fn test_grpc_v2_get_entity_history_limit_zero_defaults() {
     .await;
 
     let service = create_grpc_service_v2(pool).await;
-    let request = Request::new(V2GetEntityHistoryRequest {
+    let request = authed(V2GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -707,7 +722,7 @@ async fn test_grpc_v2_get_entity_history_invalid_version_range() {
     .await;
 
     let service = create_grpc_service_v2(pool).await;
-    let request = Request::new(V2GetEntityHistoryRequest {
+    let request = authed(V2GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -750,7 +765,7 @@ async fn test_grpc_v2_get_entity_history_limit_is_capped() {
     .await;
 
     let service = create_grpc_service_v2(pool).await;
-    let request = Request::new(V2GetEntityHistoryRequest {
+    let request = authed(V2GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -805,7 +820,7 @@ async fn test_grpc_get_entity_history_from_version_beyond_current_returns_empty(
 
     let service = create_grpc_service(pool).await;
 
-    let request = Request::new(GetEntityHistoryRequest {
+    let request = authed(GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -853,7 +868,7 @@ async fn test_grpc_v2_get_entity_history_from_version_beyond_current_returns_emp
     .await;
 
     let service = create_grpc_service_v2(pool).await;
-    let request = Request::new(V2GetEntityHistoryRequest {
+    let request = authed(V2GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -903,7 +918,7 @@ async fn test_grpc_v2_get_entity_history_from_zero_equals_one() {
 
     let service = create_grpc_service_v2(pool).await;
 
-    let request_zero = Request::new(V2GetEntityHistoryRequest {
+    let request_zero = authed(V2GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -912,7 +927,7 @@ async fn test_grpc_v2_get_entity_history_from_zero_equals_one() {
         to_version: 0,
         limit: 0,
     });
-    let request_one = Request::new(V2GetEntityHistoryRequest {
+    let request_one = authed(V2GetEntityHistoryRequest {
         tenant_id: tenant_id.0.to_string(),
         store_id: store_id.0.to_string(),
         entity_type: "order".to_string(),
@@ -1001,7 +1016,7 @@ async fn test_grpc_get_commitment_success() {
 
     let service = create_grpc_service(pool).await;
 
-    let request = Request::new(GetCommitmentRequest {
+    let request = authed(GetCommitmentRequest {
         batch_id: commitment.batch_id.to_string(),
     });
 
@@ -1028,7 +1043,7 @@ async fn test_grpc_get_commitment_not_found() {
 
     let service = create_grpc_service(pool).await;
 
-    let request = Request::new(GetCommitmentRequest {
+    let request = authed(GetCommitmentRequest {
         batch_id: Uuid::new_v4().to_string(),
     });
 
@@ -1094,7 +1109,7 @@ async fn test_grpc_get_inclusion_proof_success() {
     let service = create_grpc_service(pool).await;
 
     // Get proof for the event using batch_id and event_id
-    let request = Request::new(GetInclusionProofRequest {
+    let request = authed(GetInclusionProofRequest {
         batch_id: commitment.batch_id.to_string(),
         event_id: event_id.to_string(),
     });
@@ -1128,7 +1143,7 @@ async fn test_grpc_invalid_uuid_returns_error() {
 
     let service = create_grpc_service(pool).await;
 
-    let request = Request::new(GetHeadRequest {
+    let request = authed(GetHeadRequest {
         tenant_id: "not-a-uuid".to_string(),
         store_id: "also-not-a-uuid".to_string(),
     });
@@ -1152,13 +1167,13 @@ async fn test_grpc_empty_events_batch() {
 
     let service = create_grpc_service(pool).await;
 
-    let request = Request::new(PushRequest {
+    let request = authed(PushRequest {
         agent_id: Uuid::new_v4().to_string(),
         events: vec![],
     });
 
-    let response = service.push(request).await.unwrap().into_inner();
-
-    assert_eq!(response.events_accepted, 0);
-    assert_eq!(response.events_rejected.len(), 0);
+    // An empty push is rejected with InvalidArgument, consistent with the HTTP
+    // ingest handler ("events must not be empty").
+    let error = service.push(request).await.unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
 }
