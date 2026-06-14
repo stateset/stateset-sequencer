@@ -157,15 +157,17 @@ fn create_test_router(state: AppState, require_auth: bool) -> axum::Router<()> {
     };
 
     let public_api = stateset_sequencer::api::public_router();
-    let public_api_root = stateset_sequencer::api::public_router();
     let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
         auth_state,
         stateset_sequencer::auth::auth_middleware,
     ));
 
+    // Mirror the real server (server.rs), which only nests the public router
+    // under `/api` and does NOT merge it at the root. (The previous extra
+    // root merge exposed `/v1/agents/register` at the root, contradicting the
+    // root-alias-not-exposed test.)
     axum::Router::new()
         .nest("/api", public_api)
-        .merge(public_api_root)
         .nest("/api", api)
         .with_state::<()>(state)
 }
@@ -1667,7 +1669,9 @@ async fn test_create_ves_commitment_success() {
 
     assert_eq!(status, StatusCode::OK, "body: {:?}", body);
     assert!(body["batch_id"].as_str().is_some());
-    assert!(body["events_root"].as_str().is_some());
+    // The VES commitment response field is `merkle_root` (the legacy
+    // commitment uses `events_root`).
+    assert!(body["merkle_root"].as_str().is_some());
 }
 
 // ============================================================================
