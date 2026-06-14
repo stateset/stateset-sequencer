@@ -35,7 +35,7 @@ use stateset_sequencer::server::AppState;
 
 use common::*;
 
-const STORE_SCOPED_KEY: &str = "sk_test_store_scoped_key_12345";
+const STORE_SCOPED_KEY: &str = "ss_test_store_scoped_key_12345";
 const STORE_SCOPED_TENANT: &str = "11111111-1111-1111-1111-111111111111";
 const STORE_SCOPED_STORE: &str = "22222222-2222-2222-2222-222222222222";
 
@@ -122,7 +122,7 @@ fn create_test_router(state: AppState, require_auth: bool) -> axum::Router<()> {
     let api_key_validator = Arc::new(ApiKeyValidator::new());
 
     // Register a test admin API key
-    let test_key = "sk_test_integration_key_12345";
+    let test_key = "ss_test_integration_key_12345";
     let key_hash = ApiKeyValidator::hash_key(test_key);
     api_key_validator.register_key(ApiKeyRecord {
         key_hash,
@@ -397,7 +397,7 @@ async fn test_x402_list_requires_auth_and_tenant() {
         Method::GET,
         "/api/v1/x402/payments",
         None,
-        Some("sk_test_integration_key_12345"),
+        Some("ss_test_integration_key_12345"),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -408,7 +408,7 @@ async fn test_x402_list_requires_auth_and_tenant() {
         Method::GET,
         &uri,
         None,
-        Some("sk_test_integration_key_12345"),
+        Some("ss_test_integration_key_12345"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1431,7 +1431,7 @@ async fn test_auth_accepts_valid_api_key() {
         Method::GET,
         &uri,
         None,
-        Some("sk_test_integration_key_12345"),
+        Some("ss_test_integration_key_12345"),
     )
     .await;
 
@@ -1684,7 +1684,7 @@ fn create_tenant_scoped_router(
     let api_key_validator = Arc::new(ApiKeyValidator::new());
 
     // Generate a unique test key for this tenant
-    let test_key = format!("sk_test_tenant_{}_{}", tenant_id, Uuid::new_v4());
+    let test_key = format!("ss_test_tenant_{}_{}", tenant_id, Uuid::new_v4());
     let key_hash = ApiKeyValidator::hash_key(&test_key);
     api_key_validator.register_key(ApiKeyRecord {
         key_hash,
@@ -1736,7 +1736,7 @@ async fn test_cross_tenant_schema_read_denied() {
     let schema_id = Uuid::new_v4();
     sqlx::query(
         r#"
-        INSERT INTO schemas (id, tenant_id, event_type, version, schema_json, status, compatibility, created_at, updated_at)
+        INSERT INTO event_schemas (id, tenant_id, event_type, version, schema_json, status, compatibility, created_at, updated_at)
         VALUES ($1, $2, 'order.created', 1, '{"type": "object"}', 'active', 'backward', NOW(), NOW())
         "#,
     )
@@ -1814,7 +1814,7 @@ async fn test_cross_tenant_schema_delete_denied() {
     let schema_id = Uuid::new_v4();
     sqlx::query(
         r#"
-        INSERT INTO schemas (id, tenant_id, event_type, version, schema_json, status, compatibility, created_at, updated_at)
+        INSERT INTO event_schemas (id, tenant_id, event_type, version, schema_json, status, compatibility, created_at, updated_at)
         VALUES ($1, $2, 'order.created', 1, '{"type": "object"}', 'active', 'backward', NOW(), NOW())
         "#,
     )
@@ -1828,7 +1828,7 @@ async fn test_cross_tenant_schema_delete_denied() {
 
     // Create router scoped to tenant_b with admin permissions
     let api_key_validator = Arc::new(ApiKeyValidator::new());
-    let test_key = format!("sk_test_admin_{}", Uuid::new_v4());
+    let test_key = format!("ss_test_admin_{}", Uuid::new_v4());
     let key_hash = ApiKeyValidator::hash_key(&test_key);
     api_key_validator.register_key(ApiKeyRecord {
         key_hash,
@@ -1889,7 +1889,7 @@ async fn test_cross_tenant_schema_update_status_denied() {
     let schema_id = Uuid::new_v4();
     sqlx::query(
         r#"
-        INSERT INTO schemas (id, tenant_id, event_type, version, schema_json, status, compatibility, created_at, updated_at)
+        INSERT INTO event_schemas (id, tenant_id, event_type, version, schema_json, status, compatibility, created_at, updated_at)
         VALUES ($1, $2, 'order.created', 1, '{"type": "object"}', 'active', 'backward', NOW(), NOW())
         "#,
     )
