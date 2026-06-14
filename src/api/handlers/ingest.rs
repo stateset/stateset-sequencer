@@ -33,6 +33,7 @@ use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::api::auth_helpers::ensure_write;
+use crate::api::error::ApiError;
 use crate::api::utils::map_sequencer_error;
 use crate::api::types::{
     IngestRequest, IngestResponse, RejectionInfo, VesIngestRequest, VesIngestResponse,
@@ -549,7 +550,7 @@ pub async fn ingest_events(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<IngestRequest>,
-) -> Result<Json<IngestResponse>, (StatusCode, String)> {
+) -> Result<Json<IngestResponse>, ApiError> {
     let _timer = TimerGuard::new(state.metrics.clone(), metric_names::INGEST_LATENCY);
     info!("Ingesting {} events via legacy API", request.events.len());
     state
@@ -569,14 +570,15 @@ pub async fn ingest_events(
                 return Err((
                     StatusCode::BAD_REQUEST,
                     "All events in a batch must share the same tenant_id and store_id".to_string(),
-                ));
+                )
+                    .into());
             }
         }
 
         // If auth is scoped to an agent, require it matches the request agent_id.
         if let Some(agent_id) = auth.agent_id {
             if agent_id != request.agent_id {
-                return Err((StatusCode::FORBIDDEN, "Agent mismatch".to_string()));
+                return Err((StatusCode::FORBIDDEN, "Agent mismatch".to_string()).into());
             }
         }
 
@@ -706,7 +708,7 @@ pub async fn ingest_events(
                 .metrics
                 .inc_counter(metric_names::DATABASE_ERRORS)
                 .await;
-            Err(map_sequencer_error(e))
+            Err(map_sequencer_error(e).into())
         }
     }
 }
@@ -720,7 +722,7 @@ pub async fn ingest_ves_events(
     State(state): State<AppState>,
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(request): Json<VesIngestRequest>,
-) -> Result<Json<VesIngestResponse>, (StatusCode, String)> {
+) -> Result<Json<VesIngestResponse>, ApiError> {
     let _timer = TimerGuard::new(state.metrics.clone(), metric_names::INGEST_LATENCY);
     info!("Ingesting {} VES events", request.events.len());
     state
@@ -739,7 +741,8 @@ pub async fn ingest_ves_events(
         return Err((
             StatusCode::BAD_REQUEST,
             "events must not be empty".to_string(),
-        ));
+        )
+            .into());
     }
 
     let first = &request.events[0];
@@ -751,14 +754,15 @@ pub async fn ingest_ves_events(
             return Err((
                 StatusCode::BAD_REQUEST,
                 "All events in a batch must share the same tenantId and storeId".to_string(),
-            ));
+            )
+                .into());
         }
     }
 
     // If auth is scoped to an agent, require it matches the request.
     if let Some(agent_id) = auth.agent_id {
         if agent_id != request.agent_id {
-            return Err((StatusCode::FORBIDDEN, "Agent mismatch".to_string()));
+            return Err((StatusCode::FORBIDDEN, "Agent mismatch".to_string()).into());
         }
     }
 
@@ -902,7 +906,7 @@ pub async fn ingest_ves_events(
                 .metrics
                 .inc_counter(metric_names::DATABASE_ERRORS)
                 .await;
-            Err(map_sequencer_error(e))
+            Err(map_sequencer_error(e).into())
         }
     }
 }
