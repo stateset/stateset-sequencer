@@ -1017,30 +1017,50 @@ impl PgX402Repository {
     }
 
     /// Commit a batch with Merkle root computation
+    /// Commit a batch: claim its intents, compute the Merkle root, and mark the
+    /// batch committed — atomically.
+    ///
+    /// `intent_ids` is the set of sequenced intents that make up the batch (the
+    /// caller already selected them via `get_pending_intents_for_batch`). The
+    /// previous implementation read intents `WHERE batch_id = $1` *before*
+    /// anything had set `batch_id`, so it always found an empty set and failed
+    /// with "No intents in batch" — the x402 auto-commit and manual-commit
+    /// paths were both non-functional. Assignment, read, and commit now happen
+    /// in one transaction, so a crash can't strand intents as `batched` under an
+    /// uncommitted batch.
     pub async fn commit_batch_with_merkle(
         &self,
         batch_id: Uuid,
+        intent_ids: &[Uuid],
         tenant_id: &TenantId,
         store_id: &StoreId,
     ) -> Result<(Hash256, Hash256)> {
-        // Fetch all intents for this batch
-        let intent_ids: Vec<(Uuid,)> = sqlx::query_as(
+        let mut tx = self.pool.begin().await?;
+
+        // Claim the intents into this batch (sequenced -> batched, sets batch_id).
+        // Errors with an invariant violation if any intent is missing or no
+        // longer in the sequenced state.
+        self.assign_intents_to_batch_tx(&mut tx, batch_id, intent_ids)
+            .await?;
+
+        // Read the batch's members back within the same transaction, ordered by
+        // sequence number so the Merkle leaf order is deterministic and matches
+        // inclusion-proof generation.
+        let rows: Vec<X402IntentRow> = sqlx::query_as(
             r#"
-            SELECT intent_id FROM x402_payment_intents
+            SELECT * FROM x402_payment_intents
             WHERE batch_id = $1
             ORDER BY sequence_number ASC
             LIMIT 10000
             "#,
         )
         .bind(batch_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
-        let mut intents = Vec::with_capacity(intent_ids.len());
-        for (id,) in intent_ids {
-            if let Some(intent) = self.get_intent(id).await? {
-                intents.push(intent);
-            }
+        let mut intents = Vec::with_capacity(rows.len());
+        for row in rows {
+            intents.push(Self::row_to_intent(row)?);
         }
 
         // Compute Merkle root
@@ -1060,11 +1080,34 @@ impl PgX402Repository {
             hash
         };
 
-        // Update batch in database
-        let intent_ids_only: Vec<Uuid> = intents.iter().map(|i| i.intent_id).collect();
-        self.commit_batch(batch_id, merkle_root, new_state_root, &intent_ids_only)
-            .await?;
+        // Mark the batch committed (pending -> committed) within the same tx.
+        let batch_result = sqlx::query(
+            r#"
+            UPDATE x402_payment_batches
+            SET status = 'committed',
+                merkle_root = $2,
+                new_state_root = $3,
+                committed_at = NOW()
+            WHERE batch_id = $1
+              AND status = 'pending'
+            "#,
+        )
+        .bind(batch_id)
+        .bind(merkle_root.as_slice())
+        .bind(new_state_root.as_slice())
+        .execute(&mut *tx)
+        .await?;
 
+        if batch_result.rows_affected() == 0 {
+            return Err(SequencerError::InvalidStateTransition {
+                entity_type: "x402_payment_batch".into(),
+                entity_id: batch_id.to_string(),
+                from: "not pending".into(),
+                to: "committed".into(),
+            });
+        }
+
+        tx.commit().await?;
         Ok((merkle_root, new_state_root))
     }
 

@@ -610,9 +610,12 @@ mod integration {
             .await
             .expect("Failed to insert batch");
 
-        // Commit batch with Merkle root
+        // Commit batch with Merkle root. commit_batch_with_merkle claims the
+        // given intents into the batch (sequenced -> batched), computes the root,
+        // and marks the batch committed — all atomically.
+        let intent_ids: Vec<_> = pending.iter().map(|i| i.intent_id).collect();
         let (merkle_root, state_root) = repo
-            .commit_batch_with_merkle(batch.batch_id, &tenant_id, &store_id)
+            .commit_batch_with_merkle(batch.batch_id, &intent_ids, &tenant_id, &store_id)
             .await
             .expect("Failed to commit batch");
 

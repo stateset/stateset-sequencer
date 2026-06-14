@@ -1031,9 +1031,10 @@ pub async fn create_batch(
         })?;
 
     // Compute Merkle root + commit batch
+    let intent_ids: Vec<_> = intents.iter().map(|i| i.intent_id).collect();
     let (merkle_root, _state_root) = match state
         .x402_repository
-        .commit_batch_with_merkle(batch.batch_id, &tenant_id, &store_id)
+        .commit_batch_with_merkle(batch.batch_id, &intent_ids, &tenant_id, &store_id)
         .await
     {
         Ok(result) => result,

@@ -400,7 +400,7 @@ impl X402BatchWorker {
         if self.config.auto_commit {
             match self
                 .repository
-                .commit_batch_with_merkle(batch.batch_id, tenant_id, store_id)
+                .commit_batch_with_merkle(batch.batch_id, &intent_ids, tenant_id, store_id)
                 .await
             {
                 Ok((merkle_root, _state_root)) => {
