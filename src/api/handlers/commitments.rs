@@ -11,7 +11,7 @@ use crate::infra::CACHE_STAMPEDE_DELAY;
 
 use crate::api::auth_helpers::{ensure_read, ensure_write};
 use crate::api::types::{CreateCommitmentRequest, HeadQuery};
-use crate::api::utils::internal_error;
+use crate::api::utils::{internal_error, map_sequencer_error};
 use crate::auth::AuthContextExt;
 use crate::domain::{BatchCommitment, StoreId, TenantId};
 use crate::infra::CommitmentEngine;
@@ -148,7 +148,7 @@ pub async fn create_commitment(
             (request.sequence_start, request.sequence_end),
         )
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        .map_err(map_sequencer_error)?;
 
     state
         .cache_manager

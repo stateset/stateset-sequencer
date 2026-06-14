@@ -52,6 +52,14 @@ pub const X402_DEFAULT_BATCH_SIZE: usize = 100;
 /// Maximum batch size
 pub const X402_MAX_BATCH_SIZE: usize = 1000;
 
+/// Maximum payment amount (smallest unit).
+///
+/// Amounts are persisted to Postgres `BIGINT` (`i64`) columns, so the
+/// representable ceiling is `i64::MAX`. Values above this would silently wrap to
+/// a negative number on storage, corrupting DB-side aggregation (`SUM`),
+/// ordering, and any external reader. Reject at ingest instead.
+pub const X402_MAX_AMOUNT: u64 = i64::MAX as u64;
+
 // =============================================================================
 // x402 Network & Asset Types
 // =============================================================================
@@ -551,7 +559,9 @@ impl X402PaymentBatch {
             .iter_mut()
             .find(|t| t.asset == intent.asset)
         {
-            total.total_amount += intent.amount;
+            // Saturate rather than wrap/panic: per-intent amounts are bounded by
+            // X402_MAX_AMOUNT at ingest, but a large batch can still exceed u64.
+            total.total_amount = total.total_amount.saturating_add(intent.amount);
             total.payment_count += 1;
         } else {
             self.total_amounts.push(X402BatchTotal {
@@ -825,6 +835,16 @@ mod tests {
     fn test_x402_intent_status_display() {
         assert_eq!(X402IntentStatus::Pending.to_string(), "pending");
         assert_eq!(X402IntentStatus::Settled.to_string(), "settled");
+    }
+
+    #[test]
+    fn test_x402_max_amount_is_bigint_ceiling() {
+        // Amounts persist to Postgres BIGINT (i64); the ceiling must be i64::MAX
+        // so storage never silently wraps to a negative value.
+        assert_eq!(X402_MAX_AMOUNT, i64::MAX as u64);
+        assert_eq!(X402_MAX_AMOUNT as i64, i64::MAX);
+        // One above the ceiling would wrap negative when bound as i64.
+        assert!((X402_MAX_AMOUNT + 1) as i64 <= 0);
     }
 
     #[test]

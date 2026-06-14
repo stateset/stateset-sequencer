@@ -15,6 +15,116 @@ use crate::crypto::{
 use crate::domain::{Hash256, MerkleProof, StoreId, TenantId, VesBatchCommitment};
 use crate::infra::{Result, SequencerError};
 
+/// Pure VES Merkle tree operations.
+///
+/// These functions are intentionally free of any database or runtime
+/// dependency: the tree is a pure function of its leaves. Keeping them out of
+/// [`PgVesCommitmentEngine`] (which holds a `PgPool`) lets the consensus-critical
+/// proof logic be unit- and property-tested directly, with no pool or Tokio
+/// runtime. The engine's methods delegate here.
+pub(crate) mod merkle {
+    use super::{compute_node_hash, next_power_of_two, pad_leaf, Hash256, MerkleProof};
+    use crate::infra::{Result, SequencerError};
+
+    /// Pad leaves up to the next power of two with the canonical pad leaf.
+    pub(crate) fn pad_leaves(leaves: &[Hash256]) -> Vec<Hash256> {
+        if leaves.is_empty() {
+            return Vec::new();
+        }
+
+        let padded_len = next_power_of_two(leaves.len());
+        let mut padded = Vec::with_capacity(padded_len);
+        padded.extend_from_slice(leaves);
+        padded.resize(padded_len, pad_leaf());
+        padded
+    }
+
+    /// Build every level of the tree, from padded leaves up to the root.
+    pub(crate) fn build_levels(leaves: &[Hash256]) -> Vec<Vec<Hash256>> {
+        let mut levels = Vec::new();
+        if leaves.is_empty() {
+            return levels;
+        }
+
+        levels.push(pad_leaves(leaves));
+
+        loop {
+            let Some(current) = levels.last() else {
+                break;
+            };
+            if current.len() <= 1 {
+                break;
+            }
+            let mut next = Vec::with_capacity(current.len() / 2);
+            for pair in current.chunks_exact(2) {
+                next.push(compute_node_hash(&pair[0], &pair[1]));
+            }
+            levels.push(next);
+        }
+
+        levels
+    }
+
+    /// Compute the Merkle root of the given leaves (`[0u8; 32]` for an empty set).
+    pub(crate) fn compute_merkle_root(leaves: &[Hash256]) -> Hash256 {
+        if leaves.is_empty() {
+            return [0u8; 32];
+        }
+
+        let levels = build_levels(leaves);
+        levels
+            .last()
+            .and_then(|l| l.first().copied())
+            .unwrap_or([0u8; 32])
+    }
+
+    /// Produce an inclusion proof for the leaf at `leaf_index`.
+    pub(crate) fn prove_inclusion(leaf_index: usize, leaves: &[Hash256]) -> Result<MerkleProof> {
+        if leaves.is_empty() {
+            return Err(SequencerError::Internal(
+                "cannot prove inclusion for empty tree".to_string(),
+            ));
+        }
+        if leaf_index >= leaves.len() {
+            return Err(SequencerError::Internal(
+                "leaf_index out of bounds".to_string(),
+            ));
+        }
+
+        let levels = build_levels(leaves);
+        let mut proof_path = Vec::with_capacity(levels.len().saturating_sub(1));
+
+        let mut idx = leaf_index;
+        for level in &levels[..levels.len().saturating_sub(1)] {
+            let sibling_idx = idx ^ 1;
+            let sibling = level
+                .get(sibling_idx)
+                .copied()
+                .ok_or_else(|| SequencerError::Internal("invalid proof index".to_string()))?;
+            proof_path.push(sibling);
+            idx /= 2;
+        }
+
+        Ok(MerkleProof::new(leaves[leaf_index], proof_path, leaf_index))
+    }
+
+    /// Verify that `leaf` is included under `root` given `proof`.
+    pub(crate) fn verify_inclusion(leaf: Hash256, proof: &MerkleProof, root: Hash256) -> bool {
+        let mut current = leaf;
+
+        for (i, sibling) in proof.proof_path.iter().enumerate() {
+            let is_left = proof.directions.get(i).copied().unwrap_or(true);
+            current = if is_left {
+                compute_node_hash(&current, sibling)
+            } else {
+                compute_node_hash(sibling, &current)
+            };
+        }
+
+        current == root
+    }
+}
+
 /// PostgreSQL-backed VES commitment engine.
 pub struct PgVesCommitmentEngine {
     pool: PgPool,
@@ -322,97 +432,16 @@ impl PgVesCommitmentEngine {
         i64::from_be_bytes(bytes)
     }
 
-    fn pad_leaves(&self, leaves: &[Hash256]) -> Vec<Hash256> {
-        if leaves.is_empty() {
-            return Vec::new();
-        }
-
-        let padded_len = next_power_of_two(leaves.len());
-        let mut padded = Vec::with_capacity(padded_len);
-        padded.extend_from_slice(leaves);
-        padded.resize(padded_len, pad_leaf());
-        padded
-    }
-
-    fn build_levels(&self, leaves: &[Hash256]) -> Vec<Vec<Hash256>> {
-        let mut levels = Vec::new();
-        if leaves.is_empty() {
-            return levels;
-        }
-
-        levels.push(self.pad_leaves(leaves));
-
-        loop {
-            let Some(current) = levels.last() else {
-                break;
-            };
-            if current.len() <= 1 {
-                break;
-            }
-            let mut next = Vec::with_capacity(current.len() / 2);
-            for pair in current.chunks_exact(2) {
-                next.push(compute_node_hash(&pair[0], &pair[1]));
-            }
-            levels.push(next);
-        }
-
-        levels
-    }
-
     pub fn compute_merkle_root(&self, leaves: &[Hash256]) -> Hash256 {
-        if leaves.is_empty() {
-            return [0u8; 32];
-        }
-
-        let levels = self.build_levels(leaves);
-        levels
-            .last()
-            .and_then(|l| l.first().copied())
-            .unwrap_or([0u8; 32])
+        merkle::compute_merkle_root(leaves)
     }
 
     pub fn prove_inclusion(&self, leaf_index: usize, leaves: &[Hash256]) -> Result<MerkleProof> {
-        if leaves.is_empty() {
-            return Err(SequencerError::Internal(
-                "cannot prove inclusion for empty tree".to_string(),
-            ));
-        }
-        if leaf_index >= leaves.len() {
-            return Err(SequencerError::Internal(
-                "leaf_index out of bounds".to_string(),
-            ));
-        }
-
-        let levels = self.build_levels(leaves);
-        let mut proof_path = Vec::with_capacity(levels.len().saturating_sub(1));
-
-        let mut idx = leaf_index;
-        for level in &levels[..levels.len().saturating_sub(1)] {
-            let sibling_idx = idx ^ 1;
-            let sibling = level
-                .get(sibling_idx)
-                .copied()
-                .ok_or_else(|| SequencerError::Internal("invalid proof index".to_string()))?;
-            proof_path.push(sibling);
-            idx /= 2;
-        }
-
-        Ok(MerkleProof::new(leaves[leaf_index], proof_path, leaf_index))
+        merkle::prove_inclusion(leaf_index, leaves)
     }
 
     pub fn verify_inclusion(&self, leaf: Hash256, proof: &MerkleProof, root: Hash256) -> bool {
-        let mut current = leaf;
-
-        for (i, sibling) in proof.proof_path.iter().enumerate() {
-            let is_left = proof.directions.get(i).copied().unwrap_or(true);
-            current = if is_left {
-                compute_node_hash(&current, sibling)
-            } else {
-                compute_node_hash(sibling, &current)
-            };
-        }
-
-        current == root
+        merkle::verify_inclusion(leaf, proof, root)
     }
 
     pub async fn create_commitment(
@@ -1386,26 +1415,23 @@ mod tests {
     // Padding Tests
     // ============================================================================
 
-    #[tokio::test]
-    async fn pad_leaves_empty_returns_empty() {
-        let engine = engine();
-        let padded = engine.pad_leaves(&[]);
+    #[test]
+    fn pad_leaves_empty_returns_empty() {
+        let padded = merkle::pad_leaves(&[]);
         assert!(padded.is_empty());
     }
 
-    #[tokio::test]
-    async fn pad_leaves_power_of_two_no_change() {
-        let engine = engine();
+    #[test]
+    fn pad_leaves_power_of_two_no_change() {
         let leaves: Vec<Hash256> = (0u8..4u8).map(|b| [b; 32]).collect();
-        let padded = engine.pad_leaves(&leaves);
+        let padded = merkle::pad_leaves(&leaves);
         assert_eq!(padded.len(), 4);
     }
 
-    #[tokio::test]
-    async fn pad_leaves_to_next_power_of_two() {
-        let engine = engine();
+    #[test]
+    fn pad_leaves_to_next_power_of_two() {
         let leaves: Vec<Hash256> = (0u8..5u8).map(|b| [b; 32]).collect();
-        let padded = engine.pad_leaves(&leaves);
+        let padded = merkle::pad_leaves(&leaves);
         assert_eq!(padded.len(), 8);
 
         // First 5 should be original
@@ -1423,18 +1449,16 @@ mod tests {
     // Build Levels Tests
     // ============================================================================
 
-    #[tokio::test]
-    async fn build_levels_empty_returns_empty() {
-        let engine = engine();
-        let levels = engine.build_levels(&[]);
+    #[test]
+    fn build_levels_empty_returns_empty() {
+        let levels = merkle::build_levels(&[]);
         assert!(levels.is_empty());
     }
 
-    #[tokio::test]
-    async fn build_levels_single_leaf() {
-        let engine = engine();
+    #[test]
+    fn build_levels_single_leaf() {
         let leaves = vec![[1u8; 32]];
-        let levels = engine.build_levels(&leaves);
+        let levels = merkle::build_levels(&leaves);
 
         // Should have at least 1 level
         assert!(!levels.is_empty());
@@ -1446,11 +1470,10 @@ mod tests {
         assert!(levels[0].contains(&[1u8; 32]));
     }
 
-    #[tokio::test]
-    async fn build_levels_four_leaves() {
-        let engine = engine();
+    #[test]
+    fn build_levels_four_leaves() {
         let leaves: Vec<Hash256> = (0u8..4u8).map(|b| [b; 32]).collect();
-        let levels = engine.build_levels(&leaves);
+        let levels = merkle::build_levels(&leaves);
 
         // 4 leaves -> 2 intermediate nodes -> 1 root
         assert_eq!(levels.len(), 3);
@@ -1459,11 +1482,10 @@ mod tests {
         assert_eq!(levels[2].len(), 1);
     }
 
-    #[tokio::test]
-    async fn build_levels_eight_leaves() {
-        let engine = engine();
+    #[test]
+    fn build_levels_eight_leaves() {
         let leaves: Vec<Hash256> = (0u8..8u8).map(|b| [b; 32]).collect();
-        let levels = engine.build_levels(&leaves);
+        let levels = merkle::build_levels(&leaves);
 
         // 8 -> 4 -> 2 -> 1
         assert_eq!(levels.len(), 4);
@@ -1616,5 +1638,76 @@ mod tests {
         assert!(commitment.chain_tx_hash.is_none());
         assert!(commitment.chain_block_number.is_none());
         assert!(commitment.anchored_at.is_none());
+    }
+
+    // ========================================================================
+    // Merkle Property Tests
+    //
+    // The fixed-size tests above exercise powers of two (1, 2, 4, 8). The
+    // hand-rolled tree pads to the next power of two, so the bug-prone cases are
+    // the *non*-power-of-two sizes (3, 5, 6, 7, 9, ...) where padding and
+    // odd-node handling kick in. These properties sweep arbitrary sizes and
+    // leaves to guarantee the prove/verify round-trip holds and that tampered
+    // inputs are rejected — the consensus-critical invariant of the proof system.
+    // ========================================================================
+    mod proptests {
+        use crate::domain::Hash256;
+        use crate::infra::ves_commitment::merkle;
+        use proptest::prelude::*;
+
+        fn arb_leaves(max: usize) -> impl Strategy<Value = Vec<Hash256>> {
+            prop::collection::vec(prop::array::uniform32(any::<u8>()), 1..=max)
+        }
+
+        proptest! {
+            // Every leaf in a tree of any size proves and verifies against the root.
+            #[test]
+            fn prove_verify_roundtrip_any_size(leaves in arb_leaves(40)) {
+                let root = merkle::compute_merkle_root(&leaves);
+                for idx in 0..leaves.len() {
+                    let proof = merkle::prove_inclusion(idx, &leaves).unwrap();
+                    prop_assert!(
+                        merkle::verify_inclusion(leaves[idx], &proof, root),
+                        "leaf {idx} of {} failed to verify", leaves.len()
+                    );
+                }
+            }
+
+            // A tampered leaf must never verify against a proof built for the original.
+            #[test]
+            fn tampered_leaf_is_rejected(leaves in arb_leaves(40), seed in any::<usize>()) {
+                let root = merkle::compute_merkle_root(&leaves);
+                let idx = seed % leaves.len();
+                let proof = merkle::prove_inclusion(idx, &leaves).unwrap();
+
+                let mut tampered = leaves[idx];
+                tampered[0] ^= 0xFF; // guaranteed different from the real leaf
+                prop_assert!(!merkle::verify_inclusion(tampered, &proof, root));
+            }
+
+            // A proof built for index i must not verify a *different* leaf value.
+            // (Distinct leaf values ⇒ distinct recomputed roots, barring a SHA-256
+            // collision, so this is a deterministic property, not a flaky one.)
+            #[test]
+            fn proof_does_not_verify_other_leaves(leaves in arb_leaves(40), seed in any::<usize>()) {
+                let root = merkle::compute_merkle_root(&leaves);
+                let i = seed % leaves.len();
+                let proof = merkle::prove_inclusion(i, &leaves).unwrap();
+                for (j, leaf) in leaves.iter().enumerate() {
+                    if j != i && *leaf != leaves[i] {
+                        prop_assert!(!merkle::verify_inclusion(*leaf, &proof, root));
+                    }
+                }
+            }
+
+            // The root is a pure function of the leaves: identical input ⇒ identical root.
+            #[test]
+            fn root_is_deterministic(leaves in arb_leaves(40)) {
+                prop_assert_eq!(
+                    merkle::compute_merkle_root(&leaves),
+                    merkle::compute_merkle_root(&leaves)
+                );
+            }
+        }
     }
 }

@@ -67,6 +67,13 @@ use crate::proto::{
 /// Maximum events allowed in a single gRPC push request.
 const MAX_GRPC_BATCH_SIZE: usize = 1000;
 
+/// Maximum events returned from a single entity-history request.
+///
+/// Mirrors the HTTP handler (`api::handlers::events`) and the v2 gRPC service so
+/// the v1 path cannot be coerced into materializing and serializing an entire
+/// multi-million-event entity history into one response.
+const MAX_ENTITY_HISTORY: usize = 100;
+
 /// gRPC Sequencer service implementation
 pub struct SequencerService {
     sequencer: Arc<PgSequencer>,
@@ -1077,9 +1084,14 @@ impl SequencerTrait for SequencerService {
             ));
         }
 
+        // Cap the response window at MAX_ENTITY_HISTORY, matching the HTTP and v2
+        // gRPC paths. Without this an authenticated reader could request the full
+        // version range of a hot entity and force the whole history to be
+        // serialized into a single response.
         let take_count = to_version
             .saturating_sub(requested_from_version)
-            .saturating_add(1) as usize;
+            .saturating_add(1)
+            .min(MAX_ENTITY_HISTORY as u64) as usize;
         let start_index = usize::try_from(requested_from_version - 1)
             .map_err(|_| Status::invalid_argument("from_version is out of range"))?;
 

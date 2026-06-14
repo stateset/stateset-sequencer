@@ -242,10 +242,16 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         let payload_kind =
             PayloadKind::from_u32(row.payload_kind as u32).unwrap_or(PayloadKind::Plaintext);
 
-        let payload_encrypted = if let Some(enc_json) = row.payload_encrypted {
-            serde_json::from_value(enc_json).ok()
-        } else {
-            None
+        // Propagate (rather than swallow with `.ok()`) a malformed encrypted
+        // payload: silently yielding `None` while `payload_kind` stays
+        // `Encrypted` would violate the "encrypted ⇒ payload present" invariant
+        // and cause downstream re-hash/replay checks to misbehave instead of
+        // failing loudly.
+        let payload_encrypted = match row.payload_encrypted {
+            Some(enc_json) => Some(serde_json::from_value(enc_json).map_err(|e| {
+                SequencerError::Internal(format!("invalid stored encrypted payload: {e}"))
+            })?),
+            None => None,
         };
 
         let base_version = row
@@ -1166,6 +1172,12 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         receipt: &VesSequencerReceipt,
     ) -> Result<()> {
         let sequence_number = Self::encode_sequence(receipt.sequence_number)?;
+        // `ON CONFLICT DO NOTHING` rather than `WHERE NOT EXISTS`: the latter is
+        // not atomic against a concurrent inserter (both transactions can see
+        // "not exists" and both attempt the insert), and since `event_id` is the
+        // PK the loser would then abort with a duplicate-key error, rolling back
+        // the entire ingest transaction. The upsert makes a redundant insert a
+        // benign no-op.
         sqlx::query(
             r#"
             INSERT INTO ves_sequencer_receipts (
@@ -1173,10 +1185,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 sequencer_signature, sequencer_key_version,
                 receipt_signature_scheme, receipt_signature_bundle
             )
-            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9
-            WHERE NOT EXISTS (
-                SELECT 1 FROM ves_sequencer_receipts WHERE event_id = $1
-            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            ON CONFLICT (event_id) DO NOTHING
             "#,
         )
         .bind(receipt.event_id)

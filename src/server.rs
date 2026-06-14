@@ -26,7 +26,7 @@ use tonic::transport::Server as TonicServer;
 use tower_http::cors::AllowOrigin;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use uuid::Uuid;
 
@@ -1057,12 +1057,38 @@ pub async fn run() -> anyhow::Result<()> {
     let (x402_batch_worker_task, x402_batch_worker_control) =
         spawn_batch_worker(X402BatchWorkerConfig::from_env(), x402_repository.clone());
     let batch_worker_shutdown = shutdown_coordinator.signal();
+    let batch_worker_coordinator = shutdown_coordinator.clone();
+    let mut x402_batch_worker_task = x402_batch_worker_task;
     tokio::spawn(async move {
-        batch_worker_shutdown.wait().await;
-        let _ = x402_batch_worker_control
-            .send(BatchWorkerMessage::Shutdown)
-            .await;
-        let _ = x402_batch_worker_task.await;
+        tokio::select! {
+            _ = batch_worker_shutdown.wait() => {
+                // Normal shutdown path: ask the worker to stop, then drain it.
+                let _ = x402_batch_worker_control
+                    .send(BatchWorkerMessage::Shutdown)
+                    .await;
+                let _ = x402_batch_worker_task.await;
+            }
+            join_result = &mut x402_batch_worker_task => {
+                // Unexpected early exit (panic or return) before shutdown:
+                // x402 batching/sequencing has stopped. Surface it and trigger
+                // a coordinated shutdown so the process is restarted rather than
+                // silently leaving payments un-batched.
+                match join_result {
+                    Ok(()) => error!(
+                        "x402 batch worker exited unexpectedly before shutdown; triggering coordinated shutdown"
+                    ),
+                    Err(e) if e.is_panic() => error!(
+                        error = ?e,
+                        "x402 batch worker panicked; triggering coordinated shutdown"
+                    ),
+                    Err(e) => error!(
+                        error = ?e,
+                        "x402 batch worker task failed to join; triggering coordinated shutdown"
+                    ),
+                }
+                batch_worker_coordinator.shutdown().await;
+            }
+        }
     });
     info!("x402 batch worker started");
 
@@ -1127,12 +1153,40 @@ pub async fn run() -> anyhow::Result<()> {
             ves_commitment_engine.clone(),
         );
         let anchor_worker_shutdown = shutdown_coordinator.signal();
+        let anchor_worker_coordinator = shutdown_coordinator.clone();
+        let mut anchor_worker_task = anchor_worker_task;
         tokio::spawn(async move {
-            anchor_worker_shutdown.wait().await;
-            let _ = anchor_worker_control
-                .send(AnchorWorkerMessage::Shutdown)
-                .await;
-            let _ = anchor_worker_task.await;
+            tokio::select! {
+                _ = anchor_worker_shutdown.wait() => {
+                    // Normal shutdown path: ask the worker to stop, then drain it.
+                    let _ = anchor_worker_control
+                        .send(AnchorWorkerMessage::Shutdown)
+                        .await;
+                    let _ = anchor_worker_task.await;
+                }
+                join_result = &mut anchor_worker_task => {
+                    // The worker exited on its own *before* shutdown was
+                    // requested — a panic or unexpected return. Anchoring has
+                    // stopped, so Merkle roots will silently stop reaching L2.
+                    // Surface it loudly and trigger a coordinated shutdown so a
+                    // process supervisor restarts the sequencer rather than
+                    // letting it run degraded with no anchoring.
+                    match join_result {
+                        Ok(()) => error!(
+                            "Anchor worker exited unexpectedly before shutdown; triggering coordinated shutdown"
+                        ),
+                        Err(e) if e.is_panic() => error!(
+                            error = ?e,
+                            "Anchor worker panicked; triggering coordinated shutdown"
+                        ),
+                        Err(e) => error!(
+                            error = ?e,
+                            "Anchor worker task failed to join; triggering coordinated shutdown"
+                        ),
+                    }
+                    anchor_worker_coordinator.shutdown().await;
+                }
+            }
         });
         info!("Anchor worker started");
     }

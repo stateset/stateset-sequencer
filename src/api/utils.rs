@@ -6,6 +6,8 @@ use axum::http::StatusCode;
 use base64::Engine;
 use tracing::error;
 
+use crate::infra::SequencerError;
+
 /// Convert an internal error into a safe API response.
 ///
 /// Logs the full error details at ERROR level for internal observability,
@@ -16,6 +18,32 @@ pub fn internal_error(e: impl std::fmt::Display) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "Internal server error".to_string(),
     )
+}
+
+/// Map a [`SequencerError`] to a safe `(StatusCode, String)` response.
+///
+/// Infrastructure/internal variants (`Database`, `Encryption`, `MerkleTree`,
+/// `Configuration`, `Internal`) carry raw backend detail — e.g. a `Database`
+/// error renders as `database error: <raw sqlx text>`, exposing schema and
+/// constraint internals — so they are routed through [`internal_error`], which
+/// logs the detail and returns a generic 500. Genuine client-facing validation
+/// and conflict variants keep their existing `400` classification and message so
+/// callers still get actionable feedback.
+///
+/// Use this instead of a bare `.map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))`,
+/// which both leaks internal detail and mislabels infrastructure failures as
+/// client errors.
+pub fn map_sequencer_error(e: SequencerError) -> (StatusCode, String) {
+    match e {
+        SequencerError::Database(_)
+        | SequencerError::Encryption(_)
+        | SequencerError::MerkleTree(_)
+        | SequencerError::Configuration(_)
+        | SequencerError::Internal(_) => internal_error(e),
+        // Genuine client-facing errors — safe to surface; status preserved as
+        // 400 to match the existing handler behavior.
+        _ => (StatusCode::BAD_REQUEST, e.to_string()),
+    }
 }
 
 /// Decode base64 with flexible format support (standard, URL-safe, with/without padding).

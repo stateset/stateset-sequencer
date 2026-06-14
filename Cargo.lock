@@ -6226,6 +6226,7 @@ dependencies = [
  "winter-math",
  "winter-prover",
  "winter-verifier",
+ "zeroize",
 ]
 
 [[package]]
@@ -6262,6 +6263,7 @@ dependencies = [
  "winter-crypto",
  "winter-math",
  "winter-prover",
+ "zeroize",
 ]
 
 [[package]]

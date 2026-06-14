@@ -173,6 +173,7 @@ impl PayloadEncryption {
             .await
             .map_err(|e| SequencerError::Encryption(e.to_string()))?;
 
+        let key_count = keys.len();
         let mut last_error: Option<EncryptionError> = None;
         for key in keys {
             match decrypt_payload_at_rest(&key, aad, ciphertext) {
@@ -185,6 +186,16 @@ impl PayloadEncryption {
             }
         }
 
+        // Reaching here means the AEAD tag failed to verify against *every*
+        // available key. That is no longer ordinary key-rotation churn — it
+        // indicates ciphertext tampering, corruption, or AAD mismatch. Surface
+        // it at WARN so tamper attempts are observable (the loop above
+        // intentionally stays quiet on per-key misses to avoid rotation noise).
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            keys_tried = key_count,
+            "payload decryption failed against all tenant keys (possible tampering, corruption, or AAD mismatch)"
+        );
         Err(SequencerError::Encryption(
             last_error
                 .map(|e| e.to_string())
