@@ -688,6 +688,53 @@ mod tests {
         assert_eq!(outbox.unacked_count().await.unwrap(), 0);
     }
 
+    /// Build a pulled (remotely-sequenced) event. `seq = None` simulates the
+    /// invariant-violating case the outbox must reject rather than store at PK 0.
+    fn make_pulled_event(seq: Option<u64>) -> SequencedEvent {
+        let envelope = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-pull",
+            EventType::from("order.created"),
+            serde_json::json!({ "k": "v" }),
+            AgentId::new(),
+        );
+        let mut event = SequencedEvent::new(envelope, seq.unwrap_or(1));
+        event.envelope.sequence_number = seq;
+        event
+    }
+
+    #[tokio::test]
+    async fn test_store_pulled_event_rejects_missing_sequence() {
+        let outbox = create_test_db().await;
+
+        // A valid, sequenced pulled event stores fine.
+        outbox
+            .store_pulled_event(&make_pulled_event(Some(7)))
+            .await
+            .unwrap();
+
+        // One without a sequence number must be rejected, not defaulted to PK 0
+        // (which would let a second such event silently overwrite the first).
+        let result = outbox.store_pulled_event(&make_pulled_event(None)).await;
+        assert!(
+            result.is_err(),
+            "pulled event without a sequence number must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_pulled_events_batch_rejects_missing_sequence() {
+        let outbox = create_test_db().await;
+        let batch = vec![make_pulled_event(Some(1)), make_pulled_event(None)];
+        let result = outbox.store_pulled_events(&batch).await;
+        assert!(
+            result.is_err(),
+            "a batch containing an un-sequenced pulled event must be rejected"
+        );
+    }
+
     #[tokio::test]
     async fn test_sync_state() {
         let outbox = create_test_db().await;
