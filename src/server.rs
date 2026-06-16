@@ -43,7 +43,7 @@ use crate::auth::{
     JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RateLimiterConfig, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
-use crate::infra::ShutdownCoordinator;
+use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::infra::{
     extract_client_ip, spawn_anchor_worker, spawn_batch_worker, spawn_x402_nonce_cleanup,
     AnchorWorkerConfig,
@@ -757,6 +757,55 @@ fn parse_admin_allowlist() -> anyhow::Result<Option<Arc<Vec<AllowedIp>>>> {
 }
 
 /// Start the HTTP server.
+/// Supervise a critical background worker for the lifetime of the process.
+///
+/// On a coordinated shutdown signal, runs `send_stop` (which tells the worker to
+/// stop) and then drains the task. If the worker instead exits on its own
+/// *before* shutdown — a panic or an early return — a critical background loop
+/// (x402 batching, anchoring) has silently stopped; we log loudly and trigger a
+/// coordinated shutdown so a process supervisor restarts the sequencer rather
+/// than letting it run degraded.
+///
+/// This consolidates what were two near-identical `select!` supervision blocks
+/// (one per worker) into a single audited code path.
+fn supervise_worker<F, Fut>(
+    name: &'static str,
+    mut task: tokio::task::JoinHandle<()>,
+    shutdown_signal: ShutdownSignal,
+    coordinator: Arc<ShutdownCoordinator>,
+    send_stop: F,
+) where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_signal.wait() => {
+                // Normal shutdown path: ask the worker to stop, then drain it.
+                send_stop().await;
+                let _ = task.await;
+            }
+            join_result = &mut task => {
+                match join_result {
+                    Ok(()) => error!(
+                        worker = name,
+                        "worker exited unexpectedly before shutdown; triggering coordinated shutdown"
+                    ),
+                    Err(e) if e.is_panic() => error!(
+                        worker = name, error = ?e,
+                        "worker panicked; triggering coordinated shutdown"
+                    ),
+                    Err(e) => error!(
+                        worker = name, error = ?e,
+                        "worker task failed to join; triggering coordinated shutdown"
+                    ),
+                }
+                coordinator.shutdown().await;
+            }
+        }
+    });
+}
+
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
 
@@ -1142,40 +1191,17 @@ pub async fn run() -> anyhow::Result<()> {
     // Start x402 batch worker
     let (x402_batch_worker_task, x402_batch_worker_control) =
         spawn_batch_worker(X402BatchWorkerConfig::from_env(), x402_repository.clone());
-    let batch_worker_shutdown = shutdown_coordinator.signal();
-    let batch_worker_coordinator = shutdown_coordinator.clone();
-    let mut x402_batch_worker_task = x402_batch_worker_task;
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = batch_worker_shutdown.wait() => {
-                // Normal shutdown path: ask the worker to stop, then drain it.
-                let _ = x402_batch_worker_control
-                    .send(BatchWorkerMessage::Shutdown)
-                    .await;
-                let _ = x402_batch_worker_task.await;
-            }
-            join_result = &mut x402_batch_worker_task => {
-                // Unexpected early exit (panic or return) before shutdown:
-                // x402 batching/sequencing has stopped. Surface it and trigger
-                // a coordinated shutdown so the process is restarted rather than
-                // silently leaving payments un-batched.
-                match join_result {
-                    Ok(()) => error!(
-                        "x402 batch worker exited unexpectedly before shutdown; triggering coordinated shutdown"
-                    ),
-                    Err(e) if e.is_panic() => error!(
-                        error = ?e,
-                        "x402 batch worker panicked; triggering coordinated shutdown"
-                    ),
-                    Err(e) => error!(
-                        error = ?e,
-                        "x402 batch worker task failed to join; triggering coordinated shutdown"
-                    ),
-                }
-                batch_worker_coordinator.shutdown().await;
-            }
-        }
-    });
+    supervise_worker(
+        "x402_batch_worker",
+        x402_batch_worker_task,
+        shutdown_coordinator.signal(),
+        shutdown_coordinator.clone(),
+        move || async move {
+            let _ = x402_batch_worker_control
+                .send(BatchWorkerMessage::Shutdown)
+                .await;
+        },
+    );
     info!("x402 batch worker started");
 
     // Schema validation mode for event ingestion
@@ -1238,42 +1264,17 @@ pub async fn run() -> anyhow::Result<()> {
             anchor_svc.clone(),
             ves_commitment_engine.clone(),
         );
-        let anchor_worker_shutdown = shutdown_coordinator.signal();
-        let anchor_worker_coordinator = shutdown_coordinator.clone();
-        let mut anchor_worker_task = anchor_worker_task;
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = anchor_worker_shutdown.wait() => {
-                    // Normal shutdown path: ask the worker to stop, then drain it.
-                    let _ = anchor_worker_control
-                        .send(AnchorWorkerMessage::Shutdown)
-                        .await;
-                    let _ = anchor_worker_task.await;
-                }
-                join_result = &mut anchor_worker_task => {
-                    // The worker exited on its own *before* shutdown was
-                    // requested — a panic or unexpected return. Anchoring has
-                    // stopped, so Merkle roots will silently stop reaching L2.
-                    // Surface it loudly and trigger a coordinated shutdown so a
-                    // process supervisor restarts the sequencer rather than
-                    // letting it run degraded with no anchoring.
-                    match join_result {
-                        Ok(()) => error!(
-                            "Anchor worker exited unexpectedly before shutdown; triggering coordinated shutdown"
-                        ),
-                        Err(e) if e.is_panic() => error!(
-                            error = ?e,
-                            "Anchor worker panicked; triggering coordinated shutdown"
-                        ),
-                        Err(e) => error!(
-                            error = ?e,
-                            "Anchor worker task failed to join; triggering coordinated shutdown"
-                        ),
-                    }
-                    anchor_worker_coordinator.shutdown().await;
-                }
-            }
-        });
+        supervise_worker(
+            "anchor_worker",
+            anchor_worker_task,
+            shutdown_coordinator.signal(),
+            shutdown_coordinator.clone(),
+            move || async move {
+                let _ = anchor_worker_control
+                    .send(AnchorWorkerMessage::Shutdown)
+                    .await;
+            },
+        );
         info!("Anchor worker started");
     }
 
