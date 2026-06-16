@@ -45,7 +45,8 @@ use crate::auth::{
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::ShutdownCoordinator;
 use crate::infra::{
-    extract_client_ip, spawn_anchor_worker, spawn_batch_worker, AnchorWorkerConfig,
+    extract_client_ip, spawn_anchor_worker, spawn_batch_worker, spawn_x402_nonce_cleanup,
+    AnchorWorkerConfig,
     AnchorWorkerMessage, BatchWorkerMessage, CacheManager, CacheManagerConfig,
     CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry,
     PgAuditLogger, PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer,
@@ -345,6 +346,53 @@ fn parse_auth_mode() -> anyhow::Result<AuthMode> {
             "Invalid AUTH_MODE value: {auth_mode}; expected required or disabled"
         )),
     }
+}
+
+/// Whether the process is running in a production-like deployment.
+///
+/// Controlled by `SEQUENCER_ENV`/`ENVIRONMENT` (case-insensitive). Production
+/// is the *safe* default for unknown values: an operator who misspells the
+/// environment gets the strict checks rather than silently weakened ones.
+/// Only the explicit non-production values disable hardening.
+fn is_production_env() -> bool {
+    let raw = std::env::var("SEQUENCER_ENV")
+        .or_else(|_| std::env::var("ENVIRONMENT"))
+        .unwrap_or_default();
+    !matches!(
+        raw.trim().to_lowercase().as_str(),
+        // Empty means "unset" — treat as non-production so local/dev/CI runs
+        // are not forced to provision strong secrets. Any other recognized
+        // non-prod label also relaxes the checks.
+        "" | "local" | "dev" | "development" | "test" | "testing" | "ci" | "staging"
+    )
+}
+
+/// Minimum acceptable entropy (in characters) for HMAC/shared secrets.
+const MIN_SECRET_LEN: usize = 32;
+
+/// Validate that a configured secret is strong enough to use. In production a
+/// weak secret is fatal; outside production it is downgraded to a warning so
+/// developers are nudged without being blocked.
+fn enforce_secret_strength(
+    name: &str,
+    value: &str,
+    min_len: usize,
+    is_production: bool,
+) -> anyhow::Result<()> {
+    let len = value.trim().chars().count();
+    if len >= min_len {
+        return Ok(());
+    }
+    if is_production {
+        anyhow::bail!(
+            "{name} is too weak for production: {len} chars, need >= {min_len}. \
+             Generate a high-entropy secret (e.g. `openssl rand -hex 32`)."
+        );
+    }
+    warn!(
+        "{name} is weak ({len} chars, recommended >= {min_len}); acceptable for non-production only"
+    );
+    Ok(())
 }
 
 /// Server configuration.
@@ -721,10 +769,17 @@ pub async fn run() -> anyhow::Result<()> {
     let secrets: Box<dyn SecretsProvider> = Box::new(EnvSecretsProvider::new());
 
     // Auth configuration
+    let is_production = is_production_env();
     let auth_mode = parse_auth_mode()?;
     let allow_auth_disabled = parse_bool_env("ALLOW_AUTH_DISABLED", false)?;
     let require_auth = match auth_mode {
         AuthMode::Required => true,
+        AuthMode::Disabled if is_production => {
+            anyhow::bail!(
+                "AUTH_MODE=disabled is refused in production (SEQUENCER_ENV/ENVIRONMENT); \
+                 authentication cannot be skipped on a production deployment"
+            );
+        }
         AuthMode::Disabled if !allow_auth_disabled => {
             anyhow::bail!(
                 "AUTH_MODE=disabled requires explicit opt-in via ALLOW_AUTH_DISABLED=true"
@@ -746,6 +801,12 @@ pub async fn run() -> anyhow::Result<()> {
         .bootstrap_api_key()
         .map_err(|e| anyhow::anyhow!("Failed to load bootstrap API key: {e}"))?
     {
+        enforce_secret_strength(
+            "BOOTSTRAP_ADMIN_API_KEY",
+            &bootstrap_key,
+            MIN_SECRET_LEN,
+            is_production,
+        )?;
         let key_hash = ApiKeyValidator::hash_key(&bootstrap_key);
         let record = ApiKeyRecord {
             key_hash,
@@ -767,6 +828,7 @@ pub async fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to load JWT secret: {e}"))?
     {
         Some(secret) => {
+            enforce_secret_strength("JWT_SECRET", &secret, MIN_SECRET_LEN, is_production)?;
             let issuer = secrets
                 .jwt_issuer()
                 .map_err(|e| anyhow::anyhow!("Failed to load JWT issuer: {e}"))?;
@@ -1052,6 +1114,30 @@ pub async fn run() -> anyhow::Result<()> {
     // Initialize x402 payment repository
     let x402_repository = Arc::new(PgX402Repository::new(pool.clone()));
     info!("x402 payment repository initialized");
+
+    // Periodically prune expired nonce-tracking rows so the replay-protection
+    // table cannot grow without bound. Retention is 2x the maximum intent
+    // validity window to absorb clock skew; once a nonce is that old any replay
+    // of its intent is already rejected by the expiry check at ingest.
+    {
+        let nonce_retention = Duration::from_secs(
+            crate::domain::X402_MAX_VALIDITY_SECS.saturating_mul(2),
+        );
+        let nonce_cleanup_interval = Duration::from_secs(read_u64_env(
+            "X402_NONCE_CLEANUP_INTERVAL_SECS",
+            3600,
+        ));
+        spawn_x402_nonce_cleanup(
+            x402_repository.clone(),
+            nonce_cleanup_interval,
+            nonce_retention,
+        );
+        info!(
+            "x402 nonce cleanup scheduled (every {}s, retention {}s)",
+            nonce_cleanup_interval.as_secs(),
+            nonce_retention.as_secs()
+        );
+    }
 
     // Start x402 batch worker
     let (x402_batch_worker_task, x402_batch_worker_control) =
@@ -1926,6 +2012,49 @@ mod tests {
         assert!(err.to_string().contains("sslmode must be require"));
 
         std::env::remove_var("ALLOW_INSECURE_LOCAL_DB");
+    }
+
+    #[test]
+    fn enforce_secret_strength_accepts_strong_secret() {
+        let strong = "0123456789abcdef0123456789abcdef"; // 32 chars
+        assert!(enforce_secret_strength("JWT_SECRET", strong, MIN_SECRET_LEN, true).is_ok());
+        assert!(enforce_secret_strength("JWT_SECRET", strong, MIN_SECRET_LEN, false).is_ok());
+    }
+
+    #[test]
+    fn enforce_secret_strength_rejects_weak_secret_in_production() {
+        let weak = "short";
+        let err = enforce_secret_strength("JWT_SECRET", weak, MIN_SECRET_LEN, true)
+            .expect_err("weak secret must be fatal in production");
+        assert!(err.to_string().contains("too weak for production"));
+    }
+
+    #[test]
+    fn enforce_secret_strength_warns_but_allows_weak_secret_outside_production() {
+        let weak = "short";
+        assert!(
+            enforce_secret_strength("JWT_SECRET", weak, MIN_SECRET_LEN, false).is_ok(),
+            "weak secret should be allowed (with a warning) outside production"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn is_production_env_defaults_and_labels() {
+        std::env::remove_var("SEQUENCER_ENV");
+        std::env::remove_var("ENVIRONMENT");
+        assert!(!is_production_env(), "unset env must default to non-production");
+
+        for label in ["dev", "development", "test", "ci", "staging", "LOCAL"] {
+            std::env::set_var("SEQUENCER_ENV", label);
+            assert!(!is_production_env(), "{label} must be non-production");
+        }
+
+        for label in ["production", "prod", "PRODUCTION", "live"] {
+            std::env::set_var("SEQUENCER_ENV", label);
+            assert!(is_production_env(), "{label} must be production");
+        }
+        std::env::remove_var("SEQUENCER_ENV");
     }
 
     #[tokio::test]

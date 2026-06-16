@@ -424,6 +424,32 @@ impl PgX402Repository {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Prune nonce-tracking rows that can no longer protect against replay.
+    ///
+    /// A nonce only needs to be remembered while a replayed intent bearing it
+    /// could still be accepted. Submission caps `valid_until` at
+    /// `created_at + X402_MAX_VALIDITY_SECS` (see `api/handlers/x402.rs`), and the
+    /// ingest path rejects any intent whose `valid_until` is in the past. So once
+    /// a nonce row is older than the maximum validity window, any replay of its
+    /// intent is already rejected by the expiry check — the row is dead weight.
+    ///
+    /// `retention_secs` should be at least `X402_MAX_VALIDITY_SECS`; callers add a
+    /// safety margin for clock skew. Returns the number of rows deleted.
+    pub async fn cleanup_expired_nonces(&self, retention_secs: i64) -> Result<u64> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM x402_nonce_tracking
+            WHERE created_at < NOW() - make_interval(secs => $1)
+            "#,
+        )
+        .bind(retention_secs as f64)
+        .execute(&self.pool)
+        .await
+        .map_err(SequencerError::from)?;
+
+        Ok(result.rows_affected())
+    }
+
     /// Assign sequence number within an existing transaction.
     ///
     /// Folding sequence assignment into the same transaction as the intent
@@ -1379,6 +1405,33 @@ impl PgX402Repository {
             ))),
         }
     }
+}
+
+/// Spawn a background task that periodically prunes expired x402 nonce rows.
+///
+/// `retention` must be at least `X402_MAX_VALIDITY_SECS` (a margin is recommended
+/// for clock skew); the sweep runs every `interval`. The handle aborts on shutdown.
+pub fn spawn_x402_nonce_cleanup(
+    repo: std::sync::Arc<PgX402Repository>,
+    interval: std::time::Duration,
+    retention: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    let retention_secs = retention.as_secs() as i64;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            match repo.cleanup_expired_nonces(retention_secs).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(deleted, retention_secs, "x402 nonce cleanup completed");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("x402 nonce cleanup failed: {}", e);
+                }
+            }
+        }
+    })
 }
 
 impl std::fmt::Display for X402BatchStatus {
