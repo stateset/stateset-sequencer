@@ -15,6 +15,46 @@ This guide covers deploying the StateSet Sequencer to production environments.
 - SSD storage (100+ GB recommended)
 - TLS certificates for HTTPS
 
+## Horizontal Scaling & High Availability
+
+The sequencer scales out by running **multiple stateless nodes against one shared
+PostgreSQL database** (e.g. the `replicas: 3` Kubernetes Deployment below).
+
+**Why this is safe for the write path.** Event ordering is partitioned by
+`(tenant_id, store_id)` and serialized by a `SELECT … FOR UPDATE` lock on each
+stream's sequence-counter row. That lock serializes concurrent writers no matter
+which node they run on, so sequence numbers stay gap-free and strictly monotonic
+with any number of nodes. Idempotent replay (dedup on `event_id` / `command_id`)
+is likewise enforced in the database. **HTTP and gRPC ingest therefore scale
+horizontally with no additional coordination** — put the nodes behind a load
+balancer and add replicas.
+
+**Singleton background workers.** Two background jobs must run on exactly one
+node, or they would duplicate work and race:
+
+- the **L2 anchor worker** (would otherwise double-anchor Merkle roots, wasting gas), and
+- the **x402 batch-sequencing worker**.
+
+The sequencer elects a single runner for each using a PostgreSQL **session-level
+advisory lock** (`pg_try_advisory_lock`). The elected node holds the lock on a
+dedicated connection; if that node crashes, PostgreSQL releases the lock
+automatically when the connection drops, and a standby acquires it on its next
+retry (default within ~10s) — **automatic failover with no external coordinator**.
+A single-node deployment wins the lock immediately and behaves exactly as before.
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `WORKER_LEADER_ELECTION` | `true` | Elect one node per singleton worker. Set `false` to force the legacy run-on-every-node behavior (only safe for single-node deployments). |
+
+Operational notes:
+
+- The elected (leader) node holds one extra pooled connection per singleton
+  worker for the lease; size `max_connections` accordingly.
+- Ingest nodes need no special configuration — just scale the replica count.
+- Run database migrations once before rolling out (`DB_MIGRATE_ON_STARTUP=true`
+  on a single node, or as a separate migration job), not concurrently on every
+  replica.
+
 ## Docker Compose Deployment
 
 ### Basic Setup

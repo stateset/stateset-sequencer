@@ -45,8 +45,8 @@ use crate::auth::{
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::infra::{
-    extract_client_ip, spawn_anchor_worker, spawn_batch_worker, spawn_x402_nonce_cleanup,
-    AnchorWorkerConfig,
+    extract_client_ip, lock_keys, spawn_anchor_worker, spawn_batch_worker, spawn_elected_worker,
+    spawn_x402_nonce_cleanup, AnchorWorkerConfig, ElectionConfig,
     AnchorWorkerMessage, BatchWorkerMessage, CacheManager, CacheManagerConfig,
     CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry,
     PgAuditLogger, PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer,
@@ -1189,19 +1189,48 @@ pub async fn run() -> anyhow::Result<()> {
     }
 
     // Start x402 batch worker
-    let (x402_batch_worker_task, x402_batch_worker_control) =
-        spawn_batch_worker(X402BatchWorkerConfig::from_env(), x402_repository.clone());
-    supervise_worker(
-        "x402_batch_worker",
-        x402_batch_worker_task,
-        shutdown_coordinator.signal(),
-        shutdown_coordinator.clone(),
-        move || async move {
-            let _ = x402_batch_worker_control
-                .send(BatchWorkerMessage::Shutdown)
-                .await;
-        },
-    );
+    // Distributed/HA mode: when multiple sequencer nodes share this database,
+    // ingest scales horizontally for free (FOR UPDATE serializes writes), but
+    // the singleton workers below must run on exactly one node. Leader election
+    // via PostgreSQL advisory locks enforces that, with automatic failover when
+    // the leader dies. A single node wins instantly, so behavior is unchanged.
+    // Set WORKER_LEADER_ELECTION=false to force the legacy run-everywhere path.
+    let leader_election = parse_bool_env("WORKER_LEADER_ELECTION", true)?;
+    let election_config = ElectionConfig::default();
+    info!("Worker leader election: {}", leader_election);
+
+    if leader_election {
+        let repo = x402_repository.clone();
+        spawn_elected_worker(
+            "x402_batch_worker",
+            lock_keys::X402_BATCH_WORKER,
+            pool.clone(),
+            election_config.clone(),
+            shutdown_coordinator.signal(),
+            shutdown_coordinator.clone(),
+            move || {
+                let (task, control) =
+                    spawn_batch_worker(X402BatchWorkerConfig::from_env(), repo.clone());
+                (task, move || async move {
+                    let _ = control.send(BatchWorkerMessage::Shutdown).await;
+                })
+            },
+        );
+    } else {
+        let (x402_batch_worker_task, x402_batch_worker_control) =
+            spawn_batch_worker(X402BatchWorkerConfig::from_env(), x402_repository.clone());
+        supervise_worker(
+            "x402_batch_worker",
+            x402_batch_worker_task,
+            shutdown_coordinator.signal(),
+            shutdown_coordinator.clone(),
+            move || async move {
+                let _ = x402_batch_worker_control
+                    .send(BatchWorkerMessage::Shutdown)
+                    .await;
+            },
+        );
+    }
     info!("x402 batch worker started");
 
     // Schema validation mode for event ingestion
@@ -1259,22 +1288,45 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Start anchor worker (only if anchor service is configured)
     if let Some(ref anchor_svc) = anchor_service {
-        let (anchor_worker_task, anchor_worker_control) = spawn_anchor_worker(
-            AnchorWorkerConfig::from_env(),
-            anchor_svc.clone(),
-            ves_commitment_engine.clone(),
-        );
-        supervise_worker(
-            "anchor_worker",
-            anchor_worker_task,
-            shutdown_coordinator.signal(),
-            shutdown_coordinator.clone(),
-            move || async move {
-                let _ = anchor_worker_control
-                    .send(AnchorWorkerMessage::Shutdown)
-                    .await;
-            },
-        );
+        if leader_election {
+            let svc = anchor_svc.clone();
+            let engine = ves_commitment_engine.clone();
+            spawn_elected_worker(
+                "anchor_worker",
+                lock_keys::ANCHOR_WORKER,
+                pool.clone(),
+                election_config.clone(),
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || {
+                    let (task, control) = spawn_anchor_worker(
+                        AnchorWorkerConfig::from_env(),
+                        svc.clone(),
+                        engine.clone(),
+                    );
+                    (task, move || async move {
+                        let _ = control.send(AnchorWorkerMessage::Shutdown).await;
+                    })
+                },
+            );
+        } else {
+            let (anchor_worker_task, anchor_worker_control) = spawn_anchor_worker(
+                AnchorWorkerConfig::from_env(),
+                anchor_svc.clone(),
+                ves_commitment_engine.clone(),
+            );
+            supervise_worker(
+                "anchor_worker",
+                anchor_worker_task,
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || async move {
+                    let _ = anchor_worker_control
+                        .send(AnchorWorkerMessage::Shutdown)
+                        .await;
+                },
+            );
+        }
         info!("Anchor worker started");
     }
 
