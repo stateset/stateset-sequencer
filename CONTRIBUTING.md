@@ -76,6 +76,11 @@ sqlx migrate run
 
 ### Build and Run
 
+> The default build requires the private [`stateset-stark`](https://github.com/stateset/stateset-stark)
+> checkout at `../stateset-stark` (for the `stark` feature's path dependencies).
+> To build without it, use the core feature set — see "Cargo features" in the
+> [README](README.md#cargo-features).
+
 ```bash
 # Development build
 cargo build

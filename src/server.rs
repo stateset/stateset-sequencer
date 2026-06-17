@@ -43,9 +43,10 @@ use crate::auth::{
     JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RateLimiterConfig, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
-use crate::infra::ShutdownCoordinator;
+use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::infra::{
-    extract_client_ip, spawn_anchor_worker, spawn_batch_worker, AnchorWorkerConfig,
+    extract_client_ip, lock_keys, spawn_anchor_worker, spawn_batch_worker, spawn_elected_worker,
+    spawn_x402_nonce_cleanup, AnchorWorkerConfig, ElectionConfig,
     AnchorWorkerMessage, BatchWorkerMessage, CacheManager, CacheManagerConfig,
     CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry,
     PgAuditLogger, PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer,
@@ -345,6 +346,53 @@ fn parse_auth_mode() -> anyhow::Result<AuthMode> {
             "Invalid AUTH_MODE value: {auth_mode}; expected required or disabled"
         )),
     }
+}
+
+/// Whether the process is running in a production-like deployment.
+///
+/// Controlled by `SEQUENCER_ENV`/`ENVIRONMENT` (case-insensitive). Production
+/// is the *safe* default for unknown values: an operator who misspells the
+/// environment gets the strict checks rather than silently weakened ones.
+/// Only the explicit non-production values disable hardening.
+fn is_production_env() -> bool {
+    let raw = std::env::var("SEQUENCER_ENV")
+        .or_else(|_| std::env::var("ENVIRONMENT"))
+        .unwrap_or_default();
+    !matches!(
+        raw.trim().to_lowercase().as_str(),
+        // Empty means "unset" — treat as non-production so local/dev/CI runs
+        // are not forced to provision strong secrets. Any other recognized
+        // non-prod label also relaxes the checks.
+        "" | "local" | "dev" | "development" | "test" | "testing" | "ci" | "staging"
+    )
+}
+
+/// Minimum acceptable entropy (in characters) for HMAC/shared secrets.
+const MIN_SECRET_LEN: usize = 32;
+
+/// Validate that a configured secret is strong enough to use. In production a
+/// weak secret is fatal; outside production it is downgraded to a warning so
+/// developers are nudged without being blocked.
+fn enforce_secret_strength(
+    name: &str,
+    value: &str,
+    min_len: usize,
+    is_production: bool,
+) -> anyhow::Result<()> {
+    let len = value.trim().chars().count();
+    if len >= min_len {
+        return Ok(());
+    }
+    if is_production {
+        anyhow::bail!(
+            "{name} is too weak for production: {len} chars, need >= {min_len}. \
+             Generate a high-entropy secret (e.g. `openssl rand -hex 32`)."
+        );
+    }
+    warn!(
+        "{name} is weak ({len} chars, recommended >= {min_len}); acceptable for non-production only"
+    );
+    Ok(())
 }
 
 /// Server configuration.
@@ -709,6 +757,55 @@ fn parse_admin_allowlist() -> anyhow::Result<Option<Arc<Vec<AllowedIp>>>> {
 }
 
 /// Start the HTTP server.
+/// Supervise a critical background worker for the lifetime of the process.
+///
+/// On a coordinated shutdown signal, runs `send_stop` (which tells the worker to
+/// stop) and then drains the task. If the worker instead exits on its own
+/// *before* shutdown — a panic or an early return — a critical background loop
+/// (x402 batching, anchoring) has silently stopped; we log loudly and trigger a
+/// coordinated shutdown so a process supervisor restarts the sequencer rather
+/// than letting it run degraded.
+///
+/// This consolidates what were two near-identical `select!` supervision blocks
+/// (one per worker) into a single audited code path.
+fn supervise_worker<F, Fut>(
+    name: &'static str,
+    mut task: tokio::task::JoinHandle<()>,
+    shutdown_signal: ShutdownSignal,
+    coordinator: Arc<ShutdownCoordinator>,
+    send_stop: F,
+) where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_signal.wait() => {
+                // Normal shutdown path: ask the worker to stop, then drain it.
+                send_stop().await;
+                let _ = task.await;
+            }
+            join_result = &mut task => {
+                match join_result {
+                    Ok(()) => error!(
+                        worker = name,
+                        "worker exited unexpectedly before shutdown; triggering coordinated shutdown"
+                    ),
+                    Err(e) if e.is_panic() => error!(
+                        worker = name, error = ?e,
+                        "worker panicked; triggering coordinated shutdown"
+                    ),
+                    Err(e) => error!(
+                        worker = name, error = ?e,
+                        "worker task failed to join; triggering coordinated shutdown"
+                    ),
+                }
+                coordinator.shutdown().await;
+            }
+        }
+    });
+}
+
 pub async fn run() -> anyhow::Result<()> {
     init_tracing();
 
@@ -721,10 +818,17 @@ pub async fn run() -> anyhow::Result<()> {
     let secrets: Box<dyn SecretsProvider> = Box::new(EnvSecretsProvider::new());
 
     // Auth configuration
+    let is_production = is_production_env();
     let auth_mode = parse_auth_mode()?;
     let allow_auth_disabled = parse_bool_env("ALLOW_AUTH_DISABLED", false)?;
     let require_auth = match auth_mode {
         AuthMode::Required => true,
+        AuthMode::Disabled if is_production => {
+            anyhow::bail!(
+                "AUTH_MODE=disabled is refused in production (SEQUENCER_ENV/ENVIRONMENT); \
+                 authentication cannot be skipped on a production deployment"
+            );
+        }
         AuthMode::Disabled if !allow_auth_disabled => {
             anyhow::bail!(
                 "AUTH_MODE=disabled requires explicit opt-in via ALLOW_AUTH_DISABLED=true"
@@ -746,6 +850,12 @@ pub async fn run() -> anyhow::Result<()> {
         .bootstrap_api_key()
         .map_err(|e| anyhow::anyhow!("Failed to load bootstrap API key: {e}"))?
     {
+        enforce_secret_strength(
+            "BOOTSTRAP_ADMIN_API_KEY",
+            &bootstrap_key,
+            MIN_SECRET_LEN,
+            is_production,
+        )?;
         let key_hash = ApiKeyValidator::hash_key(&bootstrap_key);
         let record = ApiKeyRecord {
             key_hash,
@@ -767,6 +877,7 @@ pub async fn run() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to load JWT secret: {e}"))?
     {
         Some(secret) => {
+            enforce_secret_strength("JWT_SECRET", &secret, MIN_SECRET_LEN, is_production)?;
             let issuer = secrets
                 .jwt_issuer()
                 .map_err(|e| anyhow::anyhow!("Failed to load JWT issuer: {e}"))?;
@@ -1053,43 +1164,73 @@ pub async fn run() -> anyhow::Result<()> {
     let x402_repository = Arc::new(PgX402Repository::new(pool.clone()));
     info!("x402 payment repository initialized");
 
+    // Periodically prune expired nonce-tracking rows so the replay-protection
+    // table cannot grow without bound. Retention is 2x the maximum intent
+    // validity window to absorb clock skew; once a nonce is that old any replay
+    // of its intent is already rejected by the expiry check at ingest.
+    {
+        let nonce_retention = Duration::from_secs(
+            crate::domain::X402_MAX_VALIDITY_SECS.saturating_mul(2),
+        );
+        let nonce_cleanup_interval = Duration::from_secs(read_u64_env(
+            "X402_NONCE_CLEANUP_INTERVAL_SECS",
+            3600,
+        ));
+        spawn_x402_nonce_cleanup(
+            x402_repository.clone(),
+            nonce_cleanup_interval,
+            nonce_retention,
+        );
+        info!(
+            "x402 nonce cleanup scheduled (every {}s, retention {}s)",
+            nonce_cleanup_interval.as_secs(),
+            nonce_retention.as_secs()
+        );
+    }
+
     // Start x402 batch worker
-    let (x402_batch_worker_task, x402_batch_worker_control) =
-        spawn_batch_worker(X402BatchWorkerConfig::from_env(), x402_repository.clone());
-    let batch_worker_shutdown = shutdown_coordinator.signal();
-    let batch_worker_coordinator = shutdown_coordinator.clone();
-    let mut x402_batch_worker_task = x402_batch_worker_task;
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = batch_worker_shutdown.wait() => {
-                // Normal shutdown path: ask the worker to stop, then drain it.
+    // Distributed/HA mode: when multiple sequencer nodes share this database,
+    // ingest scales horizontally for free (FOR UPDATE serializes writes), but
+    // the singleton workers below must run on exactly one node. Leader election
+    // via PostgreSQL advisory locks enforces that, with automatic failover when
+    // the leader dies. A single node wins instantly, so behavior is unchanged.
+    // Set WORKER_LEADER_ELECTION=false to force the legacy run-everywhere path.
+    let leader_election = parse_bool_env("WORKER_LEADER_ELECTION", true)?;
+    let election_config = ElectionConfig::default();
+    info!("Worker leader election: {}", leader_election);
+
+    if leader_election {
+        let repo = x402_repository.clone();
+        spawn_elected_worker(
+            "x402_batch_worker",
+            lock_keys::X402_BATCH_WORKER,
+            pool.clone(),
+            election_config.clone(),
+            shutdown_coordinator.signal(),
+            shutdown_coordinator.clone(),
+            move || {
+                let (task, control) =
+                    spawn_batch_worker(X402BatchWorkerConfig::from_env(), repo.clone());
+                (task, move || async move {
+                    let _ = control.send(BatchWorkerMessage::Shutdown).await;
+                })
+            },
+        );
+    } else {
+        let (x402_batch_worker_task, x402_batch_worker_control) =
+            spawn_batch_worker(X402BatchWorkerConfig::from_env(), x402_repository.clone());
+        supervise_worker(
+            "x402_batch_worker",
+            x402_batch_worker_task,
+            shutdown_coordinator.signal(),
+            shutdown_coordinator.clone(),
+            move || async move {
                 let _ = x402_batch_worker_control
                     .send(BatchWorkerMessage::Shutdown)
                     .await;
-                let _ = x402_batch_worker_task.await;
-            }
-            join_result = &mut x402_batch_worker_task => {
-                // Unexpected early exit (panic or return) before shutdown:
-                // x402 batching/sequencing has stopped. Surface it and trigger
-                // a coordinated shutdown so the process is restarted rather than
-                // silently leaving payments un-batched.
-                match join_result {
-                    Ok(()) => error!(
-                        "x402 batch worker exited unexpectedly before shutdown; triggering coordinated shutdown"
-                    ),
-                    Err(e) if e.is_panic() => error!(
-                        error = ?e,
-                        "x402 batch worker panicked; triggering coordinated shutdown"
-                    ),
-                    Err(e) => error!(
-                        error = ?e,
-                        "x402 batch worker task failed to join; triggering coordinated shutdown"
-                    ),
-                }
-                batch_worker_coordinator.shutdown().await;
-            }
-        }
-    });
+            },
+        );
+    }
     info!("x402 batch worker started");
 
     // Schema validation mode for event ingestion
@@ -1147,47 +1288,45 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Start anchor worker (only if anchor service is configured)
     if let Some(ref anchor_svc) = anchor_service {
-        let (anchor_worker_task, anchor_worker_control) = spawn_anchor_worker(
-            AnchorWorkerConfig::from_env(),
-            anchor_svc.clone(),
-            ves_commitment_engine.clone(),
-        );
-        let anchor_worker_shutdown = shutdown_coordinator.signal();
-        let anchor_worker_coordinator = shutdown_coordinator.clone();
-        let mut anchor_worker_task = anchor_worker_task;
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = anchor_worker_shutdown.wait() => {
-                    // Normal shutdown path: ask the worker to stop, then drain it.
+        if leader_election {
+            let svc = anchor_svc.clone();
+            let engine = ves_commitment_engine.clone();
+            spawn_elected_worker(
+                "anchor_worker",
+                lock_keys::ANCHOR_WORKER,
+                pool.clone(),
+                election_config.clone(),
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || {
+                    let (task, control) = spawn_anchor_worker(
+                        AnchorWorkerConfig::from_env(),
+                        svc.clone(),
+                        engine.clone(),
+                    );
+                    (task, move || async move {
+                        let _ = control.send(AnchorWorkerMessage::Shutdown).await;
+                    })
+                },
+            );
+        } else {
+            let (anchor_worker_task, anchor_worker_control) = spawn_anchor_worker(
+                AnchorWorkerConfig::from_env(),
+                anchor_svc.clone(),
+                ves_commitment_engine.clone(),
+            );
+            supervise_worker(
+                "anchor_worker",
+                anchor_worker_task,
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || async move {
                     let _ = anchor_worker_control
                         .send(AnchorWorkerMessage::Shutdown)
                         .await;
-                    let _ = anchor_worker_task.await;
-                }
-                join_result = &mut anchor_worker_task => {
-                    // The worker exited on its own *before* shutdown was
-                    // requested — a panic or unexpected return. Anchoring has
-                    // stopped, so Merkle roots will silently stop reaching L2.
-                    // Surface it loudly and trigger a coordinated shutdown so a
-                    // process supervisor restarts the sequencer rather than
-                    // letting it run degraded with no anchoring.
-                    match join_result {
-                        Ok(()) => error!(
-                            "Anchor worker exited unexpectedly before shutdown; triggering coordinated shutdown"
-                        ),
-                        Err(e) if e.is_panic() => error!(
-                            error = ?e,
-                            "Anchor worker panicked; triggering coordinated shutdown"
-                        ),
-                        Err(e) => error!(
-                            error = ?e,
-                            "Anchor worker task failed to join; triggering coordinated shutdown"
-                        ),
-                    }
-                    anchor_worker_coordinator.shutdown().await;
-                }
-            }
-        });
+                },
+            );
+        }
         info!("Anchor worker started");
     }
 
@@ -1926,6 +2065,49 @@ mod tests {
         assert!(err.to_string().contains("sslmode must be require"));
 
         std::env::remove_var("ALLOW_INSECURE_LOCAL_DB");
+    }
+
+    #[test]
+    fn enforce_secret_strength_accepts_strong_secret() {
+        let strong = "0123456789abcdef0123456789abcdef"; // 32 chars
+        assert!(enforce_secret_strength("JWT_SECRET", strong, MIN_SECRET_LEN, true).is_ok());
+        assert!(enforce_secret_strength("JWT_SECRET", strong, MIN_SECRET_LEN, false).is_ok());
+    }
+
+    #[test]
+    fn enforce_secret_strength_rejects_weak_secret_in_production() {
+        let weak = "short";
+        let err = enforce_secret_strength("JWT_SECRET", weak, MIN_SECRET_LEN, true)
+            .expect_err("weak secret must be fatal in production");
+        assert!(err.to_string().contains("too weak for production"));
+    }
+
+    #[test]
+    fn enforce_secret_strength_warns_but_allows_weak_secret_outside_production() {
+        let weak = "short";
+        assert!(
+            enforce_secret_strength("JWT_SECRET", weak, MIN_SECRET_LEN, false).is_ok(),
+            "weak secret should be allowed (with a warning) outside production"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn is_production_env_defaults_and_labels() {
+        std::env::remove_var("SEQUENCER_ENV");
+        std::env::remove_var("ENVIRONMENT");
+        assert!(!is_production_env(), "unset env must default to non-production");
+
+        for label in ["dev", "development", "test", "ci", "staging", "LOCAL"] {
+            std::env::set_var("SEQUENCER_ENV", label);
+            assert!(!is_production_env(), "{label} must be non-production");
+        }
+
+        for label in ["production", "prod", "PRODUCTION", "live"] {
+            std::env::set_var("SEQUENCER_ENV", label);
+            assert!(is_production_env(), "{label} must be production");
+        }
+        std::env::remove_var("SEQUENCER_ENV");
     }
 
     #[tokio::test]

@@ -112,7 +112,13 @@ impl ApiKeyValidator {
             return Err(AuthError::InvalidApiKey);
         }
 
-        // Hash the key
+        // Hash the key, then look the key up *by its hash*. Lookup is keyed on
+        // the SHA-256 digest, never on the raw secret, so this is not the
+        // classic byte-by-byte `==` timing oracle: an attacker would have to
+        // already know a digest's preimage to influence lookup timing, and the
+        // map probe leaks at most coarse hash-bucket timing over a 256-bit
+        // space — not exploitable. (If this ever becomes a list scan that
+        // compares secrets directly, switch to a constant-time comparison.)
         let key_hash = Self::hash_key(key);
 
         // Look up the key

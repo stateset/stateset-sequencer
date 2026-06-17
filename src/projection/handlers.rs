@@ -1855,4 +1855,74 @@ mod tests {
         let return_proj = store.get("ret-001").await.unwrap().unwrap();
         assert_eq!(return_proj.status, ReturnStatus::Completed);
     }
+
+    // ========================================================================
+    // Inventory Projector — arithmetic-safety regressions
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_inventory_adjust_overflow_is_rejected() {
+        let store = Arc::new(InMemoryInventoryStore::default());
+        let projector = InventoryProjector::new(store.clone());
+
+        let init = create_test_event(
+            "inventory",
+            "prod-1:loc-1",
+            "inventory.initialized",
+            json!({ "quantity": 100 }),
+        );
+        assert!(matches!(
+            projector.apply(&init, None).await.unwrap(),
+            ApplyResult::Applied { .. }
+        ));
+
+        // An adjustment near i64::MAX must be rejected, not wrap (release) or
+        // panic (debug). Regression for the unchecked `+=` arithmetic.
+        let adjust = create_test_event(
+            "inventory",
+            "prod-1:loc-1",
+            "inventory.adjusted",
+            json!({ "adjustment": i64::MAX }),
+        );
+        let result = projector.apply(&adjust, Some(1)).await.unwrap();
+        assert!(
+            matches!(result, ApplyResult::Rejected { .. }),
+            "overflowing adjustment should be rejected, got {result:?}"
+        );
+
+        // State must be unchanged.
+        let inv = store.get("prod-1", "loc-1").await.unwrap().unwrap();
+        assert_eq!(inv.quantity_on_hand, 100);
+    }
+
+    #[tokio::test]
+    async fn test_inventory_reserve_negative_quantity_is_rejected() {
+        let store = Arc::new(InMemoryInventoryStore::default());
+        let projector = InventoryProjector::new(store.clone());
+
+        let init = create_test_event(
+            "inventory",
+            "prod-1:loc-1",
+            "inventory.initialized",
+            json!({ "quantity": 100 }),
+        );
+        projector.apply(&init, None).await.unwrap();
+
+        // A negative reserve quantity previously passed the availability check
+        // and *decreased* reserved stock; it must be rejected.
+        let reserve = create_test_event(
+            "inventory",
+            "prod-1:loc-1",
+            "inventory.reserved",
+            json!({ "quantity": -50 }),
+        );
+        let result = projector.apply(&reserve, Some(1)).await.unwrap();
+        assert!(
+            matches!(result, ApplyResult::Rejected { .. }),
+            "negative reserve quantity should be rejected, got {result:?}"
+        );
+
+        let inv = store.get("prod-1", "loc-1").await.unwrap().unwrap();
+        assert_eq!(inv.quantity_reserved, 0);
+    }
 }

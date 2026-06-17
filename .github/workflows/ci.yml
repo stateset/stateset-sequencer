@@ -10,6 +10,15 @@ env:
   RUST_BACKTRACE: "1"
   # Minimum coverage threshold (percentage)
   COVERAGE_THRESHOLD: 70
+  # Core feature set: `full` minus `stark`, so lint/test/coverage build the
+  # whole sequencer except the STARK proof verifier (whose crates live in the
+  # private stateset-stark workspace). See the `stark` feature in Cargo.toml.
+  CORE_FEATURES: grpc,telemetry,anchoring,schema-validation,pqc,sqlite
+  # Token with read access to the private stateset-stark repo. Add it under
+  # Settings → Secrets and variables → Actions. Required because the ves-stark-*
+  # crates are path dependencies that cargo must resolve even when the `stark`
+  # feature is off.
+  STARK_REPO_TOKEN: ${{ secrets.STARK_REPO_TOKEN }}
 
 jobs:
   lint:
@@ -21,7 +30,10 @@ jobs:
       - name: Fetch local STARK dependency source
         run: |
           if [ ! -d ../stateset-stark ]; then
-            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+            if [ -z "$STARK_REPO_TOKEN" ]; then
+              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            fi
+            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
 
       - uses: dtolnay/rust-toolchain@stable
@@ -34,7 +46,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --no-default-features --features "$CORE_FEATURES,integration" --all-targets -- -D warnings
 
   test:
     name: Test
@@ -64,7 +76,10 @@ jobs:
       - name: Fetch local STARK dependency source
         run: |
           if [ ! -d ../stateset-stark ]; then
-            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+            if [ -z "$STARK_REPO_TOKEN" ]; then
+              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            fi
+            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
 
       - uses: dtolnay/rust-toolchain@stable
@@ -72,13 +87,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run unit tests
-        run: cargo test --locked --lib --bins
+        run: cargo test --locked --no-default-features --features "$CORE_FEATURES" --lib --bins
 
       - name: Run integration tests
-        run: cargo test --locked --tests -- --ignored
+        run: cargo test --locked --no-default-features --features "$CORE_FEATURES,integration" --tests -- --include-ignored
 
       - name: Run property tests
-        run: cargo test --locked property_test
+        run: cargo test --locked --no-default-features --features "$CORE_FEATURES" --test property_test
 
   coverage:
     name: Code Coverage
@@ -108,7 +123,10 @@ jobs:
       - name: Fetch local STARK dependency source
         run: |
           if [ ! -d ../stateset-stark ]; then
-            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+            if [ -z "$STARK_REPO_TOKEN" ]; then
+              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            fi
+            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
 
       - uses: dtolnay/rust-toolchain@stable
@@ -121,6 +139,7 @@ jobs:
       - name: Generate coverage (unit tests)
         run: |
           cargo tarpaulin \
+            --no-default-features --features "$CORE_FEATURES" \
             --out Json \
             --out Xml \
             --output-dir coverage \
@@ -134,6 +153,7 @@ jobs:
       - name: Generate coverage (integration tests)
         run: |
           cargo tarpaulin \
+            --no-default-features --features "$CORE_FEATURES,integration" \
             --out Json \
             --out Xml \
             --output-dir coverage-integration \
@@ -187,7 +207,10 @@ jobs:
       - name: Fetch local STARK dependency source
         run: |
           if [ ! -d ../stateset-stark ]; then
-            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+            if [ -z "$STARK_REPO_TOKEN" ]; then
+              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            fi
+            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
 
       - uses: dtolnay/rust-toolchain@stable
@@ -207,7 +230,10 @@ jobs:
       - name: Fetch local STARK dependency source
         run: |
           if [ ! -d ../stateset-stark ]; then
-            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+            if [ -z "$STARK_REPO_TOKEN" ]; then
+              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            fi
+            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
 
       - uses: dtolnay/rust-toolchain@stable
@@ -235,7 +261,10 @@ jobs:
       - name: Fetch local STARK dependency source
         run: |
           if [ ! -d ../stateset-stark ]; then
-            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+            if [ -z "$STARK_REPO_TOKEN" ]; then
+              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            fi
+            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
 
       - uses: dtolnay/rust-toolchain@stable
@@ -254,7 +283,10 @@ jobs:
       - name: Fetch local STARK dependency source
         run: |
           if [ ! -d ../stateset-stark ]; then
-            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+            if [ -z "$STARK_REPO_TOKEN" ]; then
+              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            fi
+            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
 
       - uses: dtolnay/rust-toolchain@stable
@@ -288,7 +320,10 @@ jobs:
       - name: Ensure local STARK dependency source for Docker build
         run: |
           if [ ! -d ../stateset-stark ]; then
-            git clone --depth 1 https://github.com/stateset/stateset-stark.git ../stateset-stark
+            if [ -z "$STARK_REPO_TOKEN" ]; then
+              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            fi
+            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
 
       - name: Set up Docker Buildx

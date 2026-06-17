@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Background workers (anchor + x402 batch) are now supervised.** Previously each monitor task simply blocked on the shutdown signal, so if a worker panicked or returned early the death went completely unnoticed — anchoring/batching stopped silently while the server kept serving. The monitors now `select!` between the shutdown signal and the worker task completing; an unexpected early exit (panic or return) is logged at `ERROR` and triggers a coordinated shutdown so a process supervisor restarts the sequencer instead of running degraded.
 
+### API consistency
+
+- **Event-ingestion error responses are now structured JSON** (`{ "error": { "code", "message", ... } }`), matching the x402 and other handlers, instead of bare plain-text bodies. The legacy and VES ingest handlers return `ApiError`, with a `From<(StatusCode, String)>` conversion so their validation helpers keep their existing return type. (api integration suite now 44/44.)
+
 ### Observability
 
 - The at-rest payload decrypt path logs a `WARN` when ciphertext fails to decrypt against *every* tenant key (the genuine tampering / corruption / AAD-mismatch signal), while still staying quiet on ordinary per-key rotation misses.

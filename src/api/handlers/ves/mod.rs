@@ -2,15 +2,22 @@
 
 pub mod anchoring;
 pub mod commitments;
-pub mod compliance_proofs;
 pub mod inclusion_proofs;
+
+// STARK proof endpoints depend on the private stateset-stark workspace.
+#[cfg(feature = "stark")]
+pub mod compliance_proofs;
+#[cfg(feature = "stark")]
 pub mod validity_proofs;
 
 // Re-export all handlers for convenience
 pub use anchoring::*;
 pub use commitments::*;
-pub use compliance_proofs::*;
 pub use inclusion_proofs::*;
+
+#[cfg(feature = "stark")]
+pub use compliance_proofs::*;
+#[cfg(feature = "stark")]
 pub use validity_proofs::*;
 
 use axum::http::StatusCode;

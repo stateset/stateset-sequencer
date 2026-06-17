@@ -437,16 +437,71 @@ impl ProjectionRunner {
 
         match result {
             ApplyResult::Applied { new_version } => {
-                // Update version
-                self.version_store
-                    .set_version(
+                // Persist the new version with an atomic compare-and-set guarded
+                // against the version we read at the start of this event. A plain
+                // read-then-write would be a TOCTOU: if another writer advanced the
+                // entity between `get_version` above and this store, we would
+                // silently clobber it. CAS turns that race into a detected
+                // conflict. (Runners are expected to be single-writer per
+                // tenant/store — see `run()` — but this keeps the invariant
+                // enforced rather than assumed, including for any persistent
+                // `EntityVersionStore` added later.)
+                let committed = self
+                    .version_store
+                    .compare_and_set_version(
                         tenant_id,
                         store_id,
                         entity_type,
                         event.entity_id(),
+                        current_version,
                         new_version,
                     )
                     .await?;
+
+                if !committed {
+                    // The entity changed underneath us: another writer is active
+                    // for this tenant/store. Treat as a version conflict rather
+                    // than overwriting, and route to the DLQ for retry.
+                    let actual_version = self
+                        .version_store
+                        .get_version(tenant_id, store_id, entity_type, event.entity_id())
+                        .await?;
+
+                    let rejection = RejectionEvent {
+                        original_event_id: event.event_id(),
+                        original_sequence: event.sequence_number(),
+                        entity_type: entity_type.clone(),
+                        entity_id: event.entity_id().to_string(),
+                        reason: "Concurrent version update".to_string(),
+                        reason_code: "VERSION_CONFLICT".to_string(),
+                        expected_version: current_version,
+                        actual_version,
+                    };
+                    self.rejection_sink.emit_rejection(rejection).await?;
+
+                    self.send_to_dead_letter_queue(
+                        tenant_id,
+                        store_id,
+                        event,
+                        DeadLetterReason::VersionConflict,
+                        &format!(
+                            "Concurrent version update: expected {current_version:?}, found {actual_version:?}"
+                        ),
+                        event.payload().clone(),
+                    )
+                    .await;
+
+                    warn!(
+                        event_id = %event.event_id(),
+                        expected = ?current_version,
+                        actual = ?actual_version,
+                        "Event rejected due to concurrent version update"
+                    );
+
+                    let mut stats = self.stats.write().await;
+                    stats.events_rejected += 1;
+                    return Ok(());
+                }
 
                 debug!(
                     event_id = %event.event_id(),
@@ -714,6 +769,187 @@ impl RejectionSink for InMemoryRejectionSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{AgentId, EntityType, EventEnvelope, EventType, SequencedEvent};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Version store that simulates a concurrent writer: `get_version` returns
+    /// the value the runner reads, but `compare_and_set_version` always fails as
+    /// if another writer advanced the row in between. The second `get_version`
+    /// call (used to report the conflicting value) returns the "concurrent"
+    /// version so we can assert it is surfaced in the rejection.
+    struct RacyVersionStore {
+        get_calls: AtomicUsize,
+        read_version: Option<u64>,
+        concurrent_version: Option<u64>,
+    }
+
+    #[async_trait]
+    impl EntityVersionStore for RacyVersionStore {
+        async fn get_version(
+            &self,
+            _t: &TenantId,
+            _s: &StoreId,
+            _et: &str,
+            _ei: &str,
+        ) -> Result<Option<u64>, SequencerError> {
+            let n = self.get_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(if n == 0 {
+                self.read_version
+            } else {
+                self.concurrent_version
+            })
+        }
+
+        async fn set_version(
+            &self,
+            _t: &TenantId,
+            _s: &StoreId,
+            _et: &str,
+            _ei: &str,
+            _v: u64,
+        ) -> Result<(), SequencerError> {
+            panic!("runner must use compare_and_set_version, not set_version");
+        }
+
+        async fn compare_and_set_version(
+            &self,
+            _t: &TenantId,
+            _s: &StoreId,
+            _et: &str,
+            _ei: &str,
+            _expected: Option<u64>,
+            _new: u64,
+        ) -> Result<bool, SequencerError> {
+            // Always lose the race.
+            Ok(false)
+        }
+    }
+
+    /// Minimal projector that always applies and bumps the version.
+    struct AlwaysApplyProjector {
+        entity_type: String,
+    }
+
+    #[async_trait]
+    impl DomainProjector for AlwaysApplyProjector {
+        fn entity_type(&self) -> &str {
+            &self.entity_type
+        }
+        async fn apply(
+            &self,
+            _event: &SequencedEvent,
+            current_version: Option<u64>,
+        ) -> Result<ApplyResult, SequencerError> {
+            Ok(ApplyResult::Applied {
+                new_version: current_version.unwrap_or(0) + 1,
+            })
+        }
+        async fn rebuild(
+            &self,
+            _t: &TenantId,
+            _s: &StoreId,
+            _ei: &str,
+            _events: &[SequencedEvent],
+        ) -> Result<(), SequencerError> {
+            Ok(())
+        }
+    }
+
+    struct EmptyEventSource;
+
+    #[async_trait]
+    impl EventSource for EmptyEventSource {
+        async fn get_events_from(
+            &self,
+            _t: &TenantId,
+            _s: &StoreId,
+            _from: u64,
+            _limit: usize,
+        ) -> Result<Vec<SequencedEvent>, SequencerError> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn make_runner(version_store: Arc<dyn EntityVersionStore>) -> (ProjectionRunner, Arc<InMemoryRejectionSink>) {
+        let rejection_sink = Arc::new(InMemoryRejectionSink::new());
+        let mut runner = ProjectionRunner::new(
+            ProjectionRunnerConfig::default(),
+            Arc::new(EmptyEventSource),
+            Arc::new(InMemoryCheckpointStore::new()),
+            version_store,
+            rejection_sink.clone(),
+        );
+        runner.register_projector(Arc::new(AlwaysApplyProjector {
+            entity_type: EntityType::order().0,
+        }));
+        (runner, rejection_sink)
+    }
+
+    fn make_event() -> SequencedEvent {
+        let envelope = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-1",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({"amount": 1}),
+            AgentId::new(),
+        );
+        SequencedEvent::new(envelope, 1)
+    }
+
+    #[tokio::test]
+    async fn process_event_rejects_on_concurrent_version_update() {
+        // The runner reads version 0, the projector applies (new_version 1), but
+        // the CAS loses to a concurrent writer that advanced the row to 7.
+        let version_store = Arc::new(RacyVersionStore {
+            get_calls: AtomicUsize::new(0),
+            read_version: Some(0),
+            concurrent_version: Some(7),
+        });
+        let (runner, rejection_sink) = make_runner(version_store);
+        let event = make_event();
+        let tenant_id = event.envelope.tenant_id;
+        let store_id = event.envelope.store_id;
+
+        runner
+            .process_event(&tenant_id, &store_id, &event)
+            .await
+            .expect("conflict must be handled gracefully, not error out");
+
+        // The losing CAS must surface as a detected conflict, not a silent clobber.
+        let rejections = rejection_sink.get_rejections().await;
+        assert_eq!(rejections.len(), 1, "expected exactly one rejection");
+        assert_eq!(rejections[0].reason_code, "VERSION_CONFLICT");
+        assert_eq!(rejections[0].actual_version, Some(7));
+        assert_eq!(runner.stats().await.events_rejected, 1);
+        assert_eq!(runner.stats().await.events_applied, 0);
+    }
+
+    #[tokio::test]
+    async fn process_event_applies_when_cas_succeeds() {
+        // Real in-memory store (functioning CAS): a fresh entity applies cleanly.
+        let version_store = Arc::new(InMemoryVersionStore::new());
+        let (runner, rejection_sink) = make_runner(version_store.clone());
+        let event = make_event();
+        let tenant_id = event.envelope.tenant_id;
+        let store_id = event.envelope.store_id;
+
+        runner
+            .process_event(&tenant_id, &store_id, &event)
+            .await
+            .expect("apply must succeed");
+
+        assert!(rejection_sink.get_rejections().await.is_empty());
+        assert_eq!(runner.stats().await.events_applied, 1);
+        assert_eq!(runner.stats().await.events_rejected, 0);
+        // Version advanced from (none -> 1).
+        let v = version_store
+            .get_version(&tenant_id, &store_id, &EntityType::order().0, "order-1")
+            .await
+            .unwrap();
+        assert_eq!(v, Some(1));
+    }
 
     #[tokio::test]
     async fn test_in_memory_version_store() {

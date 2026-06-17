@@ -1978,7 +1978,7 @@ async fn test_agent_scoped_ingest_denies_mismatched_agent() {
         body
     );
     assert!(
-        body["error"]
+        body["error"]["message"]
             .as_str()
             .map(|s| s.contains("Agent mismatch"))
             .unwrap_or(false),
@@ -2030,7 +2030,7 @@ async fn test_agent_scoped_ingest_rejects_event_source_agent_mismatch() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "body: {:?}", body);
     assert!(
-        body["error"]
+        body["error"]["message"]
             .as_str()
             .map(|s| s.contains("source_agent"))
             .unwrap_or(false),

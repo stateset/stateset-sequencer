@@ -412,6 +412,34 @@ impl IntoResponse for ApiError {
 // Conversion from SequencerError
 // ============================================================================
 
+/// Convert a legacy `(StatusCode, String)` error tuple into a structured
+/// [`ApiError`].
+///
+/// Older handlers (e.g. event ingestion) returned plain-text `(StatusCode,
+/// String)` errors, which render as a bare string body — inconsistent with the
+/// structured `{ "error": { "code", "message", ... } }` JSON the rest of the API
+/// returns. This `From` lets those handlers switch their error type to
+/// `ApiError` while their helper functions keep returning the tuple (it converts
+/// automatically through `?`).
+impl From<(StatusCode, String)> for ApiError {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        let code = match status {
+            StatusCode::UNAUTHORIZED => ErrorCode::AuthRequired,
+            StatusCode::FORBIDDEN => ErrorCode::InsufficientPermissions,
+            StatusCode::NOT_FOUND => ErrorCode::ResourceNotFound,
+            StatusCode::CONFLICT => ErrorCode::AlreadyExists,
+            StatusCode::PAYLOAD_TOO_LARGE => ErrorCode::PayloadTooLarge,
+            StatusCode::TOO_MANY_REQUESTS => ErrorCode::RateLimitExceeded,
+            StatusCode::SERVICE_UNAVAILABLE => ErrorCode::ServiceUnavailable,
+            s if s.is_server_error() => ErrorCode::InternalError,
+            // BAD_REQUEST and any other client error fall back to a generic
+            // validation code (same 400 status).
+            _ => ErrorCode::InvalidFieldValue,
+        };
+        ApiError::new(code, message)
+    }
+}
+
 impl From<crate::infra::SequencerError> for ApiError {
     fn from(err: crate::infra::SequencerError) -> Self {
         use crate::infra::SequencerError;

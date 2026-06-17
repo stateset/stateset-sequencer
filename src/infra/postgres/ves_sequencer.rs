@@ -5,6 +5,24 @@
 //! - Payload hash validation
 //! - Idempotent event ingestion
 //! - Sequencer receipts
+//!
+//! # Concurrency & isolation
+//!
+//! Ingestion runs inside a single database transaction (`pool.begin()`) and
+//! relies on **pessimistic row locks**, not a stronger isolation level:
+//!
+//! - The per-`(tenant_id, store_id)` sequence counter is read `FOR UPDATE`, so
+//!   concurrent ingests for the same stream serialize on that row — sequence
+//!   numbers are gap-free and strictly monotonic.
+//! - Each touched `entity_versions` row is read `FOR UPDATE` before its OCC
+//!   check, closing the read-check-write TOCTOU on entity version.
+//!
+//! Because every conflicting pair of transactions contends on the same locked
+//! row, the default `READ COMMITTED` isolation is sufficient and correct here;
+//! `SERIALIZABLE` would add abort/retry overhead without changing the outcome.
+//! The guarantee holds only while these operations stay within one transaction
+//! with the locks acquired *before* the corresponding reads — see
+//! `get_entity_version_tx` and the sequence-counter `FOR UPDATE` query.
 
 use chrono::Utc;
 use sqlx::postgres::PgPool;

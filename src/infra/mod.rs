@@ -21,6 +21,7 @@ mod commitment;
 mod dead_letter;
 mod error;
 mod graceful_shutdown;
+mod leader_election;
 mod net;
 mod payload_encryption;
 mod pool_monitor;
@@ -60,11 +61,13 @@ pub use graceful_shutdown::{
     serve_with_shutdown, shutdown_signal, spawn_until_shutdown, GracefulShutdownConfig,
     RequestGuard, RequestTracker, ShutdownCoordinator, ShutdownSignal,
 };
+pub use leader_election::{lock_keys, spawn_elected_worker, ElectionConfig};
 pub use net::extract_client_ip;
 pub use payload_encryption::{PayloadEncryption, PayloadEncryptionMode};
 pub use pool_monitor::{PoolHealthStatus, PoolMonitor, PoolMonitorConfig, PoolStats};
 pub use postgres::{
-    PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer, PgX402Repository, VesSequencer,
+    spawn_x402_nonce_cleanup, PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer,
+    PgX402Repository, VesSequencer,
 };
 pub use retry::{is_retryable_db_error, retry, retry_with_config, Retry, RetryConfig, RetryResult};
 pub use schema_validation::SchemaValidationMode;

@@ -9,7 +9,17 @@ repository = "https://github.com/stateset/stateset-sequencer"
 
 [features]
 default = ["full"]
-full = ["grpc", "telemetry", "anchoring", "schema-validation", "pqc"]
+full = ["grpc", "telemetry", "anchoring", "schema-validation", "pqc", "stark"]
+
+# STARK proof verification endpoints (depends on the private stateset-stark
+# workspace via the ves-stark-* crates). Disable to build/test the core
+# sequencer without that dependency.
+stark = [
+    "dep:ves-stark-verifier",
+    "dep:ves-stark-primitives",
+    "dep:ves-stark-batch",
+    "dep:ves-stark-prover",
+]
 
 # Enable gRPC service (adds tonic/prost dependencies)
 grpc = []
@@ -111,10 +121,17 @@ tower-http = { version = "0.6", features = ["compression-gzip", "cors", "timeout
 # Hex encoding for hashes
 hex = "0.4"
 
-# StateSet STARK (Winterfell) verification
-ves-stark-verifier = { path = "../stateset-stark/crates/ves-stark-verifier" }
-ves-stark-primitives = { path = "../stateset-stark/crates/ves-stark-primitives" }
-ves-stark-batch = { path = "../stateset-stark/crates/ves-stark-batch" }
+# StateSet STARK (Winterfell) verification.
+# Optional + behind the `stark` feature: these crates live in the separate,
+# private `stateset-stark` workspace, so gating them lets the core sequencer
+# build and be tested (e.g. in CI) without that dependency. `ves-stark-prover`
+# is only used by tests but is declared here (not in dev-dependencies, which
+# cannot be optional) so `cargo test` without the `stark` feature does not pull
+# the private repo.
+ves-stark-verifier = { path = "../stateset-stark/crates/ves-stark-verifier", optional = true }
+ves-stark-primitives = { path = "../stateset-stark/crates/ves-stark-primitives", optional = true }
+ves-stark-batch = { path = "../stateset-stark/crates/ves-stark-batch", optional = true }
+ves-stark-prover = { path = "../stateset-stark/crates/ves-stark-prover", optional = true }
 
 # Ethereum/EVM interaction
 # Explicit feature set (not "full") so the HTTP transport uses rustls instead of
@@ -136,7 +153,6 @@ alloy = { version = "0.8", default-features = false, features = [
 tonic-build = "0.12"
 
 [dev-dependencies]
-ves-stark-prover = { path = "../stateset-stark/crates/ves-stark-prover" }
 tokio-test = "0.4"
 tempfile = "3"
 serial_test = "3"
