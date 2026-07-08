@@ -24,6 +24,9 @@
 //! - Proofs are encrypted at rest with AES-GCM
 //! - AAD includes event_id, proof_id, and policy_hash to prevent substitution
 //! - Proof hash is stored separately for verification without decryption
+//! - For STARK proofs, the committed amount is re-extracted from the stored
+//!   event payload and the proof is rejected if it commits to a different
+//!   amount (see the [`super::amount_binding`] module docs for the trust model)
 
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
@@ -36,6 +39,9 @@ use tracing::instrument;
 use uuid::Uuid;
 
 use crate::api::auth_helpers::{ensure_read, ensure_write};
+use crate::api::handlers::ves::amount_binding::{
+    allow_unverified_amount_binding, check_payload_amount_binding, AmountBindingCheck,
+};
 use crate::api::handlers::ves::ves_compliance_public_inputs;
 use crate::api::types::{
     SubmitVesComplianceProofRequest, VesComplianceInputsRequest, WitnessCommitment,
@@ -291,6 +297,41 @@ pub async fn submit_ves_compliance_proof(
         None => Some(canonical_inputs.clone()),
     };
 
+    // Soundness: bind the committed amount to the stored event payload.
+    //
+    // The STARK circuit proves a range predicate over a committed amount but
+    // does not parse the payload, so the sequencer re-extracts the amount from
+    // the payload it stored at ingest and rejects proofs whose witness
+    // commitment commits to a different amount. This check is independent of
+    // (and much cheaper than) full proof verification, so it runs even when
+    // verify-on-submit is disabled.
+    let amount_binding_check: Option<AmountBindingCheck> = if is_stark {
+        let commitment_u64 =
+            witness_commitment_bytes_to_u64(&witness_commitment.expect("checked above for STARK"));
+        let check = check_payload_amount_binding(
+            &inputs,
+            &commitment_u64,
+            allow_unverified_amount_binding(),
+        )
+        .map_err(|reason| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Payload amount binding rejected: {reason}"),
+            )
+        })?;
+        if !check.verified {
+            tracing::warn!(
+                event_id = %event_id,
+                policy_id = %policy_id,
+                "accepting STARK compliance proof with unverified payload amount binding \
+                 (VES_STARK_ALLOW_UNVERIFIED_AMOUNT_BINDING is enabled)"
+            );
+        }
+        Some(check)
+    } else {
+        None
+    };
+
     // Optional: reject invalid STARK proofs at submission time.
     if is_stark && stark_verify_on_submit_enabled() {
         let public_inputs: ves_stark_primitives::public_inputs::CompliancePublicInputs =
@@ -405,6 +446,8 @@ pub async fn submit_ves_compliance_proof(
         "proof_hash": hex::encode(summary.proof_hash),
         "witness_commitment": witness_commitment_u64,
         "witness_commitment_hex": witness_commitment_hex,
+        "amount_binding_verified": amount_binding_check.as_ref().map(|c| c.verified),
+        "amount_binding_hash": amount_binding_check.as_ref().and_then(|c| c.amount_binding_hash.clone()),
         "public_inputs": summary.public_inputs,
         "submitted_at": summary.submitted_at,
     })))
@@ -644,8 +687,34 @@ pub async fn verify_ves_compliance_proof(
         }
     }
 
+    // Soundness: re-extract the payload amount and check it against the stored
+    // witness commitment (see the `amount_binding` module docs). Without this,
+    // the proven amount is whatever the prover chose to commit.
+    let mut amount_binding_verified: Option<bool> = None;
+    let mut amount_binding_error: Option<String> = None;
+    let mut amount_binding_hash: Option<String> = None;
+    if is_stark {
+        if let Some(commitment_u64) = witness_commitment_u64 {
+            match check_payload_amount_binding(
+                &inputs,
+                &commitment_u64,
+                allow_unverified_amount_binding(),
+            ) {
+                Ok(check) => {
+                    amount_binding_verified = Some(check.verified);
+                    amount_binding_hash = check.amount_binding_hash;
+                }
+                Err(reason) => {
+                    amount_binding_verified = Some(false);
+                    amount_binding_error = Some(reason);
+                }
+            }
+        }
+    }
+
+    let amount_binding_ok = amount_binding_error.is_none();
     let valid = if is_stark {
-        base_valid && stark_valid.unwrap_or(false)
+        base_valid && stark_valid.unwrap_or(false) && amount_binding_ok
     } else {
         base_valid
     };
@@ -654,8 +723,10 @@ pub async fn verify_ves_compliance_proof(
         None
     } else if !base_valid {
         reason
-    } else if is_stark {
+    } else if is_stark && !stark_valid.unwrap_or(false) {
         Some("stark_invalid")
+    } else if is_stark && !amount_binding_ok {
+        Some("amount_binding_failed")
     } else {
         reason
     };
@@ -679,6 +750,9 @@ pub async fn verify_ves_compliance_proof(
         "stark_valid": stark_valid,
         "stark_error": stark_error,
         "stark_verification_time_ms": stark_verification_time_ms,
+        "amount_binding_verified": amount_binding_verified,
+        "amount_binding_error": amount_binding_error,
+        "amount_binding_hash": amount_binding_hash,
         "valid": valid,
         "reason": reason,
     })))

@@ -1,8 +1,28 @@
 //! VES validity proof handlers.
 //!
 //! Validity proofs provide cryptographic attestation that a batch commitment
-//! was correctly computed from its constituent events. This enables light
-//! clients to verify batch integrity without processing all events.
+//! was correctly computed from its constituent events, and that the committed
+//! amounts satisfy the batch's configured policy predicates (e.g. per-event
+//! caps). This enables light clients to verify batch integrity without
+//! processing all events.
+//!
+//! # Scope (what this proof does and does NOT attest)
+//!
+//! The STARK attests **commitment integrity plus policy compliance**:
+//!  - leaf hashes are correctly computed (Rescue-Prime),
+//!  - the Merkle tree is correctly constructed over those leaves,
+//!  - the state-root transition (`prev_state_root` -> `new_state_root`) is
+//!    consistent with the committed leaves,
+//!  - committed amounts satisfy the configured range/cap policies
+//!    (see `ves-stark-air` policies, e.g. `order_total_cap`).
+//!
+//! It does **not** prove that each underlying commerce operation obeyed its
+//! business-rule invariants (double-entry balance, legal order-status
+//! transitions, no inventory oversell). Those invariants are enforced by the
+//! embedded commerce engine at write time; the amount-to-payload binding is
+//! enforced separately (see `amount_binding`). "Validity proof" here means
+//! batch/commitment validity + policy compliance, not general
+//! commerce-state-machine validity.
 //!
 //! # Proof Workflow
 //!
@@ -11,7 +31,8 @@
 //! 3. Client generates STARK proof off-chain proving:
 //!    - All leaf hashes are correctly computed
 //!    - Merkle tree is correctly constructed
-//!    - State transition is valid
+//!    - The state-root transition is consistent with the committed leaves
+//!    - Committed amounts satisfy the configured policy predicates
 //! 4. Client submits proof via `/submit`
 //! 5. Sequencer stores proof with batch commitment
 //!
@@ -46,11 +67,15 @@ use ves_stark_primitives::felt_from_u64;
 use ves_stark_primitives::Felt;
 
 use crate::api::auth_helpers::{ensure_admin, ensure_read};
+use crate::api::handlers::ves::amount_binding::{
+    check_batch_amounts_against_policy, BatchAmountCheckSummary, BatchAmountEvent,
+};
 use crate::api::handlers::ves::ves_validity_public_inputs;
 use crate::api::types::SubmitVesValidityProofRequest;
 use crate::api::utils::{decode_base64_any, internal_error};
 use crate::auth::AuthContextExt;
 use crate::crypto::{canonical_json_hash, compute_ves_validity_proof_hash};
+use crate::domain::VesBatchCommitment;
 use crate::server::AppState;
 
 const MAX_VALIDITY_PROOF_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
@@ -292,6 +317,70 @@ fn parse_batch_public_inputs(
     ))
 }
 
+/// Re-check a batch validity proof's `allCompliant` claim against stored payloads.
+///
+/// The batch STARK proves the policy predicate over prover-supplied amounts;
+/// nothing in the circuit parses event payloads. For every plaintext event in
+/// the committed sequence range whose canonical amount is extractable, this
+/// re-extracts the amount and checks the claimed predicate directly, rejecting
+/// the proof if any stored payload contradicts the claim. Encrypted events and
+/// payloads without a canonical amount remain prover-attested and are only
+/// counted as skipped.
+///
+/// Returns `Ok(None)` when the canonical inputs claim no enforceable amount
+/// policy (`allCompliant` false or `policyLimit` 0).
+async fn recheck_batch_amounts(
+    state: &AppState,
+    commitment: &VesBatchCommitment,
+    canonical_inputs: &serde_json::Value,
+) -> Result<Option<BatchAmountCheckSummary>, (StatusCode, String)> {
+    let all_compliant = canonical_inputs
+        .get("allCompliant")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let policy_limit = canonical_inputs
+        .get("policyLimit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let policy_kind = canonical_inputs
+        .get("policyKind")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    if !all_compliant || policy_limit == 0 {
+        return Ok(None);
+    }
+
+    let events = state
+        .ves_sequencer_reader
+        .read_range(
+            &commitment.tenant_id,
+            &commitment.store_id,
+            commitment.sequence_range.0,
+            commitment.sequence_range.1,
+        )
+        .await
+        .map_err(internal_error)?;
+
+    let views: Vec<BatchAmountEvent<'_>> = events
+        .iter()
+        .map(|e| BatchAmountEvent {
+            event_id: e.envelope.event_id,
+            event_type: e.envelope.event_type.as_str(),
+            payload_kind: e.envelope.payload_kind.as_u32(),
+            payload: e.envelope.payload.as_ref(),
+        })
+        .collect();
+
+    check_batch_amounts_against_policy(&views, policy_kind, policy_limit)
+        .map(Some)
+        .map_err(|reason| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Batch allCompliant claim contradicted by stored event payloads: {reason}"),
+            )
+        })
+}
+
 /// GET /api/v1/ves/validity/:batch_id/inputs - Get validity public inputs.
 #[instrument(skip(state, auth), fields(batch_id = %batch_id))]
 pub async fn get_ves_validity_public_inputs(
@@ -388,6 +477,20 @@ pub async fn submit_ves_validity_proof(
         None => Some(canonical_inputs),
     };
 
+    // Soundness: the batch proof's amounts are prover-supplied, so re-check the
+    // claimed policy against the stored event payloads wherever they are
+    // recoverable. Runs even when verify-on-submit is disabled.
+    let amount_recheck = if is_stark {
+        recheck_batch_amounts(
+            &state,
+            &commitment,
+            public_inputs.as_ref().expect("public inputs set above"),
+        )
+        .await?
+    } else {
+        None
+    };
+
     if is_stark && stark_verify_on_submit_enabled() {
         let batch_public_inputs = parse_batch_public_inputs(public_inputs.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -473,6 +576,10 @@ pub async fn submit_ves_validity_proof(
         "proof_type": summary.proof_type,
         "proof_version": summary.proof_version,
         "proof_hash": hex::encode(summary.proof_hash),
+        "payload_amount_recheck": amount_recheck.map(|s| serde_json::json!({
+            "checked": s.checked,
+            "skipped": s.skipped,
+        })),
         "public_inputs": summary.public_inputs,
         "submitted_at": summary.submitted_at,
     })))
@@ -670,6 +777,20 @@ pub async fn verify_ves_validity_proof(
         }
     }
 
+    // Soundness: re-check the claimed batch policy against the stored event
+    // payloads (see `recheck_batch_amounts`).
+    let mut amount_recheck_summary: Option<BatchAmountCheckSummary> = None;
+    let mut amount_recheck_error: Option<String> = None;
+    if is_stark {
+        match recheck_batch_amounts(&state, &commitment, &canonical_public_inputs).await {
+            Ok(summary) => amount_recheck_summary = summary,
+            Err((status, msg)) if status == StatusCode::BAD_REQUEST => {
+                amount_recheck_error = Some(msg)
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
     let base_valid = if !proof_hash_match {
         (false, Some("proof_hash_mismatch"))
     } else if proof.public_inputs.is_none() {
@@ -681,7 +802,7 @@ pub async fn verify_ves_validity_proof(
     };
 
     let valid = if is_stark {
-        base_valid.0 && stark_valid.unwrap_or(false)
+        base_valid.0 && stark_valid.unwrap_or(false) && amount_recheck_error.is_none()
     } else {
         base_valid.0
     };
@@ -690,8 +811,10 @@ pub async fn verify_ves_validity_proof(
         None
     } else if !base_valid.0 {
         base_valid.1
-    } else if is_stark {
+    } else if is_stark && !stark_valid.unwrap_or(false) {
         Some("stark_invalid")
+    } else if is_stark && amount_recheck_error.is_some() {
+        Some("payload_amount_policy_violation")
     } else {
         base_valid.1
     };
@@ -711,6 +834,11 @@ pub async fn verify_ves_validity_proof(
         "stark_valid": stark_valid,
         "stark_error": stark_error,
         "stark_verification_time_ms": stark_verification_time_ms,
+        "payload_amount_recheck": amount_recheck_summary.map(|s| serde_json::json!({
+            "checked": s.checked,
+            "skipped": s.skipped,
+        })),
+        "payload_amount_recheck_error": amount_recheck_error,
         "valid": valid,
         "reason": reason,
     })))

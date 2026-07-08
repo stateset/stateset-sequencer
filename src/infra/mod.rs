@@ -29,6 +29,7 @@ pub mod postgres;
 mod retry;
 mod schema_validation;
 mod secrets;
+mod settlement_worker;
 pub mod sqlite;
 mod traits;
 mod ves_commitment;
@@ -72,6 +73,9 @@ pub use postgres::{
 pub use retry::{is_retryable_db_error, retry, retry_with_config, Retry, RetryConfig, RetryResult};
 pub use schema_validation::SchemaValidationMode;
 pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
+pub use settlement_worker::{
+    spawn_settlement_worker, SettlementWorker, SettlementWorkerConfig, SettlementWorkerMessage,
+};
 pub use sqlite::SqliteOutbox;
 pub use traits::*;
 pub use ves_commitment::PgVesCommitmentEngine;

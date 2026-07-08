@@ -111,6 +111,11 @@ pub enum ErrorCode {
     AnchorFailed,
     /// Commitment not yet anchored
     NotAnchored,
+
+    // Payment errors (10xxx)
+    /// Payment required to access this resource (x402 challenge).
+    /// The response `details` carry the JSON payment requirements.
+    PaymentRequired,
 }
 
 impl ErrorCode {
@@ -172,6 +177,9 @@ impl ErrorCode {
             ErrorCode::AnchorNotConfigured => 9001,
             ErrorCode::AnchorFailed => 9002,
             ErrorCode::NotAnchored => 9003,
+
+            // Payment (10xxx)
+            ErrorCode::PaymentRequired => 10001,
         }
     }
 
@@ -233,6 +241,9 @@ impl ErrorCode {
             ErrorCode::AnchorNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::AnchorFailed => StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::NotAnchored => StatusCode::BAD_REQUEST,
+
+            // Payment -> 402
+            ErrorCode::PaymentRequired => StatusCode::PAYMENT_REQUIRED,
         }
     }
 }
@@ -278,6 +289,7 @@ impl std::fmt::Display for ErrorCode {
             ErrorCode::AnchorNotConfigured => "ANCHOR_NOT_CONFIGURED",
             ErrorCode::AnchorFailed => "ANCHOR_FAILED",
             ErrorCode::NotAnchored => "NOT_ANCHORED",
+            ErrorCode::PaymentRequired => "PAYMENT_REQUIRED",
         };
         write!(f, "{}", code_str)
     }

@@ -48,6 +48,11 @@ const X402_MAX_STRING_FIELD_LEN: usize = 1024;
 const X402_MAX_IDEMPOTENCY_KEY_LEN: usize = 255;
 const X402_MAX_URI_LEN: usize = 4096;
 const X402_MAX_DESCRIPTION_LEN: usize = 8192;
+/// Upper bound on the raw (decoded) EIP-712 authorization blob. A 65-byte EOA
+/// ECDSA signature is the common case; ERC-1271 smart-contract-wallet signatures
+/// are longer but bounded well under this. Rejecting oversized blobs keeps a
+/// single settleBatch calldata from being griefed into an unsubmittable size.
+const X402_MAX_AUTHORIZATION_LEN: usize = 2048;
 
 // =============================================================================
 // Submit Payment Intent
@@ -90,6 +95,25 @@ pub async fn submit_payment_intent(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(payload): Json<SubmitX402PaymentRequest>,
 ) -> Result<Json<SubmitX402PaymentResponse>, ApiError> {
+    verify_and_sequence_payment(&state.x402_repository, &state.agent_key_registry, &auth, payload)
+        .await
+        .map(Json)
+}
+
+/// Validate, verify, and persist a signed x402 payment intent.
+///
+/// This is the single ingestion path for payment intents: it is used both by
+/// `POST /api/v1/x402/payments` and by the HTTP 402 payment-gate middleware
+/// (`api::middleware::payment_required`), so intents accepted via `X-Payment`
+/// headers get exactly the same validation, Ed25519 verification, nonce
+/// replay protection, and sequencing as directly submitted ones — and enter
+/// the same batching pipeline.
+pub(crate) async fn verify_and_sequence_payment(
+    x402_repository: &crate::infra::PgX402Repository,
+    agent_key_registry: &crate::infra::PgAgentKeyRegistry,
+    auth: &crate::auth::AuthContext,
+    payload: SubmitX402PaymentRequest,
+) -> Result<SubmitX402PaymentResponse, ApiError> {
     info!(
         payer = %payload.payer_address,
         payee = %payload.payee_address,
@@ -186,7 +210,7 @@ pub async fn submit_payment_intent(
         validate_length(merchant_id, "merchant_id", X402_MAX_STRING_FIELD_LEN)?;
     }
 
-    ensure_write(&auth, tenant_id.0, store_id.0)
+    ensure_write(auth, tenant_id.0, store_id.0)
         .map_err(|(_, msg)| ApiError::new(ErrorCode::InsufficientPermissions, msg))?;
 
     // Check expiry
@@ -219,6 +243,26 @@ pub async fn submit_payment_intent(
         )
     })?;
 
+    // Parse optional EIP-712 on-chain payer authorization. This is stored
+    // verbatim and relayed in the SetPaymentBatch.settleBatch calldata; the
+    // *contract* verifies the signature (EOA ECDSA or ERC-1271), so we do NOT
+    // re-verify it off-chain here — only shape-check it (hex, bounded length).
+    let eip712_authorization = match payload.eip712_authorization.as_deref() {
+        Some(raw) => Some(parse_eip712_authorization(raw)?),
+        None => None,
+    };
+
+    // Lower validity bound (EIP-712 validAfter). Defaults to 0 (no lower bound).
+    // A window that can never open (valid_after > valid_until) is rejected so an
+    // un-settleable intent never burns a nonce.
+    let valid_after = payload.valid_after.unwrap_or(0);
+    if valid_after > payload.valid_until {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "valid_after must be <= valid_until",
+        ));
+    }
+
     // Parse optional public key
     let payer_public_key = if let Some(ref pk) = payload.payer_public_key {
         Some(parse_hash256(pk).map_err(|e| {
@@ -233,8 +277,7 @@ pub async fn submit_payment_intent(
 
     // Check for duplicate via idempotency key
     if let Some(ref key) = payload.idempotency_key {
-        if let Ok(Some(existing)) = state
-            .x402_repository
+        if let Ok(Some(existing)) = x402_repository
             .get_intent_by_idempotency(&tenant_id, &store_id, key)
             .await
         {
@@ -243,13 +286,13 @@ pub async fn submit_payment_intent(
                 intent_id = %existing.intent_id,
                 "Returning existing intent for idempotency key"
             );
-            return Ok(Json(SubmitX402PaymentResponse {
+            return Ok(SubmitX402PaymentResponse {
                 intent_id: existing.intent_id,
                 status: existing.status,
                 sequence_number: existing.sequence_number,
                 sequenced_at: existing.sequenced_at,
                 batch_id: existing.batch_id,
-            }));
+            });
         }
     }
 
@@ -294,8 +337,7 @@ pub async fn submit_payment_intent(
             AgentKeyId::new(payload.agent_key_id.unwrap_or(1)),
         );
 
-        match state
-            .agent_key_registry
+        match agent_key_registry
             .get_verifying_key_at(&lookup, Utc::now())
             .await
         {
@@ -342,8 +384,10 @@ pub async fn submit_payment_intent(
             .map(String::from),
         created_at_unix: now_unix,
         valid_until: payload.valid_until,
+        valid_after,
         nonce: payload.nonce,
         idempotency_key: payload.idempotency_key,
+        eip712_authorization,
         resource_uri: payload.resource_uri,
         description: payload.description,
         order_id: payload.order_id,
@@ -363,15 +407,14 @@ pub async fn submit_payment_intent(
     };
 
     // Persist intent and reserve nonce atomically
-    let mut tx = state.x402_repository.pool().begin().await.map_err(|e| {
+    let mut tx = x402_repository.pool().begin().await.map_err(|e| {
         ApiError::new(
             ErrorCode::InternalError,
             format!("Failed to start transaction: {}", e),
         )
     })?;
 
-    state
-        .x402_repository
+    x402_repository
         .insert_intent_tx(&mut tx, &intent)
         .await
         .map_err(|e| {
@@ -381,8 +424,7 @@ pub async fn submit_payment_intent(
             )
         })?;
 
-    let reserved = state
-        .x402_repository
+    let reserved = x402_repository
         .reserve_nonce(
             &mut tx,
             &tenant_id,
@@ -413,8 +455,7 @@ pub async fn submit_payment_intent(
     // recovery path (idempotency resubmit would keep returning the stranded
     // intent). Doing it atomically means the intent only ever becomes durable in
     // the `sequenced` state.
-    let sequence_number = state
-        .x402_repository
+    let sequence_number = x402_repository
         .assign_sequence_number_tx(&mut tx, intent_id, &tenant_id, &store_id)
         .await
         .map_err(|e| {
@@ -439,13 +480,13 @@ pub async fn submit_payment_intent(
         "x402 payment intent sequenced"
     );
 
-    Ok(Json(SubmitX402PaymentResponse {
+    Ok(SubmitX402PaymentResponse {
         intent_id,
         status: X402IntentStatus::Sequenced,
         sequence_number: Some(sequence_number),
         sequenced_at: Some(sequenced_at),
         batch_id: None,
-    }))
+    })
 }
 
 // =============================================================================
@@ -662,10 +703,23 @@ pub async fn get_batch(
 }
 
 // =============================================================================
-// Trigger Batch Settlement
+// Trigger Batch Settlement (manual / override path)
 // =============================================================================
 
-/// Trigger batch submission/settlement
+/// Manual/override batch settlement: record an externally-supplied settlement
+/// tx hash + block for a committed/submitted batch.
+///
+/// This is NOT the autonomous settlement path. When a [`SettlementService`] is
+/// configured (env `SETTLEMENT_RPC_URL` / `SET_PAYMENT_BATCH_ADDRESS` /
+/// `SETTLER_PRIVATE_KEY`), the leader-elected
+/// [`crate::infra::settlement_worker::SettlementWorker`] settles committed
+/// batches on-chain automatically via `SetPaymentBatch.settleBatch` and records
+/// the real tx hash. This endpoint remains for operator override / disaster
+/// recovery / settling via an out-of-band relayer, and for deployments that run
+/// with the autonomous settler disabled. It only bookkeeps a tx hash the caller
+/// already produced; it does not itself broadcast anything on-chain.
+///
+/// [`SettlementService`]: crate::settlement::SettlementService
 #[derive(Debug, serde::Deserialize)]
 pub struct SettleBatchRequest {
     pub batch_id: Uuid,
@@ -1060,6 +1114,43 @@ pub async fn create_batch(
 }
 
 // =============================================================================
+// Premium (Payment-Gated) Resources
+// =============================================================================
+
+/// Demonstration payment-gated resource.
+///
+/// This route is mounted behind the HTTP 402 payment-gate middleware (see
+/// `api::middleware::payment_required` and `api::premium_router`): requests
+/// without a valid `X-Payment` header receive `402 Payment Required` with the
+/// JSON payment requirements, and requests carrying a valid signed intent are
+/// served with an `X-Payment-Receipt` response header.
+#[instrument(skip_all)]
+pub async fn premium_insights(
+    State(_state): State<AppState>,
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!({
+        "resource": "x402_premium_insights",
+        "tier": "premium",
+        "tenant_id": auth.tenant_id,
+        "generated_at": Utc::now(),
+        "insights": {
+            "protocol_version": crate::domain::X402_VERSION,
+            "batching": {
+                "default_batch_size": X402_DEFAULT_BATCH_SIZE,
+                "max_batch_size": X402_MAX_BATCH_SIZE,
+            },
+            "networks": [
+                { "network": X402Network::SetChain.to_string(), "chain_id": X402Network::SetChain.chain_id() },
+                { "network": X402Network::Arc.to_string(), "chain_id": X402Network::Arc.chain_id() },
+                { "network": X402Network::ArcTestnet.to_string(), "chain_id": X402Network::ArcTestnet.chain_id() },
+                { "network": X402Network::Base.to_string(), "chain_id": X402Network::Base.chain_id() },
+            ],
+        },
+    })))
+}
+
+// =============================================================================
 // Helper Functions
 // =============================================================================
 
@@ -1134,6 +1225,42 @@ fn validate_hex_string(value: &str, field_name: &str, max_len: usize) -> Result<
     }
 
     Ok(())
+}
+
+/// Parse the optional EIP-712 payer authorization: hex (with or without `0x`),
+/// decoded to raw bytes and bounded. Shape-only — the signature itself is
+/// verified on-chain, never here.
+#[allow(clippy::result_large_err)]
+fn parse_eip712_authorization(s: &str) -> Result<Vec<u8>, ApiError> {
+    let hex_str = s.trim().strip_prefix("0x").unwrap_or_else(|| s.trim());
+    if hex_str.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "eip712_authorization cannot be empty",
+        ));
+    }
+    if !hex_str.len().is_multiple_of(2) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "eip712_authorization hex length must be even",
+        ));
+    }
+    let bytes = hex::decode(hex_str).map_err(|e| {
+        ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            format!("Invalid eip712_authorization hex: {}", e),
+        )
+    })?;
+    if bytes.len() > X402_MAX_AUTHORIZATION_LEN {
+        return Err(ApiError::new(
+            ErrorCode::PayloadTooLarge,
+            format!(
+                "eip712_authorization exceeds maximum of {} bytes",
+                X402_MAX_AUTHORIZATION_LEN
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Parse a hex string into a 64-byte signature

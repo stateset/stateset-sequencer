@@ -18,6 +18,7 @@
 
 pub mod anchor;
 pub mod api;
+pub mod settlement;
 pub mod auth;
 pub mod crypto;
 pub mod domain;

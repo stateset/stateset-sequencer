@@ -288,6 +288,40 @@ pub mod option_signature64_hex_0x {
     }
 }
 
+/// Serde module for optional variable-length byte strings with 0x prefix.
+///
+/// Used for opaque signature blobs whose length is not fixed at the type level
+/// (e.g. an EIP-712 payer authorization, which is 65 bytes for an EOA ECDSA
+/// signature but arbitrary-length for an ERC-1271 smart-contract wallet).
+pub mod option_bytes_hex_0x {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(opt: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match opt {
+            Some(bytes) => serializer.serialize_some(&format!("0x{}", hex::encode(bytes))),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<String> = Option::deserialize(deserializer)?;
+        match opt {
+            Some(s) => {
+                let hex_str = s.strip_prefix("0x").unwrap_or(&s);
+                let bytes = hex::decode(hex_str).map_err(serde::de::Error::custom)?;
+                Ok(Some(bytes))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
 /// Serde module for PublicKey32 (32-byte Ed25519 public key) with 0x prefix
 pub mod pubkey32_hex_0x {
     use serde::{self, Deserialize, Deserializer, Serializer};

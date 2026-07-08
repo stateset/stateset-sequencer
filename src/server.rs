@@ -38,6 +38,7 @@ use crate::proto::v2::key_management_server::KeyManagementServer;
 use crate::proto::v2::sequencer_server::SequencerServer as SequencerServerV2;
 
 use crate::anchor::{AnchorConfig, AnchorService};
+use crate::settlement::{SettlementConfig, SettlementService};
 use crate::auth::{
     ApiKeyRecord, ApiKeyStore, ApiKeyValidator, AuthContextExt, AuthMiddlewareState, Authenticator,
     JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RateLimiterConfig, RequestLimits,
@@ -46,8 +47,9 @@ use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::infra::{
     extract_client_ip, lock_keys, spawn_anchor_worker, spawn_batch_worker, spawn_elected_worker,
-    spawn_x402_nonce_cleanup, AnchorWorkerConfig, ElectionConfig,
+    spawn_settlement_worker, spawn_x402_nonce_cleanup, AnchorWorkerConfig, ElectionConfig,
     AnchorWorkerMessage, BatchWorkerMessage, CacheManager, CacheManagerConfig,
+    SettlementWorkerConfig, SettlementWorkerMessage,
     CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry,
     PgAuditLogger, PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer,
     PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository,
@@ -1330,6 +1332,71 @@ pub async fn run() -> anyhow::Result<()> {
         info!("Anchor worker started");
     }
 
+    // Initialize the autonomous x402 settlement service (optional — only if the
+    // settlement env vars are set). OFF BY DEFAULT. When unset the settler simply
+    // does not run and the manual POST /batches/settle path remains the only way
+    // to record settlement.
+    let settlement_service = match SettlementConfig::from_env() {
+        Some(settlement_config) => {
+            info!("x402 settlement service configured:");
+            info!("  RPC URL: {}", settlement_config.rpc_url);
+            info!("  Contract: {:?}", settlement_config.contract_address);
+            info!("  Chain ID: {}", settlement_config.chain_id);
+            Some(Arc::new(SettlementService::new(settlement_config)))
+        }
+        None => {
+            info!(
+                "x402 settlement service not configured (set SETTLEMENT_RPC_URL, SET_PAYMENT_BATCH_ADDRESS, SETTLER_PRIVATE_KEY to enable autonomous on-chain settlement)"
+            );
+            None
+        }
+    };
+
+    // Start the settlement worker (only if the settlement service is configured).
+    // Leader-elected like the anchor worker so exactly one node settles.
+    if let Some(ref settlement_svc) = settlement_service {
+        if leader_election {
+            let svc = settlement_svc.clone();
+            let repo = x402_repository.clone();
+            spawn_elected_worker(
+                "settlement_worker",
+                lock_keys::SETTLEMENT_WORKER,
+                pool.clone(),
+                election_config.clone(),
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || {
+                    let (task, control) = spawn_settlement_worker(
+                        SettlementWorkerConfig::from_env(),
+                        svc.clone(),
+                        repo.clone(),
+                    );
+                    (task, move || async move {
+                        let _ = control.send(SettlementWorkerMessage::Shutdown).await;
+                    })
+                },
+            );
+        } else {
+            let (settlement_worker_task, settlement_worker_control) = spawn_settlement_worker(
+                SettlementWorkerConfig::from_env(),
+                settlement_svc.clone(),
+                x402_repository.clone(),
+            );
+            supervise_worker(
+                "settlement_worker",
+                settlement_worker_task,
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || async move {
+                    let _ = settlement_worker_control
+                        .send(SettlementWorkerMessage::Shutdown)
+                        .await;
+                },
+            );
+        }
+        info!("x402 settlement worker started");
+    }
+
     let auth_state = AuthMiddlewareState {
         authenticator,
         require_auth,
@@ -1457,7 +1524,15 @@ pub async fn run() -> anyhow::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
     );
-    let app = build_router(auth_state, admin_access_state)?
+    // Payment gate for x402 premium (HTTP 402) routes; price is env-configured
+    // via X402_PREMIUM_ROUTE_* (see api::middleware::payment_required).
+    let payment_gate = crate::api::middleware::PaymentRequiredState::new(
+        state.x402_repository.clone(),
+        state.agent_key_registry.clone(),
+        Arc::new(crate::api::middleware::PaymentRequiredConfig::from_env()),
+    );
+
+    let app = build_router(auth_state, admin_access_state, payment_gate)?
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(request_limits.max_body_size))
         .layer(tower_http::compression::CompressionLayer::new())
@@ -1662,14 +1737,19 @@ fn init_opentelemetry_tracer(
 fn build_router(
     auth_state: AuthMiddlewareState,
     admin_access_state: AdminAccessState,
+    payment_gate: crate::api::middleware::PaymentRequiredState,
 ) -> anyhow::Result<Router<AppState>> {
     let public_api = crate::api::public_router();
     let admin_allowlist_layer =
         axum::middleware::from_fn_with_state(admin_access_state, admin_ip_allowlist_middleware);
-    let api = crate::api::router().layer(axum::middleware::from_fn_with_state(
-        auth_state.clone(),
-        crate::auth::auth_middleware,
-    ));
+    // Premium (payment-gated) routes are merged before the auth layer is
+    // applied so the x402 payment gate runs with the auth context available.
+    let api = crate::api::router()
+        .merge(crate::api::premium_router(payment_gate))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            crate::auth::auth_middleware,
+        ));
     let admin_api = crate::api::admin_router()
         .layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),

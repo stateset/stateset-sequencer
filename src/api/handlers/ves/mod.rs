@@ -6,6 +6,8 @@ pub mod inclusion_proofs;
 
 // STARK proof endpoints depend on the private stateset-stark workspace.
 #[cfg(feature = "stark")]
+pub(crate) mod amount_binding;
+#[cfg(feature = "stark")]
 pub mod compliance_proofs;
 #[cfg(feature = "stark")]
 pub mod validity_proofs;
