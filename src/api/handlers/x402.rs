@@ -95,9 +95,14 @@ pub async fn submit_payment_intent(
     Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
     Json(payload): Json<SubmitX402PaymentRequest>,
 ) -> Result<Json<SubmitX402PaymentResponse>, ApiError> {
-    verify_and_sequence_payment(&state.x402_repository, &state.agent_key_registry, &auth, payload)
-        .await
-        .map(Json)
+    verify_and_sequence_payment(
+        &state.x402_repository,
+        &state.agent_key_registry,
+        &auth,
+        payload,
+    )
+    .await
+    .map(Json)
 }
 
 /// Validate, verify, and persist a signed x402 payment intent.

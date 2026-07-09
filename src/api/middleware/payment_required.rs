@@ -173,10 +173,7 @@ impl PaymentRequiredConfig {
 /// Parse a snake_case token (e.g. `"usdc"`, `"set_chain"`) into a
 /// serde-deserializable enum such as [`X402Asset`] or [`X402Network`].
 fn parse_enum_token<T: serde::de::DeserializeOwned>(value: &str) -> Option<T> {
-    serde_json::from_value(serde_json::Value::String(
-        value.trim().to_ascii_lowercase(),
-    ))
-    .ok()
+    serde_json::from_value(serde_json::Value::String(value.trim().to_ascii_lowercase())).ok()
 }
 
 // =============================================================================
@@ -313,7 +310,9 @@ pub async fn payment_required_middleware(
     let mut response = next.run(request).await;
     match encode_receipt_header(&receipt) {
         Ok(value) => {
-            response.headers_mut().insert(X_PAYMENT_RECEIPT_HEADER, value);
+            response
+                .headers_mut()
+                .insert(X_PAYMENT_RECEIPT_HEADER, value);
         }
         Err(e) => {
             // Should be unreachable (the receipt is plain serializable data);
@@ -504,8 +503,8 @@ mod tests {
     fn test_decode_x_payment_roundtrip() {
         let config = test_config();
         let payment = test_payment(&config);
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_vec(&payment).unwrap());
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&payment).unwrap());
         let header = HeaderValue::from_str(&encoded).unwrap();
 
         let decoded = decode_x_payment(&header).expect("roundtrip failed");

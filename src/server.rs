@@ -38,24 +38,23 @@ use crate::proto::v2::key_management_server::KeyManagementServer;
 use crate::proto::v2::sequencer_server::SequencerServer as SequencerServerV2;
 
 use crate::anchor::{AnchorConfig, AnchorService};
-use crate::settlement::{SettlementConfig, SettlementService};
 use crate::auth::{
     ApiKeyRecord, ApiKeyStore, ApiKeyValidator, AuthContextExt, AuthMiddlewareState, Authenticator,
     JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RateLimiterConfig, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
-use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::infra::{
     extract_client_ip, lock_keys, spawn_anchor_worker, spawn_batch_worker, spawn_elected_worker,
-    spawn_settlement_worker, spawn_x402_nonce_cleanup, AnchorWorkerConfig, ElectionConfig,
-    AnchorWorkerMessage, BatchWorkerMessage, CacheManager, CacheManagerConfig,
-    SettlementWorkerConfig, SettlementWorkerMessage,
-    CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry,
-    PgAuditLogger, PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer,
-    PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository,
-    PoolMonitor, SchemaValidationMode, SecretsProvider, VesSequencer, X402BatchWorkerConfig,
+    spawn_settlement_worker, spawn_x402_nonce_cleanup, AnchorWorkerConfig, AnchorWorkerMessage,
+    BatchWorkerMessage, CacheManager, CacheManagerConfig, CircuitBreakerRegistry, ElectionConfig,
+    EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry, PgAuditLogger, PgCommitmentEngine,
+    PgEventStore, PgSchemaStore, PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore,
+    PgVesValidityProofStore, PgX402Repository, PoolMonitor, SchemaValidationMode, SecretsProvider,
+    SettlementWorkerConfig, SettlementWorkerMessage, VesSequencer, X402BatchWorkerConfig,
 };
+use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::metrics::{ComponentMetrics, MetricsRegistry};
+use crate::settlement::{SettlementConfig, SettlementService};
 
 /// Interval for pool health monitoring and component metrics collection.
 const MONITORING_INTERVAL: Duration = Duration::from_secs(15);
@@ -1171,13 +1170,10 @@ pub async fn run() -> anyhow::Result<()> {
     // validity window to absorb clock skew; once a nonce is that old any replay
     // of its intent is already rejected by the expiry check at ingest.
     {
-        let nonce_retention = Duration::from_secs(
-            crate::domain::X402_MAX_VALIDITY_SECS.saturating_mul(2),
-        );
-        let nonce_cleanup_interval = Duration::from_secs(read_u64_env(
-            "X402_NONCE_CLEANUP_INTERVAL_SECS",
-            3600,
-        ));
+        let nonce_retention =
+            Duration::from_secs(crate::domain::X402_MAX_VALIDITY_SECS.saturating_mul(2));
+        let nonce_cleanup_interval =
+            Duration::from_secs(read_u64_env("X402_NONCE_CLEANUP_INTERVAL_SECS", 3600));
         spawn_x402_nonce_cleanup(
             x402_repository.clone(),
             nonce_cleanup_interval,
@@ -2176,7 +2172,10 @@ mod tests {
     fn is_production_env_defaults_and_labels() {
         std::env::remove_var("SEQUENCER_ENV");
         std::env::remove_var("ENVIRONMENT");
-        assert!(!is_production_env(), "unset env must default to non-production");
+        assert!(
+            !is_production_env(),
+            "unset env must default to non-production"
+        );
 
         for label in ["dev", "development", "test", "ci", "staging", "LOCAL"] {
             std::env::set_var("SEQUENCER_ENV", label);

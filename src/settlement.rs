@@ -256,13 +256,12 @@ impl SettlementService {
             ))
         })?;
         let token: Address = match intent.token_address.as_deref() {
-            Some(t) => t.parse().map_err(|e| {
-                SequencerError::Internal(format!("invalid token address {t}: {e}"))
-            })?,
+            Some(t) => t
+                .parse()
+                .map_err(|e| SequencerError::Internal(format!("invalid token address {t}: {e}")))?,
             None => Address::ZERO,
         };
-        let authorization =
-            Bytes::from(intent.eip712_authorization.clone().unwrap_or_default());
+        let authorization = Bytes::from(intent.eip712_authorization.clone().unwrap_or_default());
 
         Ok(ISetPaymentBatch::PaymentIntent {
             intentId: Self::uuid_to_bytes32(intent.intent_id),
@@ -498,9 +497,7 @@ impl SettlementService {
                 .isIntentSettled(Self::uuid_to_bytes32(intent.intent_id))
                 .call()
                 .await
-                .map_err(|e| {
-                    SequencerError::Internal(format!("isIntentSettled call failed: {e}"))
-                })?
+                .map_err(|e| SequencerError::Internal(format!("isIntentSettled call failed: {e}")))?
                 ._0;
             if is_settled {
                 settled.push(intent.intent_id);
@@ -524,7 +521,9 @@ mod tests {
     const SETTLE_BATCH_SIG: &str = "settleBatch(bytes32,bytes32,bytes32,uint64,uint64,(bytes32,address,address,uint256,address,uint64,uint64,uint64,bytes32,bytes)[])";
 
     fn sample_intent() -> X402PaymentIntent {
-        use crate::domain::{AgentId, AgentKeyId, StoreId, TenantId, X402Asset, X402IntentStatus, X402Network};
+        use crate::domain::{
+            AgentId, AgentKeyId, StoreId, TenantId, X402Asset, X402IntentStatus, X402Network,
+        };
         X402PaymentIntent {
             intent_id: Uuid::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00),
             x402_version: 1,
@@ -624,7 +623,10 @@ mod tests {
         };
 
         let encoded = call.abi_encode();
-        assert_eq!(&encoded[..4], ISetPaymentBatch::settleBatchCall::SELECTOR.as_slice());
+        assert_eq!(
+            &encoded[..4],
+            ISetPaymentBatch::settleBatchCall::SELECTOR.as_slice()
+        );
 
         let decoded = ISetPaymentBatch::settleBatchCall::abi_decode(&encoded, true).unwrap();
         assert_eq!(decoded.sequenceStart, 1);
@@ -642,10 +644,14 @@ mod tests {
     #[test]
     fn config_from_env_is_none_without_required_vars() {
         // Snapshot + clear the required vars so the test is order-independent.
-        let saved: Vec<_> = ["SETTLEMENT_RPC_URL", "SET_PAYMENT_BATCH_ADDRESS", "SETTLER_PRIVATE_KEY"]
-            .iter()
-            .map(|k| (*k, std::env::var(k).ok()))
-            .collect();
+        let saved: Vec<_> = [
+            "SETTLEMENT_RPC_URL",
+            "SET_PAYMENT_BATCH_ADDRESS",
+            "SETTLER_PRIVATE_KEY",
+        ]
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect();
         for (k, _) in &saved {
             std::env::remove_var(k);
         }

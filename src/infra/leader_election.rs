@@ -120,7 +120,10 @@ where
                 continue;
             }
 
-            info!(worker = name, "acquired leadership; starting singleton worker");
+            info!(
+                worker = name,
+                "acquired leadership; starting singleton worker"
+            );
             let (mut task, stop) = spawn_worker();
             let mut stop = Some(stop);
             let mut health = tokio::time::interval(config.health_interval);

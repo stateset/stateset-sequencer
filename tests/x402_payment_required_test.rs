@@ -184,7 +184,9 @@ fn create_paid_router(state: AppState, config: PaymentRequiredConfig) -> axum::R
             stateset_sequencer::auth::auth_middleware,
         ));
 
-    axum::Router::new().nest("/api", api).with_state::<()>(state)
+    axum::Router::new()
+        .nest("/api", api)
+        .with_state::<()>(state)
 }
 
 /// Send a request and return status, headers, and parsed JSON body.
@@ -386,8 +388,8 @@ async fn test_paid_route_with_bad_signature_rejected() {
     let mut sig_bytes = hex::decode(sig.trim_start_matches("0x")).unwrap();
     sig_bytes[10] ^= 0xff;
     intent["payer_signature"] = json!(format!("0x{}", hex::encode(sig_bytes)));
-    let tampered = base64::engine::general_purpose::STANDARD
-        .encode(serde_json::to_vec(&intent).unwrap());
+    let tampered =
+        base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&intent).unwrap());
 
     let (status, _, body) =
         send_request(&app, Method::GET, PREMIUM_PATH, Some(tampered.as_str())).await;

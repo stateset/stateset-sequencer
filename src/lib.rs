@@ -18,7 +18,6 @@
 
 pub mod anchor;
 pub mod api;
-pub mod settlement;
 pub mod auth;
 pub mod crypto;
 pub mod domain;
@@ -29,6 +28,7 @@ pub mod migrations;
 pub mod projection;
 pub mod proto;
 pub mod server;
+pub mod settlement;
 pub mod telemetry;
 
 // Re-export commonly used types

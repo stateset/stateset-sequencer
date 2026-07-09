@@ -262,10 +262,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    fn plaintext_inputs(
-        event_type: &str,
-        payload: serde_json::Value,
-    ) -> VesComplianceEventInputs {
+    fn plaintext_inputs(event_type: &str, payload: serde_json::Value) -> VesComplianceEventInputs {
         VesComplianceEventInputs {
             event_id: Uuid::from_u128(1),
             tenant_id: TenantId::from_uuid(Uuid::from_u128(2)),
@@ -325,7 +322,10 @@ mod tests {
             err.contains("witnessCommitment does not match the amount extracted"),
             "unexpected error: {err}"
         );
-        assert!(err.contains("50000"), "error should name the payload amount: {err}");
+        assert!(
+            err.contains("50000"),
+            "error should name the payload amount: {err}"
+        );
     }
 
     #[test]
@@ -339,20 +339,23 @@ mod tests {
         let commitment = amount_witness_commitment(1);
 
         let err = check_payload_amount_binding(&inputs, &commitment, false).unwrap_err();
-        assert!(err.contains("payload_plain_hash"), "unexpected error: {err}");
+        assert!(
+            err.contains("payload_plain_hash"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn rejects_missing_plaintext_payload() {
-        let mut inputs = plaintext_inputs(
-            "order.payment_received",
-            json!({ "amount": 5_000u64 }),
-        );
+        let mut inputs = plaintext_inputs("order.payment_received", json!({ "amount": 5_000u64 }));
         inputs.payload = None;
         let commitment = amount_witness_commitment(5_000);
 
         let err = check_payload_amount_binding(&inputs, &commitment, false).unwrap_err();
-        assert!(err.contains("payload is unavailable"), "unexpected error: {err}");
+        assert!(
+            err.contains("payload is unavailable"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -361,7 +364,10 @@ mod tests {
         let commitment = amount_witness_commitment(5_000);
 
         let err = check_payload_amount_binding(&inputs, &commitment, false).unwrap_err();
-        assert!(err.contains("encrypted payloads"), "unexpected error: {err}");
+        assert!(
+            err.contains("encrypted payloads"),
+            "unexpected error: {err}"
+        );
         assert!(
             err.contains(ALLOW_UNVERIFIED_AMOUNT_BINDING_ENV),
             "error should mention the opt-out: {err}"
@@ -420,7 +426,10 @@ mod tests {
 
         // aml.threshold (policy_kind 0): amount < 10_000.
         let err = check_batch_amounts_against_policy(&events, 0, 10_000).unwrap_err();
-        assert!(err.contains(&Uuid::from_u128(11).to_string()), "unexpected error: {err}");
+        assert!(
+            err.contains(&Uuid::from_u128(11).to_string()),
+            "unexpected error: {err}"
+        );
         assert!(err.contains("50000"), "unexpected error: {err}");
     }
 
