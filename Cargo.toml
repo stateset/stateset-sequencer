@@ -154,6 +154,17 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# For on-chain integration tests (settlement send-path against a local EVM).
+alloy = { version = "0.8", default-features = false, features = [
+    "contract",
+    "network",
+    "providers",
+    "provider-http",
+    "reqwest-rustls-tls",
+    "rpc-types",
+    "signer-local",
+    "sol-types",
+] }
 tempfile = "3"
 serial_test = "3"
 fake = { version = "2", features = ["derive", "uuid", "chrono"] }
