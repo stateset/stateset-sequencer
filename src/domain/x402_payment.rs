@@ -29,8 +29,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    hash256_hex_0x, option_hash256_hex, signature64_hex_0x, AgentId, AgentKeyId, EntityType,
-    EventType, Hash256, Signature64, StoreId, TenantId,
+    hash256_hex_0x, option_bytes_hex_0x, option_hash256_hex, signature64_hex_0x, AgentId,
+    AgentKeyId, EntityType, EventType, Hash256, Signature64, StoreId, TenantId,
 };
 
 // =============================================================================
@@ -312,6 +312,13 @@ pub struct X402PaymentIntent {
     /// Unix timestamp when expires
     pub valid_until: u64,
 
+    /// Unix timestamp before which the payment is NOT yet valid (EIP-712
+    /// `validAfter`). Defaults to 0 (no lower bound). Bound into the payer's
+    /// on-chain authorization; the settlement contract skips payments presented
+    /// before this time.
+    #[serde(default)]
+    pub valid_after: u64,
+
     /// Nonce for replay protection
     pub nonce: u64,
 
@@ -347,6 +354,27 @@ pub struct X402PaymentIntent {
     /// Payer's public key (for verification without agent key lookup)
     #[serde(with = "option_hash256_hex", skip_serializing_if = "Option::is_none")]
     pub payer_public_key: Option<Hash256>,
+
+    /// Payer's EIP-712 authorization signature for on-chain settlement.
+    ///
+    /// This is the payer's signature over the contract's
+    /// `PaymentAuthorization(intentId,payer,payee,token,amount,nonce,validAfter,validBefore)`
+    /// typed-data struct (domain `EIP712("SetPaymentBatch","1")` binding the
+    /// settlement chain id + verifying contract). It is distinct from
+    /// [`payer_signature`](Self::payer_signature) (the StateSet Ed25519 scheme):
+    /// the sequencer stores it verbatim and relays it in the on-chain
+    /// `settleBatch` calldata, where the contract verifies it via
+    /// `SignatureChecker` (EOA ECDSA or ERC-1271). Intents without it are
+    /// accepted and sequenced as before but are simply not on-chain-settleable
+    /// (the contract skips them, emitting `PaymentFailed`).
+    ///
+    /// 65 bytes for an EOA ECDSA signature; variable length for ERC-1271.
+    #[serde(
+        default,
+        with = "option_bytes_hex_0x",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub eip712_authorization: Option<Vec<u8>>,
 
     // =========================================================================
     // Sequencer-Assigned Fields
@@ -663,6 +691,79 @@ pub struct X402PaymentReceipt {
 }
 
 // =============================================================================
+// HTTP 402 Challenge / Response Types
+// =============================================================================
+
+/// Payment requirements advertised in an HTTP 402 Payment Required challenge.
+///
+/// When a payment-gated resource is requested without a valid `X-Payment`
+/// header, the sequencer responds with `402 Payment Required` and these
+/// requirements so the agent knows exactly what to sign (see
+/// `api::middleware::payment_required`). The agent then signs an
+/// [`X402PaymentIntent`] over the `X402_PAYMENT_V1` domain and retries with
+/// the signed intent in the `X-Payment` header.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct X402PaymentRequirements {
+    /// x402 protocol version ([`X402_VERSION`])
+    pub x402_version: u32,
+
+    /// Required payment asset
+    pub asset: X402Asset,
+
+    /// Required settlement network
+    pub network: X402Network,
+
+    /// Chain ID for `network`
+    pub chain_id: u64,
+
+    /// Token contract address for `asset` on `network` (if any)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_address: Option<String>,
+
+    /// Minimum payment amount in the asset's smallest unit
+    pub amount: u64,
+
+    /// Recipient (payee) wallet address the intent must pay
+    pub pay_to: String,
+
+    /// Resource URI this payment unlocks (the requested path)
+    pub resource: String,
+
+    /// Human-readable description of what is being purchased
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// Maximum accepted validity window for `valid_until` (seconds from now)
+    pub max_validity_secs: u64,
+}
+
+/// Structured receipt returned in the `X-Payment-Receipt` response header
+/// (base64-encoded JSON) after a payment-gated request is served.
+///
+/// At response time the intent is sequenced but not yet batched, so the
+/// Merkle inclusion proof does not exist yet. This header receipt carries the
+/// sequencing acknowledgement plus `receipt_url`, from which the full
+/// [`X402PaymentReceipt`] (with Merkle proof) can be fetched once the intent
+/// has been batched and committed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct X402PaymentReceiptHeader {
+    /// Persisted payment intent ID
+    pub intent_id: Uuid,
+
+    /// Intent status at response time (always `sequenced`)
+    pub status: X402IntentStatus,
+
+    /// Sequence number assigned by the sequencer
+    pub sequence_number: u64,
+
+    /// When the intent was sequenced
+    pub sequenced_at: Option<DateTime<Utc>>,
+
+    /// Endpoint serving the full receipt with Merkle inclusion proof
+    pub receipt_url: String,
+}
+
+// =============================================================================
 // API Request/Response Types
 // =============================================================================
 
@@ -692,10 +793,21 @@ pub struct SubmitX402PaymentRequest {
     pub valid_until: u64,
     pub nonce: u64,
 
+    /// Lower validity bound (EIP-712 `validAfter`). Optional; defaults to 0.
+    #[serde(default)]
+    pub valid_after: Option<u64>,
+
     /// Cryptographic fields
     pub signing_hash: String,
     pub payer_signature: String,
     pub payer_public_key: Option<String>,
+
+    /// Optional payer EIP-712 authorization for on-chain settlement (hex,
+    /// with or without `0x`). Stored verbatim and relayed in `settleBatch`
+    /// calldata; verified on-chain, never re-verified off-chain. See
+    /// [`X402PaymentIntent::eip712_authorization`].
+    #[serde(default)]
+    pub eip712_authorization: Option<String>,
 
     /// Context
     pub resource_uri: Option<String>,

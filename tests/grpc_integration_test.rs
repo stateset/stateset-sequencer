@@ -8,7 +8,6 @@
 mod common;
 
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -58,13 +57,7 @@ fn authed<T>(message: T) -> tonic::Request<T> {
 }
 
 async fn connect_db() -> Option<sqlx::PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&url)
-        .await
-        .ok()?;
-    Some(pool)
+    common::connect_test_db(10).await
 }
 
 async fn create_grpc_service(pool: sqlx::PgPool) -> SequencerService {

@@ -2191,12 +2191,13 @@ These are separate keys with different cryptographic algorithms. The anchoring k
 
 | Feature | Effect |
 |---------|--------|
-| `grpc` | Enables tonic gRPC service alongside REST |
-| `telemetry` | Enables OpenTelemetry + OTLP trace export |
-| `anchoring` | Enables SET Chain L2 commitment anchoring (alloy) |
-| `schema-validation` | Enables JSON Schema payload validation (jsonschema) |
-| `sqlite` | Enables SQLite backend for local agent outbox |
-| `encryption` | Enables AES-256-GCM + HPKE payload encryption |
+| `pqc` | Enables the post-quantum suite (ML-DSA-65, ML-KEM-768) |
+| `stark` | Enables the STARK validity/compliance proof endpoints |
+| `integration` | Enables test-only modules that require a live database |
+
+gRPC, OpenTelemetry export, L2 anchoring, JSON Schema validation, the SQLite
+outbox and AES-256-GCM/HPKE payload encryption are compiled unconditionally and
+are configured at runtime, not at build time.
 
 ## Appendix D: Migration Index
 

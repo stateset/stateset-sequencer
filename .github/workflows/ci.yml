@@ -13,7 +13,15 @@ env:
   # Core feature set: `full` minus `stark`, so lint/test/coverage build the
   # whole sequencer except the STARK proof verifier (whose crates live in the
   # private stateset-stark workspace). See the `stark` feature in Cargo.toml.
-  CORE_FEATURES: grpc,telemetry,anchoring,schema-validation,pqc,sqlite
+  # `integration` is appended per-step on the jobs that run database tests.
+  CORE_FEATURES: pqc
+  # Exact stateset-stark commit this repo's Cargo.lock was resolved against.
+  # The ves-stark-* crates are path dependencies on a separate repo, so
+  # tracking its default branch meant every upstream commit silently
+  # invalidated Cargo.lock and failed every `--locked` job in this file.
+  # Bump this ref and re-resolve the ves-stark-* crates with `cargo update`
+  # in the same commit, so a STARK upgrade is always deliberate and atomic.
+  STARK_REF: "46b4b4749349b12ff99c0e26cbe3982f68b85e48"
   # Token with read access to the private stateset-stark repo. Add it under
   # Settings → Secrets and variables → Actions. Required because the ves-stark-*
   # crates are path dependencies that cargo must resolve even when the `stark`
@@ -33,8 +41,11 @@ jobs:
             if [ -z "$STARK_REPO_TOKEN" ]; then
               echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
             fi
-            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
+            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -69,6 +80,9 @@ jobs:
 
     env:
       DATABASE_URL: postgres://sequencer:sequencer@localhost:5432/stateset_sequencer
+      # Turn a missing/unreachable database into a red build instead of a
+      # silent skip: database-backed tests must never pass by not running.
+      SEQUENCER_REQUIRE_DB_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -79,8 +93,11 @@ jobs:
             if [ -z "$STARK_REPO_TOKEN" ]; then
               echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
             fi
-            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
+            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -94,6 +111,61 @@ jobs:
 
       - name: Run property tests
         run: cargo test --locked --no-default-features --features "$CORE_FEATURES" --test property_test
+
+  test-stark:
+    name: Test (stark feature)
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sequencer
+          POSTGRES_PASSWORD: sequencer
+          POSTGRES_DB: stateset_sequencer
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U sequencer -d stateset_sequencer"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    env:
+      DATABASE_URL: postgres://sequencer:sequencer@localhost:5432/stateset_sequencer
+      # Turn a missing/unreachable database into a red build instead of a
+      # silent skip: database-backed tests must never pass by not running.
+      SEQUENCER_REQUIRE_DB_TESTS: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch local STARK dependency source
+        run: |
+          if [ ! -d ../stateset-stark ]; then
+            if [ -z "$STARK_REPO_TOKEN" ]; then
+              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            fi
+            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
+          fi
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The VES proof handlers and the verifier-side amount-binding enforcement are
+      # all #[cfg(feature = "stark")] and are otherwise built/tested by no CI job.
+      - name: Clippy (stark)
+        run: cargo clippy --locked --no-default-features --features "$CORE_FEATURES,stark,integration" --all-targets -- -D warnings
+
+      - name: Unit tests (stark)
+        run: cargo test --locked --no-default-features --features "$CORE_FEATURES,stark" --lib --bins
+
+      - name: Integration tests (stark)
+        run: cargo test --locked --no-default-features --features "$CORE_FEATURES,stark,integration" --tests -- --include-ignored
 
   coverage:
     name: Code Coverage
@@ -116,6 +188,9 @@ jobs:
 
     env:
       DATABASE_URL: postgres://sequencer:sequencer@localhost:5432/stateset_sequencer
+      # Turn a missing/unreachable database into a red build instead of a
+      # silent skip: database-backed tests must never pass by not running.
+      SEQUENCER_REQUIRE_DB_TESTS: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -126,8 +201,11 @@ jobs:
             if [ -z "$STARK_REPO_TOKEN" ]; then
               echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
             fi
-            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
+            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -210,8 +288,11 @@ jobs:
             if [ -z "$STARK_REPO_TOKEN" ]; then
               echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
             fi
-            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
+            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -233,8 +314,11 @@ jobs:
             if [ -z "$STARK_REPO_TOKEN" ]; then
               echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
             fi
-            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
+            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -264,8 +348,11 @@ jobs:
             if [ -z "$STARK_REPO_TOKEN" ]; then
               echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
             fi
-            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
+            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -286,8 +373,11 @@ jobs:
             if [ -z "$STARK_REPO_TOKEN" ]; then
               echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
             fi
-            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
+            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -323,8 +413,11 @@ jobs:
             if [ -z "$STARK_REPO_TOKEN" ]; then
               echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
             fi
-            git clone --depth 1 "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
+            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -361,7 +454,7 @@ jobs:
   all-checks:
     name: All Checks
     runs-on: ubuntu-latest
-    needs: [lint, test, coverage, security, license-check, build]
+    needs: [lint, test, test-stark, coverage, security, license-check, build]
     if: always()
     steps:
       - name: Check all jobs passed
@@ -372,6 +465,10 @@ jobs:
           fi
           if [[ "${{ needs.test.result }}" != "success" ]]; then
             echo "Test failed"
+            exit 1
+          fi
+          if [[ "${{ needs.test-stark.result }}" != "success" ]]; then
+            echo "Test (stark feature) failed"
             exit 1
           fi
           if [[ "${{ needs.coverage.result }}" != "success" ]]; then

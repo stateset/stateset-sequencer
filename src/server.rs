@@ -43,17 +43,18 @@ use crate::auth::{
     JwtValidator, Permissions, PgApiKeyStore, RateLimiter, RateLimiterConfig, RequestLimits,
 };
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
-use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::infra::{
     extract_client_ip, lock_keys, spawn_anchor_worker, spawn_batch_worker, spawn_elected_worker,
-    spawn_x402_nonce_cleanup, AnchorWorkerConfig, ElectionConfig,
-    AnchorWorkerMessage, BatchWorkerMessage, CacheManager, CacheManagerConfig,
-    CircuitBreakerRegistry, EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry,
-    PgAuditLogger, PgCommitmentEngine, PgEventStore, PgSchemaStore, PgSequencer,
-    PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore, PgX402Repository,
-    PoolMonitor, SchemaValidationMode, SecretsProvider, VesSequencer, X402BatchWorkerConfig,
+    spawn_settlement_worker, spawn_x402_nonce_cleanup, AnchorWorkerConfig, AnchorWorkerMessage,
+    BatchWorkerMessage, CacheManager, CacheManagerConfig, CircuitBreakerRegistry, ElectionConfig,
+    EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry, PgAuditLogger, PgCommitmentEngine,
+    PgEventStore, PgSchemaStore, PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore,
+    PgVesValidityProofStore, PgX402Repository, PoolMonitor, SchemaValidationMode, SecretsProvider,
+    SettlementWorkerConfig, SettlementWorkerMessage, VesSequencer, X402BatchWorkerConfig,
 };
+use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::metrics::{ComponentMetrics, MetricsRegistry};
+use crate::settlement::{SettlementConfig, SettlementService};
 
 /// Interval for pool health monitoring and component metrics collection.
 const MONITORING_INTERVAL: Duration = Duration::from_secs(15);
@@ -1157,8 +1158,8 @@ pub async fn run() -> anyhow::Result<()> {
     // Initialize schema registry
     let schema_store =
         Arc::new(PgSchemaStore::new(pool.clone()).with_cache(cache_manager.schemas.clone()));
-    schema_store.initialize().await?;
-    info!("Schema registry initialized");
+    // The `event_schemas` table ships in migration 018; no runtime DDL here.
+    info!("Schema registry ready");
 
     // Initialize x402 payment repository
     let x402_repository = Arc::new(PgX402Repository::new(pool.clone()));
@@ -1169,13 +1170,10 @@ pub async fn run() -> anyhow::Result<()> {
     // validity window to absorb clock skew; once a nonce is that old any replay
     // of its intent is already rejected by the expiry check at ingest.
     {
-        let nonce_retention = Duration::from_secs(
-            crate::domain::X402_MAX_VALIDITY_SECS.saturating_mul(2),
-        );
-        let nonce_cleanup_interval = Duration::from_secs(read_u64_env(
-            "X402_NONCE_CLEANUP_INTERVAL_SECS",
-            3600,
-        ));
+        let nonce_retention =
+            Duration::from_secs(crate::domain::X402_MAX_VALIDITY_SECS.saturating_mul(2));
+        let nonce_cleanup_interval =
+            Duration::from_secs(read_u64_env("X402_NONCE_CLEANUP_INTERVAL_SECS", 3600));
         spawn_x402_nonce_cleanup(
             x402_repository.clone(),
             nonce_cleanup_interval,
@@ -1330,6 +1328,71 @@ pub async fn run() -> anyhow::Result<()> {
         info!("Anchor worker started");
     }
 
+    // Initialize the autonomous x402 settlement service (optional — only if the
+    // settlement env vars are set). OFF BY DEFAULT. When unset the settler simply
+    // does not run and the manual POST /batches/settle path remains the only way
+    // to record settlement.
+    let settlement_service = match SettlementConfig::from_env() {
+        Some(settlement_config) => {
+            info!("x402 settlement service configured:");
+            info!("  RPC URL: {}", settlement_config.rpc_url);
+            info!("  Contract: {:?}", settlement_config.contract_address);
+            info!("  Chain ID: {}", settlement_config.chain_id);
+            Some(Arc::new(SettlementService::new(settlement_config)))
+        }
+        None => {
+            info!(
+                "x402 settlement service not configured (set SETTLEMENT_RPC_URL, SET_PAYMENT_BATCH_ADDRESS, SETTLER_PRIVATE_KEY to enable autonomous on-chain settlement)"
+            );
+            None
+        }
+    };
+
+    // Start the settlement worker (only if the settlement service is configured).
+    // Leader-elected like the anchor worker so exactly one node settles.
+    if let Some(ref settlement_svc) = settlement_service {
+        if leader_election {
+            let svc = settlement_svc.clone();
+            let repo = x402_repository.clone();
+            spawn_elected_worker(
+                "settlement_worker",
+                lock_keys::SETTLEMENT_WORKER,
+                pool.clone(),
+                election_config.clone(),
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || {
+                    let (task, control) = spawn_settlement_worker(
+                        SettlementWorkerConfig::from_env(),
+                        svc.clone(),
+                        repo.clone(),
+                    );
+                    (task, move || async move {
+                        let _ = control.send(SettlementWorkerMessage::Shutdown).await;
+                    })
+                },
+            );
+        } else {
+            let (settlement_worker_task, settlement_worker_control) = spawn_settlement_worker(
+                SettlementWorkerConfig::from_env(),
+                settlement_svc.clone(),
+                x402_repository.clone(),
+            );
+            supervise_worker(
+                "settlement_worker",
+                settlement_worker_task,
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || async move {
+                    let _ = settlement_worker_control
+                        .send(SettlementWorkerMessage::Shutdown)
+                        .await;
+                },
+            );
+        }
+        info!("x402 settlement worker started");
+    }
+
     let auth_state = AuthMiddlewareState {
         authenticator,
         require_auth,
@@ -1457,7 +1520,15 @@ pub async fn run() -> anyhow::Result<()> {
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
     );
-    let app = build_router(auth_state, admin_access_state)?
+    // Payment gate for x402 premium (HTTP 402) routes; price is env-configured
+    // via X402_PREMIUM_ROUTE_* (see api::middleware::payment_required).
+    let payment_gate = crate::api::middleware::PaymentRequiredState::new(
+        state.x402_repository.clone(),
+        state.agent_key_registry.clone(),
+        Arc::new(crate::api::middleware::PaymentRequiredConfig::from_env()),
+    );
+
+    let app = build_router(auth_state, admin_access_state, payment_gate)?
         .with_state(state.clone())
         .layer(DefaultBodyLimit::max(request_limits.max_body_size))
         .layer(tower_http::compression::CompressionLayer::new())
@@ -1662,14 +1733,19 @@ fn init_opentelemetry_tracer(
 fn build_router(
     auth_state: AuthMiddlewareState,
     admin_access_state: AdminAccessState,
+    payment_gate: crate::api::middleware::PaymentRequiredState,
 ) -> anyhow::Result<Router<AppState>> {
     let public_api = crate::api::public_router();
     let admin_allowlist_layer =
         axum::middleware::from_fn_with_state(admin_access_state, admin_ip_allowlist_middleware);
-    let api = crate::api::router().layer(axum::middleware::from_fn_with_state(
-        auth_state.clone(),
-        crate::auth::auth_middleware,
-    ));
+    // Premium (payment-gated) routes are merged before the auth layer is
+    // applied so the x402 payment gate runs with the auth context available.
+    let api = crate::api::router()
+        .merge(crate::api::premium_router(payment_gate))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state.clone(),
+            crate::auth::auth_middleware,
+        ));
     let admin_api = crate::api::admin_router()
         .layer(axum::middleware::from_fn_with_state(
             auth_state.clone(),
@@ -1776,43 +1852,23 @@ fn cors_layer_from_env() -> anyhow::Result<Option<CorsLayer>> {
     ))
 }
 
-fn normalize_metrics_path(path: &str) -> String {
-    if path == "/" {
-        return "/".to_string();
+/// Label used for every request that matched no route.
+pub(crate) const UNMATCHED_PATH_LABEL: &str = "<unmatched>";
+
+/// Decide the `path` label for a request's HTTP metrics.
+///
+/// Matched requests report their route template, which is a closed set. Every
+/// unmatched request collapses into a single bucket: the raw URI is attacker
+/// controlled and unbounded, and this middleware sits outside the auth layers,
+/// so echoing it would let any anonymous client mint a time series per request
+/// until the per-metric cardinality cap is spent -- pushing real routes into
+/// the overflow bucket for the life of the process. Per-404 detail belongs in
+/// the request log and trace, which carry the request id, not in metrics.
+fn metrics_path_label(matched: Option<&str>, _raw_path: &str) -> String {
+    match matched {
+        Some(template) => template.to_string(),
+        None => UNMATCHED_PATH_LABEL.to_string(),
     }
-
-    let normalized: Vec<String> = path
-        .trim_start_matches('/')
-        .split('/')
-        .map(|segment| {
-            if looks_like_uuid(segment) {
-                ":id".to_string()
-            } else {
-                segment.to_string()
-            }
-        })
-        .collect();
-
-    format!("/{}", normalized.join("/"))
-}
-
-fn looks_like_uuid(segment: &str) -> bool {
-    if segment.len() != 36 {
-        return false;
-    }
-
-    let mut dash_count = 0;
-    for ch in segment.chars() {
-        if ch == '-' {
-            dash_count += 1;
-            continue;
-        }
-        if !ch.is_ascii_hexdigit() {
-            return false;
-        }
-    }
-
-    dash_count == 4
 }
 
 /// Middleware that extracts or generates a request ID and adds it to the
@@ -1861,11 +1917,10 @@ async fn http_metrics_middleware(
     next: Next,
 ) -> Response {
     let method = req.method().as_str().to_string();
-    let path = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| normalize_metrics_path(req.uri().path()));
+    let path = metrics_path_label(
+        req.extensions().get::<MatchedPath>().map(|p| p.as_str()),
+        req.uri().path(),
+    );
 
     let start = std::time::Instant::now();
     let response = next.run(req).await;
@@ -1916,6 +1971,31 @@ async fn metrics_handler(
 
 #[cfg(test)]
 mod tests {
+
+    /// Requests that match no route must all share one `path` label. Emitting
+    /// the raw URI here lets any unauthenticated client mint a fresh time
+    /// series per request until the cardinality cap is exhausted, after which
+    /// every genuine route falls into the overflow bucket -- HTTP metrics stay
+    /// degraded until restart.
+    #[test]
+    fn metrics_path_label_buckets_every_unmatched_path() {
+        let a = metrics_path_label(None, "/aaa1");
+        let b = metrics_path_label(None, "/aaa2");
+        let c = metrics_path_label(None, "/completely/unknown/deep/path");
+
+        assert_eq!(a, UNMATCHED_PATH_LABEL);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    /// A matched route reports its route template, so real endpoints stay
+    /// individually observable and IDs never inflate cardinality.
+    #[test]
+    fn metrics_path_label_uses_matched_route_template() {
+        let label = metrics_path_label(Some("/api/v1/ves/proofs/:seq"), "/api/v1/ves/proofs/12345");
+
+        assert_eq!(label, "/api/v1/ves/proofs/:seq");
+    }
     use super::*;
     use axum::body::Body;
     use axum::extract::{ConnectInfo, Extension, State};
@@ -2096,7 +2176,10 @@ mod tests {
     fn is_production_env_defaults_and_labels() {
         std::env::remove_var("SEQUENCER_ENV");
         std::env::remove_var("ENVIRONMENT");
-        assert!(!is_production_env(), "unset env must default to non-production");
+        assert!(
+            !is_production_env(),
+            "unset env must default to non-production"
+        );
 
         for label in ["dev", "development", "test", "ci", "staging", "LOCAL"] {
             std::env::set_var("SEQUENCER_ENV", label);

@@ -19,7 +19,13 @@ pub struct VesComplianceEventInputs {
     pub tenant_id: TenantId,
     pub store_id: StoreId,
     pub sequence_number: u64,
+    pub event_type: String,
     pub payload_kind: u32,
+    /// Stored plaintext payload (present when payload_kind = 0).
+    ///
+    /// Used to re-extract the canonical amount when verifying payload amount
+    /// bindings for STARK compliance proofs.
+    pub payload: Option<serde_json::Value>,
     pub payload_plain_hash: Hash256,
     pub payload_cipher_hash: Hash256,
     pub event_signing_hash: Hash256,
@@ -49,7 +55,9 @@ impl PgVesComplianceProofStore {
                 tenant_id,
                 store_id,
                 sequence_number,
+                event_type,
                 payload_kind,
+                payload,
                 payload_plain_hash,
                 payload_cipher_hash,
                 event_signing_hash
@@ -78,7 +86,9 @@ impl PgVesComplianceProofStore {
             tenant_id: TenantId::from_uuid(row.tenant_id),
             store_id: StoreId::from_uuid(row.store_id),
             sequence_number: row.sequence_number as u64,
+            event_type: row.event_type,
             payload_kind: row.payload_kind as u32,
+            payload: row.payload,
             payload_plain_hash,
             payload_cipher_hash,
             event_signing_hash,
@@ -425,7 +435,9 @@ struct VesEventInputsRow {
     tenant_id: Uuid,
     store_id: Uuid,
     sequence_number: i64,
+    event_type: String,
     payload_kind: i32,
+    payload: Option<serde_json::Value>,
     payload_plain_hash: Vec<u8>,
     payload_cipher_hash: Vec<u8>,
     event_signing_hash: Vec<u8>,

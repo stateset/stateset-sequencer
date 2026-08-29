@@ -53,7 +53,10 @@ async fn advisory_lock_is_mutually_exclusive_and_releasable() {
     let key = unique_key();
 
     // Leader wins.
-    assert!(try_lock(&mut leader, key).await, "first contender must acquire");
+    assert!(
+        try_lock(&mut leader, key).await,
+        "first contender must acquire"
+    );
     // Follower is excluded while the leader holds it.
     assert!(
         !try_lock(&mut follower, key).await,
@@ -61,7 +64,10 @@ async fn advisory_lock_is_mutually_exclusive_and_releasable() {
     );
 
     // Leader releases; follower can now take over.
-    assert!(unlock(&mut leader, key).await, "holder should release its lock");
+    assert!(
+        unlock(&mut leader, key).await,
+        "holder should release its lock"
+    );
     assert!(
         try_lock(&mut follower, key).await,
         "follower must acquire after explicit release"
@@ -132,7 +138,9 @@ async fn spawn_elected_worker_runs_on_exactly_one_node() {
     let max_seen = Arc::new(AtomicUsize::new(0));
 
     // Simulate three contending nodes sharing the same advisory-lock key.
-    let coordinators: Vec<_> = (0..3).map(|_| Arc::new(ShutdownCoordinator::new())).collect();
+    let coordinators: Vec<_> = (0..3)
+        .map(|_| Arc::new(ShutdownCoordinator::new()))
+        .collect();
     let mut handles = Vec::new();
     for coordinator in &coordinators {
         let active = active.clone();

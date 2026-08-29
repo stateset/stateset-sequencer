@@ -28,6 +28,7 @@ pub mod migrations;
 pub mod projection;
 pub mod proto;
 pub mod server;
+pub mod settlement;
 pub mod telemetry;
 
 // Re-export commonly used types

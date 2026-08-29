@@ -4,16 +4,59 @@ This document captures performance characteristics, benchmarks, and service leve
 
 ## Summary
 
-| Metric | Target | Current (Environment) | Measured |
-|--------|--------|----------------------|----------|
-| **Ingestion Throughput** | 5,000 events/sec | 2,500 events/sec | 2024-01-15 |
-| **P50 Ingestion Latency** | < 10ms | 8ms | 2024-01-15 |
-| **P95 Ingestion Latency** | < 50ms | 45ms | 2024-01-15 |
-| **P99 Ingestion Latency** | < 100ms | 95ms | 2024-01-15 |
-| **Query Latency** | < 20ms | 15ms | 2024-01-15 |
-| **Commitment Generation** | < 200ms | 180ms | 2024-01-15 |
-| **Merkle Proof Generation** | < 50ms | 35ms | 2024-01-15 |
-| **Availability** | 99.9% | 99.95% | 2024-01-15 |
+### Measured: CPU microbenchmarks
+
+Produced by `cargo bench --bench sequencer_bench` (Criterion, mean of 100
+samples). Reproduce with:
+
+```bash
+cargo bench --bench sequencer_bench
+```
+
+| Benchmark | Mean | What it covers |
+|---|---|---|
+| `signing_bytes` | 32 ns | Canonical signing-byte serialization |
+| `node_hash` | 153 ns | Domain-separated Merkle interior node hash |
+| `leaf_hash` | 222 ns | Domain-separated Merkle leaf hash |
+| `payload_hash_verify` | 284 ns | Payload hash comparison |
+| `event_signing_hash` | 411 ns | Full event signing hash |
+| `payload_hash` | 1.17 µs | Canonical JSON hash of an order payload |
+| `event_creation/create_batch/1` | 3.17 µs | Envelope construction, 1 event |
+| `event_creation/create_batch/10` | 29.8 µs | Envelope construction, 10 events |
+| `event_creation/create_batch/100` | 267 µs | Envelope construction, 100 events |
+| `event_creation/create_batch/1000` | 2.77 ms | Envelope construction, 1000 events |
+| `merkle_tree/build_tree/10` | 2.60 µs | Commitment tree, 10 leaves |
+| `merkle_tree/build_tree/100` | 21.6 µs | Commitment tree, 100 leaves |
+| `merkle_tree/build_tree/1000` | 187 µs | Commitment tree, 1000 leaves |
+| `merkle_tree/build_tree/4096` | 0.70 ms | Commitment tree, 4096 leaves |
+
+Reference environment: 8-core Intel Core i7-1195G7 @ 2.90 GHz, 31 GiB RAM,
+Linux 5.15, `rustc` 1.90.0, release profile. Measured 2026-08-29.
+
+These are pure-CPU paths with no database, network, or disk in the loop. Treat
+them as a ceiling on the cryptographic work per event, not as service latency.
+
+### Not measured: end-to-end service metrics
+
+The targets below are the SLOs this service is designed against. There is **no
+committed measurement of them in this repository** — the benchmark suite covers
+CPU paths only, and nothing here exercises sustained ingestion against a real
+database, so any "current" figure would be fabricated.
+
+| Metric | Target | Current |
+|---|---|---|
+| Ingestion throughput | 5,000 events/sec sustained | Not measured |
+| P50 ingestion latency | < 10 ms | Not measured |
+| P95 ingestion latency | < 50 ms | Not measured |
+| P99 ingestion latency | < 100 ms | Not measured |
+| Query latency | < 20 ms | Not measured |
+| Commitment generation | < 200 ms | Not measured |
+| Merkle proof generation | < 50 ms | Not measured |
+| Availability | 99.9% | Not measured |
+
+To populate the `Current` column, run the load profiles in `load/profiles/`
+against a deployed instance and record the result together with the commit SHA,
+the environment, and the date. Do not copy numbers forward between runs.
 
 ## Service Level Objectives (SLOs)
 

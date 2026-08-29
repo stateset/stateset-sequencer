@@ -9,7 +9,21 @@ repository = "https://github.com/stateset/stateset-sequencer"
 
 [features]
 default = ["full"]
-full = ["grpc", "telemetry", "anchoring", "schema-validation", "pqc", "stark"]
+full = ["pqc", "stark"]
+
+# Only features that actually gate code are declared here.
+#
+# `grpc`, `telemetry`, `anchoring`, `schema-validation`, `sqlite` and
+# `encryption` used to be listed as toggles, but each was an empty feature that
+# gated nothing: tonic/prost, the OpenTelemetry stack, alloy, jsonschema and the
+# sqlx sqlite driver are all unconditional dependencies, and the corresponding
+# modules compile unconditionally. Passing `--no-default-features --features
+# grpc` therefore built the exact same binary as a default build, while
+# implying the opposite. They are removed rather than kept as no-ops: a feature
+# that silently does nothing is worse than an absent one, because it lets a
+# build be described as "without gRPC" when gRPC is still compiled in and
+# served. Reintroduce them only alongside the `#[cfg(feature = ...)]` gates and
+# `optional = true` dependencies that would make them real.
 
 # STARK proof verification endpoints (depends on the private stateset-stark
 # workspace via the ves-stark-* crates). Disable to build/test the core
@@ -21,28 +35,10 @@ stark = [
     "dep:ves-stark-prover",
 ]
 
-# Enable gRPC service (adds tonic/prost dependencies)
-grpc = []
-
-# Enable OpenTelemetry distributed tracing and OTLP export
-telemetry = []
-
-# Enable L2 blockchain anchoring (adds alloy dependency)
-anchoring = []
-
-# Enable JSON Schema validation (adds jsonschema dependency)
-schema-validation = []
-
-# Enable SQLite backend for embedded/local agents
-sqlite = []
-
-# Enable payload encryption at rest
-encryption = []
-
-# Enable post-quantum cryptography (ML-DSA-65, ML-KEM-768)
+# Post-quantum cryptography (ML-DSA-65, ML-KEM-768).
 pqc = ["dep:ml-kem", "dep:ml-dsa", "dep:zeroize", "dep:subtle", "dep:hkdf"]
 
-# Integration-only toggles for test modules
+# Gates test-only modules that need a live database or external service.
 integration = []
 
 [dependencies]
@@ -154,6 +150,17 @@ tonic-build = "0.12"
 
 [dev-dependencies]
 tokio-test = "0.4"
+# For on-chain integration tests (settlement send-path against a local EVM).
+alloy = { version = "0.8", default-features = false, features = [
+    "contract",
+    "network",
+    "providers",
+    "provider-http",
+    "reqwest-rustls-tls",
+    "rpc-types",
+    "signer-local",
+    "sol-types",
+] }
 tempfile = "3"
 serial_test = "3"
 fake = { version = "2", features = ["derive", "uuid", "chrono"] }

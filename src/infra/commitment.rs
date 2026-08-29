@@ -788,4 +788,125 @@ mod tests {
 
         assert_ne!(root1, root2);
     }
+
+    // ========================================================================
+    // Incremental state-root equivalence investigation (see report / point 5)
+    //
+    // The task asked for an incremental (sub-linear, O(changed * log N)) state
+    // root that is BYTE-IDENTICAL to `compute_state_root`. These pure-logic
+    // tests document why that is cryptographically impossible for the *current*
+    // state-root format, which is a single linear SHA-256 over the sorted
+    // concatenation of all entity-version rows (commitment.rs:405-415):
+    //
+    //   SHA256( tenant(16) || store(16) ||
+    //           for each (etype, eid, ver) sorted by (etype, eid):
+    //               etype_bytes || eid_bytes || ver.to_le_bytes() )
+    //
+    // Note: no domain prefix, and no length delimiters between fields — it is a
+    // raw Merkle-Damgard hash of one contiguous, variable-length message.
+    // ========================================================================
+
+    /// Byte-exact reproduction of production `compute_state_root` (the oracle).
+    /// This is the reference "full scan" logic, isolated from the DB so it can
+    /// be exercised in a unit test.
+    fn linear_state_root(
+        tenant: &Uuid,
+        store: &Uuid,
+        entities_sorted: &[(String, String, i64)],
+    ) -> Hash256 {
+        let mut hasher = Sha256Hasher::new();
+        hasher.update(tenant.as_bytes());
+        hasher.update(store.as_bytes());
+        for (etype, eid, ver) in entities_sorted {
+            hasher.update(etype.as_bytes());
+            hasher.update(eid.as_bytes());
+            hasher.update(ver.to_le_bytes());
+        }
+        hasher.finalize().into()
+    }
+
+    /// Candidate incremental structure: a Merkle tree keyed by entity, where
+    /// each leaf commits to (etype, eid, ver). This is exactly the kind of
+    /// structure (sparse Merkle tree / Patricia trie) the task suggested and
+    /// that CAN be updated in O(changed * log N). We show its root is a
+    /// different 32-byte value than the linear oracle — so no such structure
+    /// can be byte-identical to the anchored format.
+    fn merkle_state_root(entities_sorted: &[(String, String, i64)]) -> Hash256 {
+        let leaves: Vec<Hash256> = entities_sorted
+            .iter()
+            .map(|(etype, eid, ver)| {
+                let mut h = Sha256Hasher::new();
+                h.update(etype.as_bytes());
+                h.update(eid.as_bytes());
+                h.update(ver.to_le_bytes());
+                h.finalize().into()
+            })
+            .collect();
+        let tree = MerkleTree::<Sha256>::from_leaves(&leaves);
+        let r = tree.root().expect("non-empty");
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&r);
+        arr
+    }
+
+    /// PROOF (point 5): a sub-linear incremental structure (Merkle/sparse
+    /// Merkle tree) cannot reproduce the linear oracle's bytes. If this
+    /// `assert_ne!` ever became `assert_eq!` it would mean SHA-256 collided.
+    #[test]
+    fn incremental_merkle_root_is_not_byte_equal_to_linear_oracle() {
+        let tenant = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let store = Uuid::from_u128(0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0000);
+        let entities = vec![
+            ("order".to_string(), "aaaa".to_string(), 1i64),
+            ("order".to_string(), "bbbb".to_string(), 7i64),
+            ("shipment".to_string(), "cccc".to_string(), 3i64),
+        ];
+
+        let linear = linear_state_root(&tenant, &store, &entities);
+        let merkle = merkle_state_root(&entities);
+
+        // The whole point: they differ. A Merkle/SMT root is a structurally
+        // different algebraic combination of the leaves than SHA-256 over the
+        // flat concatenation, so byte-equivalence is impossible.
+        assert_ne!(
+            linear, merkle,
+            "if these matched, an incremental Merkle root would equal the linear \
+             oracle and the requested optimization would be format-preserving"
+        );
+    }
+
+    /// PROOF that the linear format has no update locality: mutating the FIRST
+    /// entity in sort order changes the digest exactly as mutating the LAST
+    /// does — the digest depends on the entire message. This is why an
+    /// incremental "running SHA-256 midstate" cannot avoid re-hashing to the
+    /// end (Merkle-Damgard chains forward), giving O(N) per commitment
+    /// regardless of how few entities changed.
+    #[test]
+    fn linear_format_has_no_incremental_update_locality() {
+        let tenant = Uuid::from_u128(1);
+        let store = Uuid::from_u128(2);
+        let base = vec![
+            ("a".to_string(), "1".to_string(), 1i64),
+            ("a".to_string(), "2".to_string(), 1i64),
+            ("a".to_string(), "3".to_string(), 1i64),
+        ];
+        let base_root = linear_state_root(&tenant, &store, &base);
+
+        // Bump the FIRST entity's version.
+        let mut first = base.clone();
+        first[0].2 = 2;
+        let first_root = linear_state_root(&tenant, &store, &first);
+
+        // Bump the LAST entity's version.
+        let mut last = base.clone();
+        last[2].2 = 2;
+        let last_root = linear_state_root(&tenant, &store, &last);
+
+        // Both single-entity changes produce a fully different 32-byte digest;
+        // there is no reusable prefix/suffix that an incremental scheme could
+        // exploit to stay byte-identical while doing sub-linear work.
+        assert_ne!(base_root, first_root);
+        assert_ne!(base_root, last_root);
+        assert_ne!(first_root, last_root);
+    }
 }

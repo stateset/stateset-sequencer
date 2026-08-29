@@ -57,6 +57,8 @@ pub mod lock_keys {
     pub const X402_BATCH_WORKER: i64 = 0x5354_5341_5f78_3432;
     /// Leader lock for the L2 anchor worker.
     pub const ANCHOR_WORKER: i64 = 0x5354_5341_5f61_6e63;
+    /// Leader lock for the autonomous x402 on-chain settlement worker.
+    pub const SETTLEMENT_WORKER: i64 = 0x5354_5341_5f73_7431;
 }
 
 /// Run `spawn_worker` on exactly one node at a time, elected via a PostgreSQL
@@ -118,7 +120,10 @@ where
                 continue;
             }
 
-            info!(worker = name, "acquired leadership; starting singleton worker");
+            info!(
+                worker = name,
+                "acquired leadership; starting singleton worker"
+            );
             let (mut task, stop) = spawn_worker();
             let mut stop = Some(stop);
             let mut health = tokio::time::interval(config.health_interval);
@@ -190,7 +195,16 @@ mod tests {
 
     #[test]
     fn lock_keys_are_distinct() {
-        assert_ne!(lock_keys::X402_BATCH_WORKER, lock_keys::ANCHOR_WORKER);
+        let keys = [
+            lock_keys::X402_BATCH_WORKER,
+            lock_keys::ANCHOR_WORKER,
+            lock_keys::SETTLEMENT_WORKER,
+        ];
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b, "advisory-lock keys must be unique");
+            }
+        }
     }
 
     #[tokio::test]

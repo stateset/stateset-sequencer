@@ -34,11 +34,11 @@ use uuid::Uuid;
 
 use crate::api::auth_helpers::ensure_write;
 use crate::api::error::ApiError;
-use crate::api::utils::map_sequencer_error;
 use crate::api::types::{
     IngestRequest, IngestResponse, RejectionInfo, VesIngestRequest, VesIngestResponse,
     VesReceiptResponse,
 };
+use crate::api::utils::map_sequencer_error;
 use crate::auth::{AuthContextExt, RequestLimits};
 use crate::domain::{
     AgentId, EventBatch, EventEnvelope, RejectedEvent, RejectionReason, StoreId, TenantId,

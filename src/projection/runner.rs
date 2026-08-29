@@ -870,7 +870,9 @@ mod tests {
         }
     }
 
-    fn make_runner(version_store: Arc<dyn EntityVersionStore>) -> (ProjectionRunner, Arc<InMemoryRejectionSink>) {
+    fn make_runner(
+        version_store: Arc<dyn EntityVersionStore>,
+    ) -> (ProjectionRunner, Arc<InMemoryRejectionSink>) {
         let rejection_sink = Arc::new(InMemoryRejectionSink::new());
         let mut runner = ProjectionRunner::new(
             ProjectionRunnerConfig::default(),

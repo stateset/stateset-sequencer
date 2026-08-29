@@ -38,8 +38,10 @@ struct X402IntentRow {
     token_address: Option<String>,
     created_at_unix: i64,
     valid_until: i64,
+    valid_after: i64,
     nonce: i64,
     idempotency_key: Option<String>,
+    eip712_authorization: Option<Vec<u8>>,
     resource_uri: Option<String>,
     description: Option<String>,
     order_id: Option<Uuid>,
@@ -211,7 +213,8 @@ impl PgX402Repository {
                 signing_hash, payer_signature, payer_public_key,
                 sequence_number, sequenced_at, batch_id,
                 tx_hash, block_number, settled_at,
-                metadata, created_at, updated_at
+                metadata, created_at, updated_at,
+                valid_after, eip712_authorization
             ) VALUES (
                 $1, $2, $3,
                 $4, $5, $6, $7,
@@ -221,7 +224,8 @@ impl PgX402Repository {
                 $23, $24, $25,
                 $26, $27, $28,
                 $29, $30, $31,
-                $32, $33, $34
+                $32, $33, $34,
+                $35, $36
             )
             "#,
         )
@@ -259,6 +263,8 @@ impl PgX402Repository {
         .bind(&intent.metadata)
         .bind(intent.created_at)
         .bind(intent.updated_at)
+        .bind(intent.valid_after as i64)
+        .bind(intent.eip712_authorization.as_deref())
         .execute(&self.pool)
         .await?;
 
@@ -282,7 +288,8 @@ impl PgX402Repository {
                 signing_hash, payer_signature, payer_public_key,
                 sequence_number, sequenced_at, batch_id,
                 tx_hash, block_number, settled_at,
-                metadata, created_at, updated_at
+                metadata, created_at, updated_at,
+                valid_after, eip712_authorization
             ) VALUES (
                 $1, $2, $3,
                 $4, $5, $6, $7,
@@ -292,7 +299,8 @@ impl PgX402Repository {
                 $23, $24, $25,
                 $26, $27, $28,
                 $29, $30, $31,
-                $32, $33, $34
+                $32, $33, $34,
+                $35, $36
             )
             "#,
         )
@@ -330,6 +338,8 @@ impl PgX402Repository {
         .bind(&intent.metadata)
         .bind(intent.created_at)
         .bind(intent.updated_at)
+        .bind(intent.valid_after as i64)
+        .bind(intent.eip712_authorization.as_deref())
         .execute(&mut **tx)
         .await?;
 
@@ -898,6 +908,150 @@ impl PgX402Repository {
     }
 
     // =========================================================================
+    // Autonomous On-Chain Settlement Support
+    // =========================================================================
+
+    /// List batches that are ready for autonomous on-chain settlement.
+    ///
+    /// A batch is settle-ready when it is `committed` (its Merkle root is fixed)
+    /// and contains at least one payment carrying an EIP-712 payer authorization
+    /// — i.e. at least one payment the `SetPaymentBatch` contract can actually
+    /// move funds for. Legacy/committed batches with no authorized payments are
+    /// intentionally skipped so the settler never burns gas settling a batch the
+    /// chain would fully reject.
+    ///
+    /// The settlement worker further filters the returned batches to those whose
+    /// `network` matches the chain its wallet/contract are bound to.
+    pub async fn list_settleable_batches(&self, limit: i64) -> Result<Vec<X402PaymentBatch>> {
+        let rows: Vec<X402BatchRow> = sqlx::query_as(
+            r#"
+            SELECT b.* FROM x402_payment_batches b
+            WHERE b.status = 'committed'
+              AND EXISTS (
+                  SELECT 1 FROM x402_payment_intents i
+                  WHERE i.batch_id = b.batch_id
+                    AND i.eip712_authorization IS NOT NULL
+              )
+            ORDER BY b.created_at ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(Self::row_to_batch).collect()
+    }
+
+    /// Record the real on-chain settlement result for a batch.
+    ///
+    /// Unlike [`Self::settle_batch`] (the manual/override path, which marks every
+    /// intent in the batch settled), this records the *per-payment* on-chain
+    /// outcome: payments the chain reported as `PaymentFailed` (skipped —
+    /// unauthorized, expired, insufficient balance/allowance, etc.) are marked
+    /// `failed`; the rest are marked `settled` with the batch's tx hash + block.
+    ///
+    /// Double-settle safety: the transition only fires from `committed`/`submitted`.
+    /// If the batch is *already* `settled` (a crash-then-retry where a prior
+    /// attempt had recorded the result) this is a no-op success — combined with
+    /// the on-chain `settledIntents`/`BatchAlreadySettled` guards, a batch's funds
+    /// can never move twice regardless of worker retries or leader failover.
+    pub async fn settle_batch_with_results(
+        &self,
+        batch_id: Uuid,
+        tx_hash: &str,
+        block_number: u64,
+        gas_used: Option<u64>,
+        failed_intent_ids: &[Uuid],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        let settled = sqlx::query(
+            r#"
+            UPDATE x402_payment_batches
+            SET status = 'settled',
+                tx_hash = $2,
+                block_number = $3,
+                gas_used = $4,
+                settled_at = NOW()
+            WHERE batch_id = $1
+              AND status IN ('committed', 'submitted')
+            "#,
+        )
+        .bind(batch_id)
+        .bind(tx_hash)
+        .bind(block_number as i64)
+        .bind(gas_used.map(|n| n as i64))
+        .execute(&mut *tx)
+        .await?;
+
+        if settled.rows_affected() == 0 {
+            // Either already settled (idempotent retry -> success) or missing /
+            // illegal transition (-> error). Never silently re-settle.
+            let status: Option<String> =
+                sqlx::query_scalar("SELECT status FROM x402_payment_batches WHERE batch_id = $1")
+                    .bind(batch_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            match status.as_deref() {
+                Some("settled") => {
+                    tx.commit().await?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(SequencerError::InvalidStateTransition {
+                        entity_type: "x402_payment_batch".into(),
+                        entity_id: batch_id.to_string(),
+                        from: status.unwrap_or_else(|| "missing".into()),
+                        to: "settled".into(),
+                    });
+                }
+            }
+        }
+
+        // Mark the payments the chain skipped as failed.
+        if !failed_intent_ids.is_empty() {
+            sqlx::query(
+                r#"
+                UPDATE x402_payment_intents
+                SET status = 'failed', updated_at = NOW()
+                WHERE batch_id = $1
+                  AND intent_id = ANY($2)
+                "#,
+            )
+            .bind(batch_id)
+            .bind(failed_intent_ids)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Mark the remaining payments settled with the real tx hash + block.
+        // `NOT (intent_id = ANY('{}'))` is true for every row, so an empty
+        // failed set settles the whole batch.
+        sqlx::query(
+            r#"
+            UPDATE x402_payment_intents
+            SET status = 'settled',
+                tx_hash = $2,
+                block_number = $3,
+                settled_at = NOW(),
+                updated_at = NOW()
+            WHERE batch_id = $1
+              AND NOT (intent_id = ANY($4))
+            "#,
+        )
+        .bind(batch_id)
+        .bind(tx_hash)
+        .bind(block_number as i64)
+        .bind(failed_intent_ids)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // =========================================================================
     // Signature Verification
     // =========================================================================
 
@@ -1267,8 +1421,10 @@ impl PgX402Repository {
             token_address: row.token_address,
             created_at_unix: row.created_at_unix as u64,
             valid_until: row.valid_until as u64,
+            valid_after: row.valid_after as u64,
             nonce: row.nonce as u64,
             idempotency_key: row.idempotency_key,
+            eip712_authorization: row.eip712_authorization,
             resource_uri: row.resource_uri,
             description: row.description,
             order_id: row.order_id,

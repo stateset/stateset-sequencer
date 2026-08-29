@@ -6,6 +6,7 @@
 pub mod auth_helpers;
 pub mod error;
 pub mod handlers;
+pub mod middleware;
 pub mod types;
 pub mod utils;
 
@@ -120,6 +121,27 @@ pub fn router() -> Router<AppState> {
         )
         // x402 payment protocol
         .nest("/v1/x402", handlers::x402_router())
+}
+
+/// Router for payment-gated (HTTP 402) premium endpoints.
+///
+/// Each route mounted here sits behind
+/// [`middleware::payment_required_middleware`]: requests must carry a valid
+/// signed x402 payment intent in the `X-Payment` header matching the price in
+/// `gate.config`, or they receive `402 Payment Required` with the JSON
+/// payment requirements. Merge this into the main `/api` router *before*
+/// applying the auth middleware layer (the payment gate relies on the auth
+/// context being present), as `server::build_router` does.
+pub fn premium_router(gate: middleware::PaymentRequiredState) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/v1/x402/premium/insights",
+            get(handlers::x402::premium_insights),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            gate,
+            middleware::payment_required_middleware,
+        ))
 }
 
 /// VES validity + compliance proof routes (STARK-verified).
