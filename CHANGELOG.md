@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-29
+
+### Security
+
+- **The `/metrics` endpoint could be taken down by any unauthenticated client, twice over.** The HTTP metrics middleware is layered *outside* the auth layers, so both paths were reachable pre-auth.
+  - **Label values were emitted unescaped.** The Prometheus text exposition format requires `\`, `"` and newline to be escaped inside a quoted label value. A single raw `"` closes the quote early and makes the *entire* payload unparseable, so Prometheus rejects the whole scrape rather than the one malformed series. Unmatched request paths were fed verbatim into the `path` label, so `GET /x"y` from anyone blacked out the endpoint until the offending series aged out.
+  - **Unmatched request paths were unbounded label cardinality.** A stream of junk 404s could exhaust the per-metric cardinality budget, after which every genuine route falls into the overflow bucket for the life of the process. All unmatched requests now share a single `<unmatched>` bucket; per-404 detail belongs in the request log and trace, which already carry the request id.
+- **A metric name used both labeled and unlabeled emitted two `# TYPE` lines**, because the two are kept in separate maps. Prometheus rejects a scrape that declares a type twice, so one stray call site would have silently taken the endpoint down. The type is now emitted once per exported name. Not reachable from current call sites; fixed as a latent footgun found while hardening the above.
+- **Resolved 4 dependency advisories**, including RUSTSEC-2026-0258 (h2 unbounded empty DATA frames), directly reachable because this service serves HTTP/2 for gRPC. Also crossbeam-epoch (RUSTSEC-2026-0204), quinn-proto (RUSTSEC-2026-0185, 7.5 high) and ruint (RUSTSEC-2026-0220). `cargo audit` exits clean.
+
 ### Fixed
+
+- **`event_schemas` was not under migration control.** The table was created by runtime DDL in `PgSchemaStore::initialize()` at boot, which kept the schema registry outside migration version control, required the application role to hold DDL grants in production, and raced between concurrently starting replicas. It also meant a freshly migrated database had no such table, so the three cross-tenant isolation tests for the registry could never run — the registry's tenant isolation was effectively unverified. Added migration `018_event_schemas.sql` and removed the runtime DDL.
+- **Database-backed tests failed open.** Every one did `env::var("DATABASE_URL").ok()?` followed by `connect(..).await.ok()?`, so a `DATABASE_URL` pointing at a database that was down, misconfigured, or unreachable produced a green run that had asserted nothing — coverage could vanish without a single red test. A set-but-unreachable database is now always a panic, and CI sets `SEQUENCER_REQUIRE_DB_TESTS=1` so a missing one is red as well. (This caught a genuinely vanished test database on its first run.)
+- **`cargo --locked` failed, so no CI job ran.** `Cargo.lock` lagged the committed `stateset-stark` HEAD, and every job in the workflow passes `--locked` — the pipeline failed before compiling anything, and none of its gates were gating. The `ves-stark-*` crates are path dependencies on a separate repository, so tracking its default branch meant any upstream commit silently invalidated the lockfile here, with no change in this repo. CI now pins `STARK_REF` to an exact commit.
+- **The compliance-proof REST test exercised the weak path.** Its fixture used an encrypted payload, whose amount binding cannot be verified, so the test broke once verifier-side binding was enforced. It now drives the verified plaintext path end to end and additionally asserts that a witness commitment disagreeing with the stored payload amount is rejected — the mechanism that stops a large payment being proved as a small one to duck a reporting threshold.
 
 - **x402 batch commit was completely non-functional; now fixed and atomic.** `commit_batch_with_merkle` read the batch's intents `WHERE batch_id = $1` *before* anything had set `batch_id` on them, so it always found an empty set and failed with "No intents in batch" — both the background batcher's auto-commit path and the manual `/x402/batches` commit endpoint were broken (every commit failed and the batch was marked failed). It now takes the batch's `intent_ids` and, in a single transaction, claims them into the batch (`sequenced` → `batched`), reads them back ordered by sequence number, computes the Merkle root, and marks the batch committed — so a crash can no longer strand intents as `batched` under an uncommitted batch. Verified end-to-end against PostgreSQL (full x402 integration suite passes).
 - **x402 sequencing is now atomic**: the payment-intent insert, nonce reservation, and sequence-number assignment run in a single transaction. Previously a crash between the intent commit and the separate sequencing transaction could strand an intent as `pending` with a permanently-burned nonce and no recovery path.
@@ -49,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Pure, runtime-free `merkle` module for VES Merkle tree operations with property tests covering arbitrary (including non-power-of-two) tree sizes: prove/verify round-trip, tampered-leaf rejection, cross-leaf rejection, and root determinism.
 - `X402_MAX_AMOUNT` ingest bound (`i64::MAX`) so payment amounts cannot silently wrap negative when persisted to Postgres `BIGINT`.
+
+### Changed
+
+- **BREAKING: removed six Cargo features that gated no code** — `grpc`, `telemetry`, `anchoring`, `schema-validation`, `sqlite`, `encryption`. tonic/prost, the OpenTelemetry stack, alloy, jsonschema and the sqlx sqlite driver are all unconditional dependencies and the corresponding modules compile unconditionally, so `--no-default-features --features grpc` produced a binary identical to a default build while implying the opposite. They were removed rather than kept as no-ops: a feature that silently does nothing is worse than an absent one, because it lets a build be described as "without gRPC" when gRPC is still compiled in and served. `full` is now `["pqc", "stark"]`. Build the core sequencer with `--no-default-features --features pqc`.
+- **`PERFORMANCE_BENCHMARKS.md` no longer reports figures nothing measures.** The summary table carried numbers dated 2024-01-15 — including an availability figure that no benchmark here could produce — presented as measurements. Replaced with 14 real Criterion results (reproducible via `cargo bench`) and explicit "Not measured" rows for the end-to-end service metrics, plus instructions for populating them.
+
+### Testing
+
+- 735 tests pass against a virgin PostgreSQL with **zero ignored**; previously 4 failed and 76 were skipped by default. clippy `-D warnings` is clean on both the core and `stark` feature sets, and `cargo deny` passes licenses and advisories.
 
 ## [0.2.7] - 2026-04-02
 
