@@ -500,7 +500,7 @@ Per-tenant rate limiting with bounded memory (LRU eviction) prevents abuse witho
 
 ### 16.4 Binary
 
-The sequencer compiles to a single binary with `lto = true` and `codegen-units = 1` for maximum optimization. Feature flags (`grpc`, `telemetry`, `anchoring`, `schema-validation`, `sqlite`, `encryption`) allow slimming the binary for constrained deployments.
+The sequencer compiles to a single binary with `lto = true` and `codegen-units = 1` for maximum optimization. Feature flags (`pqc`, `stark`) gate the post-quantum signature suite and the STARK proof endpoints; everything else is compiled unconditionally.
 
 ---
 
@@ -644,9 +644,10 @@ Nine migrations define the schema:
 
 | Feature | Dependencies Added | Purpose |
 |---------|-------------------|---------|
-| `grpc` | tonic, prost | gRPC service alongside REST |
-| `telemetry` | opentelemetry, OTLP | Distributed tracing export |
-| `anchoring` | alloy | SET Chain L2 commitment anchoring |
-| `schema-validation` | jsonschema | JSON Schema payload validation |
-| `sqlite` | sqlx/sqlite | Local agent outbox support |
-| `encryption` | aes-gcm, hpke | Payload encryption at rest |
+| `pqc` | ml-dsa, ml-kem, hkdf | Post-quantum signature + KEM suite |
+| `stark` | ves-stark-* | STARK validity/compliance proof endpoints |
+| `integration` | — | Test-only modules requiring a live database |
+
+gRPC (tonic/prost), OpenTelemetry, L2 anchoring (alloy), JSON Schema validation
+(jsonschema), the SQLite outbox and payload encryption are unconditional: they
+are always compiled and served, and are not selectable at build time.

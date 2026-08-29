@@ -9,6 +9,7 @@
 //! - **Histograms**: Distribution of values (latencies, sizes)
 //! - **Labels**: Dimensional metrics for tenant/store breakdowns
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -64,21 +65,98 @@ impl Labels {
         let parts: Vec<String> = self
             .0
             .iter()
-            .map(|(k, v)| format!("{}=\"{}\"", k, v))
+            .map(|(k, v)| format!("{}=\"{}\"", k, escape_label_value(v)))
             .collect();
         format!("{{{}}}", parts.join(","))
     }
 
     fn to_prometheus_labels_with(&self, key: &str, value: &str) -> String {
         if self.0.is_empty() {
-            return format!("{{{}=\"{}\"}}", key, value);
+            return format!("{{{}=\"{}\"}}", key, escape_label_value(value));
         }
 
         let mut parts: Vec<String> = Vec::with_capacity(self.0.len() + 1);
-        parts.push(format!("{}=\"{}\"", key, value));
-        parts.extend(self.0.iter().map(|(k, v)| format!("{}=\"{}\"", k, v)));
+        parts.push(format!("{}=\"{}\"", key, escape_label_value(value)));
+        parts.extend(
+            self.0
+                .iter()
+                .map(|(k, v)| format!("{}=\"{}\"", k, escape_label_value(v))),
+        );
         format!("{{{}}}", parts.join(","))
     }
+}
+
+/// Escape a label value for the Prometheus text exposition format.
+///
+/// The format requires `\\`, `"` and newline to be escaped inside a quoted
+/// label value. Skipping this is not a cosmetic bug: a single raw `"` closes
+/// the quote early and makes the *entire* `/metrics` payload unparseable, so
+/// Prometheus rejects the whole scrape rather than the one bad series. Label
+/// values reach us from request paths and other caller-influenced strings, so
+/// this must never be assumed safe.
+fn escape_label_value(value: &str) -> Cow<'_, str> {
+    if !value.contains(['\\', '"', '\n']) {
+        return Cow::Borrowed(value);
+    }
+
+    let mut escaped = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            other => escaped.push(other),
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+/// Group unlabeled and labeled series that share a metric name.
+///
+/// Returns `(sanitized_name, unlabeled_series, labeled_series)` per distinct
+/// exported name, so the caller can emit exactly one `# TYPE` line for each.
+/// Names are sanitized before grouping: `a.b` and `a-b` both export as `a_b`
+/// and must therefore share a single type declaration.
+#[allow(clippy::type_complexity)]
+fn merge_series<'a, T>(
+    plain: &'a HashMap<String, Arc<T>>,
+    labeled: &'a HashMap<String, HashMap<Labels, Arc<T>>>,
+) -> Vec<(String, Option<&'a Arc<T>>, Vec<&'a HashMap<Labels, Arc<T>>>)> {
+    let sanitize = |name: &str| name.replace(['.', '-'], "_");
+
+    let mut order: Vec<String> = Vec::new();
+    let mut grouped: HashMap<String, (Option<&'a Arc<T>>, Vec<&'a HashMap<Labels, Arc<T>>>)> =
+        HashMap::new();
+
+    for (name, series) in plain {
+        let key = sanitize(name);
+        let entry = grouped.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            (None, Vec::new())
+        });
+        // Two raw names collapsing to one exported name is pathological; keep
+        // the first so the output stays a valid single series.
+        if entry.0.is_none() {
+            entry.0 = Some(series);
+        }
+    }
+
+    for (name, label_map) in labeled {
+        let key = sanitize(name);
+        let entry = grouped.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            (None, Vec::new())
+        });
+        entry.1.push(label_map);
+    }
+
+    order
+        .into_iter()
+        .map(|key| {
+            let (plain, labeled) = grouped.remove(&key).expect("key came from order");
+            (key, plain, labeled)
+        })
+        .collect()
 }
 
 impl Default for Labels {
@@ -395,22 +473,24 @@ impl MetricsRegistry {
             ));
         }
 
-        // Counters
-        for (name, counter) in counters.iter() {
-            let prometheus_name = name.replace(['.', '-'], "_");
+        // Counters and gauges, unlabeled and labeled together.
+        //
+        // A metric name may legitimately have both an unlabeled series and
+        // labeled ones, but they live in separate maps. Emitting each map
+        // independently produced a second `# TYPE` line for such a name, and
+        // Prometheus rejects an entire scrape that declares a type twice --
+        // one stray call site would silently take the whole endpoint down.
+        // Emit the type once per name, then every series under it.
+        for (prometheus_name, plain, label_map) in merge_series(&counters, &labeled_counters) {
             output.push_str(&format!("# TYPE {} counter\n", prometheus_name));
-            output.push_str(&format!(
-                "{} {}\n",
-                prometheus_name,
-                counter.load(Ordering::Relaxed)
-            ));
-        }
-
-        // Labeled counters
-        for (name, label_map) in labeled_counters.iter() {
-            let prometheus_name = name.replace(['.', '-'], "_");
-            output.push_str(&format!("# TYPE {} counter\n", prometheus_name));
-            for (labels, counter) in label_map.iter() {
+            if let Some(counter) = plain {
+                output.push_str(&format!(
+                    "{} {}\n",
+                    prometheus_name,
+                    counter.load(Ordering::Relaxed)
+                ));
+            }
+            for (labels, counter) in label_map.into_iter().flatten() {
                 output.push_str(&format!(
                     "{}{} {}\n",
                     prometheus_name,
@@ -420,22 +500,16 @@ impl MetricsRegistry {
             }
         }
 
-        // Gauges
-        for (name, gauge) in gauges.iter() {
-            let prometheus_name = name.replace(['.', '-'], "_");
+        for (prometheus_name, plain, label_map) in merge_series(&gauges, &labeled_gauges) {
             output.push_str(&format!("# TYPE {} gauge\n", prometheus_name));
-            output.push_str(&format!(
-                "{} {}\n",
-                prometheus_name,
-                gauge.load(Ordering::Relaxed)
-            ));
-        }
-
-        // Labeled gauges
-        for (name, label_map) in labeled_gauges.iter() {
-            let prometheus_name = name.replace(['.', '-'], "_");
-            output.push_str(&format!("# TYPE {} gauge\n", prometheus_name));
-            for (labels, gauge) in label_map.iter() {
+            if let Some(gauge) = plain {
+                output.push_str(&format!(
+                    "{} {}\n",
+                    prometheus_name,
+                    gauge.load(Ordering::Relaxed)
+                ));
+            }
+            for (labels, gauge) in label_map.into_iter().flatten() {
                 output.push_str(&format!(
                     "{}{} {}\n",
                     prometheus_name,
@@ -996,6 +1070,71 @@ pub async fn record_pool_stats(metrics: &MetricsRegistry, stats: &PoolStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prometheus rejects a scrape that declares `# TYPE` twice for one metric
+    /// name. The registry keeps labeled and unlabeled series for the same name
+    /// in separate maps, so a name used both ways would emit two TYPE lines and
+    /// take down the whole endpoint -- the same blast radius as an unescaped
+    /// label, from a different direction.
+    #[tokio::test]
+    async fn prometheus_emits_one_type_line_per_metric_name() {
+        let registry = MetricsRegistry::new();
+        registry.inc_counter("sequencer_errors_database").await;
+        registry
+            .inc_counter_labeled(
+                "sequencer_errors_database",
+                Labels::new().with("kind", "timeout"),
+            )
+            .await;
+
+        let output = registry.to_prometheus().await;
+        let type_lines = output
+            .lines()
+            .filter(|l| l.starts_with("# TYPE sequencer_errors_database "))
+            .count();
+
+        assert_eq!(
+            type_lines, 1,
+            "one TYPE line per metric name; got {type_lines}:\n{output}"
+        );
+    }
+
+    /// A label value containing a double quote must not terminate the quoted
+    /// label early -- an unescaped `"` makes the whole exposition unparseable
+    /// and Prometheus drops the entire scrape, not just the bad line.
+    #[tokio::test]
+    async fn prometheus_label_values_escape_double_quotes() {
+        let registry = MetricsRegistry::new();
+        registry
+            .inc_counter_labeled("http_requests_total", Labels::new().with("path", "/x\"y"))
+            .await;
+
+        let output = registry.to_prometheus().await;
+        let line = output
+            .lines()
+            .find(|l| l.starts_with("http_requests_total{"))
+            .expect("labeled counter should be exported");
+
+        assert_eq!(line, r#"http_requests_total{path="/x\"y"} 1"#);
+    }
+
+    /// Backslashes and newlines are the other two characters the Prometheus
+    /// text format requires escaping in a label value.
+    #[tokio::test]
+    async fn prometheus_label_values_escape_backslash_and_newline() {
+        let registry = MetricsRegistry::new();
+        registry
+            .inc_counter_labeled("http_requests_total", Labels::new().with("path", "a\\b\nc"))
+            .await;
+
+        let output = registry.to_prometheus().await;
+        let line = output
+            .lines()
+            .find(|l| l.starts_with("http_requests_total{"))
+            .expect("labeled counter should be exported");
+
+        assert_eq!(line, r#"http_requests_total{path="a\\b\nc"} 1"#);
+    }
 
     #[tokio::test]
     async fn test_counter() {

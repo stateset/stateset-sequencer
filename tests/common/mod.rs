@@ -263,6 +263,70 @@ macro_rules! assert_err {
     };
 }
 
+// ============================================================================
+// Database test gating
+// ============================================================================
+
+/// Env var that turns a missing `DATABASE_URL` into a hard failure.
+///
+/// CI sets this so a misconfigured database service can never be mistaken for
+/// a passing run.
+pub const REQUIRE_DB_TESTS_ENV: &str = "SEQUENCER_REQUIRE_DB_TESTS";
+
+fn require_db_tests() -> bool {
+    std::env::var(REQUIRE_DB_TESTS_ENV)
+        .map(|v| {
+            !matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "off" | "no"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Connect to the test database, or return `None` when there is legitimately
+/// no database to test against.
+///
+/// The distinction matters. These tests used to do `env::var(..).ok()?` then
+/// `connect(..).await.ok()?`, so *any* failure -- including a `DATABASE_URL`
+/// that pointed at a database that was down, misconfigured, or unreachable --
+/// silently produced a green run that had asserted nothing. Coverage could
+/// vanish without a single red test.
+///
+/// Now:
+/// - `DATABASE_URL` set but unusable is always a panic. If you asked for a
+///   database, you get the connection error, never a skip.
+/// - `DATABASE_URL` unset is a skip locally, and a panic wherever
+///   `SEQUENCER_REQUIRE_DB_TESTS` is set (CI).
+pub async fn connect_test_db(max_connections: u32) -> Option<sqlx::PgPool> {
+    let url = match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.trim().is_empty() => url,
+        _ => {
+            assert!(
+                !require_db_tests(),
+                "{REQUIRE_DB_TESTS_ENV} is set but DATABASE_URL is missing or empty; \
+                 refusing to skip database tests silently"
+            );
+            eprintln!("DATABASE_URL not set; skipping database-backed test");
+            return None;
+        }
+    };
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect(&url)
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "DATABASE_URL is set but the database could not be reached: {e}. \
+                 A database test must never be skipped just because the database \
+                 is unavailable -- unset DATABASE_URL to skip deliberately."
+            )
+        });
+
+    Some(pool)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

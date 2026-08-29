@@ -1158,8 +1158,8 @@ pub async fn run() -> anyhow::Result<()> {
     // Initialize schema registry
     let schema_store =
         Arc::new(PgSchemaStore::new(pool.clone()).with_cache(cache_manager.schemas.clone()));
-    schema_store.initialize().await?;
-    info!("Schema registry initialized");
+    // The `event_schemas` table ships in migration 018; no runtime DDL here.
+    info!("Schema registry ready");
 
     // Initialize x402 payment repository
     let x402_repository = Arc::new(PgX402Repository::new(pool.clone()));
@@ -1852,43 +1852,23 @@ fn cors_layer_from_env() -> anyhow::Result<Option<CorsLayer>> {
     ))
 }
 
-fn normalize_metrics_path(path: &str) -> String {
-    if path == "/" {
-        return "/".to_string();
+/// Label used for every request that matched no route.
+pub(crate) const UNMATCHED_PATH_LABEL: &str = "<unmatched>";
+
+/// Decide the `path` label for a request's HTTP metrics.
+///
+/// Matched requests report their route template, which is a closed set. Every
+/// unmatched request collapses into a single bucket: the raw URI is attacker
+/// controlled and unbounded, and this middleware sits outside the auth layers,
+/// so echoing it would let any anonymous client mint a time series per request
+/// until the per-metric cardinality cap is spent -- pushing real routes into
+/// the overflow bucket for the life of the process. Per-404 detail belongs in
+/// the request log and trace, which carry the request id, not in metrics.
+fn metrics_path_label(matched: Option<&str>, _raw_path: &str) -> String {
+    match matched {
+        Some(template) => template.to_string(),
+        None => UNMATCHED_PATH_LABEL.to_string(),
     }
-
-    let normalized: Vec<String> = path
-        .trim_start_matches('/')
-        .split('/')
-        .map(|segment| {
-            if looks_like_uuid(segment) {
-                ":id".to_string()
-            } else {
-                segment.to_string()
-            }
-        })
-        .collect();
-
-    format!("/{}", normalized.join("/"))
-}
-
-fn looks_like_uuid(segment: &str) -> bool {
-    if segment.len() != 36 {
-        return false;
-    }
-
-    let mut dash_count = 0;
-    for ch in segment.chars() {
-        if ch == '-' {
-            dash_count += 1;
-            continue;
-        }
-        if !ch.is_ascii_hexdigit() {
-            return false;
-        }
-    }
-
-    dash_count == 4
 }
 
 /// Middleware that extracts or generates a request ID and adds it to the
@@ -1937,11 +1917,10 @@ async fn http_metrics_middleware(
     next: Next,
 ) -> Response {
     let method = req.method().as_str().to_string();
-    let path = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| normalize_metrics_path(req.uri().path()));
+    let path = metrics_path_label(
+        req.extensions().get::<MatchedPath>().map(|p| p.as_str()),
+        req.uri().path(),
+    );
 
     let start = std::time::Instant::now();
     let response = next.run(req).await;
@@ -1992,6 +1971,31 @@ async fn metrics_handler(
 
 #[cfg(test)]
 mod tests {
+
+    /// Requests that match no route must all share one `path` label. Emitting
+    /// the raw URI here lets any unauthenticated client mint a fresh time
+    /// series per request until the cardinality cap is exhausted, after which
+    /// every genuine route falls into the overflow bucket -- HTTP metrics stay
+    /// degraded until restart.
+    #[test]
+    fn metrics_path_label_buckets_every_unmatched_path() {
+        let a = metrics_path_label(None, "/aaa1");
+        let b = metrics_path_label(None, "/aaa2");
+        let c = metrics_path_label(None, "/completely/unknown/deep/path");
+
+        assert_eq!(a, UNMATCHED_PATH_LABEL);
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    /// A matched route reports its route template, so real endpoints stay
+    /// individually observable and IDs never inflate cardinality.
+    #[test]
+    fn metrics_path_label_uses_matched_route_template() {
+        let label = metrics_path_label(Some("/api/v1/ves/proofs/:seq"), "/api/v1/ves/proofs/12345");
+
+        assert_eq!(label, "/api/v1/ves/proofs/:seq");
+    }
     use super::*;
     use axum::body::Body;
     use axum::extract::{ConnectInfo, Extension, State};

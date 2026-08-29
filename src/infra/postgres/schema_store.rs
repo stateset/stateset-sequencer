@@ -34,65 +34,6 @@ impl PgSchemaStore {
         self
     }
 
-    /// Initialize the database schema for the schema registry
-    pub async fn initialize(&self) -> Result<()> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS event_schemas (
-                id UUID PRIMARY KEY,
-                tenant_id UUID NOT NULL,
-                event_type VARCHAR(255) NOT NULL,
-                version INTEGER NOT NULL,
-                schema_json JSONB NOT NULL,
-                status VARCHAR(16) NOT NULL DEFAULT 'active',
-                compatibility VARCHAR(16) NOT NULL DEFAULT 'backward',
-                description TEXT,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                created_by VARCHAR(255),
-                UNIQUE (tenant_id, event_type, version)
-            )
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(SequencerError::Database)?;
-
-        // Create indexes for efficient lookup
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_event_schemas_tenant_type
-            ON event_schemas (tenant_id, event_type)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(SequencerError::Database)?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_event_schemas_status
-            ON event_schemas (tenant_id, event_type, status)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(SequencerError::Database)?;
-
-        // Index for finding latest version
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_event_schemas_version
-            ON event_schemas (tenant_id, event_type, version DESC)
-            "#,
-        )
-        .execute(&self.pool)
-        .await
-        .map_err(SequencerError::Database)?;
-
-        Ok(())
-    }
-
     /// Convert database row to Schema
     ///
     /// Note: Parameters map directly to database columns - splitting would reduce clarity.

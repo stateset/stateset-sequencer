@@ -12,7 +12,6 @@ use axum::extract::ConnectInfo;
 use axum::http::{Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tower::ServiceExt;
@@ -44,13 +43,7 @@ const STORE_SCOPED_STORE: &str = "22222222-2222-2222-2222-222222222222";
 // ============================================================================
 
 async fn connect_db() -> Option<sqlx::PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&url)
-        .await
-        .ok()?;
-    Some(pool)
+    common::connect_test_db(10).await
 }
 
 /// Create full application state for testing.

@@ -10,7 +10,6 @@
 #![cfg_attr(not(feature = "stark"), allow(unused_imports))]
 
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
 use std::sync::Arc;
 use tokio::sync::Barrier;
 use uuid::Uuid;
@@ -38,14 +37,10 @@ use stateset_sequencer::infra::{
 };
 use stateset_sequencer::server::AppState;
 
+mod common;
+
 async fn connect_db() -> Option<sqlx::PgPool> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&url)
-        .await
-        .ok()?;
-    Some(pool)
+    common::connect_test_db(20).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -956,12 +951,18 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
     let created_at = chrono::Utc::now();
     let created_at_str = created_at.to_rfc3339();
 
-    let payload_encrypted = json!({
-        "vesEncVersion": 1,
-        "ciphertext": "AA==",
-        "recipients": [],
-    });
-    let payload_plain_hash = vec![1u8; 32];
+    // Plaintext event carrying a canonical integer minor-unit amount.
+    //
+    // A STARK compliance proof commits to an amount; the sequencer
+    // independently re-derives that amount from the payload it stored at
+    // ingest and rejects proofs committing to a different one. An encrypted
+    // payload cannot be re-extracted (the plain hash is salted), so it is
+    // refused unless VES_STARK_ALLOW_UNVERIFIED_AMOUNT_BINDING is set. Both
+    // branches are unit-tested in api::handlers::ves::amount_binding; this
+    // test drives the full REST flow over the strong path, where the binding
+    // is genuinely verified.
+    let payload = json!({ "total_amount": 5_000u64 });
+    let payload_plain_hash = stateset_sequencer::crypto::payload_plain_hash(&payload).to_vec();
     let payload_cipher_hash = vec![2u8; 32];
     let event_signing_hash = vec![3u8; 32];
     let agent_signature = vec![4u8; 64];
@@ -991,7 +992,7 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
             sequence_number,
             base_version
         ) VALUES (
-            $1,NULL,1,$2,$3,$4,1,'order','ord-1','order.created',$5,$6,1,NULL,$7,$8,$9,$10,$11,1,NULL
+            $1,NULL,1,$2,$3,$4,1,'order','ord-1','order.created',$5,$6,0,$7,NULL,$8,$9,$10,$11,1,NULL
         )
         "#,
     )
@@ -1001,7 +1002,7 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
     .bind(agent_id)
     .bind(created_at)
     .bind(&created_at_str)
-    .bind(payload_encrypted)
+    .bind(&payload)
     .bind(payload_plain_hash)
     .bind(payload_cipher_hash)
     .bind(event_signing_hash)
@@ -1245,20 +1246,50 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
     assert!(verify_json["valid"].as_bool().unwrap());
     assert!(verify_json["public_inputs_match"].as_bool().unwrap());
 
-    let conflict_body = json!({
+    // Re-submitting the identical proof is idempotent, not a conflict.
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .method(Method::POST)
+            .uri(format!("/api/v1/ves/compliance/{event_id}/proofs"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&submit_body).unwrap()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "resubmitting the same proof should be idempotent: body={}",
+        String::from_utf8_lossy(&body)
+    );
+    let replay_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        replay_json["proof_id"].as_str().unwrap(),
+        proof_id.to_string(),
+        "idempotent resubmit must return the original proof_id"
+    );
+
+    // Soundness: a prover committing to a different amount than the stored
+    // payload holds must be rejected outright, not merely recorded. This is
+    // the mechanism that stops a 50_000 payment being proved as 5_000 to duck
+    // a reporting threshold: the sequencer re-extracts the amount from the
+    // payload it stored at ingest and compares it against the submitted
+    // witness commitment, before the proof is verified or persisted.
+    //
+    // (This replaces an older assertion that submitted a second *valid* proof
+    // for a different amount to force a 409. Public inputs are now bound to
+    // the payload amount, so such a witness can no longer be constructed at
+    // all -- the fraud is refused a layer earlier than it used to be.)
+    let mismatched_commitment =
+        ves_stark_primitives::payload_amount::amount_witness_commitment(4_000);
+    let mismatched_body = json!({
         "proofType": "stark",
         "proofVersion": ves_stark_verifier::PROOF_VERSION,
         "policyId": "aml.threshold",
         "policyParams": { "threshold": 10000 },
-        "witnessCommitment": proof.witness_commitment,
-        "proofB64": ({
-            // Generate a second valid proof for the same event+policy (different witness amount)
-            // to force an idempotency conflict (proof_hash mismatch under same key).
-            let witness2 = ves_stark_prover::ComplianceWitness::new(4000, witness.public_inputs.clone());
-            let prover2 = ves_stark_prover::ComplianceProver::with_policy(ves_stark_prover::Policy::aml_threshold(10000));
-            let proof2 = prover2.prove(&witness2).unwrap();
-            base64::engine::general_purpose::STANDARD.encode(&proof2.proof_bytes)
-        })
+        "proofB64": proof_b64,
+        "witnessCommitment": mismatched_commitment,
     });
 
     let (status, body) = send(
@@ -1267,14 +1298,19 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
             .method(Method::POST)
             .uri(format!("/api/v1/ves/compliance/{event_id}/proofs"))
             .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&conflict_body).unwrap()))
+            .body(Body::from(serde_json::to_vec(&mismatched_body).unwrap()))
             .unwrap(),
     )
     .await;
+    let body_text = String::from_utf8_lossy(&body);
     assert_eq!(
         status,
-        StatusCode::CONFLICT,
-        "body={}",
-        String::from_utf8_lossy(&body)
+        StatusCode::BAD_REQUEST,
+        "a witness commitment disagreeing with the payload amount must be rejected: \
+         body={body_text}"
+    );
+    assert!(
+        body_text.contains("Payload amount binding rejected"),
+        "rejection should name the amount binding: body={body_text}"
     );
 }

@@ -114,13 +114,15 @@ The default build enables `full`. Notable feature flags:
 
 | Feature | Enables |
 |---------|---------|
-| `grpc` | gRPC service (tonic/prost) |
-| `telemetry` | OpenTelemetry tracing / OTLP export |
-| `anchoring` | L2 blockchain anchoring (alloy) |
-| `schema-validation` | JSON Schema payload validation |
 | `pqc` | Post-quantum crypto (ML-DSA-65, ML-KEM-768) |
-| `sqlite` | SQLite backend for embedded/local agents |
 | `stark` | STARK validity/compliance proof verification |
+| `integration` | Test-only modules that need a live database |
+
+gRPC, OpenTelemetry, L2 anchoring, JSON Schema validation and the SQLite outbox
+are **always compiled in** and are not behind feature flags. They were once
+listed as flags, but each was an empty feature that gated no code, so turning
+one "off" changed nothing about the resulting binary. They were removed rather
+than left as no-ops.
 
 **The `stark` feature** depends on the `ves-stark-*` crates in the separate
 [`stateset-stark`](https://github.com/stateset/stateset-stark) workspace, expected
@@ -132,8 +134,29 @@ you don't have `stateset-stark` checked out alongside this repo, the proof
 endpoints are simply not mounted):
 
 ```bash
-cargo build --no-default-features \
-  --features grpc,telemetry,anchoring,schema-validation,pqc,sqlite
+cargo build --no-default-features --features pqc
+```
+
+### Upgrading the STARK dependency
+
+`stateset-stark` is a **path dependency on a separate repository**, so its
+commits are not captured by this repo's `Cargo.lock` on their own. CI pins it to
+an exact commit via the `STARK_REF` variable in `.github/workflows/ci.yml`.
+
+Tracking its default branch instead meant every upstream commit silently
+invalidated `Cargo.lock` and turned every `--locked` CI job red, with no change
+in this repository. Upgrade deliberately, in a single commit:
+
+```bash
+# 1. Move the local checkout to the commit you want
+git -C ../stateset-stark checkout <new-sha>
+
+# 2. Re-resolve the ves-stark-* crates
+cargo update -p ves-stark-prover -p ves-stark-verifier \
+             -p ves-stark-primitives -p ves-stark-batch
+
+# 3. Verify, then commit Cargo.lock and the new STARK_REF together
+cargo test --locked --all-targets
 ```
 
 > **CI note:** because the `ves-stark-*` crates live in a private repo, CI fetches
