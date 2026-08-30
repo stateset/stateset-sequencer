@@ -6,8 +6,20 @@ use std::net::{IpAddr, SocketAddr};
 
 /// Extract the client IP address from request headers or socket address.
 ///
-/// When `trust_proxy_headers` is true, uses common proxy headers in priority order:
-/// `x-forwarded-for`, `x-real-ip`, and `forwarded`.
+/// Proxy headers are consulted only when `trust_proxy_headers` is set *and*
+/// the socket peer is itself within a trusted network, so an arbitrary host
+/// can never assert its own address.
+///
+/// Within `x-forwarded-for`, the chain is walked from the **right**. The header
+/// grows left-to-right -- each proxy appends the address it received from -- so
+/// only the rightmost entries are attested by infrastructure we trust, while
+/// the leftmost is simply whatever the original client claimed. Reading the
+/// leftmost entry would let any external client choose the address this service
+/// attributes the request to, which in turn drives the admin IP allowlist, the
+/// public-registration rate limiter, and audit records. Trusted hops are
+/// skipped so a proxy chain resolves to the first address no trusted proxy
+/// vouched for; if every hop is trusted there is no external client and the
+/// socket peer is used.
 pub fn extract_client_ip(
     headers: &HeaderMap,
     remote_addr: SocketAddr,
@@ -76,21 +88,48 @@ fn parse_proxy_entry(entry: &str) -> Option<IpNet> {
 }
 
 fn extract_forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
-    if let Some(forwarded) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = forwarded.split(',').next() {
-            if let Some(ip) = parse_ip(first.trim()) {
-                return Some(ip);
-            }
-        }
-    }
-
-    if let Some(real_ip) = headers.get("x-real-ip").and_then(|v| v.to_str().ok()) {
-        if let Some(ip) = parse_ip(real_ip.trim()) {
+    // Walk right-to-left and return the first hop no trusted proxy vouched for.
+    // Entries to the left of it are client-supplied and must not be believed.
+    // `get_all` because a chain may append separate header lines rather than
+    // extending one; joining them preserves the overall left-to-right order.
+    let forwarded_for: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
+    if !forwarded_for.is_empty() {
+        let chain = forwarded_for.join(",");
+        if let Some(ip) = chain
+            .split(',')
+            .filter_map(|entry| parse_ip(entry.trim()))
+            .rev()
+            .find(|ip| !is_remote_addr_trusted(*ip))
+        {
             return Some(ip);
         }
+        // Every hop was trusted: no external client to attribute this to.
+        return None;
     }
 
-    if let Some(forwarded) = headers.get("forwarded").and_then(|v| v.to_str().ok()) {
+    // Single-valued headers set by the proxy. Take the *last* value, since a
+    // client-supplied one arrives first and a proxy that appends rather than
+    // replaces would leave the trustworthy value at the end.
+    if let Some(ip) = headers
+        .get_all("x-real-ip")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| parse_ip(v.trim()))
+        .next_back()
+    {
+        return Some(ip);
+    }
+
+    if let Some(forwarded) = headers
+        .get_all("forwarded")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .next_back()
+    {
         for part in forwarded.split(';') {
             let part = part.trim();
             if let Some(value) = part.strip_prefix("for=") {
@@ -140,7 +179,10 @@ mod tests {
             HeaderValue::from_static("203.0.113.10, 198.51.100.1"),
         );
         let ip = extract_forwarded_ip(&headers).unwrap();
-        assert_eq!(ip, "203.0.113.10".parse::<IpAddr>().unwrap());
+        // The rightmost hop, 198.51.100.1, is the address a trusted proxy
+        // actually received the request from. 203.0.113.10 to its left is only
+        // what that host claimed, and is not evidence of anything.
+        assert_eq!(ip, "198.51.100.1".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -152,6 +194,65 @@ mod tests {
         );
         let ip = extract_forwarded_ip(&headers).unwrap();
         assert_eq!(ip, "2001:db8::1".parse::<IpAddr>().unwrap());
+    }
+
+    /// `X-Forwarded-For` grows left-to-right: each proxy *appends* the address
+    /// it received from, so the leftmost entry is whatever the client claimed
+    /// and only the rightmost entries are attested by trusted infrastructure.
+    ///
+    /// Trusting the leftmost entry lets any external client choose the IP this
+    /// service attributes the request to -- which drives the admin IP
+    /// allowlist, the registration rate limiter, and audit records.
+    #[test]
+    fn spoofed_leading_forwarded_entry_cannot_choose_the_client_ip() {
+        let mut headers = HeaderMap::new();
+        // Attacker at 203.0.113.9 sent `X-Forwarded-For: 10.0.0.1`;
+        // the trusted ingress appended the real peer.
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("10.0.0.1, 203.0.113.9"),
+        );
+        let ingress = SocketAddr::from(([10, 0, 0, 5], 443));
+
+        let ip = extract_client_ip(&headers, ingress, true).unwrap();
+
+        assert_eq!(
+            ip,
+            "203.0.113.9".parse::<IpAddr>().unwrap(),
+            "must attribute the request to the real peer, not the spoofed hop"
+        );
+    }
+
+    /// A chain of trusted proxies is skipped over to reach the first address
+    /// that trusted infrastructure did not vouch for.
+    #[test]
+    fn trusted_proxy_chain_resolves_to_the_first_untrusted_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.10, 10.0.0.7, 10.0.0.8"),
+        );
+        let ingress = SocketAddr::from(([10, 0, 0, 9], 443));
+
+        let ip = extract_client_ip(&headers, ingress, true).unwrap();
+
+        assert_eq!(ip, "203.0.113.10".parse::<IpAddr>().unwrap());
+    }
+
+    /// Every hop internal: there is no external client, so fall back to the
+    /// socket peer rather than inventing one from the header.
+    #[test]
+    fn all_trusted_forwarded_chain_falls_back_to_socket_peer() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("10.0.0.1, 10.0.0.2"),
+        );
+        let ingress = SocketAddr::from(([10, 0, 0, 5], 443));
+
+        let ip = extract_client_ip(&headers, ingress, true).unwrap();
+
+        assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
     }
 
     #[test]
@@ -179,6 +280,10 @@ mod tests {
         let remote_addr = SocketAddr::from(([127, 0, 0, 1], 12345));
         let ip = extract_client_ip(&headers, remote_addr, true).unwrap();
 
-        assert_eq!(ip, "203.0.113.10".parse::<IpAddr>().unwrap());
+        // Proxy headers are consulted (the peer is trusted), but the value
+        // taken is the rightmost untrusted hop. This assertion previously
+        // expected 203.0.113.10 -- the leftmost, client-supplied entry --
+        // which is precisely the value an attacker gets to choose.
+        assert_eq!(ip, "198.51.100.1".parse::<IpAddr>().unwrap());
     }
 }

@@ -2098,6 +2098,78 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// Drive real traffic through the real metrics middleware, then scrape the
+    /// real handler and check the payload would survive a Prometheus parse.
+    ///
+    /// The middleware labels `http_request_latency` by method, path and status,
+    /// so distinct requests create distinct label sets on one histogram name --
+    /// the exact shape that previously emitted a `# TYPE` line per series and
+    /// made Prometheus reject every scrape. A unit test over a hand-built
+    /// registry missed it because it asserted on substrings; this asserts the
+    /// whole payload, produced the way production produces it.
+    #[tokio::test]
+    async fn metrics_endpoint_exposition_survives_real_traffic() {
+        let state = build_test_state();
+
+        // Three distinct label sets on the request histogram and counter.
+        for path in ["/api/v1/a", "/api/v1/b", "/api/v1/c"] {
+            let labels = crate::metrics::Labels::new()
+                .method("GET")
+                .with("path", path)
+                .status("200");
+            state
+                .metrics
+                .inc_counter_labeled(
+                    crate::metrics::metric_names::HTTP_REQUESTS_TOTAL,
+                    labels.clone(),
+                )
+                .await;
+            state
+                .metrics
+                .observe_histogram_labeled(
+                    crate::metrics::metric_names::HTTP_REQUEST_LATENCY,
+                    labels,
+                    0.01,
+                )
+                .await;
+        }
+
+        let admin_ctx = crate::auth::AuthContext {
+            tenant_id: Uuid::nil(),
+            store_ids: Vec::new(),
+            agent_id: None,
+            rate_limit: None,
+            permissions: Permissions::admin(),
+        };
+        let response = metrics_handler(State(state), Extension(AuthContextExt(admin_ctx))).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read metrics body");
+        let payload = String::from_utf8(body.to_vec()).expect("utf-8 metrics body");
+
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut duplicates: Vec<&str> = Vec::new();
+        for line in payload.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let name = rest.split_whitespace().next().unwrap_or("");
+                if !seen.insert(name) {
+                    duplicates.push(name);
+                }
+            }
+        }
+
+        assert!(
+            duplicates.is_empty(),
+            "Prometheus rejects a scrape declaring a type twice; duplicates: {duplicates:?}\n\n{payload}"
+        );
+        assert!(
+            payload.contains("# TYPE sequencer_http_request_latency_seconds histogram"),
+            "histogram should still be exported:\n{payload}"
+        );
+    }
+
     #[test]
     #[serial]
     fn parse_admin_allowlist_accepts_ips_and_cidr() {

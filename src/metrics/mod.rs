@@ -519,15 +519,18 @@ impl MetricsRegistry {
             }
         }
 
-        // Histograms
-        for (name, histogram) in histograms.iter() {
-            output.push_str(&histogram.to_prometheus(name).await);
-        }
-
-        // Labeled histograms
-        for (name, label_map) in labeled_histograms.iter() {
-            for (labels, histogram) in label_map.iter() {
-                output.push_str(&histogram.to_prometheus_with_labels(name, labels).await);
+        // Histograms, unlabeled and labeled together, one `# TYPE` per name.
+        for (prometheus_name, plain, label_maps) in merge_series(&histograms, &labeled_histograms) {
+            output.push_str(&format!("# TYPE {} histogram\n", prometheus_name));
+            if let Some(histogram) = plain {
+                output.push_str(&histogram.to_prometheus(&prometheus_name).await);
+            }
+            for (labels, histogram) in label_maps.into_iter().flatten() {
+                output.push_str(
+                    &histogram
+                        .to_prometheus_with_labels(&prometheus_name, labels)
+                        .await,
+                );
             }
         }
 
@@ -597,12 +600,16 @@ impl Histogram {
         })
     }
 
-    /// Export as Prometheus format
+    /// Export this histogram's sample lines, without a `# TYPE` header.
+    ///
+    /// The header is deliberately not emitted here. A histogram name can carry
+    /// many label sets, and this is called once per set, so emitting the type
+    /// alongside the samples produced one `# TYPE` line per series -- which
+    /// Prometheus rejects, failing the entire scrape. The caller emits the
+    /// header exactly once per metric name.
     pub async fn to_prometheus(&self, name: &str) -> String {
         let prometheus_name = name.replace(['.', '-'], "_");
         let mut output = String::new();
-
-        output.push_str(&format!("# TYPE {} histogram\n", prometheus_name));
 
         let counts = self.counts.read().await;
         let mut cumulative = 0u64;
@@ -634,12 +641,11 @@ impl Histogram {
         output
     }
 
-    /// Export as Prometheus format with labels
+    /// Export this histogram's labeled sample lines, without a `# TYPE` header.
+    /// See [`Histogram::to_prometheus`] for why the header is the caller's job.
     pub async fn to_prometheus_with_labels(&self, name: &str, labels: &Labels) -> String {
         let prometheus_name = name.replace(['.', '-'], "_");
         let mut output = String::new();
-
-        output.push_str(&format!("# TYPE {} histogram\n", prometheus_name));
 
         let counts = self.counts.read().await;
         let mut cumulative = 0u64;
@@ -1070,6 +1076,108 @@ pub async fn record_pool_stats(metrics: &MetricsRegistry, stats: &PoolStats) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse an exposition payload and return the defects Prometheus would
+    /// reject it for. Asserting on whole-payload validity rather than on
+    /// individual substrings is deliberate: substring assertions are what let
+    /// the labeled-histogram duplicate-`# TYPE` bug survive a previous round of
+    /// hardening on this same function.
+    fn exposition_defects(payload: &str) -> Vec<String> {
+        use std::collections::HashSet;
+
+        let mut defects = Vec::new();
+        let mut typed: HashSet<&str> = HashSet::new();
+
+        for line in payload.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let name = rest.split_whitespace().next().unwrap_or("");
+                if !typed.insert(name) {
+                    defects.push(format!("duplicate `# TYPE` for {name}"));
+                }
+                continue;
+            }
+            if line.starts_with('#') {
+                continue;
+            }
+
+            // A sample line is `name[{labels}] value`. Label values are quoted;
+            // an unescaped quote inside one desynchronizes the whole parse.
+            if let Some(open) = line.find('{') {
+                let Some(close) = line.rfind('}') else {
+                    defects.push(format!("unterminated label set: {line}"));
+                    continue;
+                };
+                let labels = &line[open + 1..close];
+                let mut chars = labels.chars().peekable();
+                let mut quotes = 0usize;
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => quotes += 1,
+                        _ => {}
+                    }
+                }
+                if !quotes.is_multiple_of(2) {
+                    defects.push(format!("unbalanced quotes in labels: {line}"));
+                }
+            }
+        }
+
+        defects
+    }
+
+    /// The whole `/metrics` payload must be parseable, with a realistic mix of
+    /// unlabeled and labeled counters, gauges and histograms, and with hostile
+    /// text in a label value. Prometheus fails an entire scrape on any single
+    /// defect here, so partial correctness is worth nothing.
+    #[tokio::test]
+    async fn prometheus_exposition_is_well_formed() {
+        let registry = MetricsRegistry::new();
+
+        registry.inc_counter("sequencer_errors_database").await;
+        registry
+            .inc_counter_labeled(
+                "sequencer_errors_database",
+                Labels::new().with("kind", "timeout"),
+            )
+            .await;
+        registry.set_gauge("sequencer_pool_size", 8).await;
+        registry
+            .set_gauge_labeled("sequencer_pool_size", Labels::new().with("pool", "read"), 4)
+            .await;
+
+        // Two label sets on one histogram: any service with more than one route.
+        registry
+            .observe_histogram_labeled(
+                "http_request_latency",
+                Labels::new().with("path", "/a").with("status", "200"),
+                0.012,
+            )
+            .await;
+        registry
+            .observe_histogram_labeled(
+                "http_request_latency",
+                Labels::new().with("path", "/b\"x").with("status", "404"),
+                0.031,
+            )
+            .await;
+        registry
+            .observe_histogram("http_request_latency", 0.05)
+            .await;
+
+        let payload = registry.to_prometheus().await;
+        let defects = exposition_defects(&payload);
+
+        assert!(
+            defects.is_empty(),
+            "exposition would fail a Prometheus scrape: {defects:#?}\n\n{payload}"
+        );
+    }
 
     /// Prometheus rejects a scrape that declares `# TYPE` twice for one metric
     /// name. The registry keeps labeled and unlabeled series for the same name

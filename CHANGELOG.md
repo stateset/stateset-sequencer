@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-08-30
+
+### Security
+
+- **The client IP used for security decisions could be chosen by the caller.** `X-Forwarded-For` grows left-to-right -- each proxy *appends* the address it received from -- so only the rightmost entries are attested by trusted infrastructure, while the leftmost is whatever the original client wrote. The leftmost entry was being read, so with `TRUST_PROXY_HEADERS=true` (which any deployment behind the shipped `k8s/ingress.yaml` needs, since otherwise every client presents as the ingress) an external attacker sending `X-Forwarded-For: 10.0.0.1` was attributed that address. That value drives three things: the **`ADMIN_IP_ALLOWLIST` decision** on the admin and metrics routes, the **public agent-registration rate-limit key**, and the **client IP recorded in audit logs** -- so the allowlist could be bypassed, the rate limiter evaded by rotating fabricated addresses, and audit records poisoned with attacker-chosen IPs. The chain is now walked from the right, skipping hops that are themselves trusted proxies, so it resolves to the first address no trusted proxy vouched for; when every hop is trusted there is no external client and the socket peer is used. `x-real-ip` and `forwarded` now take the last header value rather than the first, for the same reason. Admin routes always required an admin API key as well, so this defeated a defence-in-depth layer rather than authentication itself. Not exploitable in the default configuration, where `TRUST_PROXY_HEADERS` is `false`.
+
+### Fixed
+
+- **`/metrics` emitted invalid exposition and Prometheus rejected the entire scrape.** `Histogram::to_prometheus_with_labels` emitted its own `# TYPE` line and is called once *per label set*, so a histogram with more than one label combination declared its type repeatedly. `http_request_latency` is labeled by method, path and status, so the second distinct request to any deployment was enough to break the endpoint -- observability was silently absent wherever this was scraped. The `# TYPE` header is now emitted once per metric name by the caller, with unlabeled and labeled histograms merged the way counters and gauges already were. This defect predates 0.3.0; the 0.3.0 hardening pass fixed two of the three exposition code paths and its changelog entry overstated the result, which has been corrected above.
+
+### Testing
+
+- Added a whole-payload exposition validator (`prometheus_exposition_is_well_formed`) that parses `/metrics` output and fails on any defect Prometheus would reject -- duplicate `# TYPE` declarations, unterminated label sets, unbalanced quotes -- exercised against a realistic mix of unlabeled and labeled counters, gauges and histograms plus a hostile label value. Asserting on whole-payload validity rather than on individual substrings is the check whose absence let the histogram defect survive the previous round of hardening on this same function.
+
 ## [0.3.0] - 2026-08-29
 
 ### Security
@@ -14,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The `/metrics` endpoint could be taken down by any unauthenticated client, twice over.** The HTTP metrics middleware is layered *outside* the auth layers, so both paths were reachable pre-auth.
   - **Label values were emitted unescaped.** The Prometheus text exposition format requires `\`, `"` and newline to be escaped inside a quoted label value. A single raw `"` closes the quote early and makes the *entire* payload unparseable, so Prometheus rejects the whole scrape rather than the one malformed series. Unmatched request paths were fed verbatim into the `path` label, so `GET /x"y` from anyone blacked out the endpoint until the offending series aged out.
   - **Unmatched request paths were unbounded label cardinality.** A stream of junk 404s could exhaust the per-metric cardinality budget, after which every genuine route falls into the overflow bucket for the life of the process. All unmatched requests now share a single `<unmatched>` bucket; per-404 detail belongs in the request log and trace, which already carry the request id.
-- **A metric name used both labeled and unlabeled emitted two `# TYPE` lines**, because the two are kept in separate maps. Prometheus rejects a scrape that declares a type twice, so one stray call site would have silently taken the endpoint down. The type is now emitted once per exported name. Not reachable from current call sites; fixed as a latent footgun found while hardening the above.
+- **A metric name used both labeled and unlabeled emitted two `# TYPE` lines** for counters and gauges, because the two are kept in separate maps. Prometheus rejects a scrape that declares a type twice. Deduplicated for counters and gauges. **Correction:** this entry originally claimed the type was "now emitted once per exported name" and that the bug was "not reachable from current call sites." Both statements were wrong -- histograms were left on a separate code path that emitted a `# TYPE` line *per label set*, which every deployment hits. See 0.3.1.
 - **Resolved 4 dependency advisories**, including RUSTSEC-2026-0258 (h2 unbounded empty DATA frames), directly reachable because this service serves HTTP/2 for gRPC. Also crossbeam-epoch (RUSTSEC-2026-0204), quinn-proto (RUSTSEC-2026-0185, 7.5 high) and ruint (RUSTSEC-2026-0220). `cargo audit` exits clean.
 
 ### Fixed
