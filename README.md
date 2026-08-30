@@ -1,11 +1,17 @@
 # StateSet Sequencer
 
-![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)
+![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-![codecov](https://codecov.io/gh/stateset/stateset-sequencer/branch/main/graph/badge.svg)
-![Tests](https://img.shields.io/badge/tests-passing-brightgreen)
-![Security](https://img.shields.io/badge/security-audited-green)
-![Documentation](https://img.shields.io/badge/docs-passing-blue)
+![codecov](https://codecov.io/gh/stateset/stateset-sequencer/branch/master/graph/badge.svg)
+
+Built and tested on current Rust **stable** (1.90 at time of writing). CI runs
+`cargo fmt`, `clippy -D warnings`, the full test suite against PostgreSQL,
+`cargo audit` and `cargo deny` on every push.
+
+> No minimum supported Rust version is verified in CI. This README previously
+> advertised 1.70, which is no longer accurate — the code uses APIs stabilized
+> well after it. Treat "current stable" as the requirement until an MSRV is
+> pinned in `Cargo.toml` and enforced by a build job.
 
 Verifiable Event Sync (VES) v1.0 service for deterministic event ordering, state projection, cryptographic commitments, and zero-knowledge compliance proofs.
 
@@ -24,6 +30,13 @@ The StateSet Sequencer is the **central truth clock** for distributed commerce s
 - **Offline-First**: SQLite outbox pattern for local CLI agents
 - **Payload Encryption**: AES-GCM encryption at rest with key rotation support
 - **Schema Validation**: JSON Schema validation for event payloads
+- **x402 Payments**: Payment intents, nonce-replay protection, Merkle-batched
+  settlement, and HTTP `402 Payment Required` gating for metered routes
+- **Autonomous Settlement**: Optional worker that settles committed payment
+  batches on-chain via the `SetPaymentBatch` contract
+- **Distributed / HA**: Multiple nodes may run against one database; singleton
+  workers (anchoring, batching, settlement) are leader-elected through
+  PostgreSQL advisory locks with automatic failover
 
 ## Architecture
 
@@ -286,6 +299,43 @@ GET /api/v1/head?tenant_id=<uuid>&store_id=<uuid>
 GET /api/v1/entities/{entity_type}/{entity_id}?tenant_id=<uuid>&store_id=<uuid>
 ```
 
+### x402 Payments
+
+```bash
+# Submit a payment intent (sequenced atomically with its nonce reservation)
+POST /api/v1/x402/payments
+curl -X POST http://localhost:8080/api/v1/x402/payments \
+  -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+  -d @intent.json
+
+# List / fetch intents
+GET  /api/v1/x402/payments
+GET  /api/v1/x402/payments/:intent_id
+GET  /api/v1/x402/payments/:intent_id/receipt   # Merkle inclusion receipt
+
+# Batches
+POST /api/v1/x402/batches                       # create a batch
+GET  /api/v1/x402/batches/:batch_id
+POST /api/v1/x402/batches/settle                # settle a committed batch
+```
+
+A batch is committed atomically: its intents are claimed (`sequenced` →
+`batched`), read back in sequence order, hashed into a Merkle root, and the
+batch marked committed in one transaction — so a crash cannot strand intents
+under an uncommitted batch.
+
+### Metered Routes (HTTP 402)
+
+Routes can be gated behind payment. The bundled example returns
+`402 Payment Required` with the payment requirements until a valid intent is
+presented:
+
+```bash
+GET /api/v1/x402/premium/insights
+```
+
+Configure via the `X402_PREMIUM_ROUTE_*` variables below.
+
 ### Health & Metrics
 
 ```bash
@@ -372,6 +422,30 @@ GET /metrics    # Prometheus metrics
 | `JWT_AUDIENCE` | `stateset-api` | Expected JWT audience claim |
 | `ADMIN_IP_ALLOWLIST` | (unset) | Comma-separated IPs/CIDRs allowed to access admin + metrics (e.g. `203.0.113.10,10.0.0.0/8`) |
 
+### Client IP and Proxies
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRUST_PROXY_HEADERS` | `false` | Honour `x-forwarded-for` / `x-real-ip` / `forwarded` when determining the client IP |
+| `TRUST_PROXY_ALLOWLIST` | RFC1918 + loopback + link-local | Comma-separated IPs/CIDRs whose forwarded headers are believed |
+
+The client IP decides three things: the `ADMIN_IP_ALLOWLIST` check, the
+public-registration rate-limit key, and the IP recorded in audit logs.
+
+**Enable `TRUST_PROXY_HEADERS` only when this service is genuinely behind a
+proxy you control**, and make sure `TRUST_PROXY_ALLOWLIST` covers that proxy
+and nothing else. Headers are consulted only when the socket peer is itself
+inside a trusted network, so an arbitrary host can never assert its own
+address. Within `x-forwarded-for` the chain is read **from the right**, past
+any hops that are themselves trusted proxies, because the header grows
+left-to-right — each proxy appends the address it received from, so only the
+rightmost entries are attested by infrastructure you trust and the leftmost is
+merely what the client claimed.
+
+Behind an ingress you generally must enable this: without it every request
+presents as the ingress address, which collapses per-IP rate limiting into one
+global bucket and makes an IP allowlist meaningless.
+
 ### Rate Limiting
 
 | Variable | Default | Description |
@@ -415,15 +489,105 @@ GET /metrics    # Prometheus metrics
 | `SET_REGISTRY_ADDRESS` | (unset) | StateSet registry contract address |
 | `SEQUENCER_PRIVATE_KEY` | (unset) | Private key for anchor transactions |
 | `L2_CHAIN_ID` | (unset) | L2 chain ID |
+| `ANCHOR_INTERVAL_SECS` | | How often the anchor worker runs |
+| `ANCHOR_BATCH_THRESHOLD` | | Commitments to accumulate before anchoring |
+| `ANCHOR_FINALITY_CONFIRMATIONS` | | Confirmations before an anchor is final |
+| `ANCHOR_FINALITY_POLL_SECS` | | Poll interval while awaiting finality |
+| `ANCHOR_RECONCILE_SECS` | | Interval for reconciling anchor state |
+
+### x402 Payments
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `X402_BATCH_AUTO_COMMIT` | | Auto-commit batches when thresholds are met |
+| `X402_BATCH_INTERVAL_SECS` | | Batch worker tick interval |
+| `X402_BATCH_MIN_SIZE` | | Minimum intents before committing a batch |
+| `X402_BATCH_MAX_SIZE` | `100` | Maximum intents per batch (clamped to the hard cap of 1000) |
+| `X402_BATCH_MAX_WAIT_SECS` | | Commit a partial batch after this long |
+| `X402_BATCH_NETWORKS` | | Networks the batch worker services |
+
+Metered-route (HTTP 402) settings:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `X402_PREMIUM_ROUTE_PRICE` | (unset) | Price required for the premium route; unset disables gating |
+| `X402_PREMIUM_ROUTE_ASSET` | | Asset the price is denominated in |
+| `X402_PREMIUM_ROUTE_NETWORK` | | Network the payment must settle on |
+| `X402_PREMIUM_ROUTE_PAY_TO` | | Recipient address |
+| `X402_PREMIUM_ROUTE_DESCRIPTION` | | Human-readable description in the 402 response |
+
+### Autonomous Settlement
+
+Settles committed payment batches on-chain. The worker starts **only** when all
+three required variables are set, and is leader-elected so exactly one node
+settles.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SETTLEMENT_RPC_URL` | (unset) | **Required.** RPC endpoint for the settlement chain |
+| `SET_PAYMENT_BATCH_ADDRESS` | (unset) | **Required.** `SetPaymentBatch` contract address |
+| `SETTLER_PRIVATE_KEY` | (unset) | **Required.** Settler wallet key; must be an authorized sequencer |
+| `SETTLEMENT_CHAIN_ID` | `84532001` | Settlement chain ID (defaults to Set Chain) |
+| `SETTLEMENT_INTERVAL_SECS` | | Settlement worker tick interval |
+| `SETTLEMENT_BATCH_THRESHOLD` | | Batches to accumulate before settling |
+
+### Distributed / High Availability
+
+Several workers must run on exactly one node. Leader election via PostgreSQL
+advisory locks enforces that, with automatic failover when the leader dies. A
+single node wins instantly, so single-node behaviour is unchanged.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WORKER_LEADER_ELECTION` | `true` | Leader-elect the singleton workers (anchoring, x402 batching, settlement) |
+
+### STARK Proof Verification
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VES_STARK_VERIFY_ON_SUBMIT` | `true` | Verify STARK proofs at submission time |
+| `VES_STARK_ALLOW_UNVERIFIED_AMOUNT_BINDING` | `false` | Accept prover-attested amounts when the sequencer cannot re-extract the amount from the payload |
+
+> `VES_STARK_ALLOW_UNVERIFIED_AMOUNT_BINDING=1` **weakens proof soundness to
+> prover honesty.** The sequencer normally re-derives the amount from the
+> payload it stored at ingest and rejects proofs committing to a different one,
+> which is what stops a large payment being proved as a small one to duck a
+> reporting threshold. Encrypted payloads cannot be re-extracted (the plain
+> hash is salted), so this flag is the only way to accept proofs over them.
+
+### Server & Runtime
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOST` | | Bind address for the HTTP server |
+| `GRPC_PORT` | | gRPC listen port |
+| `GRPC_DISABLED` | `false` | Disable the gRPC server |
+| `REQUEST_TIMEOUT_SECS` | `30` | HTTP request timeout |
+| `GRPC_REQUEST_TIMEOUT_SECS` | `30` | gRPC request timeout |
+| `ENVIRONMENT` / `SEQUENCER_ENV` | | Deployment environment label; `production` tightens secret-strength checks |
+| `ALLOW_INSECURE_LOCAL_DB` | `false` | Permit a non-TLS database connection to a local address |
+| `DB_STARTUP_MAX_RETRIES` | | Connection attempts at startup (for Cloud SQL Proxy sidecars) |
+| `DB_STARTUP_RETRY_DELAY_SECS` | | Delay between startup connection attempts |
+| `AUDIT_LOG_ENABLED` | | Enable the audit log |
+| `VES_STRICT_FORMAT_VALIDATION` | | Strict VES envelope format validation |
 
 ### Observability
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `RUST_LOG` | `info` | Log level filter |
+| `LOG_LEVEL` | `info` | Log level when `RUST_LOG` is unset |
 | `LOG_FORMAT` | (unset) | Set to `json` for JSON logging |
+| `LOG_JSON` | | Force JSON log output |
+| `LOG_CONSOLE` | | Force human-readable console output |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | (unset) | OpenTelemetry OTLP endpoint |
+| `OTEL_SERVICE_NAME` | | Service name reported in traces |
+| `OTEL_SERVICE_VERSION` | | Service version reported in traces |
+| `OTEL_SAMPLE_RATE` | | Trace sampling rate |
 | `CORS_ALLOW_ORIGINS` | (unset) | CORS origins (`*` or comma-separated) |
+
+`GET /metrics` returns Prometheus text exposition and requires an **admin**
+credential. It is additionally subject to `ADMIN_IP_ALLOWLIST` when that is set.
 
 ## Project Structure
 
@@ -434,6 +598,7 @@ stateset-sequencer/
 │   ├── lib.rs                  # Library exports
 │   ├── server.rs               # HTTP server bootstrap
 │   ├── anchor.rs               # On-chain anchoring service
+│   ├── settlement.rs           # On-chain x402 batch settlement
 │   ├── migrations.rs           # Migration runner
 │   ├── api/                    # REST API layer
 │   │   ├── mod.rs              # Router configuration
@@ -445,7 +610,10 @@ stateset-sequencer/
 │   │       ├── commitments.rs  # Batch commitments
 │   │       ├── agent_keys.rs   # Agent key management
 │   │       ├── schemas.rs      # Schema registry
+│   │       ├── x402.rs         # x402 payment intents & batches
 │   │       └── ves/            # VES v1.0 endpoints
+│   │   └── middleware/
+│   │       └── payment_required.rs  # HTTP 402 gating for metered routes
 │   ├── auth/                   # Authentication
 │   │   ├── api_key.rs          # API key validation & storage
 │   │   ├── jwt.rs              # JWT validation
@@ -467,6 +635,9 @@ stateset-sequencer/
 │   ├── infra/                  # Infrastructure implementations
 │   │   ├── traits.rs           # Service trait definitions
 │   │   ├── error.rs            # Error types
+│   │   ├── net.rs              # Trusted-proxy client IP resolution
+│   │   ├── x402_batch_worker.rs     # Payment batching worker
+│   │   ├── settlement_worker.rs     # On-chain settlement worker
 │   │   ├── postgres/           # PostgreSQL implementations
 │   │   │   ├── sequencer.rs    # Atomic sequence assignment
 │   │   │   ├── ves_sequencer.rs # VES v1.0 sequencer
@@ -519,6 +690,10 @@ stateset-sequencer/
 | **Rate Limiting** | Per-tenant with bounded memory (LRU eviction) |
 | **Request Limits** | Configurable body size and batch limits |
 | **STARK Proofs** | Zero-knowledge compliance verification |
+| **Amount Binding** | Compliance proofs are rejected unless the committed amount matches the amount re-derived from the stored payload |
+| **Client IP Resolution** | Forwarded headers honoured only from trusted proxies, and read from the right of the chain (see [Client IP and Proxies](#client-ip-and-proxies)) |
+| **Admin IP Allowlist** | Optional IP/CIDR restriction on admin and metrics routes, layered on top of admin authentication |
+| **Replay Protection** | Event/command ID deduplication and x402 nonce reservation, both inside the sequencing transaction |
 
 ## Cryptographic Guarantees
 
@@ -531,20 +706,54 @@ stateset-sequencer/
 ## Testing
 
 ```bash
-# Run all tests
+# Unit tests and any integration test that needs no database
 cargo test
 
-# Run ignored integration tests (requires PostgreSQL and DATABASE_URL)
-cargo test --workspace --tests -- --ignored
+# Everything, including the database-backed tests
+export DATABASE_URL=postgres://user:pass@localhost:5432/stateset_sequencer
+cargo test --tests -- --include-ignored
 
 # Run with output
 cargo test -- --nocapture
 
-# Run benchmarks
+# Benchmarks (Criterion; see docs/PERFORMANCE_BENCHMARKS.md for recorded results)
 cargo bench
 ```
 
+Database-backed tests **skip** when `DATABASE_URL` is unset, and **fail** when
+it is set but the database cannot be reached — a test is never allowed to pass
+merely because its database was missing. Set `SEQUENCER_REQUIRE_DB_TESTS=1` (as
+CI does) to turn a missing `DATABASE_URL` into a failure too, so a
+misconfigured environment cannot be mistaken for a green run.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DATABASE_URL` | (unset) | Database for the database-backed tests; unset skips them |
+| `SEQUENCER_REQUIRE_DB_TESTS` | `false` | Fail rather than skip when `DATABASE_URL` is absent |
+
 ## Admin CLI
+
+A second binary, `stateset-sequencer-admin`, handles operational tasks. Every
+command takes `--database-url` (defaulting to `DATABASE_URL`).
+
+```bash
+cargo run --bin stateset-sequencer-admin -- <command> [options]
+cargo run --bin stateset-sequencer-admin -- help <command>   # per-command help
+```
+
+| Command | Purpose |
+|---------|---------|
+| `migrate` | Run database migrations |
+| `verify-proof` | Verify a Merkle inclusion proof |
+| `export-events` | Export events to a JSON/NDJSON file |
+| `rotate-keys` | Rotate agent signing keys |
+| `list-agent-keys` | List agent keys for a tenant |
+| `reencrypt-events` | Re-encrypt event payloads under a new key |
+| `reencrypt-ves-validity-proofs` | Re-encrypt stored validity proofs |
+| `reencrypt-ves-compliance-proofs` | Re-encrypt stored compliance proofs |
+| `backfill-ves-state-roots` | Backfill VES state roots (upgrades from older versions) |
+| `ves-commit-and-anchor` | Create a VES commitment and anchor it on-chain |
+| `commands` | List available commands |
 
 ```bash
 # Run migrations
@@ -553,7 +762,7 @@ cargo run --bin stateset-sequencer-admin -- migrate
 # Backfill VES state roots
 cargo run --bin stateset-sequencer-admin -- backfill-ves-state-roots
 
-# Dry run (preview changes)
+# Preview changes without writing
 cargo run --bin stateset-sequencer-admin -- backfill-ves-state-roots --dry-run
 ```
 
