@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-08-30
+
+### Documentation
+
+- **README corrected.** Three claims were false: the Rust badge advertised
+  `1.70+` although the code uses APIs stabilized well after it; the codecov
+  badge pointed at branch `main` when the default branch is `master`; and the
+  testing section instructed readers to run `-- --ignored`, which now runs
+  nothing because no test is ignored. A `security: audited` badge that nothing
+  in the repository substantiates was removed. No replacement MSRV was invented
+  -- none is verified in CI, and the README now says so.
+- **Documented 42 environment variables the code reads and the README never
+  mentioned**, covering the x402 payment, on-chain settlement,
+  anchoring-cadence, server-runtime and OpenTelemetry surfaces.
+- **Documented `TRUST_PROXY_HEADERS` and `TRUST_PROXY_ALLOWLIST`**, which gate a
+  security decision and were previously absent entirely: the resolved client IP
+  drives the `ADMIN_IP_ALLOWLIST` check, the public-registration rate-limit key,
+  and the IP recorded in audit logs. Explains why the forwarded chain is read
+  from the right, and why a deployment behind an ingress generally must enable
+  the flag.
+- **Documented `VES_STARK_ALLOW_UNVERIFIED_AMOUNT_BINDING`** with an explicit
+  warning that it weakens proof soundness to prover honesty.
+- Documented the x402 endpoint surface, the HTTP 402 metered-route flow,
+  autonomous settlement (including the three variables required before the
+  worker starts at all), and distributed/HA leader election -- all shipped in
+  0.3.0 but never described.
+- Documented the ten admin CLI subcommands that were missing; two of twelve had
+  been listed.
+- Added `settlement.rs`, `x402.rs`, `payment_required.rs`, `settlement_worker.rs`
+  and `net.rs` to the project structure, and the amount-binding, client-IP,
+  admin-allowlist and replay-protection controls to the security table.
+- Documented the database-test gating introduced in 0.3.0: tests skip when
+  `DATABASE_URL` is unset, fail when it is set but unreachable, and fail either
+  way under `SEQUENCER_REQUIRE_DB_TESTS`.
+
+Every default, route and command in the new text was read back out of the code
+rather than assumed.
+
 ## [0.3.1] - 2026-08-30
 
 ### Security
