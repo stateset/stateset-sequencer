@@ -30,6 +30,12 @@ use crate::domain::{StoreId, TenantId};
 /// a `Duration::from_millis(25)` literal.
 pub const CACHE_STAMPEDE_DELAY: Duration = Duration::from_millis(25);
 
+/// Default age after which a miss/refresh lock is considered abandoned and may
+/// be taken by another caller. Comfortably longer than any single backing
+/// fetch (the DB statement timeout is 30s, but a cache fill is one indexed
+/// read), short enough that an abandoned key is not penalised for long.
+pub const DEFAULT_MISS_LOCK_TTL: Duration = Duration::from_secs(10);
+
 // ============================================================================
 // LRU Cache Implementation
 // ============================================================================
@@ -70,7 +76,9 @@ pub struct LruCache<K, V> {
     refresh_config: CacheRefreshConfig,
     /// Keys currently being refreshed (to prevent duplicate refresh).
     /// Arc-wrapped so cancellation-safe drop guards can release keys.
-    refreshing: Arc<RwLock<std::collections::HashSet<K>>>,
+    refreshing: Arc<RwLock<std::collections::HashMap<K, Instant>>>,
+    /// Age after which a held miss/refresh lock is treated as abandoned.
+    miss_lock_ttl: Duration,
 }
 
 struct CacheEntry<V> {
@@ -146,8 +154,15 @@ where
             entries: RwLock::new(HashMap::new()),
             stats: CacheStats::default(),
             refresh_config: CacheRefreshConfig::default(),
-            refreshing: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            refreshing: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            miss_lock_ttl: DEFAULT_MISS_LOCK_TTL,
         }
+    }
+
+    /// Override the age at which an unreleased miss lock is treated as abandoned.
+    pub fn with_miss_lock_ttl(mut self, ttl: Duration) -> Self {
+        self.miss_lock_ttl = ttl;
+        self
     }
 
     /// Create with custom refresh configuration
@@ -162,7 +177,8 @@ where
             entries: RwLock::new(HashMap::new()),
             stats: CacheStats::default(),
             refresh_config,
-            refreshing: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            refreshing: Arc::new(RwLock::new(std::collections::HashMap::new())),
+            miss_lock_ttl: DEFAULT_MISS_LOCK_TTL,
         }
     }
 
@@ -260,11 +276,18 @@ where
         K: Eq + Hash,
     {
         let mut refreshing = self.refreshing.write().await;
-        if refreshing.contains(key) {
-            false
-        } else {
-            refreshing.insert(key.clone());
-            true
+        // A lock older than `miss_lock_ttl` belongs to a holder that never
+        // released it -- a request future dropped mid-fetch when the client
+        // disconnected, or a task that panicked. Without expiry that key would
+        // stay "locked" for the life of the process: every later miss on it
+        // would pay the stampede delay, and the set would grow by one entry per
+        // such abandonment. Steal it.
+        match refreshing.get(key) {
+            Some(acquired) if acquired.elapsed() < self.miss_lock_ttl => false,
+            _ => {
+                refreshing.insert(key.clone(), Instant::now());
+                true
+            }
         }
     }
 
@@ -434,7 +457,7 @@ where
 /// abort), this guard spawns a cleanup task to remove the key from the refresh
 /// set, preventing a permanent deadlock.
 struct RefreshGuard<K: Clone + Eq + Hash + Send + Sync + 'static> {
-    refreshing: Arc<RwLock<std::collections::HashSet<K>>>,
+    refreshing: Arc<RwLock<std::collections::HashMap<K, Instant>>>,
     key: Option<K>,
 }
 
@@ -1214,6 +1237,35 @@ impl Default for CacheManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A miss lock whose holder never released it (client disconnected
+    /// mid-fetch) must become available again, or that key is penalised with
+    /// the stampede delay forever and the lock set leaks one entry per
+    /// abandonment.
+    #[tokio::test]
+    async fn abandoned_miss_lock_expires_and_can_be_retaken() {
+        let cache: LruCache<&'static str, i32> = LruCache::new(10, Duration::from_secs(60))
+            .with_miss_lock_ttl(Duration::from_millis(20));
+
+        assert!(
+            cache.try_acquire_refresh_lock(&"k").await,
+            "first acquire wins"
+        );
+        assert!(
+            !cache.try_acquire_refresh_lock(&"k").await,
+            "a live lock is exclusive"
+        );
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        assert!(
+            cache.try_acquire_refresh_lock(&"k").await,
+            "an abandoned lock past its TTL must be stealable"
+        );
+        // And a release by the new holder clears it for good.
+        cache.release_refresh_lock(&"k").await;
+        assert!(cache.try_acquire_refresh_lock(&"k").await);
+    }
 
     #[tokio::test]
     async fn test_lru_cache_basic() {

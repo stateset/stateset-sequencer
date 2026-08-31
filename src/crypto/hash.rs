@@ -102,6 +102,10 @@ pub fn encode_string(s: &str) -> Vec<u8> {
 /// Per VES v1.0 Section 5.2:
 /// payload_plain_hash = SHA256(b"VES_PAYLOAD_PLAIN_V1" || JCS(payload))
 #[inline]
+// RFC 8785 canonicalization can only fail on NaN/Infinity, which serde_json
+// cannot represent in a `Value`; unreachable by construction, not an
+// input-dependent panic.
+#[allow(clippy::expect_used)]
 pub fn payload_plain_hash(value: &serde_json::Value) -> Hash256 {
     let mut writer = Sha256Write(Sha256::new());
     writer.0.update(DOMAIN_PAYLOAD_PLAIN);
@@ -139,6 +143,10 @@ pub fn payload_plain_hash_salted(value: &serde_json::Value, salt: &[u8; 16]) -> 
 /// Panics if the JSON value contains a float that cannot be represented
 /// (NaN or Infinity). Per RFC 8785, these are not valid JSON.
 #[inline]
+// RFC 8785 canonicalization can only fail on NaN/Infinity, which serde_json
+// cannot represent in a `Value`; unreachable by construction, not an
+// input-dependent panic.
+#[allow(clippy::expect_used)]
 pub fn canonicalize_json(value: &serde_json::Value) -> String {
     serde_json_canonicalizer::to_string(value)
         .expect("Failed to canonicalize JSON - contains invalid values (NaN or Infinity)")
@@ -448,6 +456,10 @@ pub fn compute_ves_compliance_policy_hash(
 /// Compute SHA-256 hash of canonical JSON (legacy, no domain prefix)
 /// Use payload_plain_hash() for VES-compliant hashing
 #[inline]
+// RFC 8785 canonicalization can only fail on NaN/Infinity, which serde_json
+// cannot represent in a `Value`; unreachable by construction, not an
+// input-dependent panic.
+#[allow(clippy::expect_used)]
 pub fn canonical_json_hash(value: &serde_json::Value) -> Hash256 {
     // Serialize to Vec then hash in one call. Since serde_json::Map uses
     // BTreeMap (keys already sorted), serde_json::to_vec produces output

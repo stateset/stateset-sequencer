@@ -306,8 +306,12 @@ pub async fn submit_ves_compliance_proof(
     // (and much cheaper than) full proof verification, so it runs even when
     // verify-on-submit is disabled.
     let amount_binding_check: Option<AmountBindingCheck> = if is_stark {
-        let commitment_u64 =
-            witness_commitment_bytes_to_u64(&witness_commitment.expect("checked above for STARK"));
+        let Some(wc) = witness_commitment.as_ref() else {
+            return Err(internal_error(
+                "STARK proof reached binding without a witness commitment",
+            ));
+        };
+        let commitment_u64 = witness_commitment_bytes_to_u64(wc);
         let check = check_payload_amount_binding(
             &inputs,
             &commitment_u64,
@@ -341,8 +345,12 @@ pub async fn submit_ves_compliance_proof(
                     format!("Invalid canonical public inputs (bug): {e}"),
                 )
             })?;
-        let commitment_u64 =
-            witness_commitment_bytes_to_u64(&witness_commitment.expect("checked above for STARK"));
+        let Some(wc) = witness_commitment.as_ref() else {
+            return Err(internal_error(
+                "STARK proof reached binding without a witness commitment",
+            ));
+        };
+        let commitment_u64 = witness_commitment_bytes_to_u64(wc);
         let proof_bytes = proof.clone();
 
         let _permit = tokio::time::timeout(
@@ -637,7 +645,11 @@ pub async fn verify_ves_compliance_proof(
             let public_inputs: ves_stark_primitives::public_inputs::CompliancePublicInputs =
                 serde_json::from_value(canonical_public_inputs.clone())
                     .map_err(|e| internal_error(format!("invalid canonical public inputs: {e}")))?;
-            let commitment_u64 = witness_commitment_u64.expect("checked witness_commitment above");
+            let Some(commitment_u64) = witness_commitment_u64 else {
+                return Err(internal_error(
+                    "STARK proof reached verification without a witness commitment",
+                ));
+            };
             let proof_bytes = proof.proof.clone();
 
             let permit_res = tokio::time::timeout(

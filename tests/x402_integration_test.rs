@@ -468,11 +468,20 @@ mod integration {
         let database_url =
             std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for integration tests");
 
-        PgPoolOptions::new()
+        let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect(&database_url)
             .await
-            .expect("Failed to connect to database")
+            .expect("Failed to connect to database");
+
+        // Idempotent. This suite used to assume some *other* test binary had
+        // already migrated the database, and failed with "relation does not
+        // exist" when run on its own or first -- an ordering dependency between
+        // test binaries that cargo does not guarantee.
+        stateset_sequencer::migrations::run_postgres(&pool)
+            .await
+            .expect("failed to run migrations");
+        pool
     }
 
     #[tokio::test]
@@ -686,6 +695,60 @@ mod integration {
         let after = repo.get_intent(intent.intent_id).await.unwrap().unwrap();
         assert_eq!(after.status, X402IntentStatus::Sequenced);
         assert_eq!(after.batch_id, None);
+    }
+
+    /// Recording a settlement twice (worker retry after a crash between the
+    /// on-chain send and the local write, or a leader failover mid-tick) must be
+    /// a no-op success, never an error and never a second state change.
+    #[tokio::test]
+    async fn test_recording_settlement_twice_is_idempotent() {
+        let pool = get_test_pool().await;
+        let repo = Arc::new(PgX402Repository::new(pool));
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+        let intent = create_test_intent(
+            &signing_key,
+            tenant_id.clone(),
+            store_id.clone(),
+            "0x0000000000000000000000000000000000000def",
+            1_000_000,
+        );
+        repo.insert_intent(&intent).await.unwrap();
+        repo.assign_sequence_number(intent.intent_id, &tenant_id, &store_id)
+            .await
+            .unwrap();
+
+        let batch =
+            X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
+        repo.insert_batch(&batch).await.unwrap();
+        repo.commit_batch_with_merkle(batch.batch_id, &[intent.intent_id], &tenant_id, &store_id)
+            .await
+            .unwrap();
+
+        repo.settle_batch_with_results(batch.batch_id, "0xabc", 100, Some(21_000), &[])
+            .await
+            .expect("first record succeeds");
+        let first = repo.get_batch(batch.batch_id).await.unwrap().unwrap();
+
+        // Retry with a *different* tx hash / block: must not overwrite.
+        repo.settle_batch_with_results(batch.batch_id, "0xdef", 200, Some(1), &[])
+            .await
+            .expect("second record is an idempotent success");
+        let second = repo.get_batch(batch.batch_id).await.unwrap().unwrap();
+
+        assert_eq!(
+            second.status,
+            stateset_sequencer::domain::X402BatchStatus::Settled
+        );
+        assert_eq!(
+            second.tx_hash, first.tx_hash,
+            "retry must not overwrite the recorded tx hash"
+        );
+        assert_eq!(second.block_number, first.block_number);
+        let settled_intent = repo.get_intent(intent.intent_id).await.unwrap().unwrap();
+        assert_eq!(settled_intent.status, X402IntentStatus::Settled);
     }
 
     #[tokio::test]

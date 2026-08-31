@@ -412,6 +412,8 @@ impl PgEventStore {
         start: u64,
         end: u64,
     ) -> Result<Vec<SequencedEvent>> {
+        crate::infra::ensure_read_range_span(start, end)?;
+
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT event_id, command_id, sequence_number,

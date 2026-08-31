@@ -226,13 +226,16 @@ fn parse_hex_to_u64_array(
 }
 
 fn uuid_to_felts(id: &Uuid) -> [Felt; 4] {
-    let bytes = id.as_bytes();
-    [
-        felt_from_u64(u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as u64),
-        felt_from_u64(u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as u64),
-        felt_from_u64(u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as u64),
-        felt_from_u64(u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as u64),
-    ]
+    let b = id.as_bytes();
+    let limb = |i: usize| {
+        felt_from_u64(u64::from(u32::from_le_bytes([
+            b[i],
+            b[i + 1],
+            b[i + 2],
+            b[i + 3],
+        ])))
+    };
+    [limb(0), limb(4), limb(8), limb(12)]
 }
 
 fn parse_batch_public_inputs(
@@ -481,12 +484,12 @@ pub async fn submit_ves_validity_proof(
     // claimed policy against the stored event payloads wherever they are
     // recoverable. Runs even when verify-on-submit is disabled.
     let amount_recheck = if is_stark {
-        recheck_batch_amounts(
-            &state,
-            &commitment,
-            public_inputs.as_ref().expect("public inputs set above"),
-        )
-        .await?
+        let Some(public_inputs) = public_inputs.as_ref() else {
+            return Err(internal_error(
+                "STARK validity proof reached amount recheck without public inputs",
+            ));
+        };
+        recheck_batch_amounts(&state, &commitment, public_inputs).await?
     } else {
         None
     };

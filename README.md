@@ -1,17 +1,14 @@
 # StateSet Sequencer
 
-![Rust](https://img.shields.io/badge/rust-stable-orange.svg)
+![Rust](https://img.shields.io/badge/rust-1.90%2B-orange.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![codecov](https://codecov.io/gh/stateset/stateset-sequencer/branch/master/graph/badge.svg)
 
-Built and tested on current Rust **stable** (1.90 at time of writing). CI runs
-`cargo fmt`, `clippy -D warnings`, the full test suite against PostgreSQL,
-`cargo audit` and `cargo deny` on every push.
-
-> No minimum supported Rust version is verified in CI. This README previously
-> advertised 1.70, which is no longer accurate — the code uses APIs stabilized
-> well after it. Treat "current stable" as the requirement until an MSRV is
-> pinned in `Cargo.toml` and enforced by a build job.
+**Minimum supported Rust version: 1.90**, declared as `rust-version` in
+`Cargo.toml` and enforced by a CI job that builds the default feature set on
+exactly that toolchain. The floor is set by the `ves-stark-*` crates, which
+require 1.90. CI also runs `cargo fmt`, `clippy -D warnings`, the full test
+suite against PostgreSQL, `cargo audit` and `cargo deny` on every push.
 
 Verifiable Event Sync (VES) v1.0 service for deterministic event ordering, state projection, cryptographic commitments, and zero-knowledge compliance proofs.
 

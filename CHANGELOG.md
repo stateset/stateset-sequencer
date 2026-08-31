@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Settlement idempotency is now proven, not asserted.** A new on-chain test drives `SettlementService::settle_batch` twice for the same batch against a local EVM: the first call sends the transaction, the second finds `getBatch(id).settledAt != 0` and returns `already_settled` with a zero tx hash and no transaction. This is the crash-between-send-and-record / leader-failover case the code documented as safe; it is now exercised. A companion database test shows `settle_batch_with_results` called twice with different tx data is an idempotent no-op that never overwrites the first record.
+- **Structural source checks** (`tests/source_invariants_test.rs`): every `fetch_all` in the PostgreSQL layer must have a `LIMIT` in its query, or a reviewed exemption with a stated reason. This encodes the entity-history defect class so a reviewer does not have to remember to look for it.
+- **`#![deny(clippy::unwrap_used, clippy::expect_used)]` on the library** for non-test builds. The only remaining `expect` calls are the three RFC 8785 canonicalization sites, each carrying an `allow` with the reason they are unreachable; every other "checked above" `expect`/`unwrap` was converted to a proper error path.
+- **Scrape-health alerts** in `monitoring/prometheus_rules.yaml`: `SequencerScrapeDown`, `SequencerScrapeSeriesMissing` and `SequencerMetricsCardinalityOverflow`. `/metrics` was unparseable for every real deployment until 0.3.1 and nothing noticed, because missing series looked like a quiet service; these make the absence of data itself an alert.
+- **Minimum supported Rust version declared and enforced.** `rust-version = "1.90"` in `Cargo.toml`, with a CI job that builds `--all-targets --locked` on exactly that toolchain. The floor is set by the `ves-stark-*` crates, which require 1.90.
+- **Admin CLI smoke tests** (`tests/admin_cli_test.rs`): `--help` lists every command, `version` prints the crate version, an unknown command exits non-zero with guidance, and per-command help works. These run without a database.
+
+### Fixed
+
+- **Cache miss/refresh locks could leak forever.** A request future dropped mid-fetch (client disconnected) never released its stampede lock, so every later miss on that key paid the stampede delay for the life of the process and the lock set grew by one entry per abandonment. Locks now carry an acquisition time and one older than `DEFAULT_MISS_LOCK_TTL` (10s) is treated as abandoned and taken over.
+- **`read_by_type` is now span-capped** like the other range readers.
+- **x402 integration tests no longer depend on another test binary having migrated the database first.** The harness runs migrations itself (idempotently); previously the suite failed with "relation does not exist" when run alone or first, an ordering dependency cargo does not guarantee.
+
+### Changed
+
+- **`admin.rs::main()` reduced from ~1,500 lines to ~50.** Each subcommand's body is now its own `cmd_*` function; behaviour is unchanged and covered by the new smoke tests.
+
 ## [0.4.0] - 2026-08-30
 
 ### Fixed

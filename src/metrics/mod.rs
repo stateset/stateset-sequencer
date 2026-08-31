@@ -152,9 +152,10 @@ fn merge_series<'a, T>(
 
     order
         .into_iter()
-        .map(|key| {
-            let (plain, labeled) = grouped.remove(&key).expect("key came from order");
-            (key, plain, labeled)
+        .filter_map(|key| {
+            grouped
+                .remove(&key)
+                .map(|(plain, labeled)| (key, plain, labeled))
         })
         .collect()
 }

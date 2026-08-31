@@ -1,3 +1,7 @@
+// Production code must not panic on `unwrap`/`expect`; every such site is a
+// latent crash on an input path. Tests are exempt.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 //! StateSet Sequencer Library
 //!
 //! Verifiable Event Sync (VES) service for deterministic event ordering,

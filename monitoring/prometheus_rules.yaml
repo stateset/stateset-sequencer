@@ -60,3 +60,46 @@ groups:
         annotations:
           summary: "Sequencer DB acquisition timeouts detected"
           description: "Pool contention or database saturation is causing timeouts."
+
+  # ---------------------------------------------------------------------------
+  # Scrape health. /metrics was silently unparseable for every real deployment
+  # until v0.3.1 and nothing noticed, because the absence of series looked like
+  # a healthy quiet service. These rules make "no data" itself an alert.
+  # ---------------------------------------------------------------------------
+  - name: stateset-sequencer.scrape
+    rules:
+      - alert: SequencerScrapeDown
+        expr: up{job="stateset-sequencer"} == 0
+        for: 3m
+        labels:
+          severity: page
+        annotations:
+          summary: "Prometheus cannot scrape the sequencer (3m)"
+          description: >-
+            Either the target is down or /metrics returned an unparseable
+            exposition (a single malformed line fails the whole scrape).
+            Check `curl -s $SEQ/metrics | promtool check metrics` before assuming
+            the service itself is unhealthy.
+
+      - alert: SequencerScrapeSeriesMissing
+        expr: absent_over_time(sequencer_uptime_seconds{job="stateset-sequencer"}[10m])
+        for: 0m
+        labels:
+          severity: page
+        annotations:
+          summary: "No sequencer metrics received for 10m"
+          description: >-
+            The scrape may be succeeding at the transport level while the body
+            is rejected, or the job label changed. Treat as an outage of
+            observability, not as a quiet service.
+
+      - alert: SequencerMetricsCardinalityOverflow
+        expr: increase(sequencer_metrics_cardinality_overflow[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sequencer dropped label sets due to the cardinality cap"
+          description: >-
+            Some series are being folded into the overflow bucket, so per-route
+            metrics are degraded. Look for a label with unbounded values.

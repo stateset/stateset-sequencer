@@ -511,8 +511,11 @@ impl IngestService for PgSequencer {
         }
 
         let batch_id = Uuid::new_v4();
-        let (tenant_id, store_id) = Self::validate_single_stream(&batch.events)?
-            .expect("non-empty batch already handled above");
+        let Some((tenant_id, store_id)) = Self::validate_single_stream(&batch.events)? else {
+            return Err(SequencerError::Internal(
+                "empty batch reached sequencing after the emptiness check".into(),
+            ));
+        };
         let batch_agent_id = batch.agent_id;
 
         let mut tx = self.pool.begin().await?;
