@@ -24,7 +24,7 @@ pub async fn run_postgres(pool: &PgPool) -> anyhow::Result<()> {
 /// at once -- parallel test binaries, or multiple nodes racing on first boot
 /// -- hit this. Losing that race means the extension exists, which is the
 /// outcome we wanted; treat it as success.
-pub(crate) async fn create_pgcrypto(pool: &PgPool) -> anyhow::Result<()> {
+pub(crate) async fn create_pgcrypto(pool: &PgPool) -> Result<(), sqlx::Error> {
     if let Err(e) = sqlx::query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         .execute(pool)
         .await
@@ -35,7 +35,7 @@ pub(crate) async fn create_pgcrypto(pool: &PgPool) -> anyhow::Result<()> {
             .map(|c| c == "23505" || c == "42710")
             .unwrap_or(false);
         if !benign {
-            return Err(e.into());
+            return Err(e);
         }
     }
     Ok(())
