@@ -339,6 +339,109 @@ async fn postgres_ves_read_range_reports_gap_when_window_is_empty() {
     assert!(empty.is_empty());
 }
 
+/// VES entity history is paged in SQL with a repository-enforced cap; see the
+/// legacy-store counterpart in postgres_persistence_test.rs for the rationale.
+#[tokio::test]
+#[ignore]
+async fn postgres_ves_read_entity_page_bounds_rows_and_reports_total() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let source_agent_id = Uuid::new_v4();
+    let created_at = chrono::Utc::now();
+    let created_at_str = created_at.to_rfc3339();
+    let payload = json!({ "kind": "ves-page" });
+
+    // Five events on one entity, one on another, contiguous sequence numbers.
+    for seq in 1_i64..=6 {
+        let entity = if seq <= 5 { "ord-paged" } else { "ord-other" };
+        sqlx::query(
+            r#"
+            INSERT INTO ves_events (
+                event_id, command_id, ves_version, tenant_id, store_id, source_agent_id,
+                agent_key_id, entity_type, entity_id, event_type, created_at, created_at_str,
+                payload_kind, payload, payload_encrypted, payload_plain_hash, payload_cipher_hash,
+                event_signing_hash, agent_signature, sequence_number, base_version
+            ) VALUES (
+                $1,NULL,1,$2,$3,$4,1,'order',$5,'order.created',$6,$7,0,$8,NULL,$9,$10,$11,$12,$13,NULL
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(source_agent_id)
+        .bind(entity)
+        .bind(created_at)
+        .bind(&created_at_str)
+        .bind(&payload)
+        .bind(vec![seq as u8; 32])
+        .bind(vec![0u8; 32])
+        .bind(vec![seq as u8; 32])
+        .bind(vec![seq as u8; 64])
+        .bind(seq)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    let ves = VesSequencer::new(pool.clone(), registry);
+    let order = stateset_sequencer::domain::EntityType::order();
+
+    let page = ves
+        .read_entity_page(&tenant_id, &store_id, &order, "ord-paged", 1, 2)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 5);
+    let seqs: Vec<u64> = page.events.iter().map(|e| e.sequence_number()).collect();
+    assert_eq!(seqs, vec![2, 3]);
+
+    let past_end = ves
+        .read_entity_page(&tenant_id, &store_id, &order, "ord-paged", 9, 2)
+        .await
+        .unwrap();
+    assert_eq!(past_end.total, 5);
+    assert!(past_end.events.is_empty());
+
+    let clamped = ves
+        .read_entity_page(&tenant_id, &store_id, &order, "ord-paged", 0, u32::MAX)
+        .await
+        .unwrap();
+    assert_eq!(clamped.events.len(), 5);
+}
+
+#[tokio::test]
+#[ignore]
+async fn postgres_ves_read_range_rejects_oversized_span() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    let ves = VesSequencer::new(pool, registry);
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let max = stateset_sequencer::domain::MAX_READ_RANGE_SPAN;
+
+    let err = ves
+        .read_range(&tenant_id, &store_id, 1, max + 1)
+        .await
+        .expect_err("a span of MAX_READ_RANGE_SPAN + 1 must be rejected");
+    assert!(err.to_string().contains("span"), "got: {err}");
+}
+
 #[tokio::test]
 #[ignore]
 async fn postgres_sequencer_scopes_sequences_by_tenant_and_store() {

@@ -1871,6 +1871,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         if start > end || end == 0 {
             return Ok(Vec::new());
         }
+        crate::infra::ensure_read_range_span(start, end)?;
 
         let rows: Vec<VesEventRow> = sqlx::query_as(
             r#"
@@ -1928,13 +1929,44 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     }
 
     /// Read events for a specific entity (ordered by sequence).
-    pub async fn read_entity(
+    /// Read one page of an entity's history plus its total event count.
+    ///
+    /// Paged in SQL with the limit clamped to `MAX_ENTITY_HISTORY_PAGE`; there
+    /// is no unpaged variant, so an entity's full history can never be loaded
+    /// into memory in one call.
+    pub async fn read_entity_page(
         &self,
         tenant_id: &TenantId,
         store_id: &StoreId,
         entity_type: &EntityType,
         entity_id: &str,
-    ) -> Result<Vec<SequencedVesEvent>> {
+        offset: u64,
+        limit: u32,
+    ) -> Result<crate::domain::EntityHistoryPage<SequencedVesEvent>> {
+        let (total,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM ves_events
+            WHERE tenant_id = $1 AND store_id = $2
+              AND entity_type = $3 AND entity_id = $4
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(entity_type.as_str())
+        .bind(entity_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let total = u64::try_from(total).unwrap_or(0);
+
+        let limit = crate::infra::clamp_entity_history_limit(limit);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        if limit == 0 || offset as u64 >= total {
+            return Ok(crate::domain::EntityHistoryPage {
+                events: Vec::new(),
+                total,
+            });
+        }
+
         let rows: Vec<VesEventRow> = sqlx::query_as(
             r#"
             SELECT
@@ -1952,12 +1984,15 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             WHERE tenant_id = $1 AND store_id = $2
               AND entity_type = $3 AND entity_id = $4
             ORDER BY sequence_number ASC
+            LIMIT $5 OFFSET $6
             "#,
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
         .bind(entity_type.as_str())
         .bind(entity_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
@@ -1966,7 +2001,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             events.push(Self::decode_event_row(row)?);
         }
 
-        Ok(events)
+        Ok(crate::domain::EntityHistoryPage { events, total })
     }
 
     /// Read a single event by ID.

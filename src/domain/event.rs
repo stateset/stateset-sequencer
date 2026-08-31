@@ -171,6 +171,31 @@ impl EventEnvelope {
 }
 
 /// Event with assigned sequence number from sequencer
+/// Largest page of entity history a repository will return in one call.
+///
+/// Enforced in the repository, not only at the API edge: a caller that forgets
+/// to cap its request must still be unable to pull an entity's entire history
+/// into memory in one query.
+pub const MAX_ENTITY_HISTORY_PAGE: u32 = 100;
+
+/// Largest `end - start + 1` a `read_range` call will serve.
+///
+/// Every HTTP and gRPC caller already caps the span at this value; the
+/// repository enforces it too so one new call site cannot reopen an unbounded
+/// read of the log.
+pub const MAX_READ_RANGE_SPAN: u64 = 1000;
+
+/// One page of an entity's history plus the entity's total event count, so a
+/// caller can report `has_more` / `current_version` without a second query
+/// and without ever materialising the full history.
+#[derive(Debug, Clone)]
+pub struct EntityHistoryPage<T> {
+    /// Events in ascending sequence order, at most `MAX_ENTITY_HISTORY_PAGE`.
+    pub events: Vec<T>,
+    /// Total events recorded for the entity, independent of paging.
+    pub total: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SequencedEvent {
     /// The event envelope (includes assigned sequence_number)

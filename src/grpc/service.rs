@@ -72,7 +72,7 @@ const MAX_GRPC_BATCH_SIZE: usize = 1000;
 /// Mirrors the HTTP handler (`api::handlers::events`) and the v2 gRPC service so
 /// the v1 path cannot be coerced into materializing and serializing an entire
 /// multi-million-event entity history into one response.
-const MAX_ENTITY_HISTORY: usize = 100;
+const MAX_ENTITY_HISTORY: usize = crate::domain::MAX_ENTITY_HISTORY_PAGE as usize;
 
 /// gRPC Sequencer service implementation
 pub struct SequencerService {
@@ -1052,64 +1052,55 @@ impl SequencerTrait for SequencerService {
         Self::require_read(&auth_ctx)?;
         Self::authorize_tenant_store(&auth_ctx, &tenant_id, &store_id)?;
 
-        let events = self
-            .event_store
-            .read_entity(&tenant_id, &store_id, &entity_type, &req.entity_id)
-            .await
-            .map_err(super::grpc_internal_error)?;
-
-        let current_version = events.len() as u64;
         let requested_from_version = if req.from_version == 0 {
             1
         } else {
             req.from_version
         };
-        let requested_to_version = if req.to_version == 0 {
-            current_version
-        } else {
-            req.to_version
-        };
 
-        // Validate the requested range *before* the empty-result shortcut below:
-        // a from > to range is malformed input and must be rejected regardless
-        // of the entity's current version (otherwise a from_version beyond
-        // current_version masks the invalid range as an empty Ok result).
+        // Validate the requested range *before* touching the store: a from > to
+        // range is malformed input and must be rejected regardless of the
+        // entity's current version.
         if req.to_version != 0 && requested_from_version > req.to_version {
             return Err(Status::invalid_argument(
                 "from_version must be less than or equal to to_version",
             ));
         }
 
-        if current_version == 0 || requested_from_version > current_version {
-            return Ok(Response::new(GetEntityHistoryResponse {
-                events: Vec::new(),
-                current_version,
-            }));
-        }
+        // Versions are 1-based ordinals in sequence order, so the page starts at
+        // index from_version - 1. The window is capped at MAX_ENTITY_HISTORY and
+        // paged in SQL: the store never loads more than one page, so a hot
+        // entity's full history cannot be pulled into memory by one request.
+        let span = if req.to_version == 0 {
+            MAX_ENTITY_HISTORY as u64
+        } else {
+            req.to_version
+                .saturating_sub(requested_from_version)
+                .saturating_add(1)
+        };
+        let limit = span.min(MAX_ENTITY_HISTORY as u64) as u32;
 
-        let to_version = requested_to_version.min(current_version);
+        let page = self
+            .event_store
+            .read_entity_page(
+                &tenant_id,
+                &store_id,
+                &entity_type,
+                &req.entity_id,
+                requested_from_version - 1,
+                limit,
+            )
+            .await
+            .map_err(super::grpc_internal_error)?;
 
-        // Cap the response window at MAX_ENTITY_HISTORY, matching the HTTP and v2
-        // gRPC paths. Without this an authenticated reader could request the full
-        // version range of a hot entity and force the whole history to be
-        // serialized into a single response.
-        let take_count = to_version
-            .saturating_sub(requested_from_version)
-            .saturating_add(1)
-            .min(MAX_ENTITY_HISTORY as u64) as usize;
-        let start_index = usize::try_from(requested_from_version - 1)
-            .map_err(|_| Status::invalid_argument("from_version is out of range"))?;
-
-        let proto_events: Vec<SequencedEvent> = events
-            .into_iter()
-            .skip(start_index)
-            .take(take_count)
-            .map(|event| Self::to_proto_event(&event))
-            .collect();
+        // A from_version beyond the current version yields an empty page with
+        // the true current_version, exactly as before.
+        let proto_events: Vec<SequencedEvent> =
+            page.events.iter().map(Self::to_proto_event).collect();
 
         Ok(Response::new(GetEntityHistoryResponse {
             events: proto_events,
-            current_version,
+            current_version: page.total,
         }))
     }
 }

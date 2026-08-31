@@ -8,6 +8,7 @@ use sqlx::{postgres::PgPool, FromRow};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::domain::EntityHistoryPage;
 use crate::domain::{
     AgentId, EntityType, EventEnvelope, EventType, Hash256, SequencedEvent, StoreId, TenantId,
 };
@@ -242,6 +243,7 @@ impl EventStore for PgEventStore {
         if start > end || end == 0 {
             return Ok(Vec::new());
         }
+        crate::infra::ensure_read_range_span(start, end)?;
 
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
@@ -293,13 +295,39 @@ impl EventStore for PgEventStore {
         Ok(events)
     }
 
-    async fn read_entity(
+    async fn read_entity_page(
         &self,
         tenant_id: &TenantId,
         store_id: &StoreId,
         entity_type: &EntityType,
         entity_id: &str,
-    ) -> Result<Vec<SequencedEvent>> {
+        offset: u64,
+        limit: u32,
+    ) -> Result<EntityHistoryPage<SequencedEvent>> {
+        let (total,): (i64,) = sqlx::query_as(
+            r#"
+            SELECT COUNT(*) FROM events
+            WHERE tenant_id = $1 AND store_id = $2
+              AND entity_type = $3 AND entity_id = $4
+            "#,
+        )
+        .bind(tenant_id.0)
+        .bind(store_id.0)
+        .bind(entity_type.as_str())
+        .bind(entity_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let total = u64::try_from(total).unwrap_or(0);
+
+        let limit = crate::infra::clamp_entity_history_limit(limit);
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        if limit == 0 || offset as u64 >= total {
+            return Ok(EntityHistoryPage {
+                events: Vec::new(),
+                total,
+            });
+        }
+
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT event_id, command_id, sequence_number,
@@ -312,12 +340,15 @@ impl EventStore for PgEventStore {
             WHERE tenant_id = $1 AND store_id = $2
               AND entity_type = $3 AND entity_id = $4
             ORDER BY sequence_number ASC
+            LIMIT $5 OFFSET $6
             "#,
         )
         .bind(tenant_id.0)
         .bind(store_id.0)
         .bind(entity_type.as_str())
         .bind(entity_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 
@@ -325,7 +356,7 @@ impl EventStore for PgEventStore {
         for row in rows {
             events.push(self.decode_row(row).await?);
         }
-        Ok(events)
+        Ok(EntityHistoryPage { events, total })
     }
 
     async fn read_by_id(&self, event_id: Uuid) -> Result<Option<SequencedEvent>> {

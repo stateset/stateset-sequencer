@@ -76,7 +76,7 @@ use crate::proto::v2::{
 /// Maximum events allowed in a single gRPC push request.
 const MAX_GRPC_BATCH_SIZE: usize = 1000;
 /// Maximum entity history events returned per request.
-const MAX_ENTITY_HISTORY: usize = 100;
+const MAX_ENTITY_HISTORY: usize = crate::domain::MAX_ENTITY_HISTORY_PAGE as usize;
 
 /// gRPC Sequencer v2 service implementation
 pub struct SequencerServiceV2 {
@@ -1474,66 +1474,55 @@ impl SequencerTrait for SequencerServiceV2 {
         Self::require_read(&auth_ctx)?;
         Self::authorize_tenant_store(&auth_ctx, &tenant_id, &store_id)?;
 
-        let events = self
-            .ves_sequencer_reader
-            .read_entity(&tenant_id, &store_id, &entity_type, &req.entity_id)
-            .await
-            .map_err(super::grpc_internal_error)?;
-
-        let current_version = events.len() as u64;
         let requested_from_version = if req.from_version == 0 {
             1
         } else {
             req.from_version
         };
-        let requested_to_version = if req.to_version == 0 {
-            current_version
-        } else {
-            req.to_version
-        };
 
-        // Validate the requested range *before* the empty-result shortcut below:
-        // a from > to range is malformed input and must be rejected regardless
-        // of the entity's current version (otherwise a from_version beyond
-        // current_version masks the invalid range as an empty Ok result).
-        if req.to_version != 0 && requested_from_version > requested_to_version {
+        // Validate the requested range *before* touching the store: a from > to
+        // range is malformed input and must be rejected regardless of the
+        // entity's current version.
+        if req.to_version != 0 && requested_from_version > req.to_version {
             return Err(Status::invalid_argument(
                 "from_version must be less than or equal to to_version",
             ));
         }
 
-        if current_version == 0 || requested_from_version > current_version {
-            return Ok(Response::new(GetEntityHistoryResponse {
-                events: Vec::new(),
-                current_version,
-            }));
-        }
-
-        let to_version = requested_to_version.min(current_version);
-
+        // Versions are 1-based ordinals in sequence order, so the page starts at
+        // index from_version - 1. The window is the smaller of the requested
+        // version span, the requested limit, and MAX_ENTITY_HISTORY, and it is
+        // paged in SQL so a hot entity's full history is never materialised.
         let requested_limit = if req.limit == 0 {
-            MAX_ENTITY_HISTORY as u32
+            MAX_ENTITY_HISTORY as u64
         } else {
-            req.limit
+            u64::from(req.limit)
         };
-        let limit = (requested_limit as usize).min(MAX_ENTITY_HISTORY);
-        let max_records = to_version
-            .saturating_sub(requested_from_version)
-            .saturating_add(1);
-        let take_count = max_records.min(limit as u64) as usize;
-        let start_index = usize::try_from(requested_from_version - 1)
-            .map_err(|_| Status::invalid_argument("from_version is out of range"))?;
+        let span = if req.to_version == 0 {
+            MAX_ENTITY_HISTORY as u64
+        } else {
+            req.to_version
+                .saturating_sub(requested_from_version)
+                .saturating_add(1)
+        };
+        let limit = span.min(requested_limit).min(MAX_ENTITY_HISTORY as u64) as u32;
 
-        // Apply version range filter
-        let filtered_events: Vec<_> = events
-            .into_iter()
-            .enumerate()
-            .skip(start_index)
-            .take(take_count)
-            .map(|(_, e)| e)
-            .collect();
+        let page = self
+            .ves_sequencer_reader
+            .read_entity_page(
+                &tenant_id,
+                &store_id,
+                &entity_type,
+                &req.entity_id,
+                requested_from_version - 1,
+                limit,
+            )
+            .await
+            .map_err(super::grpc_internal_error)?;
+        let current_version = page.total;
 
-        let proto_events: Vec<SequencedEvent> = filtered_events
+        let proto_events: Vec<SequencedEvent> = page
+            .events
             .iter()
             .map(Self::to_proto_event)
             .collect::<Result<_, _>>()?;
@@ -2099,29 +2088,47 @@ impl SequencerTrait for SequencerServiceV2 {
         let include_history = req.include_history;
 
         tokio::spawn(async move {
-            // First, send historical events if requested
+            // First, replay history if requested. Streamed one page at a time
+            // so the replay is bounded in memory however long the entity's
+            // history is; the full history was previously loaded in one call.
             if include_history {
-                match ves_sequencer
-                    .read_entity(&tenant_id_cmp, &store_id_cmp, &entity_type, &entity_id)
-                    .await
-                {
-                    Ok(events) => {
-                        for event in &events {
-                            let proto_event = match SequencerServiceV2::to_proto_event(event) {
-                                Ok(proto_event) => proto_event,
-                                Err(e) => {
-                                    let _ = tx.send(Err(e)).await;
-                                    return;
-                                }
-                            };
-                            if tx.send(Ok(proto_event)).await.is_err() {
+                let mut offset = 0u64;
+                loop {
+                    let page = match ves_sequencer
+                        .read_entity_page(
+                            &tenant_id_cmp,
+                            &store_id_cmp,
+                            &entity_type,
+                            &entity_id,
+                            offset,
+                            MAX_ENTITY_HISTORY as u32,
+                        )
+                        .await
+                    {
+                        Ok(page) => page,
+                        Err(e) => {
+                            let _ = tx.send(Err(super::grpc_internal_error(e))).await;
+                            return;
+                        }
+                    };
+                    if page.events.is_empty() {
+                        break;
+                    }
+                    for event in &page.events {
+                        let proto_event = match SequencerServiceV2::to_proto_event(event) {
+                            Ok(proto_event) => proto_event,
+                            Err(e) => {
+                                let _ = tx.send(Err(e)).await;
                                 return;
                             }
+                        };
+                        if tx.send(Ok(proto_event)).await.is_err() {
+                            return;
                         }
                     }
-                    Err(e) => {
-                        let _ = tx.send(Err(super::grpc_internal_error(e))).await;
-                        return;
+                    offset = offset.saturating_add(page.events.len() as u64);
+                    if offset >= page.total {
+                        break;
                     }
                 }
             }

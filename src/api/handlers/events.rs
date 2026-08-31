@@ -25,7 +25,7 @@ fn map_read_range_error(err: SequencerError) -> (StatusCode, String) {
 }
 
 /// Hard max for entity history results to prevent unbounded responses.
-const MAX_ENTITY_HISTORY: usize = 100;
+const MAX_ENTITY_HISTORY: usize = crate::domain::MAX_ENTITY_HISTORY_PAGE as usize;
 /// Maximum length for entity_type path parameter.
 const MAX_ENTITY_TYPE_LEN: usize = 128;
 /// Maximum length for entity_id path parameter.
@@ -148,13 +148,7 @@ pub async fn get_entity_history(
     let tenant_id = TenantId::from_uuid(query.tenant_id);
     let store_id = StoreId::from_uuid(query.store_id);
     let entity_type = EntityType::from(entity_type.as_str());
-    let offset_u64 = query.from.unwrap_or(0);
-    let offset = usize::try_from(offset_u64).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "from offset exceeds platform limit".to_string(),
-        )
-    })?;
+    let offset = query.from.unwrap_or(0);
     let requested_limit = query.limit.unwrap_or(MAX_ENTITY_HISTORY as u32);
     let limit = if requested_limit == 0 {
         MAX_ENTITY_HISTORY as u32
@@ -165,22 +159,29 @@ pub async fn get_entity_history(
 
     ensure_read(&auth, tenant_id.0, store_id.0)?;
 
+    // Paged in SQL: the repository never materialises more than one page, so a
+    // hot entity's full history cannot be pulled into memory by one request.
     match state
         .event_store
-        .read_entity(&tenant_id, &store_id, &entity_type, &entity_id)
+        .read_entity_page(
+            &tenant_id,
+            &store_id,
+            &entity_type,
+            &entity_id,
+            offset,
+            limit as u32,
+        )
         .await
     {
-        Ok(events) => {
-            let total = events.len();
-            let page: Vec<_> = events.into_iter().skip(offset).take(limit).collect();
-            let count = page.len();
-            let has_more = offset.saturating_add(count) < total;
+        Ok(page) => {
+            let count = page.events.len();
+            let has_more = offset.saturating_add(count as u64) < page.total;
             Ok(Json(serde_json::json!({
                 "entity_type": entity_type.as_str(),
                 "entity_id": entity_id,
-                "events": page,
+                "events": page.events,
                 "count": count,
-                "total": total,
+                "total": page.total,
                 "has_more": has_more,
             })))
         }

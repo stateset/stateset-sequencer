@@ -524,14 +524,144 @@ async fn test_event_store_read_entity() {
         .unwrap();
 
     // Query entity history
-    let entity_events = event_store
-        .read_entity(&tenant_id, &store_id, &EntityType::order(), target_entity)
+    let page = event_store
+        .read_entity_page(
+            &tenant_id,
+            &store_id,
+            &EntityType::order(),
+            target_entity,
+            0,
+            100,
+        )
         .await
         .unwrap();
 
-    assert_eq!(entity_events.len(), 3);
-    for event in &entity_events {
+    assert_eq!(page.total, 3);
+    assert_eq!(page.events.len(), 3);
+    for event in &page.events {
         assert_eq!(event.entity_id(), target_entity);
+    }
+}
+
+/// Entity history must be paged in SQL, not fetched whole and sliced in Rust.
+/// Before this, `read_entity` loaded every event an entity ever had into
+/// memory on each request and the handler's `limit` only trimmed the response,
+/// so a hot entity was an amplification vector for any authenticated reader.
+#[tokio::test]
+#[ignore]
+async fn test_event_store_read_entity_page_bounds_rows_and_reports_total() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let payload_encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), payload_encryption.clone());
+    let event_store = PgEventStore::new(pool.clone(), payload_encryption);
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let entity = "ord-paged";
+
+    let events: Vec<_> = (0..7)
+        .map(|i| {
+            EventEnvelope::new(
+                tenant_id.clone(),
+                store_id.clone(),
+                EntityType::order(),
+                entity.to_string(),
+                EventType::new("order.updated"),
+                json!({ "i": i }),
+                agent_id.clone(),
+            )
+        })
+        .collect();
+    sequencer
+        .ingest(EventBatch::new(agent_id, events))
+        .await
+        .unwrap();
+
+    // A middle page: rows 3..=5 of 7, in sequence order.
+    let page = event_store
+        .read_entity_page(&tenant_id, &store_id, &EntityType::order(), entity, 2, 3)
+        .await
+        .unwrap();
+    assert_eq!(page.total, 7);
+    assert_eq!(page.events.len(), 3);
+    let seqs: Vec<u64> = page.events.iter().map(|e| e.sequence_number()).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "page must be in sequence order: {seqs:?}"
+    );
+
+    // Beyond the end: empty page, but the total is still reported.
+    let past_end = event_store
+        .read_entity_page(&tenant_id, &store_id, &EntityType::order(), entity, 10, 3)
+        .await
+        .unwrap();
+    assert_eq!(past_end.total, 7);
+    assert!(past_end.events.is_empty());
+
+    // The repository clamps oversized limits itself; it does not trust callers.
+    let clamped = event_store
+        .read_entity_page(
+            &tenant_id,
+            &store_id,
+            &EntityType::order(),
+            entity,
+            0,
+            u32::MAX,
+        )
+        .await
+        .unwrap();
+    assert!(
+        clamped.events.len() <= stateset_sequencer::domain::MAX_ENTITY_HISTORY_PAGE as usize,
+        "limit must be clamped to MAX_ENTITY_HISTORY_PAGE"
+    );
+    assert_eq!(clamped.events.len(), 7);
+}
+
+/// `read_range` is bounded at the repository, not just by caller discipline.
+/// Every HTTP/gRPC caller happens to cap the span at 1000 today, but a single
+/// new call site that forgot would let a reader pull an unbounded slice of the
+/// log in one query.
+#[tokio::test]
+#[ignore]
+async fn test_event_store_read_range_rejects_oversized_span() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let event_store = PgEventStore::new(pool, Arc::new(PayloadEncryption::disabled()));
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let max = stateset_sequencer::domain::MAX_READ_RANGE_SPAN;
+
+    let err = event_store
+        .read_range(&tenant_id, &store_id, 1, max + 1)
+        .await
+        .expect_err("a span of MAX_READ_RANGE_SPAN + 1 must be rejected");
+    assert!(
+        err.to_string().contains("span"),
+        "rejection should name the span limit, got: {err}"
+    );
+
+    // Exactly the maximum span is permitted (it may still legitimately report a
+    // gap or return nothing on an empty store; it must not be a span error).
+    match event_store.read_range(&tenant_id, &store_id, 1, max).await {
+        Ok(_) => {}
+        Err(e) => assert!(
+            !e.to_string().contains("span"),
+            "max span must be allowed: {e}"
+        ),
     }
 }
 

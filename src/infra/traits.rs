@@ -6,12 +6,32 @@ use mockall::automock;
 use uuid::Uuid;
 
 use crate::domain::{
-    AgentId, BatchCommitment, EntityType, EventBatch, EventEnvelope, EventType, Hash256,
-    IngestReceipt, MerkleProof, ProjectionResult, Schema, SchemaId, SchemaValidationResult,
-    SequencedEvent, StoreId, SyncState, TenantId,
+    AgentId, BatchCommitment, EntityHistoryPage, EntityType, EventBatch, EventEnvelope, EventType,
+    Hash256, IngestReceipt, MerkleProof, ProjectionResult, Schema, SchemaId,
+    SchemaValidationResult, SequencedEvent, StoreId, SyncState, TenantId, MAX_ENTITY_HISTORY_PAGE,
+    MAX_READ_RANGE_SPAN,
 };
 
-use super::Result;
+use super::{Result, SequencerError};
+
+/// Reject a `read_range` span wider than [`MAX_READ_RANGE_SPAN`].
+///
+/// Call after the caller's own empty/normalised-range shortcuts, so a
+/// legitimately empty request is never reported as oversized.
+pub fn ensure_read_range_span(start: u64, end: u64) -> Result<()> {
+    let span = end.saturating_sub(start).saturating_add(1);
+    if span > MAX_READ_RANGE_SPAN {
+        return Err(SequencerError::SchemaValidation(format!(
+            "read_range span {span} exceeds the maximum of {MAX_READ_RANGE_SPAN} events"
+        )));
+    }
+    Ok(())
+}
+
+/// Clamp a caller-supplied entity-history page size to [`MAX_ENTITY_HISTORY_PAGE`].
+pub fn clamp_entity_history_limit(limit: u32) -> i64 {
+    i64::from(limit.min(MAX_ENTITY_HISTORY_PAGE))
+}
 
 /// Ingest service accepts events from CLI agents and production writers.
 ///
@@ -65,14 +85,22 @@ pub trait EventStore: Send + Sync {
         end: u64,
     ) -> Result<Vec<SequencedEvent>>;
 
-    /// Read all events for a specific entity
-    async fn read_entity(
+    /// Read one page of an entity's history, in ascending sequence order,
+    /// together with the entity's total event count.
+    ///
+    /// `offset` is a zero-based event index; `limit` is clamped to
+    /// [`MAX_ENTITY_HISTORY_PAGE`] by the implementation. There is deliberately
+    /// no unpaged variant: an entity's full history must never be loaded into
+    /// memory in a single call.
+    async fn read_entity_page(
         &self,
         tenant_id: &TenantId,
         store_id: &StoreId,
         entity_type: &EntityType,
         entity_id: &str,
-    ) -> Result<Vec<SequencedEvent>>;
+        offset: u64,
+        limit: u32,
+    ) -> Result<EntityHistoryPage<SequencedEvent>>;
 
     /// Read event by ID
     async fn read_by_id(&self, event_id: Uuid) -> Result<Option<SequencedEvent>>;
