@@ -1707,27 +1707,35 @@ fn load_ves_sequencer_id(secrets: &dyn SecretsProvider) -> anyhow::Result<Option
 
 /// Initialize OpenTelemetry tracer with OTLP exporter
 fn init_opentelemetry_tracer(
-) -> Result<opentelemetry_sdk::trace::Tracer, opentelemetry::trace::TraceError> {
+) -> Result<opentelemetry_sdk::trace::Tracer, Box<dyn std::error::Error>> {
     use opentelemetry::trace::TracerProvider;
     use opentelemetry_otlp::WithExportConfig;
 
-    let exporter = opentelemetry_otlp::new_exporter().tonic().with_endpoint(
-        std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-            .unwrap_or_else(|_| "http://localhost:4317".to_string()),
-    );
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .unwrap_or_else(|_| "http://localhost:4317".to_string()),
+        )
+        .build()?;
 
-    let provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(exporter)
-        .with_trace_config(opentelemetry_sdk::trace::Config::default().with_resource(
-            opentelemetry_sdk::Resource::new(vec![
-                opentelemetry::KeyValue::new("service.name", "stateset-sequencer"),
-                opentelemetry::KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-            ]),
-        ))
-        .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_resource(
+            opentelemetry_sdk::Resource::builder()
+                .with_service_name("stateset-sequencer")
+                .with_attributes([opentelemetry::KeyValue::new(
+                    "service.version",
+                    env!("CARGO_PKG_VERSION"),
+                )])
+                .build(),
+        )
+        .build();
 
-    Ok(provider.tracer("stateset-sequencer"))
+    let tracer = provider.tracer("stateset-sequencer");
+    // Install globally so shutdown flushes through the global handle owner.
+    opentelemetry::global::set_tracer_provider(provider);
+    Ok(tracer)
 }
 
 fn build_router(

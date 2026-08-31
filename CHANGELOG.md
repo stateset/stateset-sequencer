@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Resolved five of the six open Dependabot alerts** (these sit outside RustSec, so `cargo audit` was already clean): `jsonwebtoken` 9.3 → 10.4 (CVE-2026-25537; v10 requires an explicit crypto backend — `rust_crypto` is enabled, and the panic a missing backend causes is covered by the JWT unit tests), `opentelemetry_sdk` 0.24 → 0.32.1 (CVE-2026-48504, a full 0.24→0.32 API migration of both tracer-init paths; shutdown now flushes through a kept provider handle since the global shutdown was removed), `cmov` 0.5.4 (CVE-2026-50185), `keccak` 0.1.6 (GHSA-3288-p39f-rqpv), `rsa` 0.9.10 (CVE-2026-21895).
+- **Not resolved: `lru` (GHSA-rhfx-m35p-ff5j, low).** Pinned at 0.12 by `alloy-provider` 0.8; fixing it means an alloy major upgrade touching the settlement and anchoring send paths, which deserves its own change, not a footnote to this one.
+
 ### Fixed
 
 - **Concurrent batches sharing `command_id`s could deadlock and fail an entire ingest.** Command-id reservation inserted into `ves_command_dedupe` one id at a time in hash-set (arbitrary) order, so two transactions could take the row locks in opposite orders; PostgreSQL resolved the deadlock (40P01) by aborting one whole batch, surfacing as a 500 to a client that did nothing wrong. Reservation now acquires in sorted order, which is deadlock-free by construction. Found by the new randomised concurrency test below; reproduced 3/3 before the fix, 0/3 after (plus a targeted opposite-order stress test).

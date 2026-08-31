@@ -81,7 +81,7 @@ subtle = { version = "2", optional = true }
 hkdf = { version = "0.12", optional = true }
 
 # Authentication
-jsonwebtoken = "9"
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 rand = "0.8"
 base64 = "0.22"
 
@@ -102,10 +102,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # OpenTelemetry observability
-opentelemetry = { version = "0.24", features = ["metrics", "trace"] }
-opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.17", features = ["metrics", "trace", "tonic"] }
-tracing-opentelemetry = "0.25"
+opentelemetry = { version = "0.32", features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["metrics", "trace", "grpc-tonic"] }
+tracing-opentelemetry = "0.33"
 
 # Configuration
 config = "0.14"

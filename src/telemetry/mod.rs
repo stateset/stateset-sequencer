@@ -23,10 +23,16 @@ use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
     propagation::TraceContextPropagator,
-    trace::{self as sdktrace, RandomIdGenerator, Sampler},
+    trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
     Resource,
 };
+use std::sync::OnceLock;
 use std::time::Duration;
+
+/// The installed tracer provider, kept so [`shutdown_telemetry`] can flush it.
+/// OpenTelemetry 0.28+ removed the global shutdown; the owner of the provider
+/// handle is responsible for shutting it down.
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -150,15 +156,17 @@ pub fn init_telemetry(config: &TelemetryConfig) -> Result<(), Box<dyn std::error
 fn init_tracer_provider(
     config: &TelemetryConfig,
     endpoint: &str,
-) -> Result<sdktrace::TracerProvider, Box<dyn std::error::Error>> {
-    let resource = Resource::new(vec![
-        KeyValue::new("service.name", config.service_name.clone()),
-        KeyValue::new("service.version", config.service_version.clone()),
-        KeyValue::new(
-            "deployment.environment",
-            std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()),
-        ),
-    ]);
+) -> Result<SdkTracerProvider, Box<dyn std::error::Error>> {
+    let resource = Resource::builder()
+        .with_service_name(config.service_name.clone())
+        .with_attributes([
+            KeyValue::new("service.version", config.service_version.clone()),
+            KeyValue::new(
+                "deployment.environment",
+                std::env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string()),
+            ),
+        ])
+        .build();
 
     let sampler = if config.sample_rate >= 1.0 {
         Sampler::AlwaysOn
@@ -168,28 +176,32 @@ fn init_tracer_provider(
         Sampler::TraceIdRatioBased(config.sample_rate)
     };
 
-    let tracer_provider = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_endpoint(endpoint)
-                .with_timeout(Duration::from_secs(5)),
-        )
-        .with_trace_config(
-            sdktrace::Config::default()
-                .with_sampler(sampler)
-                .with_id_generator(RandomIdGenerator::default())
-                .with_resource(resource),
-        )
-        .install_batch(opentelemetry_sdk::runtime::Tokio)?;
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .with_timeout(Duration::from_secs(5))
+        .build()?;
+
+    let tracer_provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
+        .with_sampler(sampler)
+        .with_id_generator(RandomIdGenerator::default())
+        .with_resource(resource)
+        .build();
+
+    // Keep a handle for shutdown; first initialisation wins.
+    let _ = TRACER_PROVIDER.set(tracer_provider.clone());
 
     Ok(tracer_provider)
 }
 
 /// Shutdown telemetry (flush pending spans)
 pub fn shutdown_telemetry() {
-    global::shutdown_tracer_provider();
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("telemetry shutdown: {e}");
+        }
+    }
 }
 
 /// Span attribute keys for consistent instrumentation
