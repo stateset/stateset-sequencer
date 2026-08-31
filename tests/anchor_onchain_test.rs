@@ -74,7 +74,7 @@ async fn anchoring_is_idempotent_across_a_lost_local_record() {
     );
 
     let signer = PrivateKeySigner::from_str(key.trim_start_matches("0x")).expect("key");
-    let probe = ProviderBuilder::new().on_http(rpc_url.parse().expect("rpc"));
+    let probe = ProviderBuilder::new().connect_http(rpc_url.parse().expect("rpc"));
     let nonce_before = probe
         .get_transaction_count(signer.address())
         .await

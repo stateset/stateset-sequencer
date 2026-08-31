@@ -260,9 +260,8 @@ impl AnchorService {
                             let signer: PrivateKeySigner = private_key.parse()
                                 .map_err(|e| SequencerError::Internal(format!("Invalid private key: {e}")))?;
                             let provider = ProviderBuilder::new()
-                                .with_recommended_fillers()
                                 .wallet(alloy::network::EthereumWallet::from(signer))
-                                .on_http(rpc_url.parse()
+                                .connect_http(rpc_url.parse()
                                     .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?);
                             let contract = IStateSetAnchor::new(registry_address, &provider);
                             let tx = contract.commitBatch(batch_id, tenant_id, store_id, events_root, prev_state_root, state_root, seq_start, seq_end, event_count);
@@ -352,9 +351,8 @@ impl AnchorService {
                             let signer: PrivateKeySigner = private_key.parse()
                                 .map_err(|e| SequencerError::Internal(format!("Invalid private key: {e}")))?;
                             let provider = ProviderBuilder::new()
-                                .with_recommended_fillers()
                                 .wallet(alloy::network::EthereumWallet::from(signer))
-                                .on_http(rpc_url.parse()
+                                .connect_http(rpc_url.parse()
                                     .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?);
                             let contract = IStateSetAnchor::new(registry_address, &provider);
                             let tx = contract.commitBatch(batch_id, tenant_id, store_id, events_root, prev_state_root, state_root, seq_start, seq_end, leaf_count);
@@ -396,7 +394,7 @@ impl AnchorService {
 
     /// Verify a commitment is anchored on-chain
     pub async fn verify_anchored(&self, batch_id: uuid::Uuid) -> Result<bool> {
-        let provider = ProviderBuilder::new().on_http(
+        let provider = ProviderBuilder::new().connect_http(
             self.config
                 .rpc_url
                 .parse()
@@ -412,12 +410,12 @@ impl AnchorService {
             .await
             .map_err(|e| SequencerError::Internal(format!("Contract call failed: {}", e)))?;
 
-        Ok(result.exists)
+        Ok(result)
     }
 
     /// Get the on-chain head sequence for a tenant/store
     pub async fn get_chain_head(&self, tenant_id: uuid::Uuid, store_id: uuid::Uuid) -> Result<u64> {
-        let provider = ProviderBuilder::new().on_http(
+        let provider = ProviderBuilder::new().connect_http(
             self.config
                 .rpc_url
                 .parse()
@@ -435,7 +433,7 @@ impl AnchorService {
             .await
             .map_err(|e| SequencerError::Internal(format!("Contract call failed: {}", e)))?;
 
-        Ok(head.sequence)
+        Ok(head)
     }
 
     /// Verify an events root against on-chain data
@@ -444,7 +442,7 @@ impl AnchorService {
         batch_id: uuid::Uuid,
         events_root: &Hash256,
     ) -> Result<bool> {
-        let provider = ProviderBuilder::new().on_http(
+        let provider = ProviderBuilder::new().connect_http(
             self.config
                 .rpc_url
                 .parse()
@@ -463,7 +461,7 @@ impl AnchorService {
             .map_err(|e| SequencerError::Internal(format!("Contract call failed: {}", e)))?;
 
         // SetRegistry has no verifyEventsRoot; compare against the stored commitment.
-        let stored = onchain.commitment;
+        let stored = onchain;
         Ok(stored.timestamp != 0 && stored.eventsRoot == events_root_bytes)
     }
 
@@ -510,9 +508,8 @@ impl AnchorService {
                             let signer: PrivateKeySigner = private_key.parse()
                                 .map_err(|e| SequencerError::Internal(format!("Invalid private key: {e}")))?;
                             let provider = ProviderBuilder::new()
-                                .with_recommended_fillers()
                                 .wallet(alloy::network::EthereumWallet::from(signer))
-                                .on_http(rpc_url.parse()
+                                .connect_http(rpc_url.parse()
                                     .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?);
                             let contract = IStateSetAnchor::new(registry_address, &provider);
                             let tx = contract.commitBatchWithStarkProof(
@@ -560,7 +557,7 @@ impl AnchorService {
 
     /// Check if a batch has a STARK proof on-chain
     pub async fn has_stark_proof_onchain(&self, batch_id: uuid::Uuid) -> Result<bool> {
-        let provider = ProviderBuilder::new().on_http(
+        let provider = ProviderBuilder::new().connect_http(
             self.config
                 .rpc_url
                 .parse()
@@ -576,7 +573,7 @@ impl AnchorService {
             .await
             .map_err(|e| SequencerError::Internal(format!("Contract call failed: {}", e)))?;
 
-        Ok(result._0)
+        Ok(result)
     }
 
     /// Verify a STARK proof hash matches on-chain
@@ -585,7 +582,7 @@ impl AnchorService {
         batch_id: uuid::Uuid,
         proof_hash: &Hash256,
     ) -> Result<bool> {
-        let provider = ProviderBuilder::new().on_http(
+        let provider = ProviderBuilder::new().connect_http(
             self.config
                 .rpc_url
                 .parse()
@@ -603,7 +600,7 @@ impl AnchorService {
             .await
             .map_err(|e| SequencerError::Internal(format!("Contract call failed: {}", e)))?;
 
-        Ok(valid._0)
+        Ok(valid)
     }
 }
 

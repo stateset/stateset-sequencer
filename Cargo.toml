@@ -135,7 +135,7 @@ ves-stark-prover = { path = "../stateset-stark/crates/ves-stark-prover", optiona
 # reqwest's default native-tls, which pulls `openssl` (banned by deny.toml in
 # favor of rustls). Only the providers/HTTP-transport/signer/sol surface that
 # anchor.rs actually uses is enabled.
-alloy = { version = "0.8", default-features = false, features = [
+alloy = { version = "1.6", default-features = false, features = [
     "contract",
     "network",
     "providers",
@@ -152,7 +152,7 @@ tonic-build = "0.12"
 [dev-dependencies]
 tokio-test = "0.4"
 # For on-chain integration tests (settlement send-path against a local EVM).
-alloy = { version = "0.8", default-features = false, features = [
+alloy = { version = "1.6", default-features = false, features = [
     "contract",
     "network",
     "providers",

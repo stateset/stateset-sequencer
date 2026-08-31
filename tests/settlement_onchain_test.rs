@@ -67,9 +67,8 @@ async fn settle_batch_send_path_settles_batch_and_skips_unauthorized_payment() {
     let signer = PrivateKeySigner::from_str(key.trim_start_matches("0x"))
         .expect("valid settler private key");
     let provider = ProviderBuilder::new()
-        .with_recommended_fillers()
         .wallet(alloy::network::EthereumWallet::from(signer))
-        .on_http(rpc_url.parse().expect("valid rpc url"));
+        .connect_http(rpc_url.parse().expect("valid rpc url"));
 
     let address = Address::from_str(&pb_addr).expect("valid contract address");
     let contract = ISetPaymentBatch::new(address, &provider);
@@ -120,10 +119,7 @@ async fn settle_batch_send_path_settles_batch_and_skips_unauthorized_payment() {
         .call()
         .await
         .expect("getBatch call");
-    assert_ne!(
-        batch._0.settledAt, 0,
-        "batch must be marked settled on-chain"
-    );
+    assert_ne!(batch.settledAt, 0, "batch must be marked settled on-chain");
 }
 
 /// Double-settle safety, end to end. A batch settled on-chain whose local
@@ -228,7 +224,7 @@ async fn settle_batch_is_idempotent_across_a_lost_local_record() {
     // would pass with the pre-check removed -- after burning a mined revert
     // and two minutes of retries. The nonce must not move.
     let signer = PrivateKeySigner::from_str(key.trim_start_matches("0x")).expect("key");
-    let probe = ProviderBuilder::new().on_http(rpc_url.parse().expect("rpc url"));
+    let probe = ProviderBuilder::new().connect_http(rpc_url.parse().expect("rpc url"));
     let nonce_before = alloy::providers::Provider::get_transaction_count(&probe, signer.address())
         .await
         .expect("nonce");

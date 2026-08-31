@@ -348,9 +348,8 @@ impl SettlementService {
                                     SequencerError::Internal(format!("Invalid private key: {e}"))
                                 })?;
                                 let provider = ProviderBuilder::new()
-                                    .with_recommended_fillers()
                                     .wallet(alloy::network::EthereumWallet::from(signer))
-                                    .on_http(rpc_url.parse().map_err(|e| {
+                                    .connect_http(rpc_url.parse().map_err(|e| {
                                         SequencerError::Internal(format!("Invalid RPC URL: {e}"))
                                     })?);
                                 let contract =
@@ -378,7 +377,7 @@ impl SettlementService {
                                         "settleBatch transaction reverted".into(),
                                     ));
                                 }
-                                let gas_used = u64::try_from(receipt.gas_used).unwrap_or(u64::MAX);
+                                let gas_used = receipt.gas_used;
                                 Ok::<_, SequencerError>((
                                     receipt.transaction_hash.0,
                                     receipt.block_number,
@@ -450,7 +449,7 @@ impl SettlementService {
 
     /// Whether the batch is already settled on-chain (`settledAt != 0`).
     pub async fn is_batch_settled_onchain(&self, batch_id: Uuid) -> Result<bool> {
-        let provider = ProviderBuilder::new().on_http(
+        let provider = ProviderBuilder::new().connect_http(
             self.config
                 .rpc_url
                 .parse()
@@ -462,7 +461,7 @@ impl SettlementService {
             .call()
             .await
             .map_err(|e| SequencerError::Internal(format!("getBatch call failed: {e}")))?;
-        Ok(batch._0.settledAt != 0)
+        Ok(batch.settledAt != 0)
     }
 
     /// Classify batch intents into (settled, failed) by querying the contract's
@@ -471,7 +470,7 @@ impl SettlementService {
         &self,
         intents: &[X402PaymentIntent],
     ) -> Result<(Vec<Uuid>, Vec<Uuid>)> {
-        let provider = ProviderBuilder::new().on_http(
+        let provider = ProviderBuilder::new().connect_http(
             self.config
                 .rpc_url
                 .parse()
@@ -485,8 +484,9 @@ impl SettlementService {
                 .isIntentSettled(Self::uuid_to_bytes32(intent.intent_id))
                 .call()
                 .await
-                .map_err(|e| SequencerError::Internal(format!("isIntentSettled call failed: {e}")))?
-                ._0;
+                .map_err(|e| {
+                    SequencerError::Internal(format!("isIntentSettled call failed: {e}"))
+                })?;
             if is_settled {
                 settled.push(intent.intent_id);
             } else {
@@ -616,7 +616,7 @@ mod tests {
             ISetPaymentBatch::settleBatchCall::SELECTOR.as_slice()
         );
 
-        let decoded = ISetPaymentBatch::settleBatchCall::abi_decode(&encoded, true).unwrap();
+        let decoded = ISetPaymentBatch::settleBatchCall::abi_decode(&encoded).unwrap();
         assert_eq!(decoded.sequenceStart, 1);
         assert_eq!(decoded.sequenceEnd, 9);
         assert_eq!(decoded.payments.len(), 1);
