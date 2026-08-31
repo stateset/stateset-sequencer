@@ -58,7 +58,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
         with:
           components: rustfmt, clippy
 
@@ -121,7 +121,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -185,7 +185,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -251,7 +251,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -342,6 +342,8 @@ jobs:
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
       - uses: Swatinem/rust-cache@v2
+      - name: Install protoc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       # The advertised minimum must actually build the advertised default
       # feature set. Anything less is a number in a README, not an MSRV.
       - name: Build on the minimum supported toolchain
@@ -376,7 +378,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
 
       - name: Install cargo-audit
         run: cargo install cargo-audit
@@ -413,7 +415,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
 
       - name: Install cargo-deny
         run: cargo install cargo-deny
@@ -458,7 +460,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
 
       - uses: Swatinem/rust-cache@v2
 
@@ -494,7 +496,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.90.0
 
       - uses: Swatinem/rust-cache@v2
 

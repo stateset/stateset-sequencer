@@ -1033,6 +1033,63 @@ async fn postgres_ves_sequencer_concurrent_exact_replay_returns_existing_receipt
     assert_eq!(stored[0].event_id(), event_id);
 }
 
+/// N callers migrating a *fresh* database at once must all succeed.
+/// `run_postgres` created the pgcrypto extension outside the migrator's
+/// advisory lock, and Postgres's CREATE EXTENSION IF NOT EXISTS is not
+/// concurrency-safe -- two sessions can both pass the existence check and one
+/// then fails on pg_extension_name_index. Every parallel test binary (and any
+/// multi-node deployment racing on first boot) could hit it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn postgres_concurrent_first_migration_is_race_free() {
+    let Some(admin) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+    let base = std::env::var("DATABASE_URL").unwrap();
+
+    for round in 0..10 {
+        let dbname = format!(
+            "mig_race_{round}_{}",
+            &Uuid::new_v4().simple().to_string()[..8]
+        );
+        sqlx::query(&format!("CREATE DATABASE {dbname}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let url = {
+            let idx = base.rfind('/').unwrap();
+            format!("{}/{}", &base[..idx], dbname)
+        };
+
+        let barrier = Arc::new(Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let url = url.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                let pool = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&url)
+                    .await
+                    .unwrap();
+                barrier.wait().await;
+                stateset_sequencer::migrations::run_postgres(&pool).await
+            }));
+        }
+        for h in handles {
+            h.await.unwrap().unwrap_or_else(|e| {
+                panic!("round {round}: concurrent first migration failed: {e}")
+            });
+        }
+
+        sqlx::query(&format!("DROP DATABASE {dbname} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+}
+
 /// Two batches that share command_ids and submit them in opposite orders must
 /// both complete -- one wins each command, the other gets DuplicateCommandId.
 /// Reserving command_ids in hash-set (i.e. arbitrary) order let the two
