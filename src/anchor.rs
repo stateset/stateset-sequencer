@@ -12,7 +12,8 @@ use tracing::{info, warn};
 
 use crate::domain::{BatchCommitment, Hash256, StoreId, TenantId, VesBatchCommitment};
 use crate::infra::{
-    CircuitBreaker, CircuitBreakerConfig, Result, Retry, RetryConfig, SequencerError,
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError, Result, Retry, RetryConfig,
+    SequencerError,
 };
 
 /// STARK batch proof commitment for on-chain anchoring
@@ -53,23 +54,39 @@ pub struct StarkBatchProof {
 // Generate contract bindings
 sol! {
     #[sol(rpc)]
+    /// Binding for the deployed `SetRegistry` contract (set/contracts/SetRegistry.sol).
+    ///
+    /// The previous binding declared `anchor`, `isAnchored`, `getLatestSequence`
+    /// and `verifyEventsRoot`, none of which exist on SetRegistry, so every
+    /// anchor attempt in the shipped stack reverted on selector lookup. The
+    /// functions below are the ones the contract actually exposes.
     interface IStateSetAnchor {
-        function anchor(
+        struct BatchCommitment {
+            bytes32 eventsRoot;
+            bytes32 newStateRoot;
+            uint64 sequenceStart;
+            uint64 sequenceEnd;
+            uint32 eventCount;
+            uint64 timestamp;
+        }
+
+        function commitBatch(
             bytes32 batchId,
             bytes32 tenantId,
             bytes32 storeId,
             bytes32 eventsRoot,
-            bytes32 stateRoot,
+            bytes32 prevStateRoot,
+            bytes32 newStateRoot,
             uint64 sequenceStart,
             uint64 sequenceEnd,
             uint32 eventCount
         ) external;
 
-        function isAnchored(bytes32 batchId) external view returns (bool);
+        function batchExists(bytes32 batchId) external view returns (bool exists);
 
-        function getLatestSequence(bytes32 tenantId, bytes32 storeId) external view returns (uint64);
+        function getHeadSequence(bytes32 tenantId, bytes32 storeId) external view returns (uint64 sequence);
 
-        function verifyEventsRoot(bytes32 batchId, bytes32 eventsRoot) external view returns (bool);
+        function getBatchCommitment(bytes32 batchId) external view returns (BatchCommitment memory commitment);
 
         // STARK proof functions
         function commitStarkProof(
@@ -143,25 +160,18 @@ impl AnchorConfig {
     }
 }
 
-/// Determine if an anchor error is transient and worth retrying.
-/// Retries on transport/timeout errors; does NOT retry on reverts or nonce errors.
+/// Transient vs terminal classification for anchor send errors.
+/// See [`crate::infra::is_transient_chain_error`] for why reverts must be
+/// recognised even when wrapped in a send failure.
 fn is_retryable_anchor_error(err: &SequencerError) -> bool {
-    match err {
-        SequencerError::Internal(msg) => {
-            let lower = msg.to_lowercase();
-            // Transport / network / timeout errors are retryable
-            lower.contains("timeout")
-                || lower.contains("connection")
-                || lower.contains("transport")
-                || lower.contains("eof")
-                || lower.contains("reset by peer")
-                || lower.contains("broken pipe")
-                || lower.contains("failed to send")
-                || lower.contains("failed to get receipt")
-        }
-        _ => false,
-    }
+    crate::infra::is_transient_chain_error(err)
 }
+
+/// Transaction hash returned by [`AnchorService::anchor_ves_commitment`] when
+/// the commitment was found already anchored on-chain and no transaction was
+/// sent. Callers should confirm the anchor locally rather than wait for a
+/// receipt that does not exist.
+pub const ALREADY_ANCHORED_TX_HASH: Hash256 = [0u8; 32];
 
 /// On-chain anchor service with retry and circuit breaker protection
 pub struct AnchorService {
@@ -241,6 +251,7 @@ impl AnchorService {
                         let store_id = Self::uuid_to_bytes32(commitment.store_id.0);
                         let events_root = Self::to_bytes32(&commitment.events_root);
                         let state_root = Self::to_bytes32(&commitment.new_state_root);
+                        let prev_state_root = Self::to_bytes32(&commitment.prev_state_root);
                         let seq_start = commitment.sequence_range.0;
                         let seq_end = commitment.sequence_range.1;
                         let event_count = commitment.event_count;
@@ -254,7 +265,7 @@ impl AnchorService {
                                 .on_http(rpc_url.parse()
                                     .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?);
                             let contract = IStateSetAnchor::new(registry_address, &provider);
-                            let tx = contract.anchor(batch_id, tenant_id, store_id, events_root, state_root, seq_start, seq_end, event_count);
+                            let tx = contract.commitBatch(batch_id, tenant_id, store_id, events_root, prev_state_root, state_root, seq_start, seq_end, event_count);
                             let pending = tx.send().await
                                 .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {e}")))?;
                             let receipt = pending.get_receipt().await
@@ -271,7 +282,15 @@ impl AnchorService {
                 result.into_result()
             })
             .await
-            .map_err(|_| SequencerError::Internal("Anchor circuit breaker is open — RPC endpoint unavailable".into()))?;
+            .map_err(|e| match e {
+                CircuitBreakerError::ServiceError(inner) => inner,
+                CircuitBreakerError::CircuitOpen => SequencerError::Internal(
+                    "Anchor circuit breaker is open — RPC endpoint unavailable".into(),
+                ),
+                CircuitBreakerError::Timeout => {
+                    SequencerError::Internal("Anchor operation timed out".into())
+                }
+            })?;
 
         info!(
             "Commitment {} anchored in tx {} (block {})",
@@ -298,6 +317,19 @@ impl AnchorService {
         let batch_id_uuid = commitment.batch_id;
         let retry_config = self.retry_config.clone();
 
+        // Pre-check: a prior attempt may have anchored this commitment on-chain
+        // and then failed to record it locally (crash, or a lost DB write).
+        // The worker only reconciles commitments that already carry a tx hash,
+        // so without this the same commitment would be re-sent every tick,
+        // revert with BatchAlreadyCommitted, and stall the tick -- forever.
+        if self.verify_anchored(batch_id_uuid).await.unwrap_or(false) {
+            warn!(
+                batch_id = %batch_id_uuid,
+                "Commitment already anchored on-chain; reconciling local state without sending"
+            );
+            return Ok((ALREADY_ANCHORED_TX_HASH, None));
+        }
+
         let (tx_hash, block_number) = self
             .circuit_breaker
             .call(async {
@@ -311,6 +343,7 @@ impl AnchorService {
                         let store_id = Self::uuid_to_bytes32(commitment.store_id.0);
                         let events_root = Self::to_bytes32(&commitment.merkle_root);
                         let state_root = Self::to_bytes32(&commitment.new_state_root);
+                        let prev_state_root = Self::to_bytes32(&commitment.prev_state_root);
                         let seq_start = commitment.sequence_range.0;
                         let seq_end = commitment.sequence_range.1;
                         let leaf_count = commitment.leaf_count;
@@ -324,7 +357,7 @@ impl AnchorService {
                                 .on_http(rpc_url.parse()
                                     .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?);
                             let contract = IStateSetAnchor::new(registry_address, &provider);
-                            let tx = contract.anchor(batch_id, tenant_id, store_id, events_root, state_root, seq_start, seq_end, leaf_count);
+                            let tx = contract.commitBatch(batch_id, tenant_id, store_id, events_root, prev_state_root, state_root, seq_start, seq_end, leaf_count);
                             let pending = tx.send().await
                                 .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {e}")))?;
                             let receipt = pending.get_receipt().await
@@ -341,7 +374,15 @@ impl AnchorService {
                 result.into_result()
             })
             .await
-            .map_err(|_| SequencerError::Internal("Anchor circuit breaker is open — RPC endpoint unavailable".into()))?;
+            .map_err(|e| match e {
+                CircuitBreakerError::ServiceError(inner) => inner,
+                CircuitBreakerError::CircuitOpen => SequencerError::Internal(
+                    "Anchor circuit breaker is open — RPC endpoint unavailable".into(),
+                ),
+                CircuitBreakerError::Timeout => {
+                    SequencerError::Internal("Anchor operation timed out".into())
+                }
+            })?;
 
         info!(
             "VES commitment {} anchored in tx {} (block {})",
@@ -366,12 +407,12 @@ impl AnchorService {
 
         let batch_id_bytes = Self::uuid_to_bytes32(batch_id);
         let result = contract
-            .isAnchored(batch_id_bytes)
+            .batchExists(batch_id_bytes)
             .call()
             .await
             .map_err(|e| SequencerError::Internal(format!("Contract call failed: {}", e)))?;
 
-        Ok(result._0)
+        Ok(result.exists)
     }
 
     /// Get the on-chain head sequence for a tenant/store
@@ -389,12 +430,12 @@ impl AnchorService {
         let store_bytes = Self::uuid_to_bytes32(store_id);
 
         let head = contract
-            .getLatestSequence(tenant_bytes, store_bytes)
+            .getHeadSequence(tenant_bytes, store_bytes)
             .call()
             .await
             .map_err(|e| SequencerError::Internal(format!("Contract call failed: {}", e)))?;
 
-        Ok(head._0)
+        Ok(head.sequence)
     }
 
     /// Verify an events root against on-chain data
@@ -415,13 +456,15 @@ impl AnchorService {
         let batch_id_bytes = Self::uuid_to_bytes32(batch_id);
         let events_root_bytes = Self::to_bytes32(events_root);
 
-        let valid = contract
-            .verifyEventsRoot(batch_id_bytes, events_root_bytes)
+        let onchain = contract
+            .getBatchCommitment(batch_id_bytes)
             .call()
             .await
             .map_err(|e| SequencerError::Internal(format!("Contract call failed: {}", e)))?;
 
-        Ok(valid._0)
+        // SetRegistry has no verifyEventsRoot; compare against the stored commitment.
+        let stored = onchain.commitment;
+        Ok(stored.timestamp != 0 && stored.eventsRoot == events_root_bytes)
     }
 
     /// Anchor a STARK batch proof on-chain with retry and circuit breaker protection
@@ -495,7 +538,15 @@ impl AnchorService {
                 result.into_result()
             })
             .await
-            .map_err(|_| SequencerError::Internal("Anchor circuit breaker is open — RPC endpoint unavailable".into()))?;
+            .map_err(|e| match e {
+                CircuitBreakerError::ServiceError(inner) => inner,
+                CircuitBreakerError::CircuitOpen => SequencerError::Internal(
+                    "Anchor circuit breaker is open — RPC endpoint unavailable".into(),
+                ),
+                CircuitBreakerError::Timeout => {
+                    SequencerError::Internal("Anchor operation timed out".into())
+                }
+            })?;
 
         info!(
             "STARK batch proof {} anchored in tx {} (block {})",

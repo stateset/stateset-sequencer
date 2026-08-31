@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Built-in anchoring never worked against the deployed `SetRegistry`.** The sequencer's ABI binding declared `anchor`, `isAnchored`, `getLatestSequence` and `verifyEventsRoot`; the contract exposes `commitBatch`, `batchExists`, `getHeadSequence` and `getBatchCommitment`. Every anchor attempt in the shipped stack (`docker-compose.yml` points the worker at `SetRegistry`) reverted on selector lookup. This was invisible because the circuit-breaker wrapper discarded the inner error (`map_err(|_| "circuit breaker is open")`) and the retry policy then spent ~5 minutes per attempt on the guaranteed revert. The binding now matches the contract, `commitBatch` carries `prevStateRoot`, `verify_events_root_onchain` compares against the stored commitment, and breaker errors surface the real failure. Verified by a new on-chain test against a locally deployed `SetRegistry`.
+- **Reverts were classified as transient by the retry policy.** A revert at gas estimation reaches the caller wrapped in the send error — `"Failed to send … execution reverted …"` — and both the anchor and settlement predicates keyed on `"failed to send"`, so a transaction guaranteed to revert identically was retried ten times over ~5 minutes, stalling the calling worker's whole tick. A shared `is_transient_chain_error` now checks terminal markers (revert, custom error, nonce too low/high, already known, insufficient funds, invalid signature, out of gas) *before* transport markers. Measured: an already-settled batch reconciled in 0.02 s where it previously took 290 s.
+- **An anchored commitment whose local record was lost was re-sent every tick, forever.** `reconcile()` only checked commitments that already carried a tx hash. `anchor_ves_commitment` now pre-checks `batchExists` and returns `ALREADY_ANCHORED_TX_HASH` without sending; the worker, the two HTTP anchor handlers and the admin CLI confirm the anchor locally instead of recording a fake hash. Proven on-chain: second attempt is a read, the settler nonce does not move, and it completes in milliseconds.
+
 ## [0.4.1] - 2026-08-31
 
 ### Added

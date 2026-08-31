@@ -138,23 +138,11 @@ impl SettlementConfig {
     }
 }
 
-/// Determine if a settlement error is transient and worth retrying.
-/// Retries on transport/timeout errors; does NOT retry on reverts or nonce errors.
+/// Transient vs terminal classification for settlement send errors.
+/// See [`crate::infra::is_transient_chain_error`] for why reverts must be
+/// recognised even when wrapped in a send failure.
 fn is_retryable_settlement_error(err: &SequencerError) -> bool {
-    match err {
-        SequencerError::Internal(msg) => {
-            let lower = msg.to_lowercase();
-            lower.contains("timeout")
-                || lower.contains("connection")
-                || lower.contains("transport")
-                || lower.contains("eof")
-                || lower.contains("reset by peer")
-                || lower.contains("broken pipe")
-                || lower.contains("failed to send")
-                || lower.contains("failed to get receipt")
-        }
-        _ => false,
-    }
+    crate::infra::is_transient_chain_error(err)
 }
 
 /// The outcome of settling one batch on-chain.

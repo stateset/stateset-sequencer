@@ -345,6 +345,57 @@ where
 }
 
 /// Check if an error is retryable (for database errors)
+/// Classify an on-chain send/receipt error as transient (worth retrying) or
+/// terminal.
+///
+/// Terminal answers are checked *first*. A revert reaches us wrapped in the
+/// send error -- `"Failed to send … execution reverted: custom error 0x…"` --
+/// so a classifier that only looks for transport phrases sees "failed to send"
+/// and retries a transaction that will revert identically every time. With
+/// [`RetryConfig::blockchain`] that is ten attempts and roughly five minutes
+/// spent reaching the same answer, during which the calling worker's whole
+/// tick is stalled. Nonce, funds and duplicate-transaction errors are terminal
+/// for the same reason: resending the same transaction cannot fix them.
+pub fn is_transient_chain_error(err: &crate::infra::SequencerError) -> bool {
+    let crate::infra::SequencerError::Internal(msg) = err else {
+        return false;
+    };
+    let lower = msg.to_lowercase();
+
+    const TERMINAL: &[&str] = &[
+        "revert",
+        "custom error",
+        "nonce too low",
+        "nonce too high",
+        "already known",
+        "insufficient funds",
+        "invalid signature",
+        "unauthorized",
+        "invalid opcode",
+        "out of gas",
+    ];
+    if TERMINAL.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+
+    const TRANSIENT: &[&str] = &[
+        "timeout",
+        "timed out",
+        "connection",
+        "transport",
+        "eof",
+        "reset by peer",
+        "broken pipe",
+        "failed to send",
+        "failed to get receipt",
+        "temporarily unavailable",
+        "503",
+        "502",
+        "429",
+    ];
+    TRANSIENT.iter().any(|m| lower.contains(m))
+}
+
 pub fn is_retryable_db_error(err: &sqlx::Error) -> bool {
     match err {
         // Connection errors are usually transient
@@ -376,6 +427,60 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    fn internal(msg: &str) -> crate::infra::SequencerError {
+        crate::infra::SequencerError::Internal(msg.to_string())
+    }
+
+    /// A revert is a *terminal* answer from the chain: the same transaction
+    /// will revert every time. It reaches us wrapped in the send error, so a
+    /// classifier that keys on "failed to send" alone retries it -- for ten
+    /// attempts and ~five minutes in the blockchain retry profile -- before
+    /// giving up with the identical result.
+    #[test]
+    fn revert_surfaced_through_send_is_not_transient() {
+        let e = internal(
+            "Failed to send settleBatch transaction: server returned an error response: \
+             error code 3: execution reverted: custom error 0x9f8e1a9c",
+        );
+        assert!(!is_transient_chain_error(&e));
+    }
+
+    #[test]
+    fn mined_revert_is_not_transient() {
+        assert!(!is_transient_chain_error(&internal(
+            "settleBatch transaction reverted"
+        )));
+    }
+
+    #[test]
+    fn nonce_and_funds_errors_are_not_transient() {
+        for m in [
+            "Failed to send transaction: nonce too low",
+            "Failed to send transaction: insufficient funds for gas * price + value",
+            "Failed to send transaction: already known",
+        ] {
+            assert!(!is_transient_chain_error(&internal(m)), "{m}");
+        }
+    }
+
+    #[test]
+    fn transport_failures_are_transient() {
+        for m in [
+            "Failed to send transaction: error sending request: connection reset by peer",
+            "Failed to get receipt: operation timed out",
+            "Failed to send anchor transaction: transport error: unexpected EOF",
+        ] {
+            assert!(is_transient_chain_error(&internal(m)), "{m}");
+        }
+    }
+
+    #[test]
+    fn non_internal_errors_are_not_transient() {
+        assert!(!is_transient_chain_error(
+            &crate::infra::SequencerError::Configuration("bad key".into())
+        ));
+    }
 
     #[test]
     fn test_retry_config_delay_calculation() {

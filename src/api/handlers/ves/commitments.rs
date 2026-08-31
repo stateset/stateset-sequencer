@@ -259,6 +259,27 @@ pub async fn commit_and_anchor_ves_commitment(
         .await
         .map_err(internal_error)?;
 
+    if tx_hash == crate::anchor::ALREADY_ANCHORED_TX_HASH {
+        // Anchored on-chain by an earlier attempt whose local record was lost;
+        // no transaction was sent, so confirm rather than record a fake hash.
+        state
+            .ves_commitment_engine
+            .confirm_anchored(commitment.batch_id)
+            .await
+            .map_err(internal_error)?;
+        state
+            .cache_manager
+            .ves_commitments
+            .invalidate(&commitment.batch_id)
+            .await;
+        return Ok(Json(serde_json::json!({
+            "batch_id": commitment.batch_id,
+            "status": "already_anchored",
+            "chain_id": anchor_service.chain_id(),
+            "merkle_root": hex::encode(commitment.merkle_root),
+        })));
+    }
+
     state
         .ves_commitment_engine
         .update_chain_tx(

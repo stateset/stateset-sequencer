@@ -1871,6 +1871,15 @@ async fn cmd_ves_commit_and_anchor(mut args: VecDeque<String>) -> anyhow::Result
 
     let (tx_hash, chain_block_number) = anchor_service.anchor_ves_commitment(&commitment).await?;
 
+    if tx_hash == stateset_sequencer::anchor::ALREADY_ANCHORED_TX_HASH {
+        engine.confirm_anchored(commitment.batch_id).await?;
+        println!(
+            "ok: batch_id={} was already anchored on-chain; local record confirmed (no transaction sent)",
+            commitment.batch_id
+        );
+        return Ok(());
+    }
+
     engine
         .update_chain_tx(
             commitment.batch_id,

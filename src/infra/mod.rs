@@ -70,7 +70,10 @@ pub use postgres::{
     spawn_x402_nonce_cleanup, PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer,
     PgX402Repository, VesSequencer,
 };
-pub use retry::{is_retryable_db_error, retry, retry_with_config, Retry, RetryConfig, RetryResult};
+pub use retry::{
+    is_retryable_db_error, is_transient_chain_error, retry, retry_with_config, Retry, RetryConfig,
+    RetryResult,
+};
 pub use schema_validation::SchemaValidationMode;
 pub use secrets::{EnvSecretsProvider, SecretsError, SecretsProvider};
 pub use settlement_worker::{

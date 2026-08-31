@@ -229,6 +229,18 @@ impl AnchorWorker {
             }
 
             match self.anchor_service.anchor_ves_commitment(commitment).await {
+                Ok((tx_hash, _)) if tx_hash == crate::anchor::ALREADY_ANCHORED_TX_HASH => {
+                    // Already on-chain from a prior attempt whose local record
+                    // was lost; there is no new transaction to await.
+                    info!(batch_id = %commitment.batch_id, "Commitment already anchored; confirming locally");
+                    if let Err(e) = self
+                        .commitment_engine
+                        .confirm_anchored(commitment.batch_id)
+                        .await
+                    {
+                        warn!(batch_id = %commitment.batch_id, error = ?e, "Failed to confirm already-anchored commitment");
+                    }
+                }
                 Ok((tx_hash, block_number)) => {
                     info!(
                         batch_id = %commitment.batch_id,
