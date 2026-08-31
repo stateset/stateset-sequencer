@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Configuration reference moved to `docs/CONFIGURATION.md`.** The README had grown to ~770 lines, half of it per-variable tables; it now carries a six-variable boot-essentials table and a pointer, while the full reference (107 variables across 16 subsystems) lives in its own file. All internal links updated and verified.
+
 ### Security
 
 - **Resolved five of the six open Dependabot alerts** (these sit outside RustSec, so `cargo audit` was already clean): `jsonwebtoken` 9.3 → 10.4 (CVE-2026-25537; v10 requires an explicit crypto backend — `rust_crypto` is enabled, and the panic a missing backend causes is covered by the JWT unit tests), `opentelemetry_sdk` 0.24 → 0.32.1 (CVE-2026-48504, a full 0.24→0.32 API migration of both tracer-init paths; shutdown now flushes through a kept provider handle since the global shutdown was removed), `cmov` 0.5.4 (CVE-2026-50185), `keccak` 0.1.6 (GHSA-3288-p39f-rqpv), `rsa` 0.9.10 (CVE-2026-21895).
