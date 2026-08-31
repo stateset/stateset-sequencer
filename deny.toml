@@ -19,7 +19,13 @@ unmaintained = "workspace"
 # cargo-deny analyzes the resolved dependency graph, which does not include
 # `rsa` (it is only pulled by the disabled sqlx `mysql` feature). It is ignored
 # in `.cargo/audit.toml` instead, since `cargo audit` scans the full lockfile.
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071 "Marvin" RSA timing sidechannel. No fixed release
+    # exists upstream. rsa reaches this tree via jsonwebtoken 10's rust_crypto
+    # backend (RS256 support) and via sqlx-mysql at build time; the sequencer
+    # signs and verifies JWTs with HS256 only and talks to PostgreSQL, so no
+    # RSA operation ever executes at runtime. Re-evaluate when rsa ships a fix.
+    "RUSTSEC-2023-0071",]
 
 [licenses]
 # cargo-deny 0.16+ uses an allowlist model: any license not in `allow` is
