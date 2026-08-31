@@ -169,10 +169,11 @@ cargo update -p ves-stark-prover -p ves-stark-verifier \
 cargo test --locked --all-targets
 ```
 
-> **CI note:** because the `ves-stark-*` crates live in a private repo, CI fetches
-> `stateset-stark` using a `STARK_REPO_TOKEN` repository secret (a token with read
-> access to `stateset/stateset-stark`). Add it under **Settings → Secrets and
-> variables → Actions**. The lint/test/coverage jobs build with the core feature
+> **CI note:** CI fetches the `ves-stark-*` crates from the public
+> [`stateset/stateset-starks`](https://github.com/stateset/stateset-starks)
+> repository (note the trailing `s`) at the commit pinned by `STARK_REF`. No
+> secret is required; a `STARK_REPO_TOKEN` repository secret is honoured if the
+> repo is ever made private. The lint/test/coverage jobs build with the core feature
 > set (no `stark`) so they don't compile the private crates.
 
 ## API Endpoints

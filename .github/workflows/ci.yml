@@ -37,11 +37,17 @@ jobs:
 
       - name: Fetch local STARK dependency source
         run: |
+          # The GitHub repo is stateset-starks (with an s) and is public, so no
+          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
+          # the repo is made private). Every CI run in this repository's
+          # history had failed here: the secret was never configured AND the
+          # URL pointed at stateset-stark.git, which does not exist.
           if [ ! -d ../stateset-stark ]; then
-            if [ -z "$STARK_REPO_TOKEN" ]; then
-              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            if [ -n "$STARK_REPO_TOKEN" ]; then
+              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
+            else
+              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
             fi
-            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
           git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
           git -C ../stateset-stark checkout --detach "$STARK_REF"
@@ -89,11 +95,17 @@ jobs:
 
       - name: Fetch local STARK dependency source
         run: |
+          # The GitHub repo is stateset-starks (with an s) and is public, so no
+          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
+          # the repo is made private). Every CI run in this repository's
+          # history had failed here: the secret was never configured AND the
+          # URL pointed at stateset-stark.git, which does not exist.
           if [ ! -d ../stateset-stark ]; then
-            if [ -z "$STARK_REPO_TOKEN" ]; then
-              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            if [ -n "$STARK_REPO_TOKEN" ]; then
+              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
+            else
+              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
             fi
-            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
           git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
           git -C ../stateset-stark checkout --detach "$STARK_REF"
@@ -142,11 +154,17 @@ jobs:
 
       - name: Fetch local STARK dependency source
         run: |
+          # The GitHub repo is stateset-starks (with an s) and is public, so no
+          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
+          # the repo is made private). Every CI run in this repository's
+          # history had failed here: the secret was never configured AND the
+          # URL pointed at stateset-stark.git, which does not exist.
           if [ ! -d ../stateset-stark ]; then
-            if [ -z "$STARK_REPO_TOKEN" ]; then
-              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            if [ -n "$STARK_REPO_TOKEN" ]; then
+              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
+            else
+              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
             fi
-            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
           git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
           git -C ../stateset-stark checkout --detach "$STARK_REF"
@@ -197,11 +215,17 @@ jobs:
 
       - name: Fetch local STARK dependency source
         run: |
+          # The GitHub repo is stateset-starks (with an s) and is public, so no
+          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
+          # the repo is made private). Every CI run in this repository's
+          # history had failed here: the secret was never configured AND the
+          # URL pointed at stateset-stark.git, which does not exist.
           if [ ! -d ../stateset-stark ]; then
-            if [ -z "$STARK_REPO_TOKEN" ]; then
-              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            if [ -n "$STARK_REPO_TOKEN" ]; then
+              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
+            else
+              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
             fi
-            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
           git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
           git -C ../stateset-stark checkout --detach "$STARK_REF"
@@ -314,11 +338,17 @@ jobs:
 
       - name: Fetch local STARK dependency source
         run: |
+          # The GitHub repo is stateset-starks (with an s) and is public, so no
+          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
+          # the repo is made private). Every CI run in this repository's
+          # history had failed here: the secret was never configured AND the
+          # URL pointed at stateset-stark.git, which does not exist.
           if [ ! -d ../stateset-stark ]; then
-            if [ -z "$STARK_REPO_TOKEN" ]; then
-              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            if [ -n "$STARK_REPO_TOKEN" ]; then
+              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
+            else
+              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
             fi
-            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
           git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
           git -C ../stateset-stark checkout --detach "$STARK_REF"
@@ -340,11 +370,17 @@ jobs:
 
       - name: Fetch local STARK dependency source
         run: |
+          # The GitHub repo is stateset-starks (with an s) and is public, so no
+          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
+          # the repo is made private). Every CI run in this repository's
+          # history had failed here: the secret was never configured AND the
+          # URL pointed at stateset-stark.git, which does not exist.
           if [ ! -d ../stateset-stark ]; then
-            if [ -z "$STARK_REPO_TOKEN" ]; then
-              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            if [ -n "$STARK_REPO_TOKEN" ]; then
+              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
+            else
+              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
             fi
-            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
           git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
           git -C ../stateset-stark checkout --detach "$STARK_REF"
@@ -374,11 +410,17 @@ jobs:
 
       - name: Fetch local STARK dependency source
         run: |
+          # The GitHub repo is stateset-starks (with an s) and is public, so no
+          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
+          # the repo is made private). Every CI run in this repository's
+          # history had failed here: the secret was never configured AND the
+          # URL pointed at stateset-stark.git, which does not exist.
           if [ ! -d ../stateset-stark ]; then
-            if [ -z "$STARK_REPO_TOKEN" ]; then
-              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            if [ -n "$STARK_REPO_TOKEN" ]; then
+              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
+            else
+              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
             fi
-            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
           git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
           git -C ../stateset-stark checkout --detach "$STARK_REF"
@@ -399,11 +441,17 @@ jobs:
 
       - name: Fetch local STARK dependency source
         run: |
+          # The GitHub repo is stateset-starks (with an s) and is public, so no
+          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
+          # the repo is made private). Every CI run in this repository's
+          # history had failed here: the secret was never configured AND the
+          # URL pointed at stateset-stark.git, which does not exist.
           if [ ! -d ../stateset-stark ]; then
-            if [ -z "$STARK_REPO_TOKEN" ]; then
-              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            if [ -n "$STARK_REPO_TOKEN" ]; then
+              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
+            else
+              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
             fi
-            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
           git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
           git -C ../stateset-stark checkout --detach "$STARK_REF"
@@ -439,11 +487,17 @@ jobs:
 
       - name: Ensure local STARK dependency source for Docker build
         run: |
+          # The GitHub repo is stateset-starks (with an s) and is public, so no
+          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
+          # the repo is made private). Every CI run in this repository's
+          # history had failed here: the secret was never configured AND the
+          # URL pointed at stateset-stark.git, which does not exist.
           if [ ! -d ../stateset-stark ]; then
-            if [ -z "$STARK_REPO_TOKEN" ]; then
-              echo "::error::STARK_REPO_TOKEN secret is required to fetch the private stateset-stark dependency"; exit 1
+            if [ -n "$STARK_REPO_TOKEN" ]; then
+              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
+            else
+              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
             fi
-            git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-stark.git" ../stateset-stark
           fi
           git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
           git -C ../stateset-stark checkout --detach "$STARK_REF"
