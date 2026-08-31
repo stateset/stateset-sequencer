@@ -91,7 +91,7 @@ enum ReplayLookup {
 }
 
 /// Rejection reason for VES events
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VesRejectionReason {
     /// Event ID already exists
     DuplicateEventId,
@@ -1503,9 +1503,17 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         }
 
         // Reserve command_ids atomically to prevent concurrent duplicates.
+        //
+        // Sorted order matters: two concurrent batches sharing command_ids each
+        // take a row lock per id as they insert. In hash-set order the two
+        // transactions could take them in opposite orders and deadlock, and
+        // PostgreSQL resolves that by aborting one entire ingest (40P01).
+        // Acquiring in a global order is deadlock-free by construction.
         let mut duplicate_command_ids = HashSet::new();
         let mut reserved_command_ids = HashSet::new();
-        for cmd_id in &command_ids {
+        let mut ordered_command_ids: Vec<Uuid> = command_ids.iter().copied().collect();
+        ordered_command_ids.sort_unstable();
+        for cmd_id in &ordered_command_ids {
             let result = sqlx::query(
                 r#"
                 INSERT INTO ves_command_dedupe (tenant_id, store_id, command_id)

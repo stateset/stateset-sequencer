@@ -68,7 +68,7 @@ pub use payload_encryption::{PayloadEncryption, PayloadEncryptionMode};
 pub use pool_monitor::{PoolHealthStatus, PoolMonitor, PoolMonitorConfig, PoolStats};
 pub use postgres::{
     spawn_x402_nonce_cleanup, PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer,
-    PgX402Repository, VesSequencer,
+    PgX402Repository, VesRejectionReason, VesSequencer,
 };
 pub use retry::{
     is_retryable_db_error, is_transient_chain_error, retry, retry_with_config, Retry, RetryConfig,

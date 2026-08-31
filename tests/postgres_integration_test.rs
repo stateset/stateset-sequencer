@@ -1033,6 +1033,333 @@ async fn postgres_ves_sequencer_concurrent_exact_replay_returns_existing_receipt
     assert_eq!(stored[0].event_id(), event_id);
 }
 
+/// Two batches that share command_ids and submit them in opposite orders must
+/// both complete -- one wins each command, the other gets DuplicateCommandId.
+/// Reserving command_ids in hash-set (i.e. arbitrary) order let the two
+/// transactions take the `ves_command_dedupe` row locks in opposite orders,
+/// and PostgreSQL resolved the resulting deadlock (40P01) by killing one whole
+/// ingest. Reservation is now in sorted order, which is deadlock-free by
+/// construction. Repeated because the interleaving is scheduler-dependent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn postgres_ves_concurrent_batches_with_shared_command_ids_never_deadlock() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let key = AgentSigningKey::generate();
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    registry
+        .register_key(
+            &AgentKeyLookup::new(&tenant_id, &agent_id, AgentKeyId::default()),
+            AgentKeyEntry::new(key.public_key_bytes()),
+        )
+        .await
+        .unwrap();
+    let ves = Arc::new(VesSequencer::new(pool, registry));
+
+    let mk = |round: usize, tag: &str, cmd: Uuid| {
+        VesEventEnvelope::new_plaintext(
+            tenant_id.clone(),
+            store_id.clone(),
+            agent_id.clone(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            format!("ord-{round}-{tag}"),
+            EventType::new("order.updated"),
+            json!({ "round": round, "tag": tag }),
+            &key,
+        )
+        .with_command_id(cmd)
+    };
+
+    for round in 0..30 {
+        let cmds: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+        let a: Vec<_> = cmds
+            .iter()
+            .enumerate()
+            .map(|(i, c)| mk(round, &format!("a{i}"), *c))
+            .collect();
+        let b: Vec<_> = cmds
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(i, c)| mk(round, &format!("b{i}"), *c))
+            .collect();
+        let barrier = Arc::new(Barrier::new(2));
+        let hs: Vec<_> = [a, b]
+            .into_iter()
+            .map(|events| {
+                let ves = ves.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    ves.ingest(events).await
+                })
+            })
+            .collect();
+        let mut accepted = 0u32;
+        for h in hs {
+            let r = h
+                .await
+                .unwrap()
+                .unwrap_or_else(|e| panic!("round {round}: ingest failed: {e}"));
+            accepted += r.events_accepted;
+        }
+        assert_eq!(
+            accepted, 6,
+            "round {round}: each command must be honoured exactly once"
+        );
+    }
+}
+
+/// Randomised concurrent ingest. The product invariant is that per stream the
+/// sequence is contiguous from 1, every accepted event has exactly one
+/// sequence number, exact replays return the original receipt rather than a
+/// new number, and a command_id is honoured exactly once -- under *any*
+/// interleaving of batches. The fixed-shape test above checks one
+/// interleaving; this one draws batch sizes, stream choice, replay duplicates
+/// and command_id collisions from a seeded RNG so a failure reproduces.
+///
+/// Reproduce a failure with `SEQ_TEST_SEED=<printed seed>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn postgres_ves_concurrent_ingest_randomized_preserves_sequence_invariants() {
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use stateset_sequencer::infra::VesRejectionReason;
+    use std::collections::{HashMap, HashSet};
+
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let seed: u64 = std::env::var("SEQ_TEST_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(rand::random);
+    eprintln!("SEQ_TEST_SEED={seed}");
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    let ves = Arc::new(VesSequencer::new(pool.clone(), registry.clone()));
+
+    // Three independent streams, each with its own registered signing key.
+    struct Stream {
+        tenant_id: TenantId,
+        store_id: StoreId,
+        agent_id: AgentId,
+        key: AgentSigningKey,
+    }
+    let mut streams = Vec::new();
+    for _ in 0..3 {
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+        let agent_id = AgentId::new();
+        let key = AgentSigningKey::generate();
+        registry
+            .register_key(
+                &AgentKeyLookup::new(&tenant_id, &agent_id, AgentKeyId::default()),
+                AgentKeyEntry::new(key.public_key_bytes()),
+            )
+            .await
+            .unwrap();
+        streams.push(Stream {
+            tenant_id,
+            store_id,
+            agent_id,
+            key,
+        });
+    }
+
+    // Build batches. Each event is fresh, a replay of an event in an earlier
+    // batch (same envelope), or a *different* event reusing an earlier
+    // command_id (must lose the dedupe race).
+    let batches_n = 16;
+    let mut batches: Vec<(usize, Vec<VesEventEnvelope>)> = Vec::new();
+    let mut fresh_by_stream: Vec<Vec<VesEventEnvelope>> = vec![Vec::new(); streams.len()];
+    let mut used_commands_by_stream: Vec<Vec<Uuid>> = vec![Vec::new(); streams.len()];
+    let mut replayed: HashSet<Uuid> = HashSet::new();
+    let mut command_collisions: HashMap<Uuid, Vec<Uuid>> = HashMap::new(); // command -> event_ids
+    for b in 0..batches_n {
+        let si = rng.gen_range(0..streams.len());
+        let st = &streams[si];
+        let size = rng.gen_range(1..=20);
+        let mut events = Vec::with_capacity(size);
+        for i in 0..size {
+            let roll: f64 = rng.gen();
+            if roll < 0.15 && !fresh_by_stream[si].is_empty() {
+                let idx = rng.gen_range(0..fresh_by_stream[si].len());
+                let e = fresh_by_stream[si][idx].clone();
+                replayed.insert(e.event_id);
+                events.push(e);
+                continue;
+            }
+            let command_id = if roll < 0.30 && !used_commands_by_stream[si].is_empty() {
+                let idx = rng.gen_range(0..used_commands_by_stream[si].len());
+                used_commands_by_stream[si][idx]
+            } else {
+                Uuid::new_v4()
+            };
+            let e = VesEventEnvelope::new_plaintext(
+                st.tenant_id.clone(),
+                st.store_id.clone(),
+                st.agent_id.clone(),
+                AgentKeyId::default(),
+                EntityType::order(),
+                format!("ord-{b}-{i}"),
+                EventType::new("order.updated"),
+                json!({ "b": b, "i": i, "seed": seed }),
+                &st.key,
+            )
+            .with_command_id(command_id);
+            command_collisions
+                .entry(command_id)
+                .or_default()
+                .push(e.event_id);
+            used_commands_by_stream[si].push(command_id);
+            fresh_by_stream[si].push(e.clone());
+            events.push(e);
+        }
+        batches.push((si, events));
+    }
+
+    // Fire everything at once.
+    let barrier = Arc::new(Barrier::new(batches.len()));
+    let mut handles = Vec::new();
+    for (si, events) in batches.clone() {
+        let ves = ves.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            (si, ves.ingest(events).await.unwrap())
+        }));
+    }
+
+    let mut seq_of: HashMap<Uuid, u64> = HashMap::new();
+    let mut accepted_by_stream: Vec<HashSet<Uuid>> = vec![HashSet::new(); streams.len()];
+    let mut ranges_by_stream: Vec<Vec<(u64, u64)>> = vec![Vec::new(); streams.len()];
+    let mut rejected: HashMap<Uuid, VesRejectionReason> = HashMap::new();
+    for h in handles {
+        let (si, r) = h.await.unwrap();
+        // A receipt must give one and only one sequence number per event id.
+        for rc in &r.receipts {
+            if let Some(prev) = seq_of.insert(rc.event_id, rc.sequence_number) {
+                assert_eq!(
+                    prev, rc.sequence_number,
+                    "event {} got two sequence numbers",
+                    rc.event_id
+                );
+            }
+        }
+        if let (Some(s), Some(e)) = (r.assigned_sequence_start, r.assigned_sequence_end) {
+            assert!(s <= e, "seed {seed}: inverted assigned range {s}..={e}");
+            assert_eq!(
+                (e - s + 1) as u32,
+                r.events_accepted,
+                "seed {seed}: assigned range must be exactly the accepted count"
+            );
+            ranges_by_stream[si].push((s, e));
+        } else {
+            assert_eq!(
+                r.events_accepted, 0,
+                "seed {seed}: accepted events without a range"
+            );
+        }
+        for rj in &r.events_rejected {
+            rejected.insert(rj.event_id, rj.reason.clone());
+        }
+        // Everything in a receipt that is not rejected was accepted (or replayed).
+        for rc in &r.receipts {
+            accepted_by_stream[si].insert(rc.event_id);
+        }
+    }
+
+    for (si, st) in streams.iter().enumerate() {
+        let head = ves.head(&st.tenant_id, &st.store_id).await.unwrap();
+        let stored = ves
+            .read_range(&st.tenant_id, &st.store_id, 1, head.max(1))
+            .await
+            .unwrap();
+        // Contiguous from 1, no gaps, no duplicates.
+        assert_eq!(
+            stored.len() as u64,
+            head,
+            "seed {seed}: stream {si} head/rows mismatch"
+        );
+        for (i, ev) in stored.iter().enumerate() {
+            assert_eq!(
+                ev.sequence_number(),
+                i as u64 + 1,
+                "seed {seed}: stream {si} gap at {i}"
+            );
+        }
+        let ids: HashSet<Uuid> = stored.iter().map(|e| e.event_id()).collect();
+        assert_eq!(
+            ids.len(),
+            stored.len(),
+            "seed {seed}: duplicate event stored in stream {si}"
+        );
+        // Accepted batch ranges are disjoint and tile 1..=head exactly.
+        let mut rs = ranges_by_stream[si].clone();
+        rs.sort_unstable();
+        let mut expect = 1u64;
+        for (s, e) in &rs {
+            assert_eq!(
+                *s, expect,
+                "seed {seed}: stream {si} ranges do not tile: {rs:?}"
+            );
+            expect = e + 1;
+        }
+        assert_eq!(
+            expect - 1,
+            head,
+            "seed {seed}: stream {si} ranges do not reach head: {rs:?}"
+        );
+        // Every stored event has a receipt with the matching number.
+        for ev in &stored {
+            assert_eq!(
+                seq_of.get(&ev.event_id()),
+                Some(&ev.sequence_number()),
+                "seed {seed}"
+            );
+        }
+    }
+
+    // Command-id collisions: exactly one event per command is stored; the rest
+    // were rejected as DuplicateCommandId (never silently dropped).
+    let stored_ids: HashSet<Uuid> = seq_of.keys().copied().collect();
+    for (cmd, ids) in command_collisions.iter().filter(|(_, v)| v.len() > 1) {
+        let winners: Vec<_> = ids.iter().filter(|id| stored_ids.contains(id)).collect();
+        assert_eq!(
+            winners.len(),
+            1,
+            "seed {seed}: command {cmd} should win exactly once, got {ids:?}"
+        );
+        for id in ids.iter().filter(|id| !stored_ids.contains(id)) {
+            assert_eq!(
+                rejected.get(id),
+                Some(&VesRejectionReason::DuplicateCommandId),
+                "seed {seed}: loser {id} of command {cmd} must be rejected as DuplicateCommandId"
+            );
+        }
+    }
+    eprintln!(
+        "seed {seed}: {} replays, {} command collisions, all invariants held",
+        replayed.len(),
+        command_collisions.values().filter(|v| v.len() > 1).count()
+    );
+}
+
 #[cfg(feature = "stark")]
 #[tokio::test]
 #[ignore]

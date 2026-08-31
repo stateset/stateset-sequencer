@@ -21,7 +21,7 @@ env:
   # invalidated Cargo.lock and failed every `--locked` job in this file.
   # Bump this ref and re-resolve the ves-stark-* crates with `cargo update`
   # in the same commit, so a STARK upgrade is always deliberate and atomic.
-  STARK_REF: "46b4b4749349b12ff99c0e26cbe3982f68b85e48"
+  STARK_REF: "c2cd52c6511279c9c73ab6eb16c5389176f95752"
   # Token with read access to the private stateset-stark repo. Add it under
   # Settings → Secrets and variables → Actions. Required because the ves-stark-*
   # crates are path dependencies that cargo must resolve even when the `stark`
