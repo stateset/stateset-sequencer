@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-30
+
+### Fixed
+
+- **Entity history was loaded whole and paged in memory.** `EventStore::read_entity` and `VesSequencer::read_entity` fetched every event an entity ever had; the HTTP handler and both gRPC services then sliced the result with skip/take, so the documented 100-event cap bounded only the response, not the query. A hot entity cost a full-history fetch and decode per request to any authenticated reader, and gRPC v2 `subscribe_entity` with `include_history` buffered the entire history before streaming a byte. Both repositories now expose only `read_entity_page(offset, limit)`, which runs `COUNT(*)` plus `LIMIT/OFFSET` over the existing entity indexes and clamps the limit to `MAX_ENTITY_HISTORY_PAGE` inside the repository. The HTTP handler, gRPC v1/v2 `get_entity_history`, and the v2 subscribe replay (now page-at-a-time) all use it; response shapes and `current_version` semantics are unchanged.
+- **`read_range` now rejects spans wider than `MAX_READ_RANGE_SPAN` (1000) at the repository.** Every caller already capped the span at 1000, so no live behaviour changes; this closes the case where one new call site reopens an unbounded read of the log.
+- **x402: a failed batch stranded its claimed intents.** `mark_batch_failed_if_pending` flipped only the batch row. Intents already claimed (`sequenced` → `batched`) kept that status and their `batch_id`, pointing at a failed batch; the batcher selects only `sequenced` intents and settlement only committed batches, so those payments were never batched or settled again. The method now also returns the batch's `batched` intents to `sequenced` with `batch_id` cleared, in the same transaction.
+- **x402: `X402_BATCH_AUTO_COMMIT=false` was a dead end.** The worker claimed intents into a pending batch and stopped, but no endpoint commits an existing pending batch (`POST /api/v1/x402/batches` creates and commits its own), so every batch made in that mode stranded its intents. The worker no longer has a claim-without-commit path: batch creation is atomic-or-nothing.
+
+### Changed
+
+- **BREAKING: `EventStore::read_entity` removed** in favour of `read_entity_page(offset, limit) -> EntityHistoryPage`. There is deliberately no unpaged variant; implementors of the trait must provide the paged method. `VesSequencer::read_entity` is likewise replaced.
+- **BREAKING: `X402_BATCH_AUTO_COMMIT=false` now disables the batch worker's batching entirely** rather than claiming intents without committing. Intents stay `sequenced` and are batched via the API. The default (`true`) is unchanged.
+
+### Testing
+
+- Six new database-backed tests: entity paging order, totals past the end and limit clamping on both stores; span rejection on both stores; released intents after a failed batch; and a worker without auto-commit leaving intents unclaimed. 746 tests pass against a virgin PostgreSQL with zero ignored.
+
 ## [0.3.2] - 2026-08-30
 
 ### Documentation
