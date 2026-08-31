@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-31
+
 ### Added
 
 - **Settlement idempotency is now proven, not asserted.** A new on-chain test drives `SettlementService::settle_batch` twice for the same batch against a local EVM: the first call sends the transaction, the second finds `getBatch(id).settledAt != 0` and returns `already_settled` with a zero tx hash and no transaction. This is the crash-between-send-and-record / leader-failover case the code documented as safe; it is now exercised. A companion database test shows `settle_batch_with_results` called twice with different tx data is an idempotent no-op that never overwrites the first record.
