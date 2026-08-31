@@ -499,7 +499,7 @@ global bucket and makes an IP allowlist meaningless.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `X402_BATCH_AUTO_COMMIT` | | Auto-commit batches when thresholds are met |
+| `X402_BATCH_AUTO_COMMIT` | `true` | Batch worker claims and commits batches atomically. `false` disables the worker's batching entirely (batching is then done via `POST /api/v1/x402/batches`) |
 | `X402_BATCH_INTERVAL_SECS` | | Batch worker tick interval |
 | `X402_BATCH_MIN_SIZE` | | Minimum intents before committing a batch |
 | `X402_BATCH_MAX_SIZE` | `100` | Maximum intents per batch (clamped to the hard cap of 1000) |

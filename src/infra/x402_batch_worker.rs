@@ -15,7 +15,8 @@
 //! - `X402_BATCH_MAX_SIZE` - Maximum intents per batch (default: 100)
 //! - `X402_BATCH_MAX_WAIT_SECS` - Max time to wait before batching (default: 300)
 //! - `X402_BATCH_NETWORKS` - Comma-separated networks to process (default: set_chain)
-//! - `X402_BATCH_AUTO_COMMIT` - Set to true/1/on/yes to auto-commit (default: true)
+//! - `X402_BATCH_AUTO_COMMIT` - Set to false/0/off/no to disable this worker's batching
+//!   entirely and leave it to the API (default: true)
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -321,12 +322,30 @@ impl X402BatchWorker {
     }
 
     /// Create a batch for a specific tenant/store/network
-    async fn create_batch_for_tenant(
+    /// Create and commit one batch for a tenant/store/network if enough
+    /// sequenced intents are waiting. Returns `Ok(None)` when nothing was done.
+    ///
+    /// Batch creation is atomic-or-nothing: intents are claimed and the batch
+    /// committed in one transaction, or neither happens. With `auto_commit`
+    /// off this worker does not batch at all -- there is no endpoint that
+    /// commits an existing pending batch, so claiming intents without
+    /// committing stranded them as `batched` forever. Batching is then left to
+    /// `POST /api/v1/x402/batches`, which commits atomically itself.
+    pub async fn create_batch_for_tenant(
         &self,
         tenant_id: &TenantId,
         store_id: &StoreId,
         network: X402Network,
     ) -> Result<Option<BatchResult>, String> {
+        if !self.config.auto_commit {
+            debug!(
+                tenant_id = %tenant_id.0,
+                store_id = %store_id.0,
+                "Auto-commit disabled; leaving batching to the API"
+            );
+            return Ok(None);
+        }
+
         // Fetch pending intents
         let intents = self
             .repository
@@ -396,8 +415,10 @@ impl X402BatchWorker {
             committed: false,
         };
 
-        // Auto-commit if enabled
-        if self.config.auto_commit {
+        // Claim the intents and commit the batch atomically. On failure the
+        // transaction rolls back and the batch row is marked failed, which also
+        // releases anything that had been claimed.
+        {
             match self
                 .repository
                 .commit_batch_with_merkle(batch.batch_id, &intent_ids, tenant_id, store_id)
@@ -431,23 +452,6 @@ impl X402BatchWorker {
                     }
                 }
             }
-        } else if let Err(e) = self
-            .repository
-            .assign_intents_to_batch(batch.batch_id, &intent_ids)
-            .await
-        {
-            if let Err(mark_err) = self
-                .repository
-                .mark_batch_failed_if_pending(batch.batch_id)
-                .await
-            {
-                warn!(
-                    batch_id = %batch.batch_id,
-                    error = ?mark_err,
-                    "Failed to mark batch as failed"
-                );
-            }
-            return Err(e.to_string());
         }
 
         info!(

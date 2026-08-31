@@ -565,6 +565,129 @@ mod integration {
         assert_eq!(seq2, seq1 + 1);
     }
 
+    /// Failing a batch must hand its intents back to the pipeline. Before this,
+    /// `mark_batch_failed_if_pending` flipped only the batch row: intents that
+    /// had already been claimed (`sequenced` -> `batched`) stayed `batched`,
+    /// pointing at a failed batch, and the batcher only ever selects
+    /// `sequenced` intents -- so those payments silently left the pipeline for
+    /// good.
+    #[tokio::test]
+    async fn test_failing_a_batch_releases_its_claimed_intents() {
+        let pool = get_test_pool().await;
+        let repo = Arc::new(PgX402Repository::new(pool));
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+
+        let mut intent_ids = Vec::new();
+        for i in 0..3 {
+            let intent = create_test_intent(
+                &signing_key,
+                tenant_id.clone(),
+                store_id.clone(),
+                &format!("0x{:040x}", i + 1),
+                1_000_000,
+            );
+            repo.insert_intent(&intent).await.unwrap();
+            repo.assign_sequence_number(intent.intent_id, &tenant_id, &store_id)
+                .await
+                .unwrap();
+            intent_ids.push(intent.intent_id);
+        }
+
+        let batch =
+            X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
+        repo.insert_batch(&batch).await.unwrap();
+        repo.assign_intents_to_batch(batch.batch_id, &intent_ids)
+            .await
+            .unwrap();
+        for id in &intent_ids {
+            let claimed = repo.get_intent(*id).await.unwrap().unwrap();
+            assert_eq!(claimed.status, X402IntentStatus::Batched);
+            assert_eq!(claimed.batch_id, Some(batch.batch_id));
+        }
+
+        repo.mark_batch_failed_if_pending(batch.batch_id)
+            .await
+            .unwrap();
+
+        let failed = repo.get_batch(batch.batch_id).await.unwrap().unwrap();
+        assert_eq!(
+            failed.status,
+            stateset_sequencer::domain::X402BatchStatus::Failed
+        );
+
+        for id in &intent_ids {
+            let released = repo.get_intent(*id).await.unwrap().unwrap();
+            assert_eq!(
+                released.status,
+                X402IntentStatus::Sequenced,
+                "intent {id} must return to the batchable pool"
+            );
+            assert_eq!(
+                released.batch_id, None,
+                "intent {id} must no longer reference the failed batch"
+            );
+        }
+
+        // And the batcher can see them again.
+        let pending = repo
+            .get_pending_intents_for_batch(&tenant_id, &store_id, X402Network::SetChain, 100)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 3);
+    }
+
+    /// With auto-commit disabled the worker must not claim intents at all.
+    /// There is no endpoint that commits an existing pending batch, so a
+    /// claimed-but-uncommitted batch was a dead end: its intents were
+    /// `batched` forever. `auto_commit = false` now means "leave batching to
+    /// the API", which keeps intents `sequenced` and reachable by
+    /// POST /api/v1/x402/batches.
+    #[tokio::test]
+    async fn test_worker_without_auto_commit_leaves_intents_unclaimed() {
+        use stateset_sequencer::infra::{X402BatchWorker, X402BatchWorkerConfig};
+
+        let pool = get_test_pool().await;
+        let repo = Arc::new(PgX402Repository::new(pool));
+
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+
+        let intent = create_test_intent(
+            &signing_key,
+            tenant_id.clone(),
+            store_id.clone(),
+            "0x0000000000000000000000000000000000000abc",
+            1_000_000,
+        );
+        repo.insert_intent(&intent).await.unwrap();
+        repo.assign_sequence_number(intent.intent_id, &tenant_id, &store_id)
+            .await
+            .unwrap();
+
+        let config = X402BatchWorkerConfig {
+            auto_commit: false,
+            min_batch_size: 1,
+            ..X402BatchWorkerConfig::default()
+        };
+        let worker = X402BatchWorker::new(config, repo.clone());
+        let created = worker
+            .create_batch_for_tenant(&tenant_id, &store_id, X402Network::SetChain)
+            .await
+            .unwrap();
+        assert!(
+            created.is_none(),
+            "no batch may be created without auto-commit"
+        );
+
+        let after = repo.get_intent(intent.intent_id).await.unwrap().unwrap();
+        assert_eq!(after.status, X402IntentStatus::Sequenced);
+        assert_eq!(after.batch_id, None);
+    }
+
     #[tokio::test]
     async fn test_full_batch_flow() {
         let pool = get_test_pool().await;

@@ -738,7 +738,16 @@ impl PgX402Repository {
     }
 
     /// Mark a pending batch as failed
+    /// Mark a still-pending batch as failed and hand any intents it had
+    /// claimed back to the batchable pool, in one transaction.
+    ///
+    /// Releasing the intents is the point. The batcher only ever selects
+    /// `sequenced` intents, so an intent left `batched` under a failed batch
+    /// would never be batched or settled again -- the payment would simply
+    /// leave the pipeline. A batch that is no longer pending is left alone.
     pub async fn mark_batch_failed_if_pending(&self, batch_id: Uuid) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
         let result = sqlx::query(
             r#"
             UPDATE x402_payment_batches
@@ -748,13 +757,27 @@ impl PgX402Repository {
             "#,
         )
         .bind(batch_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
+            tx.rollback().await?;
             return Ok(());
         }
 
+        sqlx::query(
+            r#"
+            UPDATE x402_payment_intents
+            SET batch_id = NULL, status = 'sequenced', updated_at = NOW()
+            WHERE batch_id = $1
+              AND status = 'batched'
+            "#,
+        )
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
