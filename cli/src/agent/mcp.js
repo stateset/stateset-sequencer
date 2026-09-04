@@ -17,7 +17,7 @@ export function createMcpRequestHandler(client, policy = {}) {
           return rpcResult(request.id, {
             protocolVersion: PROTOCOL_VERSION,
             capabilities: { tools: { listChanged: false } },
-            serverInfo: { name: 'stateset-sequencer', version: '0.8.0' },
+            serverInfo: { name: 'stateset-sequencer', version: '0.8.1' },
           });
         case 'ping':
           return rpcResult(request.id, {});

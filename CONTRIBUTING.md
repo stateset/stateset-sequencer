@@ -21,7 +21,9 @@ Please be respectful and constructive in all interactions. We're building someth
 
 ### Prerequisites
 
-- **Rust**: 1.70+ (install via [rustup](https://rustup.rs/))
+- **Rust**: 1.90+ (install via [rustup](https://rustup.rs/))
+- **Node.js**: 20+ for the Node SDK test suite
+- **Python**: 3.10+ for the Python SDK test suite
 - **PostgreSQL**: 14+ (or Docker)
 - **Docker & Docker Compose**: For integration tests
 - **Git**: For version control
@@ -175,6 +177,13 @@ docs(readme): update installation instructions
 
 ```bash
 cargo test
+```
+
+Run the language SDK checks as well:
+
+```bash
+(cd cli && npm ci && npm test)
+(cd sdk/python && python -m pip install -e '.[test]' && python -m pytest)
 ```
 
 ### Run Specific Tests

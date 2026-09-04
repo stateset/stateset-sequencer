@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-04
+
+### Added
+
+- A typed Python SDK with synchronous and asynchronous clients, RFC 8785
+  canonicalization, Ed25519 event signing, resilient reads and idempotent
+  writes, projections, proofs, policies, durable cursors, and agent tool
+  definitions. CI validates it on Python 3.10 through 3.13 and verifies both
+  wheel and source distributions.
+
+### Changed
+
+- The unpublished Node package is now named `@stateset/sequencer-sdk`, with
+  complete npm repository and provenance metadata. Its existing SDK, agent
+  tools, MCP server, and x402 CLI exports remain intact.
+
+### Fixed
+
+- k6 workflows now load JSON profiles with the supported `--config` option;
+  the invalid `--opts` flag no longer blocks release-binary CI.
+
 ## [0.8.0] - 2026-09-04
 
 ### Added

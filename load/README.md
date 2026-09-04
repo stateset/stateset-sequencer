@@ -27,7 +27,7 @@ k6 run load/sequencer_ingest.js
 ### Custom Configuration
 
 ```bash
-k6 run load/sequencer_ingest.js --opts load/runner.json
+k6 run --config load/runner.json load/sequencer_ingest.js
 ```
 
 ### Standard Profiles (Recommended)

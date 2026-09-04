@@ -24,6 +24,7 @@ __pycache__/
 .ruff_cache/
 .tox/
 .python-version
+dist/
 
 # Environment files
 .env

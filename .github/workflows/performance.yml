@@ -94,7 +94,7 @@ jobs:
             -e API_KEY -e TENANT_ID -e STORE_ID -e AGENT_ID \
             -v "$PWD:/work" -w /work \
             grafana/k6:0.54.0 run \
-            --opts "load/profiles/${PROFILE}.json" \
+            --config "load/profiles/${PROFILE}.json" \
             --summary-export "performance-${PROFILE}.json" \
             load/mixed_workload.js
 

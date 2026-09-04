@@ -26,6 +26,9 @@ jobs:
       (github.event.workflow_run.head_branch == 'master' ||
        github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.existing.outputs.publish }}
+      version: ${{ steps.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,6 +45,8 @@ jobs:
           test -n "$version"
           test "$version" != "0.0.0"
           grep -q "^## \[$version\] - " CHANGELOG.md
+          test "$(node -p "require('./cli/package.json').version")" = "$version"
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' sdk/python/pyproject.toml | head -1)" = "$version"
           test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=v$version" >> "$GITHUB_OUTPUT"
@@ -116,3 +121,61 @@ jobs:
             --verify-tag \
             --generate-notes \
             --title "StateSet Sequencer $TAG"
+
+  publish-node-sdk:
+    name: Publish Node SDK
+    needs: release
+    if: needs.release.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - name: Publish with provenance
+        run: npm publish
+        env:
+          # OIDC trusted publishing is preferred. This optional token permits
+          # the one-time initial package creation before npm can attach trust.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  publish-python-sdk:
+    name: Publish Python SDK
+    needs: release
+    if: needs.release.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build distributions
+        working-directory: sdk/python
+        run: |
+          python -m pip install --upgrade build twine
+          python -m build
+          python -m twine check dist/*
+      - name: Publish with trusted OIDC identity
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdk/python/dist

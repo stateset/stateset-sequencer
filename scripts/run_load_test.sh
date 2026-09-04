@@ -37,6 +37,6 @@ k6 run "$SCRIPT_PATH" \
   --tag "script=${script_name}" \
   --out "json=${json_out}" \
   --summary-export "${summary_out}" \
-  --opts "${PROFILE_FILE}"
+  --config "${PROFILE_FILE}"
 
 echo "Summary written to ${summary_out}"

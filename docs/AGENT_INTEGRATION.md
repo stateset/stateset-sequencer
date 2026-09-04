@@ -451,7 +451,7 @@ AI assistants record actions and decisions as signed events for:
 
 ```js
 import { randomUUID } from 'node:crypto';
-import { VesClient, loadVesPrivateKey } from '@stateset/x402-cli';
+import { VesClient, loadVesPrivateKey } from '@stateset/sequencer-sdk';
 
 const agent = new VesClient({
   baseUrl: process.env.STATESET_SEQUENCER_URL,

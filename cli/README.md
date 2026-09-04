@@ -4,14 +4,15 @@ The package provides a VES client, model-tool definitions, an MCP stdio server,
 and the existing x402 CLI. It requires Node.js 18 or newer.
 
 ```bash
-cd cli
-npm ci
+npm install @stateset/sequencer-sdk
 ```
+
+For repository development, run `npm ci && npm test` from `cli/`.
 
 ## Record a signed action
 
 ```js
-import { VesClient, loadVesPrivateKey } from '@stateset/x402-cli';
+import { VesClient, loadVesPrivateKey } from '@stateset/sequencer-sdk';
 
 const sequencer = new VesClient({
   baseUrl: process.env.STATESET_SEQUENCER_URL,
@@ -56,7 +57,7 @@ additional least-privilege boundary.
 import {
   createSequencerToolExecutor,
   sequencerTools,
-} from '@stateset/x402-cli/agent-tools';
+} from '@stateset/sequencer-sdk/agent-tools';
 
 const execute = createSequencerToolExecutor(sequencer, {
   allowedEventTypes: ['order.confirmed', 'order.cancelled'],

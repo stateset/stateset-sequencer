@@ -176,13 +176,15 @@ cargo test --locked --all-targets
 > repo is ever made private. The lint/test/coverage jobs build with the core feature
 > set (no `stark`) so they don't compile the private crates.
 
-## AI Agent SDK and MCP
+## AI Agent SDKs and MCP
 
-The Node.js agent SDK creates correctly canonicalized and signed VES events,
+The Node.js and Python agent SDKs create correctly canonicalized and signed VES events,
 performs idempotent retries, reads entity history, follows sequence cursors, and
 retrieves inclusion proofs. It also exports OpenAI-compatible function tools and
 a policy-constrained MCP stdio server. See [AI agent integration](docs/AGENT_INTEGRATION.md)
-and the [SDK guide](cli/README.md).
+and the [Node SDK guide](cli/README.md) or [Python SDK guide](sdk/python/README.md).
+Maintainers should complete the one-time trusted-publisher setup in the
+[release guide](docs/RELEASING.md) before the first registry release.
 
 Private signing keys remain inside the tool host and are never exposed to model
 context. Local validation hooks run before signing, while authoritative
