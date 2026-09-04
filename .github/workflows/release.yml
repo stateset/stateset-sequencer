@@ -3,11 +3,18 @@ name: release
 # A release is derived only from a fully successful CI run on the default
 # branch. This prevents publishing a tag or binary from a partially validated
 # revision. Bumping Cargo.toml and adding the matching changelog section is the
-# release request; this workflow is the sole publisher.
+# release request; this workflow is the sole publisher. Manual dispatch is
+# limited to retrying missing SDK packages for an existing release tag.
 on:
   workflow_run:
     workflows: [ci]
     types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag whose missing SDK packages should be published
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -16,29 +23,32 @@ permissions:
   attestations: write
 
 concurrency:
-  group: release-${{ github.event.workflow_run.head_sha }}
+  group: release-${{ github.event.workflow_run.head_sha || inputs.tag }}
   cancel-in-progress: false
 
 jobs:
   release:
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      (github.event.workflow_run.head_branch == 'master' ||
-       github.event.workflow_run.head_branch == 'main')
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       (github.event.workflow_run.head_branch == 'master' ||
+        github.event.workflow_run.head_branch == 'main'))
     runs-on: ubuntu-latest
     outputs:
-      publish: ${{ steps.existing.outputs.publish }}
+      publish_sdks: ${{ steps.existing.outputs.publish_sdks }}
+      create_release: ${{ steps.existing.outputs.create_release }}
       version: ${{ steps.metadata.outputs.version }}
+      release_sha: ${{ steps.metadata.outputs.release_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.workflow_run.head_sha }}
           fetch-depth: 0
 
       - name: Validate release metadata
         id: metadata
         env:
-          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
@@ -47,40 +57,65 @@ jobs:
           grep -q "^## \[$version\] - " CHANGELOG.md
           test "$(node -p "require('./cli/package.json').version")" = "$version"
           test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' sdk/python/pyproject.toml | head -1)" = "$version"
-          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+          release_sha=$(git rev-parse HEAD)
+          if [ -n "$REQUESTED_TAG" ]; then
+            test "$REQUESTED_TAG" = "v$version"
+          fi
+          {
+            echo "version=$version"
+            echo "tag=v$version"
+            echo "release_sha=$release_sha"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check whether this version is already released
         id: existing
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.metadata.outputs.tag }}
-          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          RELEASE_SHA: ${{ steps.metadata.outputs.release_sha }}
         run: |
           set -euo pipefail
           git fetch --force --tags origin
           if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
             tagged_sha=$(git rev-list -n 1 "$TAG")
-            if [ "$tagged_sha" = "$RELEASE_SHA" ] && ! gh release view "$TAG" >/dev/null 2>&1; then
-              echo "publish=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "publish=false" >> "$GITHUB_OUTPUT"
+            if [ "$tagged_sha" != "$RELEASE_SHA" ]; then
+              {
+                echo "publish_sdks=false"
+                echo "create_release=false"
+              } >> "$GITHUB_OUTPUT"
               echo "Version $TAG already points to $tagged_sha; no release requested by this revision."
+            elif gh release view "$TAG" >/dev/null 2>&1; then
+              {
+                echo "publish_sdks=true"
+                echo "create_release=false"
+              } >> "$GITHUB_OUTPUT"
+              echo "GitHub release $TAG exists; missing SDK publications may be retried."
+            else
+              if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+                echo "Manual SDK retries require an existing GitHub release for $TAG." >&2
+                exit 1
+              fi
+              {
+                echo "publish_sdks=true"
+                echo "create_release=true"
+              } >> "$GITHUB_OUTPUT"
             fi
           else
-            echo "publish=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "publish_sdks=true"
+              echo "create_release=true"
+            } >> "$GITHUB_OUTPUT"
           fi
 
       - name: Download CI-validated binary
-        if: steps.existing.outputs.publish == 'true'
+        if: steps.existing.outputs.create_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: gh run download "$RUN_ID" --name stateset-sequencer --dir dist
 
       - name: Package release artifact
-        if: steps.existing.outputs.publish == 'true'
+        if: steps.existing.outputs.create_release == 'true'
         env:
           VERSION: ${{ steps.metadata.outputs.version }}
         run: |
@@ -90,13 +125,13 @@ jobs:
           sha256sum "dist/stateset-sequencer-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" > "dist/SHA256SUMS"
 
       - name: Attest release artifact provenance
-        if: steps.existing.outputs.publish == 'true'
+        if: steps.existing.outputs.create_release == 'true'
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/stateset-sequencer-${{ steps.metadata.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
 
       - name: Create annotated tag when absent
-        if: steps.existing.outputs.publish == 'true'
+        if: steps.existing.outputs.create_release == 'true'
         env:
           TAG: ${{ steps.metadata.outputs.tag }}
           VERSION: ${{ steps.metadata.outputs.version }}
@@ -110,7 +145,7 @@ jobs:
           fi
 
       - name: Publish GitHub release
-        if: steps.existing.outputs.publish == 'true'
+        if: steps.existing.outputs.create_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.metadata.outputs.tag }}
@@ -125,7 +160,7 @@ jobs:
   publish-node-sdk:
     name: Publish Node SDK
     needs: release
-    if: needs.release.outputs.publish == 'true'
+    if: needs.release.outputs.publish_sdks == 'true'
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -137,26 +172,44 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.release.outputs.release_sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "24"
           registry-url: https://registry.npmjs.org
           cache: npm
           cache-dependency-path: cli/package-lock.json
-      - run: npm ci
-      - run: npm test
+      - name: Check npm registry
+        id: registry
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          if npm view "@stateset/sequencer-sdk@$VERSION" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "@stateset/sequencer-sdk@$VERSION is already published."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.registry.outputs.exists != 'true'
+        run: npm ci
+      - if: steps.registry.outputs.exists != 'true'
+        run: npm test
       - name: Publish with provenance
+        if: steps.registry.outputs.exists != 'true'
         run: npm publish
         env:
           # OIDC trusted publishing is preferred. This optional token permits
           # the one-time initial package creation before npm can attach trust.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Verify npm publication
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: npm view "@stateset/sequencer-sdk@$VERSION" version
 
   publish-python-sdk:
     name: Publish Python SDK
     needs: release
-    if: needs.release.outputs.publish == 'true'
+    if: needs.release.outputs.publish_sdks == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -165,17 +218,45 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ needs.release.outputs.release_sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Check PyPI registry
+        id: registry
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            "https://pypi.org/pypi/stateset-sequencer-sdk/$VERSION/json")
+          case "$status" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "stateset-sequencer-sdk==$VERSION is already published."
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected PyPI response: HTTP $status" >&2
+              exit 1
+              ;;
+          esac
       - name: Build distributions
+        if: steps.registry.outputs.exists != 'true'
         working-directory: sdk/python
         run: |
           python -m pip install --upgrade build twine
           python -m build
           python -m twine check dist/*
       - name: Publish with trusted OIDC identity
+        if: steps.registry.outputs.exists != 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: sdk/python/dist
+      - name: Verify PyPI publication
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          python -m pip install "stateset-sequencer-sdk==$VERSION"
+          python -c "import stateset_sequencer"

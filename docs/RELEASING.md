@@ -28,6 +28,16 @@ the GitHub release with checksums and provenance, then publishes:
    publishing in npm. Later releases authenticate only with short-lived OIDC
    credentials and automatically carry npm provenance.
 
-Never publish a package locally from an unvalidated working tree. If any
-publication job fails, correct the registry configuration and rerun that job;
-do not reuse a version that a registry already accepted.
+Never publish a package locally from an unvalidated working tree.
+
+## Retry a partial release
+
+If an SDK publication fails after the GitHub release exists, correct the
+registry configuration and manually run the `release` workflow with the
+existing `v<version>` tag. The workflow checks each registry independently,
+skips versions that are already present, and publishes only missing packages
+from the commit referenced by that tag. It then verifies that both packages
+can be resolved from their public registries.
+
+Do not bump or reuse the version merely to recover from a registry outage or
+configuration error. Package registry versions are immutable.
