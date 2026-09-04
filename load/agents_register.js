@@ -5,13 +5,8 @@ import crypto from 'k6/crypto';
 const BASE_URL = __ENV.SEQUENCER_BASE_URL || 'http://localhost:8080';
 const ALLOW = __ENV.ALLOW_PUBLIC_REGISTRATION_LOAD === 'true';
 
-export const options = {
-  vus: 5,
-  duration: '30s',
-};
-
 function uuidv4() {
-  const bytes = crypto.randomBytes(16);
+  const bytes = new Uint8Array(crypto.randomBytes(16));
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = Array.from(bytes).map((b) => (`0${b.toString(16)}`).slice(-2)).join('');

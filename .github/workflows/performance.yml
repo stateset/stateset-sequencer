@@ -85,17 +85,20 @@ jobs:
 
       - name: Execute thresholded workload
         env:
+          SEQUENCER_BASE_URL: http://127.0.0.1:8080
           API_KEY: performance-auth-disabled
           TENANT_ID: 10000000-0000-4000-8000-000000000001
           STORE_ID: 20000000-0000-4000-8000-000000000002
           AGENT_ID: 30000000-0000-4000-8000-000000000003
         run: |
+          mkdir -p load/results
+          chmod 0777 load/results
           docker run --rm --network host \
-            -e API_KEY -e TENANT_ID -e STORE_ID -e AGENT_ID \
+            -e SEQUENCER_BASE_URL -e API_KEY -e TENANT_ID -e STORE_ID -e AGENT_ID \
             -v "$PWD:/work" -w /work \
             grafana/k6:0.54.0 run \
             --config "load/profiles/${PROFILE}.json" \
-            --summary-export "performance-${PROFILE}.json" \
+            --summary-export "load/results/performance-${PROFILE}.json" \
             load/mixed_workload.js
 
       - name: Stop sequencer
@@ -111,7 +114,7 @@ jobs:
         with:
           name: performance-${{ env.PROFILE }}-${{ github.run_id }}
           path: |
-            performance-*.json
+            load/results/performance-*.json
             performance-server.log
           if-no-files-found: warn
           retention-days: 30

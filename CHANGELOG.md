@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-04
+
+### Fixed
+
+- k6 workloads now generate valid UUIDs from `crypto.randomBytes`, honor the
+  selected execution profile, target the host service explicitly in CI, and
+  write summary evidence to a container-writable directory.
+
 ## [0.8.1] - 2026-09-04
 
 ### Added

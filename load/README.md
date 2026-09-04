@@ -18,10 +18,10 @@ sudo apt-get install k6
 
 ## Running Tests
 
-### Quick Test (Default: 10 VUs for 30s)
+### Quick Test
 
 ```bash
-k6 run load/sequencer_ingest.js
+k6 run --config load/profiles/ci.json load/sequencer_ingest.js
 ```
 
 ### Custom Configuration
@@ -29,6 +29,10 @@ k6 run load/sequencer_ingest.js
 ```bash
 k6 run --config load/runner.json load/sequencer_ingest.js
 ```
+
+The workload scripts intentionally do not embed execution settings. Select a
+profile (or pass k6 CLI options) so the requested VU, duration, stage, and
+threshold settings remain authoritative.
 
 ### Standard Profiles (Recommended)
 

@@ -645,17 +645,20 @@ jobs:
 
       - name: Run thresholded ingest load test
         env:
+          SEQUENCER_BASE_URL: http://127.0.0.1:8080
           API_KEY: ci-auth-disabled
           TENANT_ID: 10000000-0000-4000-8000-000000000001
           STORE_ID: 20000000-0000-4000-8000-000000000002
           AGENT_ID: 30000000-0000-4000-8000-000000000003
         run: |
+          mkdir -p load/results
+          chmod 0777 load/results
           docker run --rm --network host \
-            -e API_KEY -e TENANT_ID -e STORE_ID -e AGENT_ID \
+            -e SEQUENCER_BASE_URL -e API_KEY -e TENANT_ID -e STORE_ID -e AGENT_ID \
             -v "$PWD:/work" -w /work \
             grafana/k6:0.54.0 run \
             --config load/profiles/ci.json \
-            --summary-export load-smoke-summary.json \
+            --summary-export load/results/load-smoke-summary.json \
             load/sequencer_ingest.js
 
       - name: Stop release binary
@@ -671,7 +674,7 @@ jobs:
         with:
           name: load-smoke-evidence
           path: |
-            load-smoke-summary.json
+            load/results/load-smoke-summary.json
             sequencer-load-smoke.log
           if-no-files-found: warn
 

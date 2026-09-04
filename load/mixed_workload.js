@@ -8,13 +8,8 @@ const TENANT_ID = __ENV.TENANT_ID || '00000000-0000-0000-0000-000000000000';
 const STORE_ID = __ENV.STORE_ID || '00000000-0000-0000-0000-000000000000';
 const AGENT_ID = __ENV.AGENT_ID || '00000000-0000-0000-0000-000000000000';
 
-export const options = {
-  vus: 20,
-  duration: '60s',
-};
-
 function uuidv4() {
-  const bytes = crypto.randomBytes(16);
+  const bytes = new Uint8Array(crypto.randomBytes(16));
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   const hex = Array.from(bytes).map((b) => (`0${b.toString(16)}`).slice(-2)).join('');

@@ -6,11 +6,6 @@ const API_KEY = __ENV.API_KEY;
 const TENANT_ID = __ENV.TENANT_ID || '00000000-0000-0000-0000-000000000000';
 const STORE_ID = __ENV.STORE_ID || '00000000-0000-0000-0000-000000000000';
 
-export const options = {
-  vus: 10,
-  duration: '30s',
-};
-
 export default function () {
   if (!API_KEY) {
     throw new Error('API_KEY is required');
