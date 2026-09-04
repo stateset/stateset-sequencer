@@ -37,6 +37,19 @@ const result = await sequencer.recordAction({
 attempt. Reuse it when retrying so the sequencer can return the original result
 without applying the action twice.
 
+After an agent has durably processed events, persist its monotonic server-side
+cursor. A stale acknowledgement cannot move the cursor backwards:
+
+```js
+await sequencer.acknowledge(lastProcessedSequence);
+const { acknowledgedSequence, lag } = await sequencer.getCursor();
+```
+
+Administrators can configure a second, authoritative policy boundary with
+`getAgentPolicy()` and `setAgentPolicy()`. Server policies apply equally to
+REST, gRPC, SDK, and MCP writes; local MCP allowlists remain useful as an
+additional least-privilege boundary.
+
 ## Give tools to a model
 
 ```js

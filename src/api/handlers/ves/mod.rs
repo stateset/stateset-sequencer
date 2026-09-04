@@ -2,6 +2,7 @@
 
 pub mod anchoring;
 pub mod commitments;
+pub mod cursors;
 pub mod events;
 pub mod inclusion_proofs;
 
@@ -16,6 +17,7 @@ pub mod validity_proofs;
 // Re-export all handlers for convenience
 pub use anchoring::*;
 pub use commitments::*;
+pub use cursors::*;
 pub use events::*;
 pub use inclusion_proofs::*;
 

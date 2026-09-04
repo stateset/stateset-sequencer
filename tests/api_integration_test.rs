@@ -1684,6 +1684,169 @@ async fn test_ves_read_endpoints_share_the_ingest_ledger() {
 
 #[tokio::test]
 #[ignore]
+async fn test_agent_policy_is_enforced_by_ves_ingest() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let key_id = AgentKeyId::new(1);
+    let signing_key = AgentSigningKey::generate();
+    PgAgentKeyRegistry::new(pool.clone())
+        .register_key(
+            &AgentKeyLookup::new(&tenant_id, &agent_id, key_id),
+            AgentKeyEntry::new(signing_key.public_key_bytes()),
+        )
+        .await
+        .unwrap();
+
+    let app = create_test_router(create_test_state(pool).await, false);
+    let policy_uri = format!("/api/v1/agents/{}/policy", agent_id.0);
+    let (status, policy) = send_request(
+        &app,
+        Method::PUT,
+        &policy_uri,
+        Some(json!({
+            "tenantId": tenant_id.0,
+            "allowedEventTypes": ["order.confirmed"],
+            "allowedEntityTypes": ["order"],
+            "requireBaseVersion": true,
+            "maxPayloadBytes": 1024,
+            "enabled": true
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "policy response: {policy}");
+    assert_eq!(policy["allowedEventTypes"][0], "order.confirmed");
+
+    let denied = VesEventEnvelope::new_plaintext(
+        tenant_id.clone(),
+        store_id.clone(),
+        agent_id.clone(),
+        key_id,
+        EntityType::order(),
+        "ORD-POLICY",
+        EventType::new("order.cancelled"),
+        json!({ "reason": "model requested it" }),
+        &signing_key,
+    )
+    .with_base_version(0);
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/ves/events/ingest",
+        Some(json!({ "agentId": agent_id.0, "events": [denied] })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["eventsAccepted"], 0);
+    assert_eq!(body["eventsRejected"], 1);
+    assert!(body["rejections"][0]["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.starts_with("policy_violation")));
+
+    let missing_version = VesEventEnvelope::new_plaintext(
+        tenant_id.clone(),
+        store_id.clone(),
+        agent_id.clone(),
+        key_id,
+        EntityType::order(),
+        "ORD-POLICY",
+        EventType::new("order.confirmed"),
+        json!({ "approved": true }),
+        &signing_key,
+    );
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/ves/events/ingest",
+        Some(json!({ "agentId": agent_id.0, "events": [missing_version] })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["eventsAccepted"], 0);
+
+    let allowed = VesEventEnvelope::new_plaintext(
+        tenant_id,
+        store_id,
+        agent_id.clone(),
+        key_id,
+        EntityType::order(),
+        "ORD-POLICY",
+        EventType::new("order.confirmed"),
+        json!({ "approved": true }),
+        &signing_key,
+    )
+    .with_base_version(0);
+    let (status, body) = send_request(
+        &app,
+        Method::POST,
+        "/api/v1/ves/events/ingest",
+        Some(json!({ "agentId": agent_id.0, "events": [allowed] })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["eventsAccepted"], 1, "ingest response: {body}");
+
+    let cursor_uri = format!("/api/v1/ves/cursors/{}", agent_id.0);
+    let (status, body) = send_request(
+        &app,
+        Method::PUT,
+        &cursor_uri,
+        Some(json!({
+            "tenantId": tenant_id.0,
+            "storeId": store_id.0,
+            "sequenceNumber": 1
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["acknowledgedSequence"], 1);
+    assert_eq!(body["lag"], 0);
+
+    let (_, body) = send_request(
+        &app,
+        Method::PUT,
+        &cursor_uri,
+        Some(json!({
+            "tenantId": tenant_id.0,
+            "storeId": store_id.0,
+            "sequenceNumber": 0
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(body["acknowledgedSequence"], 1);
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &format!(
+            "{cursor_uri}?tenant_id={}&store_id={}",
+            tenant_id.0, store_id.0
+        ),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["acknowledgedSequence"], 1);
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_create_ves_commitment_success() {
     let Some(pool) = connect_db().await else {
         eprintln!("DATABASE_URL not set; skipping");

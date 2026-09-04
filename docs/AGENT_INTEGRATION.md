@@ -259,9 +259,20 @@ curl "https://sequencer.example.com/api/v1/ves/events?tenant_id=550e8400...&stor
 
 ### 5. Sync State Management
 
-REST consumers persist the response's `next_sequence` as their durable cursor
-and pass it as `from` on the next request. gRPC consumers can use `SyncStream`,
-which carries explicit acknowledgement and sync-state messages.
+REST consumers acknowledge completed work with
+`PUT /api/v1/ves/cursors/{agent_id}` and resume from
+`acknowledgedSequence + 1`. Cursor updates are monotonic, so a delayed retry
+cannot move a consumer backwards. The response also includes `headSequence`
+and `lag`. gRPC consumers use `SyncStream`; acknowledgements persist the same
+server-side cursor, and `GetSyncState` returns its current value.
+
+Administrators can constrain an agent with
+`PUT /api/v1/agents/{agent_id}/policy`. Exact rules and namespace wildcards
+such as `order.*` are supported for event and entity types. The server enforces
+these capabilities, optional `base_version` requirements, payload limits, and
+the policy's enabled state after signature verification and before sequencing.
+An absent policy preserves backwards compatibility; an enabled policy with an
+empty allowlist permits no values in that category.
 
 ## Data Structures
 
@@ -275,9 +286,9 @@ which carries explicit acknowledgement and sync-state messages.
 | `store_id` | UUID | Event stream scope |
 | `source_agent_id` | UUID | Agent that created the event |
 | `agent_key_id` | u32 | Which key version signed this event |
-| `entity_type` | string | Entity category (1-64 chars) |
-| `entity_id` | string | Entity identifier (1-256 chars) |
-| `event_type` | string | Event name (1-64 chars) |
+| `entity_type` | string | Entity category (1-128 chars) |
+| `entity_id` | string | Entity identifier (1-512 chars) |
+| `event_type` | string | Event name (1-256 chars) |
 | `created_at` | string | RFC 3339 timestamp |
 | `payload_kind` | u32 | 0=plaintext, 1=encrypted |
 | `payload` | JSON | Event data (if plaintext) |
@@ -288,17 +299,17 @@ which carries explicit acknowledgement and sync-state messages.
 | `command_id` | UUID? | Optional idempotency key |
 | `base_version` | u64? | Optional optimistic concurrency |
 
-### Sync State
+### Durable Cursor State
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `agent_id` | UUID | Agent identifier |
-| `tenant_id` | UUID | Tenant scope |
-| `store_id` | UUID | Store scope |
-| `last_pushed_sequence` | u64 | Last event pushed by this agent |
-| `last_pulled_sequence` | u64 | Last event pulled by this agent |
-| `head_sequence` | u64 | Current head of the stream |
-| `last_sync_at` | DateTime | Last sync timestamp |
+| `agentId` | UUID | Agent identifier |
+| `tenantId` | UUID | Tenant scope |
+| `storeId` | UUID | Store scope |
+| `acknowledgedSequence` | u64 | Highest durably processed sequence |
+| `headSequence` | u64 | Current head of the stream |
+| `lag` | u64 | Events between the cursor and stream head |
+| `updatedAt` | DateTime? | Last acknowledgement time |
 
 ## API Reference
 
@@ -310,6 +321,7 @@ which carries explicit acknowledgement and sync-state messages.
 | `/api/v1/agents/{agent_id}` | GET | Read an agent registration |
 | `/api/v1/agents/{agent_id}/api-keys` | GET/POST | List or create API credentials |
 | `/api/v1/agents/{agent_id}/api-keys/{key_prefix}` | DELETE | Revoke an API credential |
+| `/api/v1/agents/{agent_id}/policy` | GET/PUT | Read or enforce an agent policy (admin) |
 
 ### Event Operations
 
@@ -319,11 +331,15 @@ which carries explicit acknowledgement and sync-state messages.
 | `/api/v1/ves/events` | GET | Fetch a bounded page from the VES stream |
 | `/api/v1/ves/head` | GET | Get the VES stream head |
 | `/api/v1/ves/entities/{entity_type}/{entity_id}` | GET | Read paged VES entity history |
+| `/api/v1/ves/cursors/{agent_id}` | GET/PUT | Read or acknowledge a durable agent cursor |
 | `/api/v1/ves/proofs/{sequence_number}` | GET | Read an inclusion proof |
 | `/api/v1/ves/proofs/verify` | POST | Verify an inclusion proof |
 
-For durable bidirectional synchronization and sync-state updates, use the gRPC
-`SyncStream` API; the REST agent SDK uses explicit VES sequence cursors.
+REST and gRPC share the same durable cursor. In gRPC, include `tenant_id` and
+`store_id` in `EventAck` and set `agent_head_sequence` only to the highest
+contiguous sequence whose work is durable. The optional `sequence_numbers`
+list acknowledges individual events but never advances across a gap.
+`SyncState` returns `acknowledged_sequence` and `lag`.
 
 ## Error Handling
 

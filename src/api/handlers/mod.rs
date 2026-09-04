@@ -2,6 +2,7 @@
 
 pub mod admin;
 pub mod agent_keys;
+pub mod agent_policies;
 pub mod agents;
 pub mod anchoring;
 pub mod commitments;
@@ -15,6 +16,7 @@ pub mod x402;
 
 pub use admin::*;
 pub use agent_keys::*;
+pub use agent_policies::*;
 pub use agents::*;
 pub use anchoring::*;
 pub use commitments::*;

@@ -64,6 +64,28 @@ export const sequencerTools = [
   {
     type: 'function',
     function: {
+      name: 'stateset_get_cursor',
+      description: 'Read this agent’s durable acknowledged sequence and current stream lag.',
+      parameters: { type: 'object', additionalProperties: false, properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'stateset_acknowledge',
+      description:
+        'Persist the highest sequence this agent has durably processed. Call only after side effects and state updates succeed.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['sequenceNumber'],
+        properties: { sequenceNumber: { type: 'integer', minimum: 0 } },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'stateset_wait_for_event',
       description: 'Wait briefly for a matching event, starting at an explicit durable cursor.',
       parameters: {
@@ -84,8 +106,11 @@ export const sequencerTools = [
 
 export function createSequencerToolExecutor(client, options = {}) {
   async function recordAction(args) {
-    if (options.allowedEventTypes && !options.allowedEventTypes.includes(args.eventType)) {
+    if (options.allowedEventTypes && !matchesAny(options.allowedEventTypes, args.eventType)) {
       throw new Error(`Event type is not allowed for this agent: ${args.eventType}`);
+    }
+    if (options.allowedEntityTypes && !matchesAny(options.allowedEntityTypes, args.entityType)) {
+      throw new Error(`Entity type is not allowed for this agent: ${args.entityType}`);
     }
     if (
       options.requireBaseVersion &&
@@ -93,6 +118,12 @@ export function createSequencerToolExecutor(client, options = {}) {
       args.baseVersion === undefined
     ) {
       throw new Error('baseVersion is required when modifying an existing entity');
+    }
+    if (
+      options.maxPayloadBytes !== undefined &&
+      new TextEncoder().encode(JSON.stringify(args.payload)).byteLength > options.maxPayloadBytes
+    ) {
+      throw new Error(`Payload exceeds this agent's ${options.maxPayloadBytes} byte policy limit`);
     }
     await options.validateAction?.(args);
     return client.recordAction(args);
@@ -105,6 +136,8 @@ export function createSequencerToolExecutor(client, options = {}) {
     stateset_record_action: recordAction,
     stateset_get_inclusion_proof: ({ sequenceNumber }) =>
       client.getInclusionProof(sequenceNumber),
+    stateset_get_cursor: () => client.getCursor(),
+    stateset_acknowledge: ({ sequenceNumber }) => client.acknowledge(sequenceNumber),
     stateset_wait_for_event: ({ from, entityType, entityId, eventType, timeoutMs }) =>
       client.waitForEvent(
         (event) => {
@@ -136,15 +169,15 @@ export function validateToolArguments(name, args) {
   }
 
   if (name === 'stateset_get_entity_history' || name === 'stateset_record_action') {
-    boundedString(args.entityType, 'entityType', 64);
-    boundedString(args.entityId, 'entityId', 256);
+    boundedString(args.entityType, 'entityType', 128);
+    boundedString(args.entityId, 'entityId', 512);
   }
   if (name === 'stateset_get_entity_history') {
     optionalInteger(args.from, 'from', 0);
     optionalInteger(args.limit, 'limit', 1, 100);
   }
   if (name === 'stateset_record_action') {
-    boundedString(args.eventType, 'eventType', 64);
+    boundedString(args.eventType, 'eventType', 256);
     if (!args.payload || typeof args.payload !== 'object' || Array.isArray(args.payload)) {
       throw new TypeError('payload must be a JSON object');
     }
@@ -154,13 +187,25 @@ export function validateToolArguments(name, args) {
   if (name === 'stateset_get_inclusion_proof') {
     requiredInteger(args.sequenceNumber, 'sequenceNumber', 1);
   }
+  if (name === 'stateset_acknowledge') {
+    requiredInteger(args.sequenceNumber, 'sequenceNumber', 0);
+  }
   if (name === 'stateset_wait_for_event') {
     requiredInteger(args.from, 'from', 1);
-    if (args.entityType !== undefined) boundedString(args.entityType, 'entityType', 64);
-    if (args.entityId !== undefined) boundedString(args.entityId, 'entityId', 256);
-    if (args.eventType !== undefined) boundedString(args.eventType, 'eventType', 64);
+    if (args.entityType !== undefined) boundedString(args.entityType, 'entityType', 128);
+    if (args.entityId !== undefined) boundedString(args.entityId, 'entityId', 512);
+    if (args.eventType !== undefined) boundedString(args.eventType, 'eventType', 256);
     optionalInteger(args.timeoutMs, 'timeoutMs', 1, 30000);
   }
+}
+
+function matchesAny(patterns, value) {
+  return patterns.some(
+    (pattern) =>
+      pattern === '*' ||
+      pattern === value ||
+      (pattern.endsWith('*') && value.startsWith(pattern.slice(0, -1))),
+  );
 }
 
 function boundedString(value, name, maxLength) {

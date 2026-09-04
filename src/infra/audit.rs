@@ -32,6 +32,7 @@ pub enum AuditAction {
     AgentKeyRegistered,
     AgentKeyRotated,
     AgentKeyRevoked,
+    AgentPolicyUpdated,
 
     // Configuration
     ConfigUpdated,
@@ -65,6 +66,7 @@ impl std::fmt::Display for AuditAction {
             AuditAction::AgentKeyRegistered => write!(f, "agent_key_registered"),
             AuditAction::AgentKeyRotated => write!(f, "agent_key_rotated"),
             AuditAction::AgentKeyRevoked => write!(f, "agent_key_revoked"),
+            AuditAction::AgentPolicyUpdated => write!(f, "agent_policy_updated"),
             AuditAction::ConfigUpdated => write!(f, "config_updated"),
             AuditAction::EventsPurged => write!(f, "events_purged"),
             AuditAction::CommitmentDeleted => write!(f, "commitment_deleted"),

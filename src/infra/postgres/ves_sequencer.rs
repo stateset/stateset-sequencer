@@ -42,6 +42,8 @@ use crate::domain::{
 };
 use crate::infra::{Result, SequencerError};
 
+use super::{PgAgentCursorStore, PgAgentEventPolicyStore};
+
 /// Database row for VES events (needed because SQLx tuples max at 16 elements)
 #[derive(sqlx::FromRow)]
 struct VesEventRow {
@@ -109,6 +111,8 @@ pub enum VesRejectionReason {
     UnsupportedVersion,
     /// Schema validation failed
     SchemaValidation(String),
+    /// Server-side agent capability policy rejected the action
+    PolicyViolation(String),
     /// Version conflict (optimistic concurrency at sequencer)
     VersionConflict { expected: u64, actual: u64 },
 }
@@ -124,6 +128,7 @@ impl std::fmt::Display for VesRejectionReason {
             Self::AgentKeyInvalid(msg) => write!(f, "agent_key_invalid: {}", msg),
             Self::UnsupportedVersion => write!(f, "unsupported_version"),
             Self::SchemaValidation(msg) => write!(f, "schema_validation: {}", msg),
+            Self::PolicyViolation(msg) => write!(f, "policy_violation: {}", msg),
             Self::VersionConflict { expected, actual } => {
                 write!(
                     f,
@@ -196,6 +201,10 @@ pub struct VesSequencer<R: AgentKeyRegistry> {
     security_profile: String,
     /// Enforce strict formatting for VES hex/base64url fields
     strict_format_validation: bool,
+    /// Server-side event capabilities shared by REST and gRPC ingestion.
+    agent_policy_store: PgAgentEventPolicyStore,
+    /// Durable acknowledgement cursors for reconnectable streams.
+    agent_cursor_store: PgAgentCursorStore,
 }
 
 impl<R: AgentKeyRegistry> VesSequencer<R> {
@@ -379,6 +388,8 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     /// Create a new VES sequencer
     pub fn new(pool: PgPool, key_registry: Arc<R>) -> Self {
         Self {
+            agent_policy_store: PgAgentEventPolicyStore::new(pool.clone()),
+            agent_cursor_store: PgAgentCursorStore::new(pool.clone()),
             pool,
             key_registry,
             sequencer_id: Uuid::new_v4(),
@@ -423,6 +434,16 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     /// Return the active runtime security profile.
     pub fn security_profile(&self) -> &str {
         &self.security_profile
+    }
+
+    /// Access policies for administrative API operations.
+    pub fn agent_policy_store(&self) -> &PgAgentEventPolicyStore {
+        &self.agent_policy_store
+    }
+
+    /// Access durable agent acknowledgement cursors.
+    pub fn agent_cursor_store(&self) -> &PgAgentCursorStore {
+        &self.agent_cursor_store
     }
 
     /// Set the signing key version (monotonic rotation index, Section 10.5)
@@ -1420,6 +1441,17 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             }
         }
 
+        let source_agent_ids: Vec<Uuid> = events
+            .iter()
+            .map(|event| event.source_agent_id.0)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let agent_policies = self
+            .agent_policy_store
+            .get_for_agents(tenant_id.0, &source_agent_ids)
+            .await?;
+
         let mut tx = self.pool.begin().await?;
 
         let mut rejected = Vec::new();
@@ -1485,6 +1517,17 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             if let Some(rejection) = self.validate_event(&event).await {
                 rejected.push(rejection);
                 continue;
+            }
+
+            if let Some(policy) = agent_policies.get(&event.source_agent_id.0) {
+                if let Err(message) = policy.validate(&event) {
+                    rejected.push(VesRejectedEvent {
+                        event_id: event.event_id,
+                        reason: VesRejectionReason::PolicyViolation(message.clone()),
+                        message,
+                    });
+                    continue;
+                }
             }
 
             if let Some(cmd_id) = event.command_id {
@@ -2063,6 +2106,8 @@ mod tests {
             .expect("connect_lazy should not fail");
 
         VesSequencer {
+            agent_policy_store: PgAgentEventPolicyStore::new(pool.clone()),
+            agent_cursor_store: PgAgentCursorStore::new(pool.clone()),
             pool,
             key_registry: registry,
             sequencer_id: Uuid::new_v4(),

@@ -203,6 +203,40 @@ export class VesClient {
     return this.request('/api/v1/ves/proofs/verify', { method: 'POST', body: proof });
   }
 
+  getCursor() {
+    return this.request(
+      `/api/v1/ves/cursors/${encodeURIComponent(this.agentId)}?${this.scopeQuery()}`,
+    );
+  }
+
+  acknowledge(sequenceNumber) {
+    if (!Number.isSafeInteger(sequenceNumber) || sequenceNumber < 0) {
+      throw new TypeError('sequenceNumber must be a non-negative integer');
+    }
+    return this.request(`/api/v1/ves/cursors/${encodeURIComponent(this.agentId)}`, {
+      method: 'PUT',
+      body: {
+        tenantId: this.tenantId,
+        storeId: this.storeId,
+        sequenceNumber,
+      },
+      retryable: true,
+    });
+  }
+
+  getAgentPolicy(agentId = this.agentId) {
+    const query = new URLSearchParams({ tenant_id: this.tenantId });
+    return this.request(`/api/v1/agents/${encodeURIComponent(agentId)}/policy?${query}`);
+  }
+
+  setAgentPolicy(policy, agentId = this.agentId) {
+    return this.request(`/api/v1/agents/${encodeURIComponent(agentId)}/policy`, {
+      method: 'PUT',
+      body: { ...policy, tenantId: this.tenantId },
+      retryable: true,
+    });
+  }
+
   async waitForEvent(predicate, options = {}) {
     let cursor = options.from ?? 1;
     const pollIntervalMs = options.pollIntervalMs ?? 1_000;

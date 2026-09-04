@@ -67,7 +67,8 @@ pub use net::{extract_client_ip, validate_trusted_proxy_allowlist};
 pub use payload_encryption::{PayloadEncryption, PayloadEncryptionMode};
 pub use pool_monitor::{PoolHealthStatus, PoolMonitor, PoolMonitorConfig, PoolStats};
 pub use postgres::{
-    spawn_x402_nonce_cleanup, PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer,
+    spawn_x402_nonce_cleanup, AgentCursor, AgentEventPolicy, PgAgentCursorStore,
+    PgAgentEventPolicyStore, PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer,
     PgX402Repository, VesRejectionReason, VesSequencer,
 };
 pub use retry::{

@@ -121,6 +121,8 @@ test('agent tool executor exposes reads and signed actions without leaking the k
     getEntityHistory: async (...args) => (calls.push(['history', ...args]), { events: [] }),
     recordAction: async (args) => (calls.push(['record', args]), { receipt: { sequenceNumber: 9 } }),
     getInclusionProof: async (sequence) => (calls.push(['proof', sequence]), { included: true }),
+    getCursor: async () => ({ acknowledgedSequence: 4, lag: 5 }),
+    acknowledge: async (sequence) => ({ acknowledgedSequence: sequence }),
   };
   const execute = createSequencerToolExecutor(client);
 
@@ -131,7 +133,14 @@ test('agent tool executor exposes reads and signed actions without leaking the k
     ),
     { events: [] },
   );
-  assert.equal(sequencerTools.length, 5);
+  assert.deepEqual(await execute('stateset_get_cursor', {}), {
+    acknowledgedSequence: 4,
+    lag: 5,
+  });
+  assert.deepEqual(await execute('stateset_acknowledge', { sequenceNumber: 9 }), {
+    acknowledgedSequence: 9,
+  });
+  assert.equal(sequencerTools.length, 7);
   assert.deepEqual(calls, [['history', 'order', 'O-1', { from: 2, limit: 10 }]]);
 });
 
@@ -139,14 +148,19 @@ test('agent policy rejects unauthorized event types before they reach the client
   let called = false;
   const execute = createSequencerToolExecutor(
     { recordAction: async () => (called = true) },
-    { allowedEventTypes: ['order.confirmed'], requireBaseVersion: true },
+    {
+      allowedEventTypes: ['order.*'],
+      allowedEntityTypes: ['order'],
+      requireBaseVersion: true,
+      maxPayloadBytes: 1024,
+    },
   );
 
   await assert.rejects(
     execute('stateset_record_action', {
       entityType: 'order',
       entityId: 'O-1',
-      eventType: 'order.refunded',
+      eventType: 'inventory.refunded',
       commandId: ids.commandId,
       payload: {},
       baseVersion: 2,
@@ -197,7 +211,37 @@ test('MCP handler lists tools and returns tool failures as MCP results', async (
     },
   });
 
-  assert.equal(listed.result.tools.length, 5);
+  assert.equal(listed.result.tools.length, 7);
   assert.equal(failed.result.isError, true);
   assert.equal(failed.result.content[0].text, 'policy denied');
+});
+
+test('durable cursor methods use the scoped monotonic cursor API', async () => {
+  const requests = [];
+  const client = new VesClient({
+    tenantId: ids.tenantId,
+    storeId: ids.storeId,
+    agentId: ids.agentId,
+    privateKey: new Uint8Array(32).fill(9),
+    maxRetries: 0,
+    fetch: async (url, init) => {
+      requests.push({ url, init });
+      return new Response(JSON.stringify({ acknowledgedSequence: 7, lag: 0 }), { status: 200 });
+    },
+  });
+
+  await client.acknowledge(7);
+  await client.getCursor();
+  await client.setAgentPolicy({
+    tenantId: '00000000-0000-0000-0000-000000000000',
+    allowedEventTypes: ['order.*'],
+    allowedEntityTypes: ['order'],
+  });
+  await client.getAgentPolicy();
+
+  assert.equal(requests[0].init.method, 'PUT');
+  assert.equal(JSON.parse(requests[0].init.body).sequenceNumber, 7);
+  assert.match(requests[1].url, /tenant_id=.*store_id=/);
+  assert.equal(JSON.parse(requests[2].init.body).tenantId, ids.tenantId);
+  assert.match(requests[3].url, /\/agents\/.*\/policy\?tenant_id=/);
 });

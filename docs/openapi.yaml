@@ -22,7 +22,7 @@ info:
     - Merkle tree commitments
     - L2 anchoring for finality
     - Inclusion proofs for any event
-  version: 0.2.7
+  version: 0.7.0
   contact:
     email: engineering@stateset.io
     url: https://github.com/stateset/stateset-sequencer
@@ -142,6 +142,99 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+
+  /v1/ves/cursors/{agentId}:
+    parameters:
+      - name: agentId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      summary: Read an agent's durable VES cursor
+      operationId: getVesAgentCursor
+      tags: [VES, Agents]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+      responses:
+        '200':
+          description: Cursor and current stream lag
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentCursor'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    put:
+      summary: Monotonically acknowledge a VES sequence
+      operationId: acknowledgeVesAgentCursor
+      tags: [VES, Agents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcknowledgeAgentCursorRequest'
+      responses:
+        '200':
+          description: Updated cursor and current stream lag
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentCursor'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/agents/{agentId}/policy:
+    parameters:
+      - name: agentId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      summary: Read a server-enforced agent event policy
+      operationId: getAgentEventPolicy
+      tags: [Agents, Admin]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+      responses:
+        '200':
+          description: Agent event policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentEventPolicy'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      summary: Create or replace a server-enforced agent event policy
+      operationId: upsertAgentEventPolicy
+      tags: [Agents, Admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAgentEventPolicyRequest'
+      responses:
+        '200':
+          description: Stored agent event policy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentEventPolicy'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
   # ==========================================================================
   # Event Retrieval
@@ -1171,6 +1264,128 @@ components:
           type: string
           format: uri
           description: Link to error documentation
+
+    AgentCursor:
+      type: object
+      required:
+        - tenantId
+        - storeId
+        - agentId
+        - acknowledgedSequence
+        - headSequence
+        - lag
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        storeId:
+          type: string
+          format: uuid
+        agentId:
+          type: string
+          format: uuid
+        acknowledgedSequence:
+          type: integer
+          format: int64
+          minimum: 0
+        headSequence:
+          type: integer
+          format: int64
+          minimum: 0
+        lag:
+          type: integer
+          format: int64
+          minimum: 0
+        updatedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    AcknowledgeAgentCursorRequest:
+      type: object
+      required: [tenantId, storeId, sequenceNumber]
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        storeId:
+          type: string
+          format: uuid
+        sequenceNumber:
+          type: integer
+          format: int64
+          minimum: 0
+
+    AgentEventPolicy:
+      type: object
+      required:
+        - tenantId
+        - agentId
+        - allowedEventTypes
+        - allowedEntityTypes
+        - requireBaseVersion
+        - enabled
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        agentId:
+          type: string
+          format: uuid
+        allowedEventTypes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            maxLength: 256
+        allowedEntityTypes:
+          type: array
+          maxItems: 128
+          items:
+            type: string
+            maxLength: 128
+        requireBaseVersion:
+          type: boolean
+        maxPayloadBytes:
+          type: integer
+          minimum: 1
+          maximum: 10485760
+          nullable: true
+        enabled:
+          type: boolean
+
+    UpsertAgentEventPolicyRequest:
+      type: object
+      required: [tenantId]
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        allowedEventTypes:
+          type: array
+          maxItems: 128
+          default: []
+          items:
+            type: string
+            maxLength: 256
+        allowedEntityTypes:
+          type: array
+          maxItems: 128
+          default: []
+          items:
+            type: string
+            maxLength: 128
+        requireBaseVersion:
+          type: boolean
+          default: true
+        maxPayloadBytes:
+          type: integer
+          minimum: 1
+          maximum: 10485760
+          nullable: true
+        enabled:
+          type: boolean
+          default: true
 
     AgentRegistrationRequest:
       type: object

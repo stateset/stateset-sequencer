@@ -292,6 +292,10 @@ pub struct SyncState {
     pub latest_commitment: ::core::option::Option<BatchCommitment>,
     #[prost(message, optional, tag = "6")]
     pub timestamp: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(uint64, tag = "7")]
+    pub acknowledged_sequence: u64,
+    #[prost(uint64, tag = "8")]
+    pub lag: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BatchCommitment {
@@ -467,10 +471,18 @@ pub mod sync_message {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EventAck {
+    /// Individually processed events; does not imply contiguity
     #[prost(uint64, repeated, tag = "1")]
     pub sequence_numbers: ::prost::alloc::vec::Vec<u64>,
+    /// Highest contiguous, durably processed sequence
     #[prost(uint64, tag = "2")]
     pub agent_head_sequence: u64,
+    /// Required for durable cursor persistence
+    #[prost(string, tag = "3")]
+    pub tenant_id: ::prost::alloc::string::String,
+    /// Required for durable cursor persistence
+    #[prost(string, tag = "4")]
+    pub store_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct Heartbeat {
@@ -741,6 +753,7 @@ pub enum RejectionReason {
     VersionConflict = 7,
     InvalidFormat = 8,
     QuotaExceeded = 9,
+    PolicyViolation = 10,
 }
 impl RejectionReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -759,6 +772,7 @@ impl RejectionReason {
             Self::VersionConflict => "REJECTION_REASON_VERSION_CONFLICT",
             Self::InvalidFormat => "REJECTION_REASON_INVALID_FORMAT",
             Self::QuotaExceeded => "REJECTION_REASON_QUOTA_EXCEEDED",
+            Self::PolicyViolation => "REJECTION_REASON_POLICY_VIOLATION",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -774,6 +788,7 @@ impl RejectionReason {
             "REJECTION_REASON_VERSION_CONFLICT" => Some(Self::VersionConflict),
             "REJECTION_REASON_INVALID_FORMAT" => Some(Self::InvalidFormat),
             "REJECTION_REASON_QUOTA_EXCEEDED" => Some(Self::QuotaExceeded),
+            "REJECTION_REASON_POLICY_VIOLATION" => Some(Self::PolicyViolation),
             _ => None,
         }
     }

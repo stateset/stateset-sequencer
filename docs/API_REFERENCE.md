@@ -172,6 +172,59 @@ POST /v1/ves/events/ingest
 
 ---
 
+### Agent Event Policy
+
+Administrators can install an authoritative policy for an agent. Rules are
+exact strings or suffix wildcards such as `order.*`; `*` permits every value.
+
+```http
+PUT /v1/agents/{agent_id}/policy
+GET /v1/agents/{agent_id}/policy?tenant_id={tenant_id}
+```
+
+```json
+{
+  "tenantId": "uuid",
+  "allowedEventTypes": ["order.*", "inventory.reserved"],
+  "allowedEntityTypes": ["order", "inventory_item"],
+  "requireBaseVersion": true,
+  "maxPayloadBytes": 65536,
+  "enabled": true
+}
+```
+
+The sequencer evaluates the policy after authenticating and verifying the
+event signature but before assigning a sequence number. Events rejected by a
+policy return a `policy_violation` rejection (or
+`REJECTION_REASON_POLICY_VIOLATION` over gRPC). An enabled policy with an empty event or
+entity allowlist denies every value in that category.
+
+---
+
+### Durable Agent Cursor
+
+Read or monotonically advance an agent's persisted consumer cursor:
+
+```http
+GET /v1/ves/cursors/{agent_id}?tenant_id={tenant_id}&store_id={store_id}
+PUT /v1/ves/cursors/{agent_id}
+```
+
+```json
+{
+  "tenantId": "uuid",
+  "storeId": "uuid",
+  "sequenceNumber": 42
+}
+```
+
+Both methods return `acknowledgedSequence`, `headSequence`, `lag`, and
+`updatedAt`. Updates use a database-side maximum and are therefore safe to
+retry or deliver out of order. A cursor cannot advance beyond the current
+stream head. Non-admin credentials may only access their own agent cursor.
+
+---
+
 ### List Events
 
 Retrieve events by sequence range.

@@ -56,6 +56,19 @@ export class VesClient {
   ): Promise<Record<string, unknown>>;
   getInclusionProof(sequenceNumber: number): Promise<Record<string, unknown>>;
   verifyInclusionProof(proof: unknown): Promise<Record<string, unknown>>;
+  getCursor(): Promise<Record<string, unknown>>;
+  acknowledge(sequenceNumber: number): Promise<Record<string, unknown>>;
+  getAgentPolicy(agentId?: string): Promise<Record<string, unknown>>;
+  setAgentPolicy(
+    policy: {
+      allowedEventTypes: string[];
+      allowedEntityTypes: string[];
+      requireBaseVersion?: boolean;
+      maxPayloadBytes?: number;
+      enabled?: boolean;
+    },
+    agentId?: string,
+  ): Promise<Record<string, unknown>>;
   waitForEvent(
     predicate: (event: Record<string, unknown>) => boolean | Promise<boolean>,
     options?: WaitForEventOptions,

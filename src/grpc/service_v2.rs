@@ -165,6 +165,7 @@ impl SequencerServiceV2 {
             VesRejectionReason::UnsupportedVersion | VesRejectionReason::SchemaValidation(_) => {
                 RejectionReason::InvalidFormat
             }
+            VesRejectionReason::PolicyViolation(_) => RejectionReason::PolicyViolation,
             VesRejectionReason::VersionConflict { .. } => RejectionReason::VersionConflict,
         }
     }
@@ -850,7 +851,6 @@ impl SequencerTrait for SequencerServiceV2 {
             .head(&tenant_id, &store_id)
             .await
             .map_err(super::grpc_internal_error)?;
-
         // Read events (replica -> primary fallback)
         let mut events = self
             .ves_sequencer_reader
@@ -962,6 +962,19 @@ impl SequencerTrait for SequencerServiceV2 {
             .head(&tenant_id, &store_id)
             .await
             .map_err(super::grpc_internal_error)?;
+        let acknowledged_sequence = if let Some(agent_id) = auth_ctx.agent_id {
+            self.ves_sequencer
+                .agent_cursor_store()
+                .get(tenant_id.0, store_id.0, agent_id)
+                .await
+                .map_err(super::grpc_internal_error)?
+                .map(|cursor| cursor.sequence())
+                .transpose()
+                .map_err(super::grpc_internal_error)?
+                .unwrap_or(0)
+        } else {
+            0
+        };
 
         let cache = &self.cache_manager.ves_commitments;
         let mut lock_acquired = false;
@@ -1037,6 +1050,8 @@ impl SequencerTrait for SequencerServiceV2 {
                 seconds: Utc::now().timestamp(),
                 nanos: 0,
             }),
+            acknowledged_sequence,
+            lag: head.saturating_sub(acknowledged_sequence),
         }))
     }
 
@@ -1722,6 +1737,7 @@ impl SequencerTrait for SequencerServiceV2 {
         let (tx, rx) = mpsc::channel(128);
 
         let ves_sequencer = self.ves_sequencer.clone();
+        let agent_cursor_store = self.ves_sequencer.agent_cursor_store().clone();
         let mut event_rx = self.event_tx.subscribe();
         let event_tx = self.event_tx.clone();
         let auth_ctx = Arc::new(auth_ctx);
@@ -1784,6 +1800,12 @@ impl SequencerTrait for SequencerServiceV2 {
 
                                         if push_req.events.is_empty() {
                                             let _ = tx.send(Err(Status::invalid_argument("events must not be empty"))).await;
+                                            continue;
+                                        }
+                                        if push_req.events.len() > MAX_GRPC_BATCH_SIZE {
+                                            let _ = tx.send(Err(Status::invalid_argument(format!(
+                                                "batch exceeds maximum size of {MAX_GRPC_BATCH_SIZE} events"
+                                            )))).await;
                                             continue;
                                         }
 
@@ -1969,9 +1991,88 @@ impl SequencerTrait for SequencerServiceV2 {
                                             }
                                         }
                                     }
-                                    Some(v2::sync_message::Message::Ack(_ack)) => {
-                                        // Acknowledge received - could track for flow control
-                                        debug!("Received ack from client");
+                                    Some(v2::sync_message::Message::Ack(ack)) => {
+                                        if let Err(e) = SequencerServiceV2::require_read(auth_ctx.as_ref()) {
+                                            let _ = tx.send(Err(e)).await;
+                                            continue;
+                                        }
+                                        let Some(agent_id) = auth_ctx.agent_id else {
+                                            let _ = tx.send(Err(Status::permission_denied(
+                                                "durable acknowledgements require agent-scoped authentication",
+                                            ))).await;
+                                            continue;
+                                        };
+                                        let tenant_id = match Uuid::parse_str(&ack.tenant_id) {
+                                            Ok(id) => TenantId(id),
+                                            Err(e) => {
+                                                let _ = tx.send(Err(Status::invalid_argument(format!("invalid ack tenant_id: {e}")))).await;
+                                                continue;
+                                            }
+                                        };
+                                        let store_id = match Uuid::parse_str(&ack.store_id) {
+                                            Ok(id) => StoreId(id),
+                                            Err(e) => {
+                                                let _ = tx.send(Err(Status::invalid_argument(format!("invalid ack store_id: {e}")))).await;
+                                                continue;
+                                            }
+                                        };
+                                        if let Err(e) = SequencerServiceV2::authorize_tenant_store(auth_ctx.as_ref(), &tenant_id, &store_id) {
+                                            let _ = tx.send(Err(e)).await;
+                                            continue;
+                                        }
+                                        let highest_referenced_sequence = ack
+                                            .sequence_numbers
+                                            .iter()
+                                            .copied()
+                                            .chain(std::iter::once(ack.agent_head_sequence))
+                                            .max()
+                                            .unwrap_or(0);
+                                        let head = match ves_sequencer.head(&tenant_id, &store_id).await {
+                                            Ok(head) => head,
+                                            Err(e) => {
+                                                let _ = tx.send(Err(super::grpc_internal_error(e))).await;
+                                                continue;
+                                            }
+                                        };
+                                        if highest_referenced_sequence > head {
+                                            let _ = tx.send(Err(Status::invalid_argument(
+                                                "acknowledged sequences cannot exceed the stream head",
+                                            ))).await;
+                                            continue;
+                                        }
+                                        let acknowledged_sequence = ack.agent_head_sequence;
+                                        let cursor = match agent_cursor_store
+                                            .acknowledge(tenant_id.0, store_id.0, agent_id, acknowledged_sequence)
+                                            .await
+                                        {
+                                            Ok(cursor) => match cursor.sequence() {
+                                                Ok(sequence) => sequence,
+                                                Err(e) => {
+                                                    let _ = tx.send(Err(super::grpc_internal_error(e))).await;
+                                                    continue;
+                                                }
+                                            },
+                                            Err(e) => {
+                                                let _ = tx.send(Err(super::grpc_internal_error(e))).await;
+                                                continue;
+                                            }
+                                        };
+                                        debug!(%agent_id, acknowledged_sequence = cursor, "Persisted agent acknowledgement");
+                                        let _ = tx.send(Ok(SyncMessage {
+                                            message: Some(v2::sync_message::Message::SyncState(SyncState {
+                                                tenant_id: tenant_id.0.to_string(),
+                                                store_id: store_id.0.to_string(),
+                                                head_sequence: head,
+                                                state_root: Vec::new(),
+                                                latest_commitment: None,
+                                                timestamp: Some(prost_types::Timestamp {
+                                                    seconds: Utc::now().timestamp(),
+                                                    nanos: 0,
+                                                }),
+                                                acknowledged_sequence: cursor,
+                                                lag: head.saturating_sub(cursor),
+                                            })),
+                                        })).await;
                                     }
                                     Some(v2::sync_message::Message::Heartbeat(hb)) => {
                                         // Respond to heartbeat

@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-04
+
+### Added
+
+- Server-enforced per-agent VES policies with exact and namespace-wildcard
+  event/entity allowlists, optimistic-concurrency requirements, payload limits,
+  enable/disable controls, administrative APIs, and audit logging.
+- Durable, monotonic per-agent acknowledgement cursors over REST and gRPC,
+  including stream-head lag reporting and protection against acknowledging
+  events that do not exist.
+
+### Changed
+
+- gRPC sync state now reports the authenticated agent's persisted
+  `acknowledged_sequence` and `lag`; `SyncStream` acknowledgements persist the
+  same cursor used by REST clients and the Node.js SDK.
+
 ## [0.6.0] - 2026-09-04
 
 ### Added

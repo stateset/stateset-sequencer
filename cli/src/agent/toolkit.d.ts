@@ -2,7 +2,9 @@ import type { VesClient } from '../ves/client.js';
 
 export interface SequencerToolPolicy {
   allowedEventTypes?: string[];
+  allowedEntityTypes?: string[];
   requireBaseVersion?: boolean;
+  maxPayloadBytes?: number;
   validateAction?: (action: Record<string, unknown>) => void | Promise<void>;
 }
 

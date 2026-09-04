@@ -261,6 +261,7 @@ enum RejectionReason {
   REJECTION_REASON_VERSION_CONFLICT = 7;
   REJECTION_REASON_INVALID_FORMAT = 8;
   REJECTION_REASON_QUOTA_EXCEEDED = 9;
+  REJECTION_REASON_POLICY_VIOLATION = 10;
 }
 
 // ============================================================================
@@ -303,6 +304,8 @@ message SyncState {
   bytes state_root = 4;                   // Empty = not available
   BatchCommitment latest_commitment = 5;  // Null message = not available
   google.protobuf.Timestamp timestamp = 6;
+  uint64 acknowledged_sequence = 7;
+  uint64 lag = 8;
 }
 
 // ============================================================================
@@ -418,8 +421,10 @@ message SyncMessage {
 }
 
 message EventAck {
-  repeated uint64 sequence_numbers = 1;
-  uint64 agent_head_sequence = 2;
+  repeated uint64 sequence_numbers = 1; // Individually processed events; does not imply contiguity
+  uint64 agent_head_sequence = 2;       // Highest contiguous, durably processed sequence
+  string tenant_id = 3;                 // Required for durable cursor persistence
+  string store_id = 4;                  // Required for durable cursor persistence
 }
 
 message Heartbeat {

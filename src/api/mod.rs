@@ -12,7 +12,7 @@ pub mod utils;
 
 pub use error::{ApiError, ErrorCode, ErrorDetails};
 
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::Router;
 
 use crate::server::AppState;
@@ -29,6 +29,14 @@ pub fn router() -> Router<AppState> {
         .route(
             "/v1/ves/entities/:entity_type/:entity_id",
             get(handlers::ves::get_ves_entity_history),
+        )
+        .route(
+            "/v1/ves/cursors/:agent_id",
+            get(handlers::ves::get_agent_cursor),
+        )
+        .route(
+            "/v1/ves/cursors/:agent_id",
+            put(handlers::ves::acknowledge_agent_cursor),
         )
         // VES commitments + proofs
         .route(
@@ -104,6 +112,14 @@ pub fn router() -> Router<AppState> {
         )
         // Agent signing key management
         .route("/v1/agents/keys", post(handlers::register_agent_key))
+        .route(
+            "/v1/agents/:agent_id/policy",
+            get(handlers::get_agent_policy),
+        )
+        .route(
+            "/v1/agents/:agent_id/policy",
+            put(handlers::upsert_agent_policy),
+        )
         // Schema registry
         .route("/v1/schemas", get(handlers::list_schemas))
         .route("/v1/schemas", post(handlers::register_schema))

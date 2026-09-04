@@ -185,8 +185,9 @@ a policy-constrained MCP stdio server. See [AI agent integration](docs/AGENT_INT
 and the [SDK guide](cli/README.md).
 
 Private signing keys remain inside the tool host and are never exposed to model
-context. Event-type allowlists and deterministic validation hooks run before an
-agent action is signed.
+context. Local validation hooks run before signing, while authoritative
+per-agent allowlists, optimistic-concurrency requirements, and payload limits
+are enforced again by the sequencer.
 
 ## API Endpoints
 
@@ -250,6 +251,15 @@ GET /api/v1/ves/events?tenant_id=<uuid>&store_id=<uuid>&from=1&limit=100
 
 # Paged history for one entity
 GET /api/v1/ves/entities/{entity_type}/{entity_id}?tenant_id=<uuid>&store_id=<uuid>&from=0&limit=100
+
+# Read and monotonically acknowledge this agent's durable consumer cursor
+GET /api/v1/ves/cursors/{agent_id}?tenant_id=<uuid>&store_id=<uuid>
+PUT /api/v1/ves/cursors/{agent_id}
+{
+  "tenantId": "uuid",
+  "storeId": "uuid",
+  "sequenceNumber": 42
+}
 ```
 
 ### VES Commitments
@@ -315,6 +325,18 @@ POST /api/v1/agents/keys
 GET /api/v1/agents/{agent_id}
 GET /api/v1/agents/{agent_id}/api-keys
 DELETE /api/v1/agents/{agent_id}/api-keys/{key_prefix}
+
+# Admin: enforce the actions this agent may append
+PUT /api/v1/agents/{agent_id}/policy
+{
+  "tenantId": "uuid",
+  "allowedEventTypes": ["order.*", "inventory.reserved"],
+  "allowedEntityTypes": ["order", "inventory_item"],
+  "requireBaseVersion": true,
+  "maxPayloadBytes": 65536,
+  "enabled": true
+}
+GET /api/v1/agents/{agent_id}/policy?tenant_id=<uuid>
 ```
 
 ### Legacy Endpoints
@@ -424,6 +446,7 @@ stateset-sequencer/
 │   │       ├── events.rs       # Event queries
 │   │       ├── commitments.rs  # Batch commitments
 │   │       ├── agent_keys.rs   # Agent key management
+│   │       ├── agent_policies.rs # Server-enforced agent capabilities
 │   │       ├── schemas.rs      # Schema registry
 │   │       ├── x402.rs         # x402 payment intents & batches
 │   │       └── ves/            # VES v1.0 endpoints
@@ -458,6 +481,8 @@ stateset-sequencer/
 │   │   │   ├── ves_sequencer.rs # VES v1.0 sequencer
 │   │   │   ├── event_store.rs  # Event storage
 │   │   │   ├── agent_keys.rs   # Agent key registry
+│   │   │   ├── agent_policy.rs # Agent capability policies
+│   │   │   ├── agent_cursor.rs # Durable consumer cursors
 │   │   │   └── schema_store.rs # Schema storage
 │   │   ├── sqlite/             # SQLite implementations
 │   │   │   └── outbox.rs       # Local agent outbox
@@ -474,16 +499,7 @@ stateset-sequencer/
 │   ├── proto/                  # Protocol buffer definitions
 │   └── metrics/                # Observability
 ├── migrations/
-│   ├── postgres/               # PostgreSQL migrations (9 files)
-│   │   ├── 001_production_postgres.sql
-│   │   ├── 002_ves_v1_tables.sql
-│   │   ├── 003_constraints.sql
-│   │   ├── 004_ves_validity_proofs.sql
-│   │   ├── 005_ves_compliance_proofs.sql
-│   │   ├── 006_key_rotation_policies.sql
-│   │   ├── 007_encryption_groups.sql
-│   │   ├── 008_command_dedupe.sql
-│   │   └── 009_api_keys.sql
+│   ├── postgres/               # Versioned PostgreSQL schema migrations
 │   └── sqlite/                 # SQLite migrations (local agents)
 ├── tests/                      # Integration tests
 ├── benches/                    # Performance benchmarks
@@ -504,6 +520,8 @@ stateset-sequencer/
 | **Payload Encryption** | AES-256-GCM with per-tenant keyrings |
 | **Rate Limiting** | Per-tenant with bounded memory (LRU eviction) |
 | **Request Limits** | Configurable body size and batch limits |
+| **Agent Capabilities** | Server-enforced event/entity allowlists, concurrency requirements, and payload limits |
+| **Durable Consumption** | Monotonic per-agent cursors shared by REST and gRPC |
 | **STARK Proofs** | Zero-knowledge compliance verification |
 | **Amount Binding** | Compliance proofs are rejected unless the committed amount matches the amount re-derived from the stored payload |
 | **Client IP Resolution** | Forwarded headers honoured only from trusted proxies, and read from the right of the chain (see [Client IP and Proxies](docs/CONFIGURATION.md#client-ip-and-proxies)) |
