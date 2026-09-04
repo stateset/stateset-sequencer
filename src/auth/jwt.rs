@@ -4,8 +4,13 @@
 
 use super::{AuthContext, AuthError, Permissions};
 use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, KeyAlgorithm};
+use jsonwebtoken::{
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::RwLock;
 use uuid::Uuid;
 
 /// JWT claims for StateSet Sequencer
@@ -45,11 +50,17 @@ pub struct Claims {
     pub perms: String,
 }
 
-/// JWT validator and issuer
+enum JwtKeys {
+    Hmac {
+        encoding: EncodingKey,
+        decoding: DecodingKey,
+    },
+    Jwks(HashMap<String, (DecodingKey, Algorithm)>),
+}
+
+/// JWT validator and optional local issuer.
 pub struct JwtValidator {
-    /// Secret key for signing/verifying
-    encoding_key: EncodingKey,
-    decoding_key: DecodingKey,
+    keys: RwLock<JwtKeys>,
 
     /// Issuer string
     issuer: String,
@@ -62,11 +73,62 @@ impl JwtValidator {
     /// Create a new JWT validator with a secret key
     pub fn new(secret: &[u8], issuer: &str, audience: &str) -> Self {
         Self {
-            encoding_key: EncodingKey::from_secret(secret),
-            decoding_key: DecodingKey::from_secret(secret),
+            keys: RwLock::new(JwtKeys::Hmac {
+                encoding: EncodingKey::from_secret(secret),
+                decoding: DecodingKey::from_secret(secret),
+            }),
             issuer: issuer.to_string(),
             audience: audience.to_string(),
         }
+    }
+
+    /// Create a validator for an externally managed OIDC/JWKS key set.
+    ///
+    /// Only asymmetric signature keys with an explicit `kid` and `alg` are
+    /// accepted. This prevents algorithm confusion and makes key rotation
+    /// deterministic. Static documents rotate through a rolling restart; use
+    /// [`Self::from_jwks_url`] for automatic refresh.
+    pub fn from_jwks_json(
+        jwks_json: &str,
+        issuer: &str,
+        audience: &str,
+    ) -> Result<Self, AuthError> {
+        let keys = parse_jwks(jwks_json)?;
+
+        Ok(Self {
+            keys: RwLock::new(JwtKeys::Jwks(keys)),
+            issuer: issuer.to_string(),
+            audience: audience.to_string(),
+        })
+    }
+
+    /// Fetch an initial key set from an OIDC/JWKS endpoint.
+    pub async fn from_jwks_url(url: &str, issuer: &str, audience: &str) -> Result<Self, AuthError> {
+        let document = fetch_jwks_document(url).await?;
+        Self::from_jwks_json(&document, issuer, audience)
+    }
+
+    /// Atomically replace externally managed keys after a successful refresh.
+    /// A malformed or unreachable refresh never destroys the last-known-good set.
+    pub async fn refresh_jwks_url(&self, url: &str) -> Result<(), AuthError> {
+        let document = fetch_jwks_document(url).await?;
+        self.replace_jwks_json(&document)
+    }
+
+    /// Atomically install a refreshed JWKS document.
+    pub fn replace_jwks_json(&self, document: &str) -> Result<(), AuthError> {
+        let keys = parse_jwks(document)?;
+        let mut current = self
+            .keys
+            .write()
+            .map_err(|_| AuthError::BackendUnavailable("JWT key lock poisoned".to_string()))?;
+        if matches!(&*current, JwtKeys::Hmac { .. }) {
+            return Err(AuthError::InvalidJwt(
+                "cannot replace locally managed HMAC keys with JWKS".to_string(),
+            ));
+        }
+        *current = JwtKeys::Jwks(keys);
+        Ok(())
     }
 
     /// Issue a new JWT token
@@ -111,22 +173,54 @@ impl JwtValidator {
             perms: perms.join(","),
         };
 
-        encode(&Header::default(), &claims, &self.encoding_key)
+        let keys = self
+            .keys
+            .read()
+            .map_err(|_| AuthError::BackendUnavailable("JWT key lock poisoned".to_string()))?;
+        let JwtKeys::Hmac { encoding, .. } = &*keys else {
+            return Err(AuthError::InvalidJwt(
+                "token issuance is disabled for externally managed JWKS authentication".to_string(),
+            ));
+        };
+        encode(&Header::default(), &claims, encoding)
             .map_err(|e| AuthError::InvalidJwt(e.to_string()))
     }
 
     /// Validate a JWT token and return auth context
     pub fn validate(&self, token: &str) -> Result<AuthContext, AuthError> {
-        let mut validation = Validation::default();
+        let keys = self
+            .keys
+            .read()
+            .map_err(|_| AuthError::BackendUnavailable("JWT key lock poisoned".to_string()))?;
+        let (decoding_key, algorithm) = match &*keys {
+            JwtKeys::Hmac { decoding, .. } => (decoding, Algorithm::HS256),
+            JwtKeys::Jwks(keys) => {
+                let header =
+                    decode_header(token).map_err(|e| AuthError::InvalidJwt(e.to_string()))?;
+                let kid = header.kid.ok_or_else(|| {
+                    AuthError::InvalidJwt("JWT signed with JWKS must include kid".to_string())
+                })?;
+                let (key, algorithm) = keys.get(&kid).ok_or_else(|| {
+                    AuthError::InvalidJwt(format!("unknown JWT signing key: {kid}"))
+                })?;
+                if header.alg != *algorithm {
+                    return Err(AuthError::InvalidJwt(format!(
+                        "JWT algorithm does not match JWKS key {kid}"
+                    )));
+                }
+                (key, *algorithm)
+            }
+        };
+
+        let mut validation = Validation::new(algorithm);
         validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&[&self.audience]);
 
-        let token_data = decode::<Claims>(token, &self.decoding_key, &validation).map_err(|e| {
-            match e.kind() {
+        let token_data =
+            decode::<Claims>(token, decoding_key, &validation).map_err(|e| match e.kind() {
                 jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
                 _ => AuthError::InvalidJwt(e.to_string()),
-            }
-        })?;
+            })?;
 
         let claims = token_data.claims;
 
@@ -176,6 +270,100 @@ impl JwtValidator {
             rate_limit: None,
             permissions,
         })
+    }
+}
+
+fn parse_jwks(jwks_json: &str) -> Result<HashMap<String, (DecodingKey, Algorithm)>, AuthError> {
+    let jwks: JwkSet = serde_json::from_str(jwks_json)
+        .map_err(|e| AuthError::InvalidJwt(format!("invalid JWT_JWKS_JSON: {e}")))?;
+    if jwks.keys.is_empty() {
+        return Err(AuthError::InvalidJwt(
+            "JWT_JWKS_JSON must contain at least one key".to_string(),
+        ));
+    }
+
+    let mut keys = HashMap::with_capacity(jwks.keys.len());
+    for jwk in jwks.keys {
+        if matches!(&jwk.algorithm, AlgorithmParameters::OctetKey(_)) {
+            return Err(AuthError::InvalidJwt(
+                "JWT_JWKS_JSON must contain asymmetric keys only".to_string(),
+            ));
+        }
+        let kid =
+            jwk.common.key_id.clone().ok_or_else(|| {
+                AuthError::InvalidJwt("every JWKS key must have a kid".to_string())
+            })?;
+        let key_algorithm = jwk
+            .common
+            .key_algorithm
+            .ok_or_else(|| AuthError::InvalidJwt(format!("JWKS key {kid} must declare alg")))?;
+        let algorithm = jwk_algorithm(key_algorithm).ok_or_else(|| {
+            AuthError::InvalidJwt(format!("JWKS key {kid} uses a non-signing algorithm"))
+        })?;
+        let decoding = DecodingKey::from_jwk(&jwk)
+            .map_err(|e| AuthError::InvalidJwt(format!("invalid JWKS key {kid}: {e}")))?;
+        if keys.insert(kid.clone(), (decoding, algorithm)).is_some() {
+            return Err(AuthError::InvalidJwt(format!(
+                "duplicate JWKS key id: {kid}"
+            )));
+        }
+    }
+
+    Ok(keys)
+}
+
+async fn fetch_jwks_document(url: &str) -> Result<String, AuthError> {
+    const MAX_JWKS_BYTES: usize = 2 * 1024 * 1024;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| AuthError::BackendUnavailable(format!("build JWKS client: {e}")))?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| AuthError::BackendUnavailable(format!("fetch JWKS: {e}")))?
+        .error_for_status()
+        .map_err(|e| AuthError::BackendUnavailable(format!("fetch JWKS: {e}")))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_JWKS_BYTES as u64)
+    {
+        return Err(AuthError::InvalidJwt(
+            "JWKS response exceeds 2 MiB".to_string(),
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| AuthError::BackendUnavailable(format!("read JWKS: {e}")))?;
+    if bytes.len() > MAX_JWKS_BYTES {
+        return Err(AuthError::InvalidJwt(
+            "JWKS response exceeds 2 MiB".to_string(),
+        ));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|e| AuthError::InvalidJwt(format!("JWKS response is not UTF-8: {e}")))
+}
+
+fn jwk_algorithm(algorithm: KeyAlgorithm) -> Option<Algorithm> {
+    match algorithm {
+        KeyAlgorithm::ES256 => Some(Algorithm::ES256),
+        KeyAlgorithm::ES384 => Some(Algorithm::ES384),
+        KeyAlgorithm::RS256 => Some(Algorithm::RS256),
+        KeyAlgorithm::RS384 => Some(Algorithm::RS384),
+        KeyAlgorithm::RS512 => Some(Algorithm::RS512),
+        KeyAlgorithm::PS256 => Some(Algorithm::PS256),
+        KeyAlgorithm::PS384 => Some(Algorithm::PS384),
+        KeyAlgorithm::PS512 => Some(Algorithm::PS512),
+        KeyAlgorithm::EdDSA => Some(Algorithm::EdDSA),
+        KeyAlgorithm::HS256
+        | KeyAlgorithm::HS384
+        | KeyAlgorithm::HS512
+        | KeyAlgorithm::RSA1_5
+        | KeyAlgorithm::RSA_OAEP
+        | KeyAlgorithm::RSA_OAEP_256
+        | KeyAlgorithm::UNKNOWN_ALGORITHM => None,
     }
 }
 
@@ -257,6 +445,56 @@ mod tests {
         let context = validator.validate(&token).unwrap();
 
         assert_eq!(context.agent_id, Some(agent_id));
+    }
+
+    #[test]
+    fn jwks_rejects_symmetric_keys() {
+        let document = r#"{"keys":[{"kty":"oct","k":"c2VjcmV0","kid":"one","alg":"HS256"}]}"#;
+        let error = JwtValidator::from_jwks_json(document, "issuer", "audience")
+            .err()
+            .expect("symmetric JWKS must be rejected");
+        assert!(error.to_string().contains("asymmetric"));
+    }
+
+    #[test]
+    fn jwks_requires_unique_key_ids_and_algorithms() {
+        let missing_kid = r#"{"keys":[{"kty":"RSA","n":"AQAB","e":"AQAB","alg":"RS256"}]}"#;
+        assert!(JwtValidator::from_jwks_json(missing_kid, "issuer", "audience").is_err());
+
+        let missing_algorithm = r#"{"keys":[{"kty":"RSA","n":"AQAB","e":"AQAB","kid":"one"}]}"#;
+        assert!(JwtValidator::from_jwks_json(missing_algorithm, "issuer", "audience").is_err());
+    }
+
+    #[test]
+    fn jwks_mode_configures_asymmetric_validation_and_disables_issuance() {
+        let document = r#"{"keys":[{"kty":"RSA","n":"AQAB","e":"AQAB","kid":"one","alg":"RS256","use":"sig"}]}"#;
+        let validator = JwtValidator::from_jwks_json(document, "issuer", "audience").unwrap();
+        let issue = validator.issue(
+            &Uuid::new_v4(),
+            &[],
+            None,
+            &Permissions::read_only(),
+            Duration::minutes(5),
+        );
+        assert!(
+            matches!(&issue, Err(AuthError::InvalidJwt(message)) if message.contains("disabled"))
+        );
+    }
+
+    #[test]
+    fn jwks_rotation_is_atomic_and_rejects_hmac_conversion() {
+        let first = r#"{"keys":[{"kty":"RSA","n":"AQAB","e":"AQAB","kid":"one","alg":"RS256"}]}"#;
+        let second = r#"{"keys":[{"kty":"RSA","n":"AQAB","e":"AQAB","kid":"two","alg":"RS256"}]}"#;
+        let validator = JwtValidator::from_jwks_json(first, "issuer", "audience").unwrap();
+        assert!(validator.replace_jwks_json("not-json").is_err());
+        validator.replace_jwks_json(second).unwrap();
+        let keys = validator.keys.read().unwrap();
+        assert!(
+            matches!(&*keys, JwtKeys::Jwks(keys) if keys.contains_key("two") && !keys.contains_key("one"))
+        );
+
+        let hmac = create_validator();
+        assert!(hmac.replace_jwks_json(second).is_err());
     }
 
     #[test]

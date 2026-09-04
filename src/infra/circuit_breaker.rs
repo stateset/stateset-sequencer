@@ -659,7 +659,8 @@ mod tests {
     async fn test_circuit_breaker_half_open() {
         let config = CircuitBreakerConfig {
             failure_threshold: 2,
-            open_timeout: Duration::from_millis(50),
+            open_timeout: Duration::from_secs(60),
+            jitter_factor: 0.0,
             ..Default::default()
         };
         let cb = CircuitBreaker::with_config("test", config);
@@ -669,8 +670,9 @@ mod tests {
         cb.record_failure().await;
         assert_eq!(cb.state().await, CircuitState::Open);
 
-        // Wait for timeout
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Age the open timestamp directly instead of relying on wall-clock
+        // sleeps; this stays deterministic under coverage instrumentation.
+        cb.state.write().await.opened_at = Some(Instant::now() - Duration::from_secs(61));
 
         // Should transition to half-open
         assert_eq!(cb.state().await, CircuitState::HalfOpen);

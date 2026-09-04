@@ -30,6 +30,23 @@ export const sequencerTools = [
   {
     type: 'function',
     function: {
+      name: 'stateset_get_projection',
+      description:
+        'Read the latest durable materialized state for a commerce entity. Use history when causality is needed and projection when current state is needed.',
+      parameters: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['entityType', 'entityId'],
+        properties: {
+          entityType: { type: 'string', description: 'For example order or inventory.' },
+          entityId: { type: 'string' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'stateset_record_action',
       description:
         'Sign and append an idempotent action to the authoritative event stream. Supply baseVersion when modifying an existing entity.',
@@ -133,6 +150,8 @@ export function createSequencerToolExecutor(client, options = {}) {
     stateset_get_head: () => client.getHead(),
     stateset_get_entity_history: ({ entityType, entityId, from, limit }) =>
       client.getEntityHistory(entityType, entityId, { from, limit }),
+    stateset_get_projection: ({ entityType, entityId }) =>
+      client.getProjection(entityType, entityId),
     stateset_record_action: recordAction,
     stateset_get_inclusion_proof: ({ sequenceNumber }) =>
       client.getInclusionProof(sequenceNumber),
@@ -168,7 +187,11 @@ export function validateToolArguments(name, args) {
     throw new TypeError('Tool arguments must be a JSON object');
   }
 
-  if (name === 'stateset_get_entity_history' || name === 'stateset_record_action') {
+  if (
+    name === 'stateset_get_entity_history' ||
+    name === 'stateset_get_projection' ||
+    name === 'stateset_record_action'
+  ) {
     boundedString(args.entityType, 'entityType', 128);
     boundedString(args.entityId, 'entityId', 512);
   }

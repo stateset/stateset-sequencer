@@ -246,6 +246,15 @@ pub struct HeadQuery {
     pub store_id: Uuid,
 }
 
+/// Query parameters for a materialized projection.
+#[derive(Debug, Deserialize)]
+pub struct ProjectionQuery {
+    pub tenant_id: Uuid,
+    pub store_id: Uuid,
+    /// Source ledger (`ves`, the default, or `legacy`).
+    pub source: Option<String>,
+}
+
 /// Query parameters for entity history.
 #[derive(Debug, Deserialize)]
 pub struct EntityHistoryQuery {

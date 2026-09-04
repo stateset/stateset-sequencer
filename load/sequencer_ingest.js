@@ -28,6 +28,15 @@ export default function () {
 
   const eventId = uuidv4();
   const now = new Date().toISOString();
+  // Keep insertion order lexicographic so JSON.stringify matches RFC 8785 for
+  // this string/number/array-only fixture, as required by payload_hash.
+  const eventPayload = {
+    currency: 'USD',
+    customer_id: `customer-${AGENT_ID}`,
+    line_items: [],
+    order_id: eventId,
+    total_amount: 42,
+  };
   const payload = {
     agent_id: AGENT_ID,
     events: [
@@ -38,11 +47,10 @@ export default function () {
         entity_type: 'order',
         entity_id: `order-${eventId}`,
         event_type: 'order.created',
-        payload: {
-          order_id: eventId,
-          total: 42,
-        },
+        payload: eventPayload,
+        payload_hash: crypto.sha256(JSON.stringify(eventPayload), 'hex'),
         created_at: now,
+        source_agent: AGENT_ID,
       },
     ],
   };

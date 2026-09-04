@@ -38,8 +38,8 @@ For detailed security guidance on deploying and operating the sequencer, see [do
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.5.x   | :white_check_mark: |
-| < 0.5   | :x:                |
+| 0.7.x   | :white_check_mark: |
+| < 0.7   | :x:                |
 
 ## Tracked Transitive Advisories
 
@@ -52,9 +52,5 @@ unsoundness and maintenance warnings are reviewed even when they are not fatal:
   integer block numbers and fixed-size hashes, neither of which has a custom
   `Drop`. The first upstream fix is `lru 0.18.2`; migrate when Alloy supports
   it, or as part of the planned Alloy 2 upgrade.
-- `RUSTSEC-2026-0205` affects `scc 2.4.0` through the test-only `serial_test`
-  dependency. It is not linked into production binaries. Upgrade when
-  `serial_test` adopts a fixed release.
-
 These are documented risk acceptances, not audit suppressions. CI continues to
 report them so an upstream resolution is visible immediately.

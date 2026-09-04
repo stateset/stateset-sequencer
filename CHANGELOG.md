@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-04
+
+### Added
+
+- Production projection workers for both VES and legacy ledgers, with dynamic
+  keyset-paginated stream discovery, source-isolated durable read models, and a
+  scoped projection read API exposed through the agent SDK and MCP toolkit.
+- Opt-in, leader-elected STARK compliance-proof generation with durable job
+  state, bounded retries and timeouts, self-verification, and encrypted proof
+  persistence.
+- Scheduled and manual k6 performance workflows, a release-binary CI smoke
+  gate, and an exact-commit release workflow with checksums and build
+  provenance attestations.
+- Secret-file inputs and remotely refreshed asymmetric JWKS support, retaining
+  the last known-good key set if refresh fails.
+
+### Fixed
+
+- gRPC receipt acknowledgements can no longer advance a durable agent cursor
+  across missing sequence numbers or beyond the stream head.
+- Load profiles now submit valid, projection-compatible events and enforce
+  explicit latency and error-rate thresholds.
+
+### Security
+
+- JWT validation rejects symmetric JWKS keys, duplicate or missing key IDs,
+  missing algorithms, and algorithm-confusion attempts; HMAC token issuance is
+  disabled whenever an external JWKS is configured.
+
 ## [0.7.0] - 2026-09-04
 
 ### Added

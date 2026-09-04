@@ -64,6 +64,10 @@ pub struct ProjectionCheckpoint {
 /// System event for rejected events
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RejectionEvent {
+    /// Stream that owns the rejected event.
+    pub tenant_id: TenantId,
+    pub store_id: StoreId,
+
     /// Original event that was rejected
     pub original_event_id: Uuid,
 

@@ -15,13 +15,18 @@ use serde_json::json;
 use std::sync::Arc;
 use uuid::Uuid;
 
+use stateset_sequencer::auth::{AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry};
+use stateset_sequencer::crypto::AgentSigningKey;
 use stateset_sequencer::domain::{
-    AgentId, EntityType, EventBatch, EventEnvelope, EventType, Hash256, StoreId, TenantId,
+    AgentId, AgentKeyId, EntityType, EventBatch, EventEnvelope, EventType, Hash256, StoreId,
+    TenantId, VesEventEnvelope,
 };
 use stateset_sequencer::infra::{
-    CommitmentEngine, EventStore, IngestService, PayloadEncryption, PgCommitmentEngine,
-    PgEventStore, PgSequencer, Sequencer, SequencerError,
+    CommitmentEngine, EventStore, IngestService, PayloadEncryption, PgAgentKeyRegistry,
+    PgCommitmentEngine, PgEventStore, PgSequencer, ProjectionWorkerConfig, ProjectionWorkerMessage,
+    Sequencer, SequencerError, VesSequencer,
 };
+use stateset_sequencer::projection::ProjectionRunnerConfig;
 
 // ============================================================================
 // Test Helpers
@@ -51,6 +56,196 @@ fn create_test_event(
 // ============================================================================
 // Sequencer Tests
 // ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn projection_worker_materializes_and_checkpoints_new_stream() {
+    let Some(pool) = connect_db().await else {
+        return;
+    };
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let encryption = Arc::new(PayloadEncryption::disabled());
+    let sequencer = PgSequencer::new(pool.clone(), encryption.clone());
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let order_id = format!("projection-order-{}", Uuid::new_v4());
+    let event = EventEnvelope::new(
+        tenant_id.clone(),
+        store_id.clone(),
+        EntityType::order(),
+        order_id.clone(),
+        EventType::new("order.created"),
+        json!({
+            "customer_id": "customer-1",
+            "total_amount": 42.5,
+            "currency": "USD",
+            "line_items": []
+        }),
+        agent_id.clone(),
+    );
+    sequencer
+        .ingest(EventBatch::new(agent_id, vec![event]))
+        .await
+        .unwrap();
+
+    let event_store: Arc<dyn EventStore> = Arc::new(PgEventStore::new(pool.clone(), encryption));
+    let config = ProjectionWorkerConfig {
+        discovery_interval: std::time::Duration::from_millis(10),
+        discovery_page_size: 100,
+        runner: ProjectionRunnerConfig {
+            batch_size: 10,
+            checkpoint_interval: 1,
+            poll_interval_ms: 10,
+            ..ProjectionRunnerConfig::default()
+        },
+    };
+    let (task, control) =
+        stateset_sequencer::infra::spawn_projection_worker(config, pool.clone(), event_store, None);
+
+    let document = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row: Option<(serde_json::Value, i64)> = sqlx::query_as(
+                "SELECT document, version FROM projection_documents WHERE tenant_id = $1 AND store_id = $2 AND entity_type = 'order' AND entity_id = $3",
+            )
+            .bind(tenant_id.0)
+            .bind(store_id.0)
+            .bind(&order_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(row) = row {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("projection worker did not materialize the event");
+
+    control
+        .send(ProjectionWorkerMessage::Shutdown)
+        .await
+        .unwrap();
+    task.await.unwrap();
+
+    assert_eq!(document.0["order_id"], order_id);
+    assert_eq!(document.0["customer_id"], "customer-1");
+    assert_eq!(document.1, 1);
+    let checkpoint: i64 = sqlx::query_scalar(
+        "SELECT last_projected_sequence FROM projection_checkpoints WHERE tenant_id = $1 AND store_id = $2",
+    )
+    .bind(tenant_id.0)
+    .bind(store_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(checkpoint, 1);
+}
+
+#[tokio::test]
+#[ignore]
+async fn projection_worker_materializes_and_checkpoints_ves_stream() {
+    let Some(pool) = connect_db().await else {
+        return;
+    };
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let order_id = format!("ves-projection-order-{}", Uuid::new_v4());
+    let signing_key = AgentSigningKey::generate();
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    registry
+        .register_key(
+            &AgentKeyLookup::new(&tenant_id, &agent_id, AgentKeyId::default()),
+            AgentKeyEntry::new(signing_key.public_key_bytes()),
+        )
+        .await
+        .unwrap();
+    let ves_sequencer = Arc::new(VesSequencer::new(pool.clone(), registry));
+    let event = VesEventEnvelope::new_plaintext(
+        tenant_id.clone(),
+        store_id.clone(),
+        agent_id,
+        AgentKeyId::default(),
+        EntityType::order(),
+        order_id.clone(),
+        EventType::new("order.created"),
+        json!({
+            "customer_id": "ves-customer-1",
+            "total_amount": 91.25,
+            "currency": "CAD",
+            "line_items": []
+        }),
+        &signing_key,
+    );
+    ves_sequencer.ingest(vec![event]).await.unwrap();
+
+    let encryption = Arc::new(PayloadEncryption::disabled());
+    let event_store: Arc<dyn EventStore> = Arc::new(PgEventStore::new(pool.clone(), encryption));
+    let config = ProjectionWorkerConfig {
+        discovery_interval: std::time::Duration::from_millis(10),
+        discovery_page_size: 100,
+        runner: ProjectionRunnerConfig {
+            batch_size: 10,
+            checkpoint_interval: 1,
+            poll_interval_ms: 10,
+            ..ProjectionRunnerConfig::default()
+        },
+    };
+    let (task, control) = stateset_sequencer::infra::spawn_projection_worker(
+        config,
+        pool.clone(),
+        event_store,
+        Some(ves_sequencer),
+    );
+
+    let document = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let row: Option<(serde_json::Value, i64)> = sqlx::query_as(
+                "SELECT document, version FROM ves_projection_documents WHERE tenant_id = $1 AND store_id = $2 AND entity_type = 'order' AND entity_id = $3",
+            )
+            .bind(tenant_id.0)
+            .bind(store_id.0)
+            .bind(&order_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(row) = row {
+                break row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("projection worker did not materialize the VES event");
+
+    control
+        .send(ProjectionWorkerMessage::Shutdown)
+        .await
+        .unwrap();
+    task.await.unwrap();
+
+    assert_eq!(document.0["order_id"], order_id);
+    assert_eq!(document.0["customer_id"], "ves-customer-1");
+    assert_eq!(document.1, 1);
+    let checkpoint: i64 = sqlx::query_scalar(
+        "SELECT last_projected_sequence FROM ves_projection_checkpoints WHERE tenant_id = $1 AND store_id = $2",
+    )
+    .bind(tenant_id.0)
+    .bind(store_id.0)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(checkpoint, 1);
+}
 
 #[tokio::test]
 #[ignore]

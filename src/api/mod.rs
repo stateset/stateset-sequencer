@@ -89,6 +89,10 @@ pub fn router() -> Router<AppState> {
             "/v1/entities/:entity_type/:entity_id",
             get(handlers::get_entity_history),
         )
+        .route(
+            "/v1/projections/:entity_type/:entity_id",
+            get(handlers::get_projection),
+        )
         // Anchor endpoints
         .route("/v1/anchor/status", get(handlers::get_anchor_status))
         .route("/v1/anchor", post(handlers::anchor_commitment))

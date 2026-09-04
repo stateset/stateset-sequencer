@@ -56,7 +56,7 @@ test-integration: ## Run integration tests only
 	cargo test --tests -- --ignored
 
 test-coverage: ## Generate test coverage report
-	@echo "Requires cargo-tarpaulin: cargo install cargo-tarpaulin"
+	@echo "Requires cargo-tarpaulin 0.37.2: cargo install cargo-tarpaulin --version 0.37.2 --locked"
 	cargo tarpaulin --out Html --output-dir coverage --timeout 300
 
 ## Code Quality

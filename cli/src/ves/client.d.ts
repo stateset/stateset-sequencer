@@ -54,6 +54,11 @@ export class VesClient {
     entityId: string,
     options?: { from?: number; limit?: number },
   ): Promise<Record<string, unknown>>;
+  getProjection(
+    entityType: string,
+    entityId: string,
+    source?: 'ves' | 'legacy',
+  ): Promise<Record<string, unknown>>;
   getInclusionProof(sequenceNumber: number): Promise<Record<string, unknown>>;
   verifyInclusionProof(proof: unknown): Promise<Record<string, unknown>>;
   getCursor(): Promise<Record<string, unknown>>;

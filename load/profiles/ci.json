@@ -1,9 +1,9 @@
 {
   "vus": 5,
-  "duration": "1m",
+  "duration": "20s",
   "thresholds": {
     "checks": ["rate>0.99"],
     "http_req_failed": ["rate<0.01"],
-    "http_req_duration": ["p(95)<200"]
+    "http_req_duration": ["p(95)<200", "p(99)<500"]
   }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "stateset-sequencer"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.90"
 authors = ["StateSet Core Infrastructure"]
@@ -82,6 +82,7 @@ hkdf = { version = "0.12", optional = true }
 
 # Authentication
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rand = "0.8"
 base64 = "0.22"
 
@@ -163,7 +164,7 @@ alloy = { version = "1.6", default-features = false, features = [
     "sol-types",
 ] }
 tempfile = "3"
-serial_test = "3"
+serial_test = "3.5"
 fake = { version = "2", features = ["derive", "uuid", "chrono"] }
 proptest = "1"
 http-body-util = "0.1"

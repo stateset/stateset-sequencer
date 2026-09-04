@@ -21,6 +21,9 @@ pub trait SecretsProvider: Send + Sync {
     /// HMAC secret for JWT validation
     fn jwt_secret(&self) -> Result<Option<String>, SecretsError>;
 
+    /// Asymmetric OIDC/JWKS document for externally issued JWTs.
+    fn jwt_jwks_json(&self) -> Result<Option<String>, SecretsError>;
+
     /// JWT issuer claim
     fn jwt_issuer(&self) -> Result<String, SecretsError>;
 
@@ -78,18 +81,52 @@ impl EnvSecretsProvider {
         Self
     }
 
-    fn get_opt(var: &str) -> Option<String> {
-        std::env::var(var).ok().filter(|v| !v.trim().is_empty())
+    fn get_opt(var: &str) -> Result<Option<String>, SecretsError> {
+        let direct = std::env::var(var).ok().filter(|v| !v.trim().is_empty());
+        let file_var = format!("{var}_FILE");
+        let file = std::env::var(&file_var)
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        if direct.is_some() && file.is_some() {
+            return Err(SecretsError::Provider(format!(
+                "{var} and {file_var} are mutually exclusive"
+            )));
+        }
+        if let Some(path) = file {
+            let metadata = std::fs::metadata(&path).map_err(|e| {
+                SecretsError::Provider(format!("cannot inspect {file_var} path {path}: {e}"))
+            })?;
+            const MAX_SECRET_FILE_BYTES: u64 = 2 * 1024 * 1024;
+            if metadata.len() > MAX_SECRET_FILE_BYTES {
+                return Err(SecretsError::Provider(format!(
+                    "{file_var} exceeds {MAX_SECRET_FILE_BYTES} bytes"
+                )));
+            }
+            let value = std::fs::read_to_string(&path).map_err(|e| {
+                SecretsError::Provider(format!("cannot read {file_var} path {path}: {e}"))
+            })?;
+            let value = value.trim().to_string();
+            return if value.is_empty() {
+                Err(SecretsError::Provider(format!("{file_var} is empty")))
+            } else {
+                Ok(Some(value))
+            };
+        }
+        Ok(direct)
     }
 }
 
 impl SecretsProvider for EnvSecretsProvider {
     fn bootstrap_api_key(&self) -> Result<Option<String>, SecretsError> {
-        Ok(Self::get_opt("BOOTSTRAP_ADMIN_API_KEY"))
+        Self::get_opt("BOOTSTRAP_ADMIN_API_KEY")
     }
 
     fn jwt_secret(&self) -> Result<Option<String>, SecretsError> {
-        Ok(Self::get_opt("JWT_SECRET"))
+        Self::get_opt("JWT_SECRET")
+    }
+
+    fn jwt_jwks_json(&self) -> Result<Option<String>, SecretsError> {
+        Self::get_opt("JWT_JWKS_JSON")
     }
 
     fn jwt_issuer(&self) -> Result<String, SecretsError> {
@@ -101,28 +138,28 @@ impl SecretsProvider for EnvSecretsProvider {
     }
 
     fn ves_sequencer_signing_key(&self) -> Result<Option<String>, SecretsError> {
-        Ok(Self::get_opt("VES_SEQUENCER_SIGNING_KEY"))
+        Self::get_opt("VES_SEQUENCER_SIGNING_KEY")
     }
 
     fn ves_sequencer_ml_dsa_seed(&self) -> Result<Option<String>, SecretsError> {
-        Ok(Self::get_opt("VES_SEQUENCER_ML_DSA_SEED"))
+        Self::get_opt("VES_SEQUENCER_ML_DSA_SEED")
     }
 
     fn ves_sequencer_security_profile(&self) -> Result<Option<String>, SecretsError> {
-        Ok(Self::get_opt("VES_SEQUENCER_SECURITY_PROFILE"))
+        Self::get_opt("VES_SEQUENCER_SECURITY_PROFILE")
     }
 
     fn ves_sequencer_id(&self) -> Result<Option<String>, SecretsError> {
-        Ok(Self::get_opt("VES_SEQUENCER_ID"))
+        Self::get_opt("VES_SEQUENCER_ID")
     }
 
     fn payload_encryption_keys(&self) -> Result<Option<Vec<String>>, SecretsError> {
         // Try multi-key var first, then single-key fallback
-        if let Some(keys_csv) = Self::get_opt("PAYLOAD_ENCRYPTION_KEYS") {
+        if let Some(keys_csv) = Self::get_opt("PAYLOAD_ENCRYPTION_KEYS")? {
             let keys: Vec<String> = keys_csv.split(',').map(|s| s.trim().to_string()).collect();
             return Ok(Some(keys));
         }
-        if let Some(key) = Self::get_opt("PAYLOAD_ENCRYPTION_KEY") {
+        if let Some(key) = Self::get_opt("PAYLOAD_ENCRYPTION_KEY")? {
             return Ok(Some(vec![key]));
         }
         Ok(None)
@@ -131,7 +168,7 @@ impl SecretsProvider for EnvSecretsProvider {
     fn payload_encryption_keys_by_tenant(
         &self,
     ) -> Result<Option<HashMap<Uuid, Vec<String>>>, SecretsError> {
-        let json_str = match Self::get_opt("PAYLOAD_ENCRYPTION_KEYS_BY_TENANT") {
+        let json_str = match Self::get_opt("PAYLOAD_ENCRYPTION_KEYS_BY_TENANT")? {
             Some(s) => s,
             None => return Ok(None),
         };
@@ -141,13 +178,15 @@ impl SecretsProvider for EnvSecretsProvider {
     }
 
     fn anchor_private_key(&self) -> Result<Option<String>, SecretsError> {
-        Ok(Self::get_opt("SEQUENCER_PRIVATE_KEY"))
+        Self::get_opt("SEQUENCER_PRIVATE_KEY")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_SECRET: &str = "STATESET_TEST_SECRET_PROVIDER_VALUE";
 
     #[test]
     fn env_provider_returns_none_for_unset_vars() {
@@ -162,5 +201,25 @@ mod tests {
         let provider = EnvSecretsProvider::new();
         assert_eq!(provider.jwt_issuer().unwrap(), "stateset-sequencer");
         assert_eq!(provider.jwt_audience().unwrap(), "stateset-api");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn file_secret_is_trimmed_and_direct_value_is_mutually_exclusive() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), "managed-secret\n").unwrap();
+        let file_var = format!("{TEST_SECRET}_FILE");
+        std::env::remove_var(TEST_SECRET);
+        std::env::set_var(&file_var, file.path());
+
+        assert_eq!(
+            EnvSecretsProvider::get_opt(TEST_SECRET).unwrap(),
+            Some("managed-secret".to_string())
+        );
+
+        std::env::set_var(TEST_SECRET, "direct-secret");
+        assert!(EnvSecretsProvider::get_opt(TEST_SECRET).is_err());
+        std::env::remove_var(TEST_SECRET);
+        std::env::remove_var(file_var);
     }
 }

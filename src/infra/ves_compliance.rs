@@ -95,6 +95,160 @@ impl PgVesComplianceProofStore {
         }))
     }
 
+    /// Return plaintext VES events that do not yet have the requested proof.
+    /// Used by the optional in-process prover; encrypted payloads are excluded
+    /// because the sequencer cannot soundly derive their private amount.
+    pub async fn list_unproved_plaintext_events(
+        &self,
+        proof_type: &str,
+        proof_version: u32,
+        policy_hash: &Hash256,
+        limit: usize,
+    ) -> Result<Vec<VesComplianceEventInputs>> {
+        let limit = i64::try_from(limit).map_err(|_| {
+            SequencerError::Configuration("proof worker batch size does not fit BIGINT".to_string())
+        })?;
+        let rows: Vec<VesEventInputsRow> = sqlx::query_as(
+            r#"
+            SELECT
+                e.event_id, e.tenant_id, e.store_id, e.sequence_number,
+                e.event_type, e.payload_kind, e.payload, e.payload_plain_hash,
+                e.payload_cipher_hash, e.event_signing_hash
+            FROM ves_events e
+            WHERE e.payload_kind = 0
+              AND e.payload IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM ves_proof_jobs j
+                  WHERE j.event_id = e.event_id
+                    AND j.policy_hash = $3
+                    AND (
+                        j.status IN ('proved', 'not_compliant', 'skipped', 'failed')
+                        OR (j.status = 'retryable' AND j.next_attempt_at > NOW())
+                    )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM ves_compliance_proofs p
+                  WHERE p.event_id = e.event_id
+                    AND p.proof_type = $1
+                    AND p.proof_version = $2
+                    AND p.policy_hash = $3
+              )
+            ORDER BY e.sequenced_at ASC, e.sequence_number ASC
+            LIMIT $4
+            "#,
+        )
+        .bind(proof_type)
+        .bind(i32::try_from(proof_version).map_err(|_| {
+            SequencerError::Configuration("proof version does not fit INTEGER".to_string())
+        })?)
+        .bind(&policy_hash[..])
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(VesComplianceEventInputs::try_from)
+            .collect()
+    }
+
+    pub async fn record_worker_proved(&self, event_id: Uuid, policy_hash: &Hash256) -> Result<()> {
+        self.upsert_worker_job(event_id, policy_hash, "proved", None, None)
+            .await
+    }
+
+    pub async fn record_worker_not_compliant(
+        &self,
+        event_id: Uuid,
+        policy_hash: &Hash256,
+        reason: &str,
+    ) -> Result<()> {
+        self.upsert_worker_job(event_id, policy_hash, "not_compliant", Some(reason), None)
+            .await
+    }
+
+    pub async fn record_worker_skipped(
+        &self,
+        event_id: Uuid,
+        policy_hash: &Hash256,
+        reason: &str,
+    ) -> Result<()> {
+        self.upsert_worker_job(event_id, policy_hash, "skipped", Some(reason), None)
+            .await
+    }
+
+    pub async fn record_worker_failure(
+        &self,
+        event_id: Uuid,
+        policy_hash: &Hash256,
+        reason: &str,
+        max_attempts: u32,
+        retry_delay: std::time::Duration,
+    ) -> Result<()> {
+        let delay_seconds = i64::try_from(retry_delay.as_secs()).unwrap_or(i64::MAX);
+        let max_attempts = i32::try_from(max_attempts).unwrap_or(i32::MAX);
+        let reason = truncate_error(reason);
+        sqlx::query(
+            r#"
+            INSERT INTO ves_proof_jobs
+                (event_id, policy_hash, status, attempts, last_error, next_attempt_at, updated_at)
+            VALUES ($1, $2,
+                    CASE WHEN 1 >= $4 THEN 'failed' ELSE 'retryable' END,
+                    1, $3, NOW() + make_interval(secs => $5), NOW())
+            ON CONFLICT (event_id, policy_hash) DO UPDATE SET
+                attempts = ves_proof_jobs.attempts + 1,
+                status = CASE
+                    WHEN ves_proof_jobs.attempts + 1 >= $4 THEN 'failed'
+                    ELSE 'retryable'
+                END,
+                last_error = $3,
+                next_attempt_at = NOW() + make_interval(secs => $5),
+                updated_at = NOW()
+            "#,
+        )
+        .bind(event_id)
+        .bind(&policy_hash[..])
+        .bind(reason)
+        .bind(max_attempts)
+        .bind(delay_seconds as f64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_worker_job(
+        &self,
+        event_id: Uuid,
+        policy_hash: &Hash256,
+        status: &str,
+        error: Option<&str>,
+        next_attempt_at: Option<DateTime<Utc>>,
+    ) -> Result<()> {
+        let error = error.map(truncate_error);
+        sqlx::query(
+            r#"
+            INSERT INTO ves_proof_jobs
+                (event_id, policy_hash, status, attempts, last_error, next_attempt_at, updated_at)
+            VALUES ($1, $2, $3, 1, $4, $5, NOW())
+            ON CONFLICT (event_id, policy_hash) DO UPDATE SET
+                status = EXCLUDED.status,
+                attempts = ves_proof_jobs.attempts + 1,
+                last_error = EXCLUDED.last_error,
+                next_attempt_at = EXCLUDED.next_attempt_at,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(event_id)
+        .bind(&policy_hash[..])
+        .bind(status)
+        .bind(error)
+        .bind(next_attempt_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Submit a compliance proof for an event.
     ///
     /// Note: Parameters represent distinct proof components per VES specification.
@@ -429,6 +583,20 @@ impl PgVesComplianceProofStore {
     }
 }
 
+fn truncate_error(reason: &str) -> &str {
+    let end = reason
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= 4000)
+        .last()
+        .unwrap_or(0);
+    if reason.len() <= 4000 {
+        reason
+    } else {
+        &reason[..end]
+    }
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct VesEventInputsRow {
     event_id: Uuid,
@@ -441,6 +609,35 @@ struct VesEventInputsRow {
     payload_plain_hash: Vec<u8>,
     payload_cipher_hash: Vec<u8>,
     event_signing_hash: Vec<u8>,
+}
+
+impl TryFrom<VesEventInputsRow> for VesComplianceEventInputs {
+    type Error = SequencerError;
+
+    fn try_from(row: VesEventInputsRow) -> Result<Self> {
+        Ok(Self {
+            event_id: row.event_id,
+            tenant_id: TenantId::from_uuid(row.tenant_id),
+            store_id: StoreId::from_uuid(row.store_id),
+            sequence_number: u64::try_from(row.sequence_number).map_err(|_| {
+                SequencerError::Internal("invalid negative VES sequence number".to_string())
+            })?,
+            event_type: row.event_type,
+            payload_kind: u32::try_from(row.payload_kind).map_err(|_| {
+                SequencerError::Internal("invalid negative VES payload kind".to_string())
+            })?,
+            payload: row.payload,
+            payload_plain_hash: row.payload_plain_hash.try_into().map_err(|_| {
+                SequencerError::Internal("invalid payload_plain_hash length".to_string())
+            })?,
+            payload_cipher_hash: row.payload_cipher_hash.try_into().map_err(|_| {
+                SequencerError::Internal("invalid payload_cipher_hash length".to_string())
+            })?,
+            event_signing_hash: row.event_signing_hash.try_into().map_err(|_| {
+                SequencerError::Internal("invalid event_signing_hash length".to_string())
+            })?,
+        })
+    }
 }
 
 #[derive(Debug, sqlx::FromRow)]

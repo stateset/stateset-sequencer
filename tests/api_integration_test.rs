@@ -1459,6 +1459,75 @@ async fn test_auth_rejects_invalid_api_key() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+#[ignore]
+async fn test_projection_endpoint_defaults_to_ves_and_isolates_legacy() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let store_id = Uuid::new_v4();
+    let entity_id = format!("projection-api-{}", Uuid::new_v4());
+    for (table, marker) in [
+        ("ves_projection_documents", "ves"),
+        ("projection_documents", "legacy"),
+    ] {
+        let sql = format!(
+            "INSERT INTO {table} (tenant_id, store_id, entity_type, entity_id, document, version) VALUES ($1, $2, 'order', $3, $4, 7)"
+        );
+        sqlx::query(&sql)
+            .bind(tenant_id)
+            .bind(store_id)
+            .bind(&entity_id)
+            .bind(json!({ "source": marker }))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let app = create_test_router(create_test_state(pool).await, true);
+    let base =
+        format!("/api/v1/projections/order/{entity_id}?tenant_id={tenant_id}&store_id={store_id}");
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &base,
+        None,
+        Some("ss_test_integration_key_12345"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["source"], "ves");
+    assert_eq!(body["document"]["source"], "ves");
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &format!("{base}&source=legacy"),
+        None,
+        Some("ss_test_integration_key_12345"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    assert_eq!(body["source"], "legacy");
+    assert_eq!(body["document"]["source"], "legacy");
+
+    let (status, _) = send_request(
+        &app,
+        Method::GET,
+        &format!("{base}&source=unknown"),
+        None,
+        Some("ss_test_integration_key_12345"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 // ============================================================================
 // Agent Key Registration Tests
 // ============================================================================

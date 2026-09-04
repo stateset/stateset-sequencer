@@ -393,6 +393,8 @@ impl ProjectionRunner {
             if expected_version != actual_version {
                 // Version conflict - emit rejection event
                 let rejection = RejectionEvent {
+                    tenant_id: *tenant_id,
+                    store_id: *store_id,
                     original_event_id: event.event_id(),
                     original_sequence: event.sequence_number(),
                     entity_type: entity_type.clone(),
@@ -468,6 +470,8 @@ impl ProjectionRunner {
                         .await?;
 
                     let rejection = RejectionEvent {
+                        tenant_id: *tenant_id,
+                        store_id: *store_id,
                         original_event_id: event.event_id(),
                         original_sequence: event.sequence_number(),
                         entity_type: entity_type.clone(),
@@ -522,6 +526,8 @@ impl ProjectionRunner {
                 };
 
                 let rejection = RejectionEvent {
+                    tenant_id: *tenant_id,
+                    store_id: *store_id,
                     original_event_id: event.event_id(),
                     original_sequence: event.sequence_number(),
                     entity_type: entity_type.clone(),

@@ -193,6 +193,15 @@ export class VesClient {
     );
   }
 
+  getProjection(entityType, entityId, source = 'ves') {
+    if (source !== 'ves' && source !== 'legacy') {
+      throw new Error('source must be "ves" or "legacy"');
+    }
+    return this.request(
+      `/api/v1/projections/${encodeURIComponent(entityType)}/${encodeURIComponent(entityId)}?${this.scopeQuery()}&source=${source}`,
+    );
+  }
+
   getInclusionProof(sequenceNumber) {
     return this.request(
       `/api/v1/ves/proofs/${encodeURIComponent(sequenceNumber)}?${this.scopeQuery()}`,

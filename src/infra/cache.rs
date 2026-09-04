@@ -1244,8 +1244,8 @@ mod tests {
     /// abandonment.
     #[tokio::test]
     async fn abandoned_miss_lock_expires_and_can_be_retaken() {
-        let cache: LruCache<&'static str, i32> = LruCache::new(10, Duration::from_secs(60))
-            .with_miss_lock_ttl(Duration::from_millis(20));
+        let cache: LruCache<&'static str, i32> =
+            LruCache::new(10, Duration::from_secs(60)).with_miss_lock_ttl(Duration::from_secs(60));
 
         assert!(
             cache.try_acquire_refresh_lock(&"k").await,
@@ -1256,7 +1256,13 @@ mod tests {
             "a live lock is exclusive"
         );
 
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        // Age the lock directly instead of relying on wall-clock sleeps; this
+        // stays deterministic under slow coverage/sanitizer instrumentation.
+        cache
+            .refreshing
+            .write()
+            .await
+            .insert("k", Instant::now() - Duration::from_secs(61));
 
         assert!(
             cache.try_acquire_refresh_lock(&"k").await,

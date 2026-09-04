@@ -16,7 +16,7 @@ serviceAccount:
 
 # By default the chart expects this Secret to be provisioned by the operator or
 # an external-secrets controller. It must contain DATABASE_URL and at least one
-# of BOOTSTRAP_ADMIN_API_KEY or JWT_SECRET.
+# of BOOTSTRAP_ADMIN_API_KEY, JWT_SECRET, or JWT_JWKS_JSON.
 secrets:
   existingSecret: stateset-sequencer-secrets
 
@@ -46,6 +46,8 @@ securityContext:
 config:
   rustLog: info
   authMode: required
+  # Prefer a managed OIDC/JWKS endpoint for automatic signing-key rotation.
+  jwtJwksUrl: ""
   maxDbConnections: 20
   trustProxyHeaders: false
   # Required when trustProxyHeaders is true. Use only the exact ingress/LB
@@ -53,6 +55,15 @@ config:
   trustProxyAllowlist: ""
   payloadEncryptionMode: required
   extraEnv: []
+
+projection:
+  enabled: true
+
+# CPU-intensive and policy-specific, so explicitly opt in.
+proofWorker:
+  enabled: false
+  policyId: ""
+  policyParams: {}
 
 anchoring:
   enabled: false

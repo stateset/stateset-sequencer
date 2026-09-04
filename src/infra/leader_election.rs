@@ -59,6 +59,10 @@ pub mod lock_keys {
     pub const ANCHOR_WORKER: i64 = 0x5354_5341_5f61_6e63;
     /// Leader lock for the autonomous x402 on-chain settlement worker.
     pub const SETTLEMENT_WORKER: i64 = 0x5354_5341_5f73_7431;
+    /// Leader lock for the production state projection worker.
+    pub const PROJECTION_WORKER: i64 = 0x5354_5341_5f70_726a;
+    /// Leader lock for in-process STARK proof generation.
+    pub const PROOF_WORKER: i64 = 0x5354_5341_5f70_7266;
 }
 
 /// Run `spawn_worker` on exactly one node at a time, elected via a PostgreSQL
@@ -199,6 +203,8 @@ mod tests {
             lock_keys::X402_BATCH_WORKER,
             lock_keys::ANCHOR_WORKER,
             lock_keys::SETTLEMENT_WORKER,
+            lock_keys::PROJECTION_WORKER,
+            lock_keys::PROOF_WORKER,
         ];
         for (i, a) in keys.iter().enumerate() {
             for b in &keys[i + 1..] {

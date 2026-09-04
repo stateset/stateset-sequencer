@@ -46,6 +46,11 @@ Run via helper script:
 ./scripts/run_load_test.sh load/sequencer_query.js stress
 ```
 
+The `performance` GitHub Actions workflow runs the thresholded sustained
+profile every Monday and can run smoke, sustained, or stress on demand. It
+uploads the k6 JSON summary and server log as 30-day evidence. Every pull
+request also runs the shorter `ci.json` profile against the release binary.
+
 ### Environment Variables
 
 Set environment variables before running:

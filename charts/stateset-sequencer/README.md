@@ -5,7 +5,7 @@ This is the canonical Helm deployment for StateSet Sequencer.
 Create or externally manage a Secret containing:
 
 - `DATABASE_URL`
-- either `BOOTSTRAP_ADMIN_API_KEY` or `JWT_SECRET`
+- one of `BOOTSTRAP_ADMIN_API_KEY`, `JWT_SECRET`, or asymmetric `JWT_JWKS_JSON`
 - `PAYLOAD_ENCRYPTION_KEY` when `config.payloadEncryptionMode=required`
 
 Then install:

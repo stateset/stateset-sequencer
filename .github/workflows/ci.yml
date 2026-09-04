@@ -312,7 +312,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        # Keep the coverage engine reproducible: changes in instrumentation or
+        # target discovery must be reviewed explicitly alongside the ratchet.
+        run: cargo install cargo-tarpaulin --version 0.37.2 --locked
 
       - name: Generate coverage (unit tests)
         run: |
@@ -489,7 +491,6 @@ jobs:
   benchmark:
     name: Benchmarks
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
 
     steps:
       - uses: actions/checkout@v4
@@ -566,6 +567,86 @@ jobs:
           name: stateset-sequencer
           path: target/release/stateset-sequencer
           if-no-files-found: error
+
+  load-smoke:
+    name: Release-binary Load Smoke
+    runs-on: ubuntu-latest
+    needs: [build]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sequencer
+          POSTGRES_PASSWORD: sequencer
+          POSTGRES_DB: stateset_sequencer
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U sequencer -d stateset_sequencer"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stateset-sequencer
+          path: dist
+
+      - name: Start the release binary
+        env:
+          DATABASE_URL: postgres://sequencer:sequencer@127.0.0.1:5432/stateset_sequencer
+          ALLOW_INSECURE_LOCAL_DB: "true"
+          AUTH_MODE: disabled
+          ALLOW_AUTH_DISABLED: "true"
+          PAYLOAD_ENCRYPTION_MODE: disabled
+          SEQUENCER_ENV: test
+          RUST_LOG: info
+        run: |
+          chmod +x dist/stateset-sequencer
+          dist/stateset-sequencer > sequencer-load-smoke.log 2>&1 &
+          echo "$!" > sequencer-load-smoke.pid
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:8080/ready >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat sequencer-load-smoke.log
+          exit 1
+
+      - name: Run thresholded ingest load test
+        env:
+          API_KEY: ci-auth-disabled
+          TENANT_ID: 10000000-0000-4000-8000-000000000001
+          STORE_ID: 20000000-0000-4000-8000-000000000002
+          AGENT_ID: 30000000-0000-4000-8000-000000000003
+        run: |
+          docker run --rm --network host \
+            -e API_KEY -e TENANT_ID -e STORE_ID -e AGENT_ID \
+            -v "$PWD:/work" -w /work \
+            grafana/k6:0.54.0 run \
+            --opts load/profiles/ci.json \
+            --summary-export load-smoke-summary.json \
+            load/sequencer_ingest.js
+
+      - name: Stop release binary
+        if: always()
+        run: |
+          if [ -f sequencer-load-smoke.pid ]; then
+            kill "$(cat sequencer-load-smoke.pid)" || true
+          fi
+
+      - name: Upload load evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: load-smoke-evidence
+          path: |
+            load-smoke-summary.json
+            sequencer-load-smoke.log
+          if-no-files-found: warn
 
   # Docker image build and push
   docker:
@@ -653,7 +734,7 @@ jobs:
   all-checks:
     name: All Checks
     runs-on: ubuntu-latest
-    needs: [agent-sdk, lint, test, test-stark, msrv, coverage, security, license-check, build]
+    needs: [agent-sdk, lint, test, test-stark, msrv, coverage, security, license-check, benchmark, build, load-smoke]
     if: always()
     steps:
       - name: Check all jobs passed
@@ -692,6 +773,14 @@ jobs:
           fi
           if [[ "${{ needs.build.result }}" != "success" ]]; then
             echo "Build failed"
+            exit 1
+          fi
+          if [[ "${{ needs.benchmark.result }}" != "success" ]]; then
+            echo "Benchmarks failed"
+            exit 1
+          fi
+          if [[ "${{ needs.load-smoke.result }}" != "success" ]]; then
+            echo "Release-binary load smoke failed"
             exit 1
           fi
           echo "All checks passed!"

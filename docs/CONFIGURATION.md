@@ -68,9 +68,20 @@ needed to boot a dev instance.
 | `ALLOW_AUTH_DISABLED` | `false` | Set to `true` to explicitly allow `AUTH_MODE=disabled` |
 | `BOOTSTRAP_ADMIN_API_KEY` | (unset) | Admin API key for bootstrap/dev |
 | `JWT_SECRET` | (unset) | HMAC secret for JWT validation |
+| `JWT_JWKS_JSON` | (unset) | Asymmetric OIDC/JWKS document for externally issued JWTs; every key requires `kid` and `alg`; mutually exclusive with `JWT_SECRET` |
+| `JWT_JWKS_URL` | (unset) | OIDC/JWKS endpoint fetched at startup and refreshed in place; HTTPS is mandatory in production; mutually exclusive with static JWT key settings |
+| `JWT_JWKS_REFRESH_SECS` | `300` | Refresh interval for `JWT_JWKS_URL`; failures retain the last-known-good keys |
 | `JWT_ISSUER` | `stateset-sequencer` | Expected JWT issuer claim |
 | `JWT_AUDIENCE` | `stateset-api` | Expected JWT audience claim |
 | `ADMIN_IP_ALLOWLIST` | (unset) | Comma-separated IPs/CIDRs allowed to access admin + metrics (e.g. `203.0.113.10,10.0.0.0/8`) |
+
+Secret-bearing settings also accept a mutually exclusive `_FILE` form, such
+as `JWT_JWKS_JSON_FILE`, `JWT_SECRET_FILE`,
+`VES_SEQUENCER_SIGNING_KEY_FILE`, `PAYLOAD_ENCRYPTION_KEYS_FILE`, and
+`SEQUENCER_PRIVATE_KEY_FILE`. This is the recommended integration point for
+Vault Agent, Secrets Store CSI, Docker secrets, and cloud secret-manager
+sidecars. Files are size-bounded, must be UTF-8 and non-empty, and are read
+only during startup so static secret rotation should use a rolling restart.
 
 ## Client IP and Proxies
 
@@ -190,7 +201,31 @@ single node wins instantly, so single-node behaviour is unchanged.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `WORKER_LEADER_ELECTION` | `true` | Leader-elect the singleton workers (anchoring, x402 batching, settlement) |
+| `WORKER_LEADER_ELECTION` | `true` | Leader-elect singleton workers (projection, proof generation, anchoring, x402 batching, settlement) |
+
+## Production Projections
+
+The projection worker dynamically discovers all VES and legacy
+`(tenant_id, store_id)` streams and maintains order, inventory, product,
+customer, and return documents. VES read models live in
+`ves_projection_documents`; legacy read models live in `projection_documents`.
+Their checkpoints and versions are source-isolated because their sequence
+spaces are independent. `GET /api/v1/projections/...` defaults to VES and
+accepts `source=legacy` for compatibility. Encrypted VES payloads remain in the
+canonical ledger but cannot be materialized without plaintext. In HA
+deployments, PostgreSQL advisory-lock election ensures one active worker.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROJECTION_WORKER_ENABLED` | `true` | Enable durable production projections |
+| `PROJECTION_DISCOVERY_INTERVAL_MS` | `5000` | Interval for discovering new streams |
+| `PROJECTION_DISCOVERY_PAGE_SIZE` | `1000` | Keyset-pagination page size for stream discovery |
+| `PROJECTION_BATCH_SIZE` | `100` | Events read per stream iteration |
+| `PROJECTION_CHECKPOINT_INTERVAL` | `100` | Applied/skipped events between durable checkpoints |
+| `PROJECTION_CONTINUE_ON_ERROR` | `true` | Continue after a handler error (the event is sent to the DLQ) |
+| `PROJECTION_MAX_RETRIES` | `3` | Reserved projection retry budget |
+| `PROJECTION_RETRY_DELAY_MS` | `100` | Reserved projection retry delay |
+| `PROJECTION_POLL_INTERVAL_MS` | `100` | Idle stream poll interval |
 
 ## STARK Proof Verification
 
@@ -198,6 +233,26 @@ single node wins instantly, so single-node behaviour is unchanged.
 |----------|---------|-------------|
 | `VES_STARK_VERIFY_ON_SUBMIT` | `true` | Verify STARK proofs at submission time |
 | `VES_STARK_ALLOW_UNVERIFIED_AMOUNT_BINDING` | `false` | Accept prover-attested amounts when the sequencer cannot re-extract the amount from the payload |
+
+### Automated proof generation
+
+The full/STARK build can generate compliance proofs inside a leader-elected
+worker. It is off by default because proving is CPU-intensive and the policy is
+an operator decision. The worker only handles plaintext events for which the
+canonical amount extractor succeeds, self-verifies every proof, and records
+proved, skipped, non-compliant, retryable, and terminal-failure outcomes in
+`ves_proof_jobs`.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VES_PROOF_WORKER_ENABLED` | `false` | Enable in-process STARK compliance proving; requires the `stark` feature |
+| `VES_PROOF_POLICY_ID` | (required when enabled) | Supported policy such as `aml.threshold` or `order_total.cap` |
+| `VES_PROOF_POLICY_PARAMS` | (required when enabled) | JSON policy parameters, e.g. `{"threshold":10000}` |
+| `VES_PROOF_BATCH_SIZE` | `4` | Candidate events handled per polling cycle |
+| `VES_PROOF_POLL_INTERVAL_MS` | `5000` | Candidate polling interval |
+| `VES_PROOF_TIMEOUT_SECS` | `60` | Maximum wait for one proof task |
+| `VES_PROOF_MAX_ATTEMPTS` | `3` | Attempts before a job becomes terminally failed |
+| `VES_PROOF_RETRY_DELAY_SECS` | `30` | Delay before retrying a failed proof job |
 
 > `VES_STARK_ALLOW_UNVERIFIED_AMOUNT_BINDING=1` **weakens proof soundness to
 > prover honesty.** The sequencer normally re-derives the amount from the

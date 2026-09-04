@@ -339,7 +339,7 @@ PUT /api/v1/agents/{agent_id}/policy
 GET /api/v1/agents/{agent_id}/policy?tenant_id=<uuid>
 ```
 
-### Legacy Endpoints
+### Read APIs
 
 ```bash
 # Get events (legacy format)
@@ -350,6 +350,9 @@ GET /api/v1/head?tenant_id=<uuid>&store_id=<uuid>
 
 # Get entity history
 GET /api/v1/entities/{entity_type}/{entity_id}?tenant_id=<uuid>&store_id=<uuid>
+
+# Get the latest durable materialized VES state (use source=legacy for the legacy ledger)
+GET /api/v1/projections/{entity_type}/{entity_id}?tenant_id=<uuid>&store_id=<uuid>&source=ves
 ```
 
 ### x402 Payments
@@ -422,8 +425,8 @@ The essentials for a local boot:
 
 Everything else — database pool tuning, caching, authentication, client-IP /
 proxy trust, rate limiting, payload encryption, anchoring, x402 payments,
-autonomous settlement, HA / leader election, STARK verification and
-observability — is documented per-variable in
+autonomous settlement, durable projections, HA / leader election, STARK
+verification and automated proof generation, and observability — is documented per-variable in
 **[docs/CONFIGURATION.md](docs/CONFIGURATION.md)**.
 
 ## Project Structure

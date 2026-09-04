@@ -79,6 +79,12 @@ spec:
                   name: {{ include "stateset-sequencer.secretName" . }}
                   key: JWT_SECRET
                   optional: true
+            - name: JWT_JWKS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: JWT_JWKS_JSON
+                  optional: true
             - name: HOST
               value: "0.0.0.0"
             - name: PORT
@@ -89,6 +95,10 @@ spec:
               value: {{ .Values.config.rustLog | quote }}
             - name: AUTH_MODE
               value: {{ .Values.config.authMode | quote }}
+            {{- if .Values.config.jwtJwksUrl }}
+            - name: JWT_JWKS_URL
+              value: {{ .Values.config.jwtJwksUrl | quote }}
+            {{- end }}
             - name: MAX_DB_CONNECTIONS
               value: {{ .Values.config.maxDbConnections | quote }}
             - name: TRUST_PROXY_HEADERS
@@ -99,6 +109,16 @@ spec:
             {{- end }}
             - name: PAYLOAD_ENCRYPTION_MODE
               value: {{ .Values.config.payloadEncryptionMode | quote }}
+            - name: PROJECTION_WORKER_ENABLED
+              value: {{ .Values.projection.enabled | quote }}
+            - name: VES_PROOF_WORKER_ENABLED
+              value: {{ .Values.proofWorker.enabled | quote }}
+            {{- if .Values.proofWorker.enabled }}
+            - name: VES_PROOF_POLICY_ID
+              value: {{ required "proofWorker.policyId is required when proofWorker.enabled=true" .Values.proofWorker.policyId | quote }}
+            - name: VES_PROOF_POLICY_PARAMS
+              value: {{ .Values.proofWorker.policyParams | toJson | quote }}
+            {{- end }}
             - name: PAYLOAD_ENCRYPTION_KEY
               valueFrom:
                 secretKeyRef:

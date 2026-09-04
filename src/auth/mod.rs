@@ -28,7 +28,7 @@
 //! - `AUTH_MODE`: `required` (default) or `disabled` (requires explicit opt-in)
 //! - `ALLOW_AUTH_DISABLED`: `true` to explicitly allow `AUTH_MODE=disabled` in a non-production flow
 //! - `BOOTSTRAP_ADMIN_API_KEY`: Initial admin key for setup
-//! - `JWT_SECRET`: HMAC secret for JWT validation
+//! - `JWT_SECRET`, `JWT_JWKS_JSON`, or `JWT_JWKS_URL`: JWT trust configuration
 
 mod agent_keys;
 mod api_key;

@@ -1,0 +1,118 @@
+name: release
+
+# A release is derived only from a fully successful CI run on the default
+# branch. This prevents publishing a tag or binary from a partially validated
+# revision. Bumping Cargo.toml and adding the matching changelog section is the
+# release request; this workflow is the sole publisher.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: release-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.head_branch == 'master' ||
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Validate release metadata
+        id: metadata
+        env:
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$version"
+          test "$version" != "0.0.0"
+          grep -q "^## \[$version\] - " CHANGELOG.md
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this version is already released
+        id: existing
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            tagged_sha=$(git rev-list -n 1 "$TAG")
+            if [ "$tagged_sha" = "$RELEASE_SHA" ] && ! gh release view "$TAG" >/dev/null 2>&1; then
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "Version $TAG already points to $tagged_sha; no release requested by this revision."
+            fi
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download CI-validated binary
+        if: steps.existing.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: gh run download "$RUN_ID" --name stateset-sequencer --dir dist
+
+      - name: Package release artifact
+        if: steps.existing.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod +x dist/stateset-sequencer
+          tar -C dist -czf "dist/stateset-sequencer-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" stateset-sequencer
+          sha256sum "dist/stateset-sequencer-${VERSION}-x86_64-unknown-linux-gnu.tar.gz" > "dist/SHA256SUMS"
+
+      - name: Attest release artifact provenance
+        if: steps.existing.outputs.publish == 'true'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/stateset-sequencer-${{ steps.metadata.outputs.version }}-x86_64-unknown-linux-gnu.tar.gz
+
+      - name: Create annotated tag when absent
+        if: steps.existing.outputs.publish == 'true'
+        env:
+          TAG: ${{ steps.metadata.outputs.tag }}
+          VERSION: ${{ steps.metadata.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG" -m "StateSet Sequencer $TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Publish GitHub release
+        if: steps.existing.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.metadata.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            dist/stateset-sequencer-*.tar.gz \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "StateSet Sequencer $TAG"

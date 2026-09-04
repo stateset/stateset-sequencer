@@ -45,14 +45,17 @@ use crate::auth::{
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::{
     extract_client_ip, lock_keys, spawn_anchor_worker, spawn_batch_worker, spawn_elected_worker,
-    spawn_settlement_worker, spawn_x402_nonce_cleanup, validate_trusted_proxy_allowlist,
-    AnchorWorkerConfig, AnchorWorkerMessage, BatchWorkerMessage, CacheManager, CacheManagerConfig,
-    CircuitBreakerRegistry, ElectionConfig, EnvSecretsProvider, PayloadEncryption,
-    PgAgentKeyRegistry, PgAuditLogger, PgCommitmentEngine, PgEventStore, PgSchemaStore,
-    PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore,
-    PgX402Repository, PoolMonitor, SchemaValidationMode, SecretsProvider, SettlementWorkerConfig,
+    spawn_projection_worker, spawn_settlement_worker, spawn_x402_nonce_cleanup,
+    validate_trusted_proxy_allowlist, AnchorWorkerConfig, AnchorWorkerMessage, BatchWorkerMessage,
+    CacheManager, CacheManagerConfig, CircuitBreakerRegistry, ElectionConfig, EnvSecretsProvider,
+    PayloadEncryption, PgAgentKeyRegistry, PgAuditLogger, PgCommitmentEngine, PgEventStore,
+    PgSchemaStore, PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore,
+    PgVesValidityProofStore, PgX402Repository, PoolMonitor, ProjectionWorkerConfig,
+    ProjectionWorkerMessage, SchemaValidationMode, SecretsProvider, SettlementWorkerConfig,
     SettlementWorkerMessage, VesSequencer, X402BatchWorkerConfig,
 };
+#[cfg(feature = "stark")]
+use crate::infra::{spawn_proof_worker, ProofWorkerConfig, ProofWorkerMessage};
 use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::metrics::{ComponentMetrics, MetricsRegistry};
 use crate::settlement::{SettlementConfig, SettlementService};
@@ -919,11 +922,31 @@ pub async fn run() -> anyhow::Result<()> {
         info!("Bootstrap admin API key is configured");
     }
 
-    let jwt_validator = match secrets
+    let jwt_secret = secrets
         .jwt_secret()
-        .map_err(|e| anyhow::anyhow!("Failed to load JWT secret: {e}"))?
+        .map_err(|e| anyhow::anyhow!("Failed to load JWT secret: {e}"))?;
+    let jwt_jwks_json = secrets
+        .jwt_jwks_json()
+        .map_err(|e| anyhow::anyhow!("Failed to load JWT JWKS: {e}"))?;
+    let jwt_jwks_url = match std::env::var("JWT_JWKS_URL") {
+        Ok(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+        Ok(_) | Err(std::env::VarError::NotPresent) => None,
+        Err(e) => anyhow::bail!("JWT_JWKS_URL is not valid Unicode: {e}"),
+    };
+    if [
+        jwt_secret.is_some(),
+        jwt_jwks_json.is_some(),
+        jwt_jwks_url.is_some(),
+    ]
+    .into_iter()
+    .filter(|configured| *configured)
+    .count()
+        > 1
     {
-        Some(secret) => {
+        anyhow::bail!("JWT_SECRET, JWT_JWKS_JSON, and JWT_JWKS_URL are mutually exclusive");
+    }
+    let jwt_validator = match (jwt_secret, jwt_jwks_json, jwt_jwks_url) {
+        (Some(secret), None, None) => {
             enforce_secret_strength("JWT_SECRET", &secret, MIN_SECRET_LEN, is_production)?;
             let issuer = secrets
                 .jwt_issuer()
@@ -938,7 +961,61 @@ pub async fn run() -> anyhow::Result<()> {
                 &audience,
             )))
         }
-        None => None,
+        (None, Some(jwks_json), None) => {
+            let issuer = secrets
+                .jwt_issuer()
+                .map_err(|e| anyhow::anyhow!("Failed to load JWT issuer: {e}"))?;
+            let audience = secrets
+                .jwt_audience()
+                .map_err(|e| anyhow::anyhow!("Failed to load JWT audience: {e}"))?;
+            let validator = JwtValidator::from_jwks_json(&jwks_json, &issuer, &audience)
+                .map_err(|e| anyhow::anyhow!("Failed to configure JWT JWKS: {e}"))?;
+            any_auth_configured = true;
+            info!("Asymmetric JWT JWKS authentication is configured");
+            Some(Arc::new(validator))
+        }
+        (None, None, Some(jwks_url)) => {
+            if is_production && !jwks_url.starts_with("https://") {
+                anyhow::bail!("JWT_JWKS_URL must use HTTPS in production");
+            }
+            let issuer = secrets
+                .jwt_issuer()
+                .map_err(|e| anyhow::anyhow!("Failed to load JWT issuer: {e}"))?;
+            let audience = secrets
+                .jwt_audience()
+                .map_err(|e| anyhow::anyhow!("Failed to load JWT audience: {e}"))?;
+            let validator = Arc::new(
+                JwtValidator::from_jwks_url(&jwks_url, &issuer, &audience)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to fetch JWT JWKS: {e}"))?,
+            );
+            let refresh_interval =
+                Duration::from_secs(parse_positive_u64_env("JWT_JWKS_REFRESH_SECS", 300)?);
+            let refresh_validator = validator.clone();
+            let refresh_signal = shutdown_coordinator.signal();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(refresh_interval);
+                interval.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            match refresh_validator.refresh_jwks_url(&jwks_url).await {
+                                Ok(()) => info!("JWT JWKS refreshed"),
+                                Err(e) => warn!(error = %e, "JWT JWKS refresh failed; retaining last-known-good keys"),
+                            }
+                        }
+                        _ = refresh_signal.wait() => break,
+                    }
+                }
+            });
+            any_auth_configured = true;
+            info!("OIDC/JWKS URL authentication is configured with automatic rotation");
+            Some(validator)
+        }
+        (None, None, None) => None,
+        _ => {
+            anyhow::bail!("JWT_SECRET, JWT_JWKS_JSON, and JWT_JWKS_URL are mutually exclusive")
+        }
     };
 
     let rate_limiter = parse_optional_positive_u32("RATE_LIMIT_PER_MINUTE")?
@@ -1100,7 +1177,7 @@ pub async fn run() -> anyhow::Result<()> {
 
     if require_auth && !any_auth_configured {
         anyhow::bail!(
-            "AUTH_MODE=required but no auth is configured; set JWT_SECRET or BOOTSTRAP_ADMIN_API_KEY (or set AUTH_MODE=disabled and ALLOW_AUTH_DISABLED=true for local dev)"
+            "AUTH_MODE=required but no auth is configured; set JWT_SECRET, JWT_JWKS_JSON, JWT_JWKS_URL, or BOOTSTRAP_ADMIN_API_KEY (or set AUTH_MODE=disabled and ALLOW_AUTH_DISABLED=true for local dev)"
         );
     }
 
@@ -1281,6 +1358,107 @@ pub async fn run() -> anyhow::Result<()> {
         );
     }
     info!("x402 batch worker started");
+
+    // Materialize the built-in order, inventory, product, customer, and return
+    // read models from every VES and legacy event stream. Stream discovery is
+    // dynamic, and advisory-lock election guarantees one worker across an HA fleet.
+    let projection_worker_enabled = parse_bool_env("PROJECTION_WORKER_ENABLED", true)?;
+    if projection_worker_enabled {
+        let projection_config = ProjectionWorkerConfig::from_env()
+            .map_err(|e| anyhow::anyhow!("invalid projection worker configuration: {e}"))?;
+        if leader_election {
+            let projection_pool = pool.clone();
+            let projection_event_store: Arc<dyn crate::infra::EventStore> = event_store.clone();
+            let projection_ves_sequencer = ves_sequencer.clone();
+            spawn_elected_worker(
+                "projection_worker",
+                lock_keys::PROJECTION_WORKER,
+                pool.clone(),
+                election_config.clone(),
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || {
+                    let (task, control) = spawn_projection_worker(
+                        projection_config.clone(),
+                        projection_pool.clone(),
+                        projection_event_store.clone(),
+                        Some(projection_ves_sequencer.clone()),
+                    );
+                    (task, move || async move {
+                        let _ = control.send(ProjectionWorkerMessage::Shutdown).await;
+                    })
+                },
+            );
+        } else {
+            let (task, control) = spawn_projection_worker(
+                projection_config,
+                pool.clone(),
+                event_store.clone(),
+                Some(ves_sequencer.clone()),
+            );
+            supervise_worker(
+                "projection_worker",
+                task,
+                shutdown_coordinator.signal(),
+                shutdown_coordinator.clone(),
+                move || async move {
+                    let _ = control.send(ProjectionWorkerMessage::Shutdown).await;
+                },
+            );
+        }
+        info!("projection worker started");
+    } else {
+        info!("projection worker disabled (PROJECTION_WORKER_ENABLED=false)");
+    }
+
+    // Proof generation is deliberately opt-in because it consumes substantial
+    // CPU and requires an operator-selected compliance policy. Generated proofs
+    // are self-verified before encrypted persistence.
+    #[cfg(feature = "stark")]
+    {
+        let proof_worker_enabled = parse_bool_env("VES_PROOF_WORKER_ENABLED", false)?;
+        if proof_worker_enabled {
+            let proof_config = ProofWorkerConfig::from_env()
+                .map_err(|e| anyhow::anyhow!("invalid proof worker configuration: {e}"))?;
+            if leader_election {
+                let proof_store = ves_compliance_proof_store.clone();
+                spawn_elected_worker(
+                    "proof_worker",
+                    lock_keys::PROOF_WORKER,
+                    pool.clone(),
+                    election_config.clone(),
+                    shutdown_coordinator.signal(),
+                    shutdown_coordinator.clone(),
+                    move || {
+                        let (task, control) =
+                            spawn_proof_worker(proof_config.clone(), proof_store.clone());
+                        (task, move || async move {
+                            let _ = control.send(ProofWorkerMessage::Shutdown).await;
+                        })
+                    },
+                );
+            } else {
+                let (task, control) =
+                    spawn_proof_worker(proof_config, ves_compliance_proof_store.clone());
+                supervise_worker(
+                    "proof_worker",
+                    task,
+                    shutdown_coordinator.signal(),
+                    shutdown_coordinator.clone(),
+                    move || async move {
+                        let _ = control.send(ProofWorkerMessage::Shutdown).await;
+                    },
+                );
+            }
+            info!("STARK compliance proof worker started");
+        } else {
+            info!("STARK compliance proof worker disabled");
+        }
+    }
+    #[cfg(not(feature = "stark"))]
+    if parse_bool_env("VES_PROOF_WORKER_ENABLED", false)? {
+        anyhow::bail!("VES_PROOF_WORKER_ENABLED requires a build with the `stark` feature");
+    }
 
     // Schema validation mode for event ingestion
     let schema_validation_mode = SchemaValidationMode::from_env();

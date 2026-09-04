@@ -26,6 +26,9 @@ mod net;
 mod payload_encryption;
 mod pool_monitor;
 pub mod postgres;
+mod projection_worker;
+#[cfg(feature = "stark")]
+mod proof_worker;
 mod retry;
 mod schema_validation;
 mod secrets;
@@ -68,9 +71,16 @@ pub use payload_encryption::{PayloadEncryption, PayloadEncryptionMode};
 pub use pool_monitor::{PoolHealthStatus, PoolMonitor, PoolMonitorConfig, PoolStats};
 pub use postgres::{
     spawn_x402_nonce_cleanup, AgentCursor, AgentEventPolicy, PgAgentCursorStore,
-    PgAgentEventPolicyStore, PgAgentKeyRegistry, PgEventStore, PgSchemaStore, PgSequencer,
+    PgAgentEventPolicyStore, PgAgentKeyRegistry, PgEventStore, PgProjectionCheckpointStore,
+    PgProjectionDocumentStore, PgProjectionEventSource, PgProjectionRejectionSink,
+    PgProjectionVersionStore, PgSchemaStore, PgSequencer, PgVesProjectionEventSource,
     PgX402Repository, VesRejectionReason, VesSequencer,
 };
+pub use projection_worker::{
+    spawn_projection_worker, ProjectionWorkerConfig, ProjectionWorkerMessage,
+};
+#[cfg(feature = "stark")]
+pub use proof_worker::{spawn_proof_worker, ProofWorkerConfig, ProofWorkerMessage};
 pub use retry::{
     is_retryable_db_error, is_transient_chain_error, retry, retry_with_config, Retry, RetryConfig,
     RetryResult,

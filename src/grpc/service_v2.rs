@@ -170,6 +170,24 @@ impl SequencerServiceV2 {
         }
     }
 
+    /// Validate an acknowledgement without confusing individually completed
+    /// events with the highest contiguous durable checkpoint.
+    fn durable_ack_sequence(ack: &v2::EventAck, head: u64) -> Result<u64, Status> {
+        let highest_referenced_sequence = ack
+            .sequence_numbers
+            .iter()
+            .copied()
+            .chain(std::iter::once(ack.agent_head_sequence))
+            .max()
+            .unwrap_or(0);
+        if highest_referenced_sequence > head {
+            return Err(Status::invalid_argument(
+                "acknowledged sequences cannot exceed the stream head",
+            ));
+        }
+        Ok(ack.agent_head_sequence)
+    }
+
     fn timestamp_to_rfc3339(ts: &prost_types::Timestamp) -> Result<String, Status> {
         if ts.nanos < 0 || ts.nanos > 999_999_999 {
             return Err(Status::invalid_argument("invalid created_at nanos"));
@@ -2020,13 +2038,6 @@ impl SequencerTrait for SequencerServiceV2 {
                                             let _ = tx.send(Err(e)).await;
                                             continue;
                                         }
-                                        let highest_referenced_sequence = ack
-                                            .sequence_numbers
-                                            .iter()
-                                            .copied()
-                                            .chain(std::iter::once(ack.agent_head_sequence))
-                                            .max()
-                                            .unwrap_or(0);
                                         let head = match ves_sequencer.head(&tenant_id, &store_id).await {
                                             Ok(head) => head,
                                             Err(e) => {
@@ -2034,13 +2045,13 @@ impl SequencerTrait for SequencerServiceV2 {
                                                 continue;
                                             }
                                         };
-                                        if highest_referenced_sequence > head {
-                                            let _ = tx.send(Err(Status::invalid_argument(
-                                                "acknowledged sequences cannot exceed the stream head",
-                                            ))).await;
-                                            continue;
-                                        }
-                                        let acknowledged_sequence = ack.agent_head_sequence;
+                                        let acknowledged_sequence = match SequencerServiceV2::durable_ack_sequence(&ack, head) {
+                                            Ok(sequence) => sequence,
+                                            Err(e) => {
+                                                let _ = tx.send(Err(e)).await;
+                                                continue;
+                                            }
+                                        };
                                         let cursor = match agent_cursor_store
                                             .acknowledge(tenant_id.0, store_id.0, agent_id, acknowledged_sequence)
                                             .await
@@ -2614,5 +2625,44 @@ impl KeyManagementTrait for KeyManagementServiceV2 {
                 nanos: 0,
             }),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack(sequence_numbers: Vec<u64>, agent_head_sequence: u64) -> v2::EventAck {
+        v2::EventAck {
+            sequence_numbers,
+            agent_head_sequence,
+            tenant_id: Uuid::new_v4().to_string(),
+            store_id: Uuid::new_v4().to_string(),
+        }
+    }
+
+    #[test]
+    fn durable_ack_never_skips_a_gap() {
+        let ack = ack(vec![8, 10], 7);
+        assert_eq!(
+            SequencerServiceV2::durable_ack_sequence(&ack, 10).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn durable_ack_rejects_any_future_sequence() {
+        let ack = ack(vec![8, 11], 8);
+        let error = SequencerServiceV2::durable_ack_sequence(&ack, 10).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn durable_ack_accepts_empty_receipt_list() {
+        let ack = ack(Vec::new(), 10);
+        assert_eq!(
+            SequencerServiceV2::durable_ack_sequence(&ack, 10).unwrap(),
+            10
+        );
     }
 }

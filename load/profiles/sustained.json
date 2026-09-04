@@ -5,6 +5,7 @@
     { "duration": "2m", "target": 0 }
   ],
   "thresholds": {
+    "checks": ["rate>0.995"],
     "http_req_failed": ["rate<0.005"],
     "http_req_duration": ["p(95)<100", "p(99)<200"]
   }

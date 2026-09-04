@@ -1,0 +1,117 @@
+name: performance
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: k6 profile to execute
+        required: true
+        default: sustained
+        type: choice
+        options: [smoke, sustained, stress]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  STARK_REF: "c2cd52c6511279c9c73ab6eb16c5389176f95752"
+  PROFILE: ${{ inputs.profile || 'sustained' }}
+
+jobs:
+  k6:
+    name: k6 ${{ inputs.profile || 'sustained' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: sequencer
+          POSTGRES_PASSWORD: sequencer
+          POSTGRES_DB: stateset_sequencer
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U sequencer -d stateset_sequencer"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate selected profile
+        run: test -f "load/profiles/${PROFILE}.json"
+
+      - name: Fetch pinned STARK dependency
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/stateset/stateset-starks.git ../stateset-stark
+          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
+          git -C ../stateset-stark checkout --detach "$STARK_REF"
+
+      - name: Install protoc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@1.90.0
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build exact revision in release mode
+        run: cargo build --release --locked
+
+      - name: Start sequencer
+        env:
+          DATABASE_URL: postgres://sequencer:sequencer@127.0.0.1:5432/stateset_sequencer
+          ALLOW_INSECURE_LOCAL_DB: "true"
+          AUTH_MODE: disabled
+          ALLOW_AUTH_DISABLED: "true"
+          PAYLOAD_ENCRYPTION_MODE: disabled
+          SEQUENCER_ENV: test
+          PROJECTION_WORKER_ENABLED: "true"
+        run: |
+          target/release/stateset-sequencer > performance-server.log 2>&1 &
+          echo "$!" > performance-server.pid
+          for attempt in $(seq 1 60); do
+            curl --fail --silent http://127.0.0.1:8080/ready >/dev/null && exit 0
+            sleep 1
+          done
+          cat performance-server.log
+          exit 1
+
+      - name: Execute thresholded workload
+        env:
+          API_KEY: performance-auth-disabled
+          TENANT_ID: 10000000-0000-4000-8000-000000000001
+          STORE_ID: 20000000-0000-4000-8000-000000000002
+          AGENT_ID: 30000000-0000-4000-8000-000000000003
+        run: |
+          docker run --rm --network host \
+            -e API_KEY -e TENANT_ID -e STORE_ID -e AGENT_ID \
+            -v "$PWD:/work" -w /work \
+            grafana/k6:0.54.0 run \
+            --opts "load/profiles/${PROFILE}.json" \
+            --summary-export "performance-${PROFILE}.json" \
+            load/mixed_workload.js
+
+      - name: Stop sequencer
+        if: always()
+        run: |
+          if [ -f performance-server.pid ]; then
+            kill "$(cat performance-server.pid)" || true
+          fi
+
+      - name: Upload performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: performance-${{ env.PROFILE }}-${{ github.run_id }}
+          path: |
+            performance-*.json
+            performance-server.log
+          if-no-files-found: warn
+          retention-days: 30

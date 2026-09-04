@@ -115,10 +115,37 @@ test('recordAction signs the event and authenticates an idempotent ingest', asyn
   assert.equal(event.base_version, 1);
 });
 
+test('getProjection defaults to VES and only permits known ledgers', async () => {
+  const urls = [];
+  const client = new VesClient({
+    baseUrl: 'https://sequencer.example',
+    tenantId: ids.tenantId,
+    storeId: ids.storeId,
+    agentId: ids.agentId,
+    privateKey: new Uint8Array(32).fill(7),
+    maxRetries: 0,
+    fetch: async (url) => {
+      urls.push(url);
+      return new Response(JSON.stringify({ document: {} }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+
+  await client.getProjection('order', 'O/1');
+  await client.getProjection('order', 'O/1', 'legacy');
+  assert.match(urls[0], /source=ves$/);
+  assert.match(urls[1], /source=legacy$/);
+  assert.match(urls[0], /\/order\/O%2F1\?/);
+  assert.throws(() => client.getProjection('order', 'O/1', 'unknown'), /source must be/);
+});
+
 test('agent tool executor exposes reads and signed actions without leaking the key', async () => {
   const calls = [];
   const client = {
     getEntityHistory: async (...args) => (calls.push(['history', ...args]), { events: [] }),
+    getProjection: async (...args) => (calls.push(['projection', ...args]), { document: {} }),
     recordAction: async (args) => (calls.push(['record', args]), { receipt: { sequenceNumber: 9 } }),
     getInclusionProof: async (sequence) => (calls.push(['proof', sequence]), { included: true }),
     getCursor: async () => ({ acknowledgedSequence: 4, lag: 5 }),
@@ -140,8 +167,15 @@ test('agent tool executor exposes reads and signed actions without leaking the k
   assert.deepEqual(await execute('stateset_acknowledge', { sequenceNumber: 9 }), {
     acknowledgedSequence: 9,
   });
-  assert.equal(sequencerTools.length, 7);
-  assert.deepEqual(calls, [['history', 'order', 'O-1', { from: 2, limit: 10 }]]);
+  assert.deepEqual(
+    await execute('stateset_get_projection', { entityType: 'order', entityId: 'O-1' }),
+    { document: {} },
+  );
+  assert.equal(sequencerTools.length, 8);
+  assert.deepEqual(calls, [
+    ['history', 'order', 'O-1', { from: 2, limit: 10 }],
+    ['projection', 'order', 'O-1'],
+  ]);
 });
 
 test('agent policy rejects unauthorized event types before they reach the client', async () => {
@@ -211,7 +245,7 @@ test('MCP handler lists tools and returns tool failures as MCP results', async (
     },
   });
 
-  assert.equal(listed.result.tools.length, 7);
+  assert.equal(listed.result.tools.length, 8);
   assert.equal(failed.result.isError, true);
   assert.equal(failed.result.content[0].text, 'policy denied');
 });
