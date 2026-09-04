@@ -50,8 +50,8 @@ jobs:
       run:
         working-directory: cli
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
@@ -59,6 +59,11 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm audit --audit-level=high
+      - name: Validate publication manifest
+        run: |
+          npm pkg fix
+          git diff --exit-code -- package.json package-lock.json
+          npm publish --dry-run
 
   python-sdk:
     name: Python SDK (${{ matrix.python-version }})
@@ -71,8 +76,8 @@ jobs:
       run:
         working-directory: sdk/python
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -91,7 +96,7 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch local STARK dependency source
         run: |
@@ -122,8 +127,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: azure/setup-helm@v4
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-helm@v5
+      - uses: azure/setup-kubectl@v5
 
       - name: Validate deployment manifests
         run: |
@@ -177,7 +182,7 @@ jobs:
       SEQUENCER_REQUIRE_DB_TESTS: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch local STARK dependency source
         run: |
@@ -241,7 +246,7 @@ jobs:
       SEQUENCER_REQUIRE_DB_TESTS: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch local STARK dependency source
         run: |
@@ -309,7 +314,7 @@ jobs:
       SEQUENCER_REQUIRE_DB_TESTS: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch local STARK dependency source
         run: |
@@ -391,14 +396,14 @@ jobs:
           fi
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: coverage/cobertura.xml
           fail_ci_if_error: false
           token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Upload coverage artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-reports
           path: |
@@ -410,7 +415,7 @@ jobs:
     name: MSRV (rust-version)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Fetch local STARK dependency source
         run: |
           if [ ! -d ../stateset-stark ]; then
@@ -439,7 +444,7 @@ jobs:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch local STARK dependency source
         run: |
@@ -476,7 +481,7 @@ jobs:
     name: License Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch local STARK dependency source
         run: |
@@ -520,7 +525,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch local STARK dependency source
         run: |
@@ -556,7 +561,7 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Fetch local STARK dependency source
         run: |
@@ -589,7 +594,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: Upload binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: stateset-sequencer
           path: target/release/stateset-sequencer
@@ -614,9 +619,9 @@ jobs:
           --health-timeout=5s
           --health-retries=10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: stateset-sequencer
           path: dist
@@ -634,7 +639,7 @@ jobs:
           chmod +x dist/stateset-sequencer
           dist/stateset-sequencer > sequencer-load-smoke.log 2>&1 &
           echo "$!" > sequencer-load-smoke.pid
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if curl --fail --silent http://127.0.0.1:8080/ready >/dev/null; then
               exit 0
             fi
@@ -670,7 +675,7 @@ jobs:
 
       - name: Upload load evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: load-smoke-evidence
           path: |
@@ -693,7 +698,7 @@ jobs:
       packages: write
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Ensure local STARK dependency source for Docker build
         run: |
@@ -719,10 +724,10 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -730,7 +735,7 @@ jobs:
 
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -750,7 +755,7 @@ jobs:
           rsync -a --exclude .git ../stateset-stark/ docker-ctx/stateset-stark/
 
       - name: Build and push
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: docker-ctx
           file: docker-ctx/stateset-sequencer/Dockerfile

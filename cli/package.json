@@ -1,6 +1,6 @@
 {
   "name": "@stateset/sequencer-sdk",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "Agent SDK and x402 payment CLI for StateSet Sequencer",
   "homepage": "https://github.com/stateset/stateset-sequencer#readme",
   "repository": {
@@ -22,8 +22,8 @@
     "README.md"
   ],
   "bin": {
-    "stateset-x402": "./bin/stateset-x402.js",
-    "stateset-agent-mcp": "./bin/stateset-agent-mcp.js"
+    "stateset-x402": "bin/stateset-x402.js",
+    "stateset-agent-mcp": "bin/stateset-agent-mcp.js"
   },
   "main": "./src/index.js",
   "types": "./src/index.d.ts",

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-09-04
+
+### Changed
+
+- SDK publication can be safely retried for an existing release tag; registry
+  checks skip immutable versions that already exist and verify each published
+  package afterward.
+- CI and release workflows use current Node 24-based major versions of their
+  maintained GitHub Actions.
+
+### Fixed
+
+- The Node SDK's executable paths now use npm's canonical package-manifest
+  form, preventing npm 11 from rewriting its two command mappings at publish
+  time. CI now rejects non-canonical publication metadata.
+
 ## [0.8.4] - 2026-09-04
 
 ### Fixed

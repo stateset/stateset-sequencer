@@ -22,7 +22,7 @@ info:
     - Merkle tree commitments
     - L2 anchoring for finality
     - Inclusion proofs for any event
-  version: 0.8.4
+  version: 0.8.5
   contact:
     email: engineering@stateset.io
     url: https://github.com/stateset/stateset-sequencer
