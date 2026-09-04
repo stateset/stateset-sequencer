@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3] - 2026-09-04
+
+### Fixed
+
+- Concurrent appends can no longer create a false sequence-gap invariant while
+  projection workers read legacy or VES ranges, preventing unnecessary
+  coordinated server shutdowns under sustained ingestion.
+
 ## [0.8.2] - 2026-09-04
 
 ### Fixed

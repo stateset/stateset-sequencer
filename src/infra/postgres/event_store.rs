@@ -245,6 +245,12 @@ impl EventStore for PgEventStore {
         }
         crate::infra::ensure_read_range_span(start, end)?;
 
+        // Capture the validation boundary before reading the range. Events are
+        // append-only, so rows committed after this point may safely appear in
+        // the result, while they must not make a complete earlier snapshot
+        // look like it contains a gap.
+        let head_sequence = self.head_sequence(tenant_id, store_id).await?;
+
         let rows = sqlx::query_as::<_, EventRow>(
             r#"
             SELECT event_id, command_id, sequence_number,
@@ -271,7 +277,6 @@ impl EventStore for PgEventStore {
             events.push(self.decode_row(row).await?);
         }
 
-        let head_sequence = self.head_sequence(tenant_id, store_id).await?;
         if events.is_empty() {
             if head_sequence >= start {
                 return Err(SequencerError::InvariantViolation {

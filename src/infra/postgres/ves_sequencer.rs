@@ -1924,6 +1924,11 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         }
         crate::infra::ensure_read_range_span(start, end)?;
 
+        // Capture the validation boundary before reading the range. Events are
+        // append-only, so a concurrent append cannot turn a complete range
+        // snapshot into a false sequence-gap violation.
+        let head_sequence = self.head_sequence(tenant_id, store_id).await?;
+
         let rows: Vec<VesEventRow> = sqlx::query_as(
             r#"
             SELECT
@@ -1955,7 +1960,6 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             events.push(Self::decode_event_row(row)?);
         }
 
-        let head_sequence = self.head_sequence(tenant_id, store_id).await?;
         if events.is_empty() {
             if head_sequence >= start {
                 return Err(SequencerError::InvariantViolation {
