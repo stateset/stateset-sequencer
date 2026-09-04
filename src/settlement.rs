@@ -12,7 +12,7 @@
 //! reports the real tx hash + block number.
 //!
 //! It mirrors [`crate::anchor::AnchorService`] one-to-one: config-gated
-//! ([`SettlementConfig::from_env`] returns `None` unless the required env is
+//! ([`SettlementConfig::from_env`] returns `Ok(None)` unless the required env is
 //! set — OFF BY DEFAULT), circuit-breaker + retry protected, and driven by the
 //! leader-elected [`crate::infra::settlement_worker::SettlementWorker`].
 //!
@@ -96,7 +96,7 @@ sol! {
 }
 
 /// Configuration for on-chain x402 settlement.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SettlementConfig {
     /// RPC URL for the settlement chain.
     pub rpc_url: String,
@@ -108,33 +108,68 @@ pub struct SettlementConfig {
     pub chain_id: u64,
 }
 
+impl std::fmt::Debug for SettlementConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SettlementConfig")
+            .field("rpc_url", &"<redacted>")
+            .field("contract_address", &self.contract_address)
+            .field("private_key", &"<redacted>")
+            .field("chain_id", &self.chain_id)
+            .finish()
+    }
+}
+
 impl SettlementConfig {
     /// Load configuration from environment variables.
     ///
-    /// Returns `None` (settlement disabled) unless all of the required vars are
-    /// set — the autonomous settler is OFF BY DEFAULT:
+    /// Returns `Ok(None)` when none of the required vars are set. Partial or
+    /// malformed configuration is an error — the autonomous settler is OFF BY
+    /// DEFAULT, but never silently disabled when an operator tried to enable it:
     ///
     /// - `SETTLEMENT_RPC_URL` — RPC endpoint for the settlement chain
     /// - `SET_PAYMENT_BATCH_ADDRESS` — `SetPaymentBatch` contract address
     /// - `SETTLER_PRIVATE_KEY` — settler wallet key (must be an authorized sequencer)
     /// - `SETTLEMENT_CHAIN_ID` — optional, defaults to Set Chain (84532001)
-    pub fn from_env() -> Option<Self> {
-        let rpc_url = std::env::var("SETTLEMENT_RPC_URL").ok()?;
-        let contract_address = std::env::var("SET_PAYMENT_BATCH_ADDRESS")
-            .ok()
-            .and_then(|s| s.parse().ok())?;
-        let private_key = std::env::var("SETTLER_PRIVATE_KEY").ok()?;
-        let chain_id = std::env::var("SETTLEMENT_CHAIN_ID")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(84532001);
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let rpc_url = std::env::var("SETTLEMENT_RPC_URL").ok();
+        let contract_address = std::env::var("SET_PAYMENT_BATCH_ADDRESS").ok();
+        let private_key = std::env::var("SETTLER_PRIVATE_KEY").ok();
 
-        Some(Self {
+        if rpc_url.is_none() && contract_address.is_none() && private_key.is_none() {
+            return Ok(None);
+        }
+
+        let rpc_url = rpc_url
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("SETTLEMENT_RPC_URL is required when settlement is configured")
+            })?;
+        let contract_address = contract_address
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "SET_PAYMENT_BATCH_ADDRESS is required when settlement is configured"
+                )
+            })?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid SET_PAYMENT_BATCH_ADDRESS: {e}"))?;
+        let private_key = private_key
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("SETTLER_PRIVATE_KEY is required when settlement is configured")
+            })?;
+        let chain_id = match std::env::var("SETTLEMENT_CHAIN_ID") {
+            Ok(raw) => raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid SETTLEMENT_CHAIN_ID: '{raw}'"))?,
+            Err(_) => 84532001,
+        };
+
+        Ok(Some(Self {
             rpc_url,
             contract_address,
             private_key,
             chain_id,
-        })
+        }))
     }
 }
 
@@ -630,6 +665,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn config_from_env_is_none_without_required_vars() {
         // Snapshot + clear the required vars so the test is order-independent.
         let saved: Vec<_> = [
@@ -643,11 +679,45 @@ mod tests {
         for (k, _) in &saved {
             std::env::remove_var(k);
         }
-        assert!(SettlementConfig::from_env().is_none());
+        assert!(SettlementConfig::from_env().unwrap().is_none());
         for (k, v) in saved {
             if let Some(v) = v {
                 std::env::set_var(k, v);
             }
         }
+    }
+
+    #[test]
+    fn settlement_config_debug_redacts_credentials() {
+        let config = SettlementConfig {
+            rpc_url: "https://user:rpc-secret@example.invalid/key?token=secret".to_string(),
+            contract_address: Address::ZERO,
+            private_key: "private-key-secret".to_string(),
+            chain_id: 1,
+        };
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("rpc-secret"));
+        assert!(!debug.contains("private-key-secret"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn settlement_config_rejects_partial_configuration() {
+        for name in [
+            "SETTLEMENT_RPC_URL",
+            "SET_PAYMENT_BATCH_ADDRESS",
+            "SETTLER_PRIVATE_KEY",
+        ] {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("SETTLEMENT_RPC_URL", "https://rpc.example.invalid");
+
+        let err = SettlementConfig::from_env()
+            .expect_err("partial settlement configuration must not silently disable the worker");
+        assert!(err.to_string().contains("SET_PAYMENT_BATCH_ADDRESS"));
+
+        std::env::remove_var("SETTLEMENT_RPC_URL");
     }
 }

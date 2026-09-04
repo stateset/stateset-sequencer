@@ -1,0 +1,16 @@
+apiVersion: v2
+name: stateset-sequencer
+description: Verifiable Event Sync sequencer for deterministic event ordering
+type: application
+version: 0.5.1
+appVersion: "0.5.1"
+home: https://github.com/stateset/stateset-sequencer
+sources:
+  - https://github.com/stateset/stateset-sequencer
+keywords:
+  - sequencer
+  - event-sourcing
+  - ves
+maintainers:
+  - name: StateSet
+    email: engineering@stateset.io

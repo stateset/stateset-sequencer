@@ -1,6 +1,6 @@
 [package]
 name = "stateset-sequencer"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.90"
 authors = ["StateSet Core Infrastructure"]
@@ -185,6 +185,9 @@ path = "src/bin/admin.rs"
 [profile.release]
 lto = true
 codegen-units = 1
+# Monetary amounts and sequence counters must never wrap silently, even if a
+# defensive checked operation is accidentally omitted on a future code path.
+overflow-checks = true
 
 [profile.bench]
 inherits = "release"

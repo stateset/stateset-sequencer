@@ -19,7 +19,7 @@
 //! It is leader-elected via the shared advisory-lock election (see
 //! `server.rs` / [`crate::infra::spawn_elected_worker`]) so exactly one node
 //! settles at a time, and it is config-gated OFF BY DEFAULT (only runs when
-//! [`crate::settlement::SettlementConfig::from_env`] returns `Some`).
+//! [`crate::settlement::SettlementConfig::from_env`] returns `Ok(Some(_))`).
 //!
 //! ## Crash & double-settle safety
 //!

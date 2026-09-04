@@ -5,6 +5,15 @@ on:
     branches: [main, master]
   pull_request:
 
+# Default the workflow token to read-only. The image publishing job grants the
+# one additional permission it needs locally.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
@@ -68,6 +77,29 @@ jobs:
           components: rustfmt, clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      - uses: azure/setup-helm@v4
+      - uses: azure/setup-kubectl@v4
+
+      - name: Validate deployment manifests
+        run: |
+          crate_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          chart_version=$(sed -n 's/^appVersion: "\([^"]*\)"/\1/p' charts/stateset-sequencer/Chart.yaml)
+          test "$crate_version" = "$chart_version"
+          grep -q "app.kubernetes.io/version: \"$crate_version\"" k8s/deployment.yaml
+          helm lint charts/stateset-sequencer
+          helm lint charts/stateset-sequencer \
+            --set autoscaling.enabled=true \
+            --set serviceMonitor.enabled=true \
+            --set ingress.enabled=true \
+            --set anchoring.enabled=true \
+            --set settlement.enabled=true \
+            --set initContainer.enabled=true \
+            --set initContainer.databaseHost=postgres \
+            --set config.trustProxyHeaders=true \
+            --set config.trustProxyAllowlist=10.42.1.0/24
+          helm template sequencer charts/stateset-sequencer >/dev/null
+          kubectl kustomize k8s >/dev/null
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -308,7 +340,8 @@ jobs:
 
             echo "::notice::Coverage ${COVERAGE}% meets threshold ${COVERAGE_THRESHOLD}%"
           else
-            echo "::warning::Coverage report not found, skipping threshold check"
+            echo "::error::Coverage report not found"
+            exit 1
           fi
 
       - name: Upload coverage to Codecov
@@ -521,7 +554,10 @@ jobs:
   docker:
     name: Build & Push Docker
     runs-on: ubuntu-latest
-    needs: [test, lint, security]
+    # Never publish an image from a revision that has only passed a subset of
+    # the required checks. `all-checks` includes both feature sets, MSRV,
+    # coverage, supply-chain checks, and the release build.
+    needs: [all-checks]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
 
     permissions:
@@ -615,6 +651,10 @@ jobs:
           fi
           if [[ "${{ needs.test-stark.result }}" != "success" ]]; then
             echo "Test (stark feature) failed"
+            exit 1
+          fi
+          if [[ "${{ needs.msrv.result }}" != "success" ]]; then
+            echo "MSRV build failed"
             exit 1
           fi
           if [[ "${{ needs.coverage.result }}" != "success" ]]; then

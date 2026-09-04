@@ -60,12 +60,8 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
-Database connection string from external secret
+Name of the operator-managed Secret containing runtime credentials.
 */}}
-{{- define "stateset-sequencer.databaseUrl" -}}
-{{- if .Values.postgresql.enabled }}
-postgres://{{ .Values.postgresql.auth.username }}:{{ .Values.postgresql.auth.password }}@{{ include "stateset-sequencer.fullname" . }}-postgresql.{{ .Release.Namespace }}.svc.cluster.local:5432/{{ .Values.postgresql.auth.database }}
-{{- else }}
-{{ .Values.externalDatabase.url }}
-{{- end }}
+{{- define "stateset-sequencer.secretName" -}}
+{{- required "secrets.existingSecret is required" .Values.secrets.existingSecret -}}
 {{- end }}

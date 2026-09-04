@@ -63,7 +63,7 @@ pub use graceful_shutdown::{
     RequestGuard, RequestTracker, ShutdownCoordinator, ShutdownSignal,
 };
 pub use leader_election::{lock_keys, spawn_elected_worker, ElectionConfig};
-pub use net::extract_client_ip;
+pub use net::{extract_client_ip, validate_trusted_proxy_allowlist};
 pub use payload_encryption::{PayloadEncryption, PayloadEncryptionMode};
 pub use pool_monitor::{PoolHealthStatus, PoolMonitor, PoolMonitorConfig, PoolStats};
 pub use postgres::{

@@ -194,6 +194,8 @@ data:
   SCHEMA_VALIDATION_MODE: "enforce"      # disabled|warn|enforce|required
   # Proxy headers (set true when behind a trusted ingress/load balancer)
   TRUST_PROXY_HEADERS: "true"
+  # Replace with the exact source CIDR(s) used by your ingress/load balancer.
+  TRUST_PROXY_ALLOWLIST: "10.42.1.0/24"
 ```
 
 ### Secrets

@@ -135,7 +135,7 @@ one "off" changed nothing about the resulting binary. They were removed rather
 than left as no-ops.
 
 **The `stark` feature** depends on the `ves-stark-*` crates in the separate
-[`stateset-stark`](https://github.com/stateset/stateset-stark) workspace, expected
+[`stateset-starks`](https://github.com/stateset/stateset-starks) workspace, expected
 at `../stateset-stark`. They are **path dependencies that cargo must resolve even
 when the feature is off**, so that checkout must be present to build at all.
 
@@ -512,6 +512,19 @@ misconfigured environment cannot be mistaken for a green run.
 |----------|---------|-------------|
 | `DATABASE_URL` | (unset) | Database for the database-backed tests; unset skips them |
 | `SEQUENCER_REQUIRE_DB_TESTS` | `false` | Fail rather than skip when `DATABASE_URL` is absent |
+
+## Kubernetes
+
+Two production-oriented deployment paths are maintained and validated in CI:
+
+- `kubectl apply -k k8s` for the GKE/Cloud SQL Proxy deployment.
+- `helm upgrade --install sequencer ./charts/stateset-sequencer` for portable
+  Kubernetes deployments. See
+  [`charts/stateset-sequencer/README.md`](charts/stateset-sequencer/README.md)
+  for its required Secret and feature flags.
+
+Both paths run the sequencer as a non-root user with privilege escalation
+disabled, Linux capabilities dropped, health probes, and resource limits.
 
 ## Admin CLI
 

@@ -17,6 +17,9 @@ data:
   PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE: "30"
   PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES: "10000"
   PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS: "60"
-  TRUST_PROXY_HEADERS: "true"
+  # Keep disabled until TRUST_PROXY_ALLOWLIST is set to the exact ingress/LB
+  # source CIDRs. Trusting every private cluster address lets another workload
+  # forge the client IP used by audit logs, rate limits, and admin allowlists.
+  TRUST_PROXY_HEADERS: "false"
   DB_STARTUP_MAX_RETRIES: "10"
   DB_STARTUP_RETRY_DELAY_SECS: "3"

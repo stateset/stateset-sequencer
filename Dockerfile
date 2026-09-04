@@ -2,7 +2,7 @@
 # Multi-stage build for optimized production image
 
 # Build stage
-FROM rust:latest AS builder
+FROM rust:1.90-bookworm AS builder
 
 WORKDIR /workspace
 
@@ -24,7 +24,7 @@ RUN mkdir -p src/bin && echo "fn main() {}" > src/main.rs && echo "" > src/lib.r
     mkdir benches && echo "fn main() {}" > benches/sequencer_bench.rs
 
 # Build dependencies (this layer will be cached)
-RUN cargo build --release && rm -rf src benches
+RUN cargo build --release --locked && rm -rf src benches
 
 # Copy actual source code
 
@@ -36,7 +36,7 @@ COPY stateset-sequencer/benches ./benches
 COPY stateset-sequencer/proto ./proto
 
 # Build the actual application
-RUN cargo build --release --manifest-path /workspace/stateset-sequencer/Cargo.toml
+RUN cargo build --release --locked --manifest-path /workspace/stateset-sequencer/Cargo.toml
 
 # Runtime stage
 FROM debian:bookworm-slim AS runtime
@@ -48,8 +48,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
-RUN useradd -r -s /bin/false sequencer
+# Fixed numeric identity keeps Docker and Kubernetes security contexts aligned.
+RUN groupadd --gid 10001 sequencer \
+    && useradd --uid 10001 --gid sequencer --no-create-home --shell /usr/sbin/nologin sequencer
 
 WORKDIR /app
 

@@ -18,16 +18,16 @@ See `docs/SLO.md` for service level objectives and alerting targets.
 Deploy the sequencer with metrics enabled (default):
 
 ```bash
-# Set your database credentials
-export DATABASE_URL="postgres://user:password@postgres:5432/stateset_sequencer"
-export BOOTSTRAP_ADMIN_API_KEY="your-api-key"
+# Provision the runtime Secret (or use your external-secrets controller).
+kubectl create secret generic stateset-sequencer-secrets \
+  --from-literal=DATABASE_URL="postgres://user:password@postgres:5432/stateset_sequencer?sslmode=require" \
+  --from-literal=BOOTSTRAP_ADMIN_API_KEY="$(openssl rand -hex 32)" \
+  --from-literal=PAYLOAD_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 
 # Install the Helm chart
 helm install sequencer ./charts/stateset-sequencer \
-  --set env[0].name=DATABASE_URL \
-  --set env[0].value=$DATABASE_URL \
-  --set env[1].name=BOOTSTRAP_ADMIN_API_KEY \
-  --set env[1].value=$BOOTSTRAP_ADMIN_API_KEY
+  --set secrets.existingSecret=stateset-sequencer-secrets \
+  --set serviceMonitor.enabled=true
 ```
 
 ### 2. Import the Dashboard
@@ -58,7 +58,8 @@ curl -X POST "$GRAFANA_URL/api/dashboards/db" \
 
 ### 3. Configure Prometheus ServiceMonitor
 
-The Helm chart creates a ServiceMonitor for the Prometheus Operator. Ensure your Prometheus is configured to pick it up:
+When `serviceMonitor.enabled=true`, the Helm chart creates a ServiceMonitor for
+the Prometheus Operator. Ensure your Prometheus is configured to pick it up:
 
 ```bash
 # Verify ServiceMonitor was created
@@ -229,7 +230,7 @@ Agent self-registration outcomes are tracked via
 
 ### Database Pool Exhaustion
 1. Check active connections in Database Pool panel
-2. Increase `database.maxConnections` in Helm chart
+2. Increase `config.maxDbConnections` in the Helm chart
 3. Review slow queries
 4. Check for connection leaks
 

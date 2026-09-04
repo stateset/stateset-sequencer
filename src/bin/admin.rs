@@ -1820,7 +1820,7 @@ async fn cmd_ves_commit_and_anchor(mut args: VecDeque<String>) -> anyhow::Result
         .await?;
     stateset_sequencer::migrations::run_postgres(&pool).await?;
 
-    let anchor_config = AnchorConfig::from_env()
+    let anchor_config = AnchorConfig::from_env()?
         .ok_or_else(|| anyhow::anyhow!("anchor service not configured in env"))?;
     let anchor_service = AnchorService::new(anchor_config);
 

@@ -77,16 +77,17 @@ needed to boot a dev instance.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TRUST_PROXY_HEADERS` | `false` | Honour `x-forwarded-for` / `x-real-ip` / `forwarded` when determining the client IP |
-| `TRUST_PROXY_ALLOWLIST` | RFC1918 + loopback + link-local | Comma-separated IPs/CIDRs whose forwarded headers are believed |
+| `TRUST_PROXY_ALLOWLIST` | (unset) | Comma-separated IPs/CIDRs whose forwarded headers are believed; required when proxy-header trust is enabled |
 
 The client IP decides three things: the `ADMIN_IP_ALLOWLIST` check, the
 public-registration rate-limit key, and the IP recorded in audit logs.
 
 **Enable `TRUST_PROXY_HEADERS` only when this service is genuinely behind a
 proxy you control**, and make sure `TRUST_PROXY_ALLOWLIST` covers that proxy
-and nothing else. Headers are consulted only when the socket peer is itself
-inside a trusted network, so an arbitrary host can never assert its own
-address. Within `x-forwarded-for` the chain is read **from the right**, past
+and nothing else. The server refuses to start if proxy trust is enabled without
+a valid, non-empty allowlist. Headers are consulted only when the socket peer
+is itself inside a trusted network, so an arbitrary host can never assert its
+own address. Within `x-forwarded-for` the chain is read **from the right**, past
 any hops that are themselves trusted proxies, because the header grows
 left-to-right — each proxy appends the address it received from, so only the
 rightmost entries are attested by infrastructure you trust and the leftmost is
@@ -238,4 +239,3 @@ single node wins instantly, so single-node behaviour is unchanged.
 
 `GET /metrics` returns Prometheus text exposition and requires an **admin**
 credential. It is additionally subject to `ADMIN_IP_ALLOWLIST` when that is set.
-

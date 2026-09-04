@@ -248,16 +248,15 @@ pub fn verify_with_key(
                     .as_ref()
                     .ok_or(SigningError::InvalidSignatureFormat)?;
                 verify_ml_dsa_65(event_signing_hash, ml_dsa_sig_bytes, ml_dsa_65_public_key)?;
+                Ok(())
             }
             #[cfg(not(feature = "pqc"))]
             {
                 let _ = ml_dsa_65_public_key;
-                return Err(SigningError::SigningFailed(
+                Err(SigningError::SigningFailed(
                     "PQC feature not enabled".to_string(),
-                ));
+                ))
             }
-
-            Ok(())
         }
 
         // PQC-strict: ML-DSA-65 only
@@ -276,16 +275,15 @@ pub fn verify_with_key(
                     .as_ref()
                     .ok_or(SigningError::InvalidSignatureFormat)?;
                 verify_ml_dsa_65(event_signing_hash, ml_dsa_sig_bytes, ml_dsa_65_public_key)?;
+                Ok(())
             }
             #[cfg(not(feature = "pqc"))]
             {
                 let _ = (ml_dsa_65_public_key, sig_bundle);
-                return Err(SigningError::SigningFailed(
+                Err(SigningError::SigningFailed(
                     "PQC feature not enabled".to_string(),
-                ));
+                ))
             }
-
-            Ok(())
         }
 
         // SECURITY: Reject legacy/Ed25519-only schemes against hybrid or strict keys.
@@ -422,6 +420,9 @@ pub fn verify_proof_of_possession(
     pop: &[u8],
     pop_bundle: Option<&ParsedSignatureBundle>,
 ) -> Result<(), SigningError> {
+    #[cfg(not(feature = "pqc"))]
+    let _ = (public_key_bundle, pop_bundle);
+
     match algorithm {
         KeyAlgorithm::Ed25519 | KeyAlgorithm::Unspecified => {
             // Legacy: Ed25519 PoP = sign(public_key)

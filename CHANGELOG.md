@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-09-04
+
+### Security
+
+- Forwarded client-IP headers now fail closed unless an exact, valid proxy
+  allowlist is configured; missing and malformed production configuration is
+  rejected at startup.
+- Sensitive database, RPC, and private-key values are redacted from diagnostic
+  output, and release builds retain integer overflow checks.
+- Container and Kubernetes defaults now use a fixed non-root identity, a
+  read-only filesystem, dropped capabilities, and the runtime-default seccomp
+  profile.
+
+### Added
+
+- A canonical, schema-validated Helm chart with autoscaling, disruption budget,
+  ingress, ServiceMonitor, external Secret, and optional worker support.
+- CI validation for Helm and Kustomize manifests, MSRV enforcement, reliable
+  coverage reporting, and release-image gating on every required check.
+
+### Fixed
+
+- Malformed database pool, session, cache, anchoring, and settlement settings
+  now produce actionable startup errors instead of silently using defaults or
+  partially enabling a subsystem.
+- Deployment versions, documentation, STARK repository references, and
+  monitoring configuration are synchronized with the release.
+
 ## [0.5.0] - 2026-08-31
 
 ### Security

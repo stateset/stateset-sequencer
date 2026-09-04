@@ -45,12 +45,13 @@ use crate::auth::{
 use crate::crypto::{secret_key_from_str, AgentSigningKey};
 use crate::infra::{
     extract_client_ip, lock_keys, spawn_anchor_worker, spawn_batch_worker, spawn_elected_worker,
-    spawn_settlement_worker, spawn_x402_nonce_cleanup, AnchorWorkerConfig, AnchorWorkerMessage,
-    BatchWorkerMessage, CacheManager, CacheManagerConfig, CircuitBreakerRegistry, ElectionConfig,
-    EnvSecretsProvider, PayloadEncryption, PgAgentKeyRegistry, PgAuditLogger, PgCommitmentEngine,
-    PgEventStore, PgSchemaStore, PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore,
-    PgVesValidityProofStore, PgX402Repository, PoolMonitor, SchemaValidationMode, SecretsProvider,
-    SettlementWorkerConfig, SettlementWorkerMessage, VesSequencer, X402BatchWorkerConfig,
+    spawn_settlement_worker, spawn_x402_nonce_cleanup, validate_trusted_proxy_allowlist,
+    AnchorWorkerConfig, AnchorWorkerMessage, BatchWorkerMessage, CacheManager, CacheManagerConfig,
+    CircuitBreakerRegistry, ElectionConfig, EnvSecretsProvider, PayloadEncryption,
+    PgAgentKeyRegistry, PgAuditLogger, PgCommitmentEngine, PgEventStore, PgSchemaStore,
+    PgSequencer, PgVesCommitmentEngine, PgVesComplianceProofStore, PgVesValidityProofStore,
+    PgX402Repository, PoolMonitor, SchemaValidationMode, SecretsProvider, SettlementWorkerConfig,
+    SettlementWorkerMessage, VesSequencer, X402BatchWorkerConfig,
 };
 use crate::infra::{ShutdownCoordinator, ShutdownSignal};
 use crate::metrics::{ComponentMetrics, MetricsRegistry};
@@ -75,36 +76,31 @@ pub struct DbPoolConfig {
 }
 
 impl DbPoolConfig {
-    fn from_env(prefix: &str, default_max: u32) -> Self {
-        let max_connections = std::env::var(format!("{prefix}MAX_DB_CONNECTIONS"))
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(default_max);
+    fn from_env(prefix: &str, default_max: u32) -> anyhow::Result<Self> {
+        let max_name = format!("{prefix}MAX_DB_CONNECTIONS");
+        let min_name = format!("{prefix}MIN_DB_CONNECTIONS");
+        let max_connections = parse_positive_u32_env(&max_name, default_max)?;
+        let min_connections = parse_u32_env(&min_name, 0)?;
+        if min_connections > max_connections {
+            anyhow::bail!(
+                "{min_name} ({min_connections}) must not exceed {max_name} ({max_connections})"
+            );
+        }
 
-        let min_connections = std::env::var(format!("{prefix}MIN_DB_CONNECTIONS"))
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        let acquire_timeout_ms =
+            parse_optional_positive_u64(&format!("{prefix}DB_ACQUIRE_TIMEOUT_MS"))?;
+        let idle_timeout_secs =
+            parse_optional_positive_u64(&format!("{prefix}DB_IDLE_TIMEOUT_SECS"))?;
+        let max_lifetime_secs =
+            parse_optional_positive_u64(&format!("{prefix}DB_MAX_LIFETIME_SECS"))?;
 
-        let acquire_timeout_ms = std::env::var(format!("{prefix}DB_ACQUIRE_TIMEOUT_MS"))
-            .ok()
-            .and_then(|v| v.parse().ok());
-
-        let idle_timeout_secs = std::env::var(format!("{prefix}DB_IDLE_TIMEOUT_SECS"))
-            .ok()
-            .and_then(|v| v.parse().ok());
-
-        let max_lifetime_secs = std::env::var(format!("{prefix}DB_MAX_LIFETIME_SECS"))
-            .ok()
-            .and_then(|v| v.parse().ok());
-
-        Self {
+        Ok(Self {
             max_connections,
             min_connections,
             acquire_timeout_ms,
             idle_timeout_secs,
             max_lifetime_secs,
-        }
+        })
     }
 }
 
@@ -131,37 +127,31 @@ const DEFAULT_LOCK_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 impl DbSessionConfig {
-    fn from_env() -> Self {
-        let statement_timeout_ms = Some(
-            std::env::var("DB_STATEMENT_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_STATEMENT_TIMEOUT_MS),
-        );
+    fn from_env() -> anyhow::Result<Self> {
+        let statement_timeout_ms = Some(parse_positive_u64_env(
+            "DB_STATEMENT_TIMEOUT_MS",
+            DEFAULT_STATEMENT_TIMEOUT_MS,
+        )?);
 
-        let idle_in_tx_timeout_ms = Some(
-            std::env::var("DB_IDLE_IN_TX_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_IDLE_IN_TX_TIMEOUT_MS),
-        );
+        let idle_in_tx_timeout_ms = Some(parse_positive_u64_env(
+            "DB_IDLE_IN_TX_TIMEOUT_MS",
+            DEFAULT_IDLE_IN_TX_TIMEOUT_MS,
+        )?);
 
-        let lock_timeout_ms = Some(
-            std::env::var("DB_LOCK_TIMEOUT_MS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_LOCK_TIMEOUT_MS),
-        );
+        let lock_timeout_ms = Some(parse_positive_u64_env(
+            "DB_LOCK_TIMEOUT_MS",
+            DEFAULT_LOCK_TIMEOUT_MS,
+        )?);
 
         let application_name = std::env::var("DB_APPLICATION_NAME")
             .unwrap_or_else(|_| "stateset-sequencer".to_string());
 
-        Self {
+        Ok(Self {
             statement_timeout_ms,
             idle_in_tx_timeout_ms,
             lock_timeout_ms,
             application_name,
-        }
+        })
     }
 }
 
@@ -183,33 +173,39 @@ pub struct CacheConfig {
 }
 
 impl CacheConfig {
-    fn from_env() -> Self {
+    fn from_env() -> anyhow::Result<Self> {
         let defaults = CacheManagerConfig::default();
 
-        let commitment_max = read_usize_env("CACHE_COMMITMENT_MAX", defaults.commitment_max);
-        let commitment_ttl_secs = read_u64_env(
+        let commitment_max =
+            parse_positive_usize_env("CACHE_COMMITMENT_MAX", defaults.commitment_max)?;
+        let commitment_ttl_secs = parse_positive_u64_env(
             "CACHE_COMMITMENT_TTL_SECS",
             defaults.commitment_ttl.as_secs(),
-        );
+        )?;
 
-        let proof_max = read_usize_env("CACHE_PROOF_MAX", defaults.proof_max);
-        let proof_ttl_secs = read_u64_env("CACHE_PROOF_TTL_SECS", defaults.proof_ttl.as_secs());
+        let proof_max = parse_positive_usize_env("CACHE_PROOF_MAX", defaults.proof_max)?;
+        let proof_ttl_secs =
+            parse_positive_u64_env("CACHE_PROOF_TTL_SECS", defaults.proof_ttl.as_secs())?;
 
-        let ves_commitment_max = read_usize_env("CACHE_VES_COMMITMENT_MAX", commitment_max);
+        let ves_commitment_max =
+            parse_positive_usize_env("CACHE_VES_COMMITMENT_MAX", commitment_max)?;
         let ves_commitment_ttl_secs =
-            read_u64_env("CACHE_VES_COMMITMENT_TTL_SECS", commitment_ttl_secs);
+            parse_positive_u64_env("CACHE_VES_COMMITMENT_TTL_SECS", commitment_ttl_secs)?;
 
-        let ves_proof_max = read_usize_env("CACHE_VES_PROOF_MAX", proof_max);
-        let ves_proof_ttl_secs = read_u64_env("CACHE_VES_PROOF_TTL_SECS", proof_ttl_secs);
+        let ves_proof_max = parse_positive_usize_env("CACHE_VES_PROOF_MAX", proof_max)?;
+        let ves_proof_ttl_secs =
+            parse_positive_u64_env("CACHE_VES_PROOF_TTL_SECS", proof_ttl_secs)?;
 
-        let agent_key_max = read_usize_env("CACHE_AGENT_KEY_MAX", defaults.agent_key_max);
+        let agent_key_max =
+            parse_positive_usize_env("CACHE_AGENT_KEY_MAX", defaults.agent_key_max)?;
         let agent_key_ttl_secs =
-            read_u64_env("CACHE_AGENT_KEY_TTL_SECS", defaults.agent_key_ttl.as_secs());
+            parse_positive_u64_env("CACHE_AGENT_KEY_TTL_SECS", defaults.agent_key_ttl.as_secs())?;
 
-        let schema_max = read_usize_env("CACHE_SCHEMA_MAX", defaults.schema_max);
-        let schema_ttl_secs = read_u64_env("CACHE_SCHEMA_TTL_SECS", defaults.schema_ttl.as_secs());
+        let schema_max = parse_positive_usize_env("CACHE_SCHEMA_MAX", defaults.schema_max)?;
+        let schema_ttl_secs =
+            parse_positive_u64_env("CACHE_SCHEMA_TTL_SECS", defaults.schema_ttl.as_secs())?;
 
-        Self {
+        Ok(Self {
             commitment_max,
             commitment_ttl_secs,
             proof_max,
@@ -222,7 +218,7 @@ impl CacheConfig {
             agent_key_ttl_secs,
             schema_max,
             schema_ttl_secs,
-        }
+        })
     }
 
     fn to_manager_config(&self) -> CacheManagerConfig {
@@ -243,20 +239,51 @@ impl CacheConfig {
     }
 }
 
-fn read_usize_env(var: &str, default: usize) -> usize {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(default)
-        .max(1)
+fn parse_u32_env(name: &str, default: u32) -> anyhow::Result<u32> {
+    match std::env::var(name) {
+        Ok(raw) => raw
+            .parse::<u32>()
+            .map_err(|_| anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected an integer")),
+        Err(_) => Ok(default),
+    }
 }
 
-fn read_u64_env(var: &str, default: u64) -> u64 {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(default)
-        .max(1)
+fn parse_positive_u32_env(name: &str, default: u32) -> anyhow::Result<u32> {
+    let value = parse_u32_env(name, default)?;
+    if value == 0 {
+        anyhow::bail!("Invalid value for {name}: '0'. Expected a value greater than 0");
+    }
+    Ok(value)
+}
+
+fn parse_positive_u64_env(name: &str, default: u64) -> anyhow::Result<u64> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw.parse::<u64>().map_err(|_| {
+                anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer")
+            })?;
+            if value == 0 {
+                anyhow::bail!("Invalid value for {name}: '{raw}'. Expected a value greater than 0");
+            }
+            Ok(value)
+        }
+        Err(_) => Ok(default),
+    }
+}
+
+fn parse_positive_usize_env(name: &str, default: usize) -> anyhow::Result<usize> {
+    match std::env::var(name) {
+        Ok(raw) => {
+            let value = raw.parse::<usize>().map_err(|_| {
+                anyhow::anyhow!("Invalid value for {name}: '{raw}'. Expected a positive integer")
+            })?;
+            if value == 0 {
+                anyhow::bail!("Invalid value for {name}: '{raw}'. Expected a value greater than 0");
+            }
+            Ok(value)
+        }
+        Err(_) => Ok(default),
+    }
 }
 
 fn parse_bool_env(name: &str, default: bool) -> anyhow::Result<bool> {
@@ -397,7 +424,7 @@ fn enforce_secret_strength(
 }
 
 /// Server configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     /// PostgreSQL connection URL.
     pub database_url: String,
@@ -417,6 +444,25 @@ pub struct Config {
     pub read_session: DbSessionConfig,
     /// Cache configuration.
     pub cache: CacheConfig,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &"<redacted>")
+            .field(
+                "read_database_url",
+                &self.read_database_url.as_ref().map(|_| "<redacted>"),
+            )
+            .field("listen_addr", &self.listen_addr)
+            .field("grpc_addr", &self.grpc_addr)
+            .field("write_pool", &self.write_pool)
+            .field("read_pool", &self.read_pool)
+            .field("session", &self.session)
+            .field("read_session", &self.read_session)
+            .field("cache", &self.cache)
+            .finish()
+    }
 }
 
 impl Config {
@@ -458,9 +504,9 @@ impl Config {
             )
         };
 
-        let write_pool = DbPoolConfig::from_env("", 10);
-        let read_pool = DbPoolConfig::from_env("READ_", write_pool.max_connections);
-        let session = DbSessionConfig::from_env();
+        let write_pool = DbPoolConfig::from_env("", 10)?;
+        let read_pool = DbPoolConfig::from_env("READ_", write_pool.max_connections)?;
+        let session = DbSessionConfig::from_env()?;
         let read_session_name = std::env::var("READ_DB_APPLICATION_NAME")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -469,7 +515,7 @@ impl Config {
             application_name: read_session_name,
             ..session.clone()
         };
-        let cache = CacheConfig::from_env();
+        let cache = CacheConfig::from_env()?;
 
         Ok(Self {
             database_url,
@@ -930,6 +976,9 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     let trust_proxy_headers = parse_bool_env("TRUST_PROXY_HEADERS", false)?;
+    if trust_proxy_headers {
+        validate_trusted_proxy_allowlist().map_err(anyhow::Error::msg)?;
+    }
 
     let admin_allowlist = parse_admin_allowlist()?;
     if let Some(list) = &admin_allowlist {
@@ -1172,8 +1221,10 @@ pub async fn run() -> anyhow::Result<()> {
     {
         let nonce_retention =
             Duration::from_secs(crate::domain::X402_MAX_VALIDITY_SECS.saturating_mul(2));
-        let nonce_cleanup_interval =
-            Duration::from_secs(read_u64_env("X402_NONCE_CLEANUP_INTERVAL_SECS", 3600));
+        let nonce_cleanup_interval = Duration::from_secs(parse_positive_u64_env(
+            "X402_NONCE_CLEANUP_INTERVAL_SECS",
+            3600,
+        )?);
         spawn_x402_nonce_cleanup(
             x402_repository.clone(),
             nonce_cleanup_interval,
@@ -1268,10 +1319,12 @@ pub async fn run() -> anyhow::Result<()> {
     info!("Circuit breaker registry initialized");
 
     // Initialize anchor service (optional - only if env vars are set)
-    let anchor_service = match AnchorConfig::from_env() {
+    let anchor_service = match AnchorConfig::from_env()? {
         Some(anchor_config) => {
             info!("Anchor service configured:");
-            info!("  RPC URL: {}", anchor_config.rpc_url);
+            // RPC URLs commonly carry provider API keys in userinfo, paths, or
+            // query strings. Never emit the configured URL to logs.
+            info!("  RPC URL: configured (redacted)");
             info!("  Registry: {:?}", anchor_config.registry_address);
             info!("  Chain ID: {}", anchor_config.chain_id);
             Some(Arc::new(AnchorService::new(anchor_config)))
@@ -1332,10 +1385,12 @@ pub async fn run() -> anyhow::Result<()> {
     // settlement env vars are set). OFF BY DEFAULT. When unset the settler simply
     // does not run and the manual POST /batches/settle path remains the only way
     // to record settlement.
-    let settlement_service = match SettlementConfig::from_env() {
+    let settlement_service = match SettlementConfig::from_env()? {
         Some(settlement_config) => {
             info!("x402 settlement service configured:");
-            info!("  RPC URL: {}", settlement_config.rpc_url);
+            // RPC URLs commonly carry provider API keys in userinfo, paths, or
+            // query strings. Never emit the configured URL to logs.
+            info!("  RPC URL: configured (redacted)");
             info!("  Contract: {:?}", settlement_config.contract_address);
             info!("  Chain ID: {}", settlement_config.chain_id);
             Some(Arc::new(SettlementService::new(settlement_config)))
@@ -2249,6 +2304,66 @@ mod tests {
             enforce_secret_strength("JWT_SECRET", weak, MIN_SECRET_LEN, false).is_ok(),
             "weak secret should be allowed (with a warning) outside production"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn db_pool_config_rejects_malformed_values() {
+        std::env::set_var("TEST_MAX_DB_CONNECTIONS", "many");
+
+        let err = DbPoolConfig::from_env("TEST_", 10)
+            .expect_err("malformed pool sizes must not silently use defaults");
+        assert!(err.to_string().contains("TEST_MAX_DB_CONNECTIONS"));
+
+        std::env::remove_var("TEST_MAX_DB_CONNECTIONS");
+    }
+
+    #[test]
+    #[serial]
+    fn db_pool_config_rejects_minimum_above_maximum() {
+        std::env::set_var("TEST_MAX_DB_CONNECTIONS", "4");
+        std::env::set_var("TEST_MIN_DB_CONNECTIONS", "5");
+
+        let err = DbPoolConfig::from_env("TEST_", 10)
+            .expect_err("an impossible pool range must fail at startup");
+        assert!(err.to_string().contains("must not exceed"));
+
+        std::env::remove_var("TEST_MAX_DB_CONNECTIONS");
+        std::env::remove_var("TEST_MIN_DB_CONNECTIONS");
+    }
+
+    #[test]
+    #[serial]
+    fn cache_config_rejects_zero_capacity() {
+        std::env::set_var("CACHE_COMMITMENT_MAX", "0");
+
+        let err = CacheConfig::from_env()
+            .expect_err("zero-capacity caches must not silently become capacity one");
+        assert!(err.to_string().contains("CACHE_COMMITMENT_MAX"));
+
+        std::env::remove_var("CACHE_COMMITMENT_MAX");
+    }
+
+    #[test]
+    #[serial]
+    fn config_debug_redacts_database_credentials() {
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres://db-user:db-password@example.invalid/sequencer",
+        );
+        std::env::set_var(
+            "READ_DATABASE_URL",
+            "postgres://reader:reader-password@example.invalid/sequencer",
+        );
+
+        let config = Config::from_env().expect("valid configuration");
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("db-password"));
+        assert!(!debug.contains("reader-password"));
+        assert!(debug.contains("<redacted>"));
+
+        std::env::remove_var("DATABASE_URL");
+        std::env::remove_var("READ_DATABASE_URL");
     }
 
     #[test]

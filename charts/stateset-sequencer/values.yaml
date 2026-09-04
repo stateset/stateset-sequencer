@@ -1,0 +1,120 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/stateset/stateset-sequencer
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+  name: ""
+
+# By default the chart expects this Secret to be provisioned by the operator or
+# an external-secrets controller. It must contain DATABASE_URL and at least one
+# of BOOTSTRAP_ADMIN_API_KEY or JWT_SECRET.
+secrets:
+  existingSecret: stateset-sequencer-secrets
+
+service:
+  type: ClusterIP
+  httpPort: 80
+  grpcPort: 8081
+  targetHttpPort: 8080
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 10001
+
+config:
+  rustLog: info
+  authMode: required
+  maxDbConnections: 20
+  trustProxyHeaders: false
+  # Required when trustProxyHeaders is true. Use only the exact ingress/LB
+  # source IPs or CIDRs; broad private-network ranges weaken spoofing defenses.
+  trustProxyAllowlist: ""
+  payloadEncryptionMode: required
+  extraEnv: []
+
+anchoring:
+  enabled: false
+
+settlement:
+  enabled: false
+
+telemetry:
+  otlpEndpoint: ""
+
+initContainer:
+  enabled: false
+  image: postgres:16-alpine
+  databaseHost: ""
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+    runAsUser: 70
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+autoscaling:
+  enabled: false
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s
+  secretName: stateset-sequencer-secrets
+  apiKeySecretKey: BOOTSTRAP_ADMIN_API_KEY
+  additionalLabels: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: sequencer.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+terminationGracePeriodSeconds: 60

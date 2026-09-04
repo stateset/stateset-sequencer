@@ -4,11 +4,10 @@
 [advisories]
 ignore = [
     # RUSTSEC-2023-0071 (rsa "Marvin Attack" timing sidechannel): no fixed
-    # version is available upstream. `rsa` is NOT in our build graph — it is
-    # only pulled by `sqlx-mysql`, and we build sqlx with the `postgres` and
-    # `sqlite` features only (no `mysql`). `cargo tree -i rsa` is empty; the
-    # crate appears in Cargo.lock solely as a record of sqlx's optional MySQL
-    # dependency and is never compiled or linked.
-    # RE-EVALUATE if the sqlx `mysql` feature is ever enabled.
+    # version is available upstream. `rsa` is reachable through jsonwebtoken's
+    # rust_crypto backend (and appears through sqlx's disabled MySQL feature),
+    # but this application issues and validates JWTs with HS256 only. No RSA
+    # operation is reachable in the configured authentication paths.
+    # RE-EVALUATE if an RS* JWT algorithm or sqlx's `mysql` feature is enabled.
     "RUSTSEC-2023-0071",
 ]

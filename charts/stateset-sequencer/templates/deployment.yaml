@@ -1,0 +1,187 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "stateset-sequencer.fullname" . }}
+  labels:
+    {{- include "stateset-sequencer.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "stateset-sequencer.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        prometheus.io/scrape: "false"
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "stateset-sequencer.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "stateset-sequencer.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.initContainer.enabled }}
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ .Values.initContainer.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - until pg_isready -h "$DATABASE_HOST"; do sleep 2; done
+          env:
+            - name: DATABASE_HOST
+              value: {{ required "initContainer.databaseHost is required when initContainer.enabled=true" .Values.initContainer.databaseHost | quote }}
+          securityContext:
+            {{- toYaml .Values.initContainer.securityContext | nindent 12 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.targetHttpPort }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.service.grpcPort }}
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: DATABASE_URL
+            - name: BOOTSTRAP_ADMIN_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: BOOTSTRAP_ADMIN_API_KEY
+                  optional: true
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: JWT_SECRET
+                  optional: true
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: {{ .Values.service.targetHttpPort | quote }}
+            - name: GRPC_PORT
+              value: {{ .Values.service.grpcPort | quote }}
+            - name: RUST_LOG
+              value: {{ .Values.config.rustLog | quote }}
+            - name: AUTH_MODE
+              value: {{ .Values.config.authMode | quote }}
+            - name: MAX_DB_CONNECTIONS
+              value: {{ .Values.config.maxDbConnections | quote }}
+            - name: TRUST_PROXY_HEADERS
+              value: {{ .Values.config.trustProxyHeaders | quote }}
+            {{- if .Values.config.trustProxyAllowlist }}
+            - name: TRUST_PROXY_ALLOWLIST
+              value: {{ .Values.config.trustProxyAllowlist | quote }}
+            {{- end }}
+            - name: PAYLOAD_ENCRYPTION_MODE
+              value: {{ .Values.config.payloadEncryptionMode | quote }}
+            - name: PAYLOAD_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: PAYLOAD_ENCRYPTION_KEY
+                  optional: {{ ne .Values.config.payloadEncryptionMode "required" }}
+            {{- if .Values.anchoring.enabled }}
+            - name: L2_RPC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: L2_RPC_URL
+            - name: SET_REGISTRY_ADDRESS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: SET_REGISTRY_ADDRESS
+            - name: SEQUENCER_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: SEQUENCER_PRIVATE_KEY
+            {{- end }}
+            {{- if .Values.settlement.enabled }}
+            - name: SETTLEMENT_RPC_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: SETTLEMENT_RPC_URL
+            - name: SET_PAYMENT_BATCH_ADDRESS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: SET_PAYMENT_BATCH_ADDRESS
+            - name: SETTLER_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "stateset-sequencer.secretName" . }}
+                  key: SETTLER_PRIVATE_KEY
+            {{- end }}
+            {{- if .Values.telemetry.otlpEndpoint }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.telemetry.otlpEndpoint | quote }}
+            {{- end }}
+            {{- with .Values.config.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

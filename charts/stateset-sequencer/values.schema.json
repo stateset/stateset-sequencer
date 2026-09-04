@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["image", "secrets", "service", "config", "autoscaling"],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "config": {
+            "properties": { "trustProxyHeaders": { "const": true } },
+            "required": ["trustProxyHeaders"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "config": {
+            "properties": { "trustProxyAllowlist": { "pattern": "\\S" } },
+            "required": ["trustProxyAllowlist"]
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "image": {
+      "type": "object",
+      "required": ["repository", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "secrets": {
+      "type": "object",
+      "required": ["existingSecret"],
+      "properties": {
+        "existingSecret": { "type": "string", "minLength": 1 }
+      }
+    },
+    "service": {
+      "type": "object",
+      "required": ["type", "httpPort", "grpcPort", "targetHttpPort"],
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "httpPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "grpcPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "targetHttpPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "config": {
+      "type": "object",
+      "required": ["authMode", "maxDbConnections", "trustProxyHeaders", "trustProxyAllowlist", "payloadEncryptionMode"],
+      "properties": {
+        "authMode": { "enum": ["required", "disabled"] },
+        "maxDbConnections": { "type": "integer", "minimum": 1 },
+        "trustProxyHeaders": { "type": "boolean" },
+        "trustProxyAllowlist": { "type": "string" },
+        "payloadEncryptionMode": { "enum": ["required", "optional", "disabled"] },
+        "extraEnv": { "type": "array" }
+      }
+    },
+    "autoscaling": {
+      "type": "object",
+      "required": ["enabled", "minReplicas", "maxReplicas"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 1 },
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "targetCPUUtilizationPercentage": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        }
+      }
+    },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 }
+  }
+}

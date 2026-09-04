@@ -19,7 +19,8 @@ Environment variables:
 - `AUTH_MODE=required` (default), or `AUTH_MODE=disabled` with `ALLOW_AUTH_DISABLED=true`
 - `BOOTSTRAP_ADMIN_API_KEY` or JWT for admin access
 - `ADMIN_IP_ALLOWLIST` — comma‑separated list of IPs or CIDRs (e.g. `203.0.113.10,10.0.0.0/8`)
-- `TRUST_PROXY_HEADERS=true` — trust `x-forwarded-for`, `x-real-ip`, `forwarded` (only behind trusted proxies)
+- `TRUST_PROXY_HEADERS=true` plus an exact `TRUST_PROXY_ALLOWLIST` — trust
+  `x-forwarded-for`, `x-real-ip`, and `forwarded` only from those proxies
 
 ## Suggested SLOs (baseline)
 

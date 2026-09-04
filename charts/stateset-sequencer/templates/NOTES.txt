@@ -1,0 +1,10 @@
+StateSet Sequencer {{ .Chart.AppVersion }} has been deployed.
+
+The workload reads DATABASE_URL and authentication/encryption credentials from:
+  {{ include "stateset-sequencer.secretName" . }}
+
+Check rollout status:
+  kubectl rollout status deployment/{{ include "stateset-sequencer.fullname" . }} -n {{ .Release.Namespace }}
+
+Access the HTTP service locally:
+  kubectl port-forward service/{{ include "stateset-sequencer.fullname" . }} 8080:{{ .Values.service.httpPort }} -n {{ .Release.Namespace }}

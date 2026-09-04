@@ -25,8 +25,23 @@ pub fn extract_client_ip(
     remote_addr: SocketAddr,
     trust_proxy_headers: bool,
 ) -> Option<IpAddr> {
-    if trust_proxy_headers && is_remote_addr_trusted(remote_addr.ip()) {
-        if let Some(ip) = extract_forwarded_ip(headers) {
+    let trusted_networks = trusted_proxy_networks();
+    extract_client_ip_with_trusted_networks(
+        headers,
+        remote_addr,
+        trust_proxy_headers,
+        &trusted_networks,
+    )
+}
+
+fn extract_client_ip_with_trusted_networks(
+    headers: &HeaderMap,
+    remote_addr: SocketAddr,
+    trust_proxy_headers: bool,
+    trusted_networks: &[IpNet],
+) -> Option<IpAddr> {
+    if trust_proxy_headers && is_ip_trusted(remote_addr.ip(), trusted_networks) {
+        if let Some(ip) = extract_forwarded_ip(headers, trusted_networks) {
             return Some(ip);
         }
     }
@@ -34,39 +49,56 @@ pub fn extract_client_ip(
     Some(remote_addr.ip())
 }
 
-fn is_remote_addr_trusted(ip: IpAddr) -> bool {
-    trusted_proxy_networks()
-        .iter()
-        .any(|network| network.contains(&ip))
+fn is_ip_trusted(ip: IpAddr, trusted_networks: &[IpNet]) -> bool {
+    trusted_networks.iter().any(|network| network.contains(&ip))
 }
 
 fn trusted_proxy_networks() -> Vec<IpNet> {
-    let configured = std::env::var("TRUST_PROXY_ALLOWLIST").ok().map(|raw| {
-        raw.split(',')
-            .filter_map(|token| parse_proxy_entry(token.trim()))
-            .collect::<Vec<_>>()
-    });
-
-    match configured {
-        Some(networks) if !networks.is_empty() => networks,
-        _ => default_trusted_proxy_networks(),
-    }
+    std::env::var("TRUST_PROXY_ALLOWLIST")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|token| parse_proxy_entry(token.trim()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
-fn default_trusted_proxy_networks() -> Vec<IpNet> {
-    [
-        "127.0.0.0/8",
-        "10.0.0.0/8",
-        "172.16.0.0/12",
-        "192.168.0.0/16",
-        "169.254.0.0/16",
-        "::1/128",
-        "fc00::/7",
-        "fe80::/10",
-    ]
-    .into_iter()
-    .filter_map(|net| net.parse::<IpNet>().ok())
-    .collect()
+/// Validate the proxy allowlist before enabling forwarded-header trust.
+///
+/// Request handling still fails closed if this validation is bypassed, but the
+/// server calls this at startup so a missing or mistyped entry is immediately
+/// visible to operators.
+pub fn validate_trusted_proxy_allowlist() -> Result<(), String> {
+    let raw = std::env::var("TRUST_PROXY_ALLOWLIST").map_err(|_| {
+        "TRUST_PROXY_ALLOWLIST is required when TRUST_PROXY_HEADERS=true".to_string()
+    })?;
+    validate_trusted_proxy_allowlist_value(&raw)
+}
+
+fn validate_trusted_proxy_allowlist_value(raw: &str) -> Result<(), String> {
+    let entries: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .collect();
+    if entries.is_empty() {
+        return Err(
+            "TRUST_PROXY_ALLOWLIST must contain at least one IP address or CIDR when TRUST_PROXY_HEADERS=true"
+                .to_string(),
+        );
+    }
+
+    if let Some(invalid) = entries
+        .iter()
+        .find(|entry| parse_proxy_entry(entry).is_none())
+    {
+        return Err(format!(
+            "invalid TRUST_PROXY_ALLOWLIST entry '{invalid}'; expected an IP address or CIDR"
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_proxy_entry(entry: &str) -> Option<IpNet> {
@@ -87,7 +119,7 @@ fn parse_proxy_entry(entry: &str) -> Option<IpNet> {
     Some(cidr)
 }
 
-fn extract_forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
+fn extract_forwarded_ip(headers: &HeaderMap, trusted_networks: &[IpNet]) -> Option<IpAddr> {
     // Walk right-to-left and return the first hop no trusted proxy vouched for.
     // Entries to the left of it are client-supplied and must not be believed.
     // `get_all` because a chain may append separate header lines rather than
@@ -103,7 +135,7 @@ fn extract_forwarded_ip(headers: &HeaderMap) -> Option<IpAddr> {
             .split(',')
             .filter_map(|entry| parse_ip(entry.trim()))
             .rev()
-            .find(|ip| !is_remote_addr_trusted(*ip))
+            .find(|ip| !is_ip_trusted(*ip, trusted_networks))
         {
             return Some(ip);
         }
@@ -171,6 +203,13 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
 
+    fn trusted_networks(entries: &[&str]) -> Vec<IpNet> {
+        entries
+            .iter()
+            .map(|entry| entry.parse::<IpNet>().unwrap())
+            .collect()
+    }
+
     #[test]
     fn parses_forwarded_for_ipv4() {
         let mut headers = HeaderMap::new();
@@ -178,7 +217,7 @@ mod tests {
             "x-forwarded-for",
             HeaderValue::from_static("203.0.113.10, 198.51.100.1"),
         );
-        let ip = extract_forwarded_ip(&headers).unwrap();
+        let ip = extract_forwarded_ip(&headers, &[]).unwrap();
         // The rightmost hop, 198.51.100.1, is the address a trusted proxy
         // actually received the request from. 203.0.113.10 to its left is only
         // what that host claimed, and is not evidence of anything.
@@ -192,7 +231,7 @@ mod tests {
             "forwarded",
             HeaderValue::from_static("for=\"[2001:db8::1]:8443\";proto=https"),
         );
-        let ip = extract_forwarded_ip(&headers).unwrap();
+        let ip = extract_forwarded_ip(&headers, &[]).unwrap();
         assert_eq!(ip, "2001:db8::1".parse::<IpAddr>().unwrap());
     }
 
@@ -213,8 +252,10 @@ mod tests {
             HeaderValue::from_static("10.0.0.1, 203.0.113.9"),
         );
         let ingress = SocketAddr::from(([10, 0, 0, 5], 443));
+        let networks = trusted_networks(&["10.0.0.0/8"]);
 
-        let ip = extract_client_ip(&headers, ingress, true).unwrap();
+        let ip =
+            extract_client_ip_with_trusted_networks(&headers, ingress, true, &networks).unwrap();
 
         assert_eq!(
             ip,
@@ -233,8 +274,10 @@ mod tests {
             HeaderValue::from_static("203.0.113.10, 10.0.0.7, 10.0.0.8"),
         );
         let ingress = SocketAddr::from(([10, 0, 0, 9], 443));
+        let networks = trusted_networks(&["10.0.0.0/8"]);
 
-        let ip = extract_client_ip(&headers, ingress, true).unwrap();
+        let ip =
+            extract_client_ip_with_trusted_networks(&headers, ingress, true, &networks).unwrap();
 
         assert_eq!(ip, "203.0.113.10".parse::<IpAddr>().unwrap());
     }
@@ -249,8 +292,10 @@ mod tests {
             HeaderValue::from_static("10.0.0.1, 10.0.0.2"),
         );
         let ingress = SocketAddr::from(([10, 0, 0, 5], 443));
+        let networks = trusted_networks(&["10.0.0.0/8"]);
 
-        let ip = extract_client_ip(&headers, ingress, true).unwrap();
+        let ip =
+            extract_client_ip_with_trusted_networks(&headers, ingress, true, &networks).unwrap();
 
         assert_eq!(ip, "10.0.0.5".parse::<IpAddr>().unwrap());
     }
@@ -264,7 +309,7 @@ mod tests {
         );
 
         let remote_addr = SocketAddr::from(([198, 51, 100, 2], 12345));
-        let ip = extract_client_ip(&headers, remote_addr, true).unwrap();
+        let ip = extract_client_ip_with_trusted_networks(&headers, remote_addr, true, &[]).unwrap();
 
         assert_eq!(ip, "198.51.100.2".parse::<IpAddr>().unwrap());
     }
@@ -278,12 +323,39 @@ mod tests {
         );
 
         let remote_addr = SocketAddr::from(([127, 0, 0, 1], 12345));
-        let ip = extract_client_ip(&headers, remote_addr, true).unwrap();
+        let networks = trusted_networks(&["127.0.0.1/32"]);
+        let ip = extract_client_ip_with_trusted_networks(&headers, remote_addr, true, &networks)
+            .unwrap();
 
         // Proxy headers are consulted (the peer is trusted), but the value
         // taken is the rightmost untrusted hop. This assertion previously
         // expected 203.0.113.10 -- the leftmost, client-supplied entry --
         // which is precisely the value an attacker gets to choose.
         assert_eq!(ip, "198.51.100.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn enabled_proxy_headers_fail_closed_without_an_allowlist() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("127.0.0.1"));
+        let remote_addr = SocketAddr::from(([10, 0, 0, 5], 443));
+
+        let ip = extract_client_ip_with_trusted_networks(&headers, remote_addr, true, &[]).unwrap();
+
+        assert_eq!(ip, remote_addr.ip());
+    }
+
+    #[test]
+    fn proxy_allowlist_validation_accepts_ips_and_cidrs() {
+        assert!(
+            validate_trusted_proxy_allowlist_value("127.0.0.1, 10.42.1.0/24, 2001:db8::/32")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn proxy_allowlist_validation_rejects_empty_or_invalid_values() {
+        assert!(validate_trusted_proxy_allowlist_value(" , ").is_err());
+        assert!(validate_trusted_proxy_allowlist_value("10.42.1.0/24,not-an-ip").is_err());
     }
 }

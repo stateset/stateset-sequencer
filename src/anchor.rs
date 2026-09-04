@@ -126,7 +126,7 @@ sol! {
 }
 
 /// Anchor service configuration
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnchorConfig {
     /// RPC URL for the L2 chain
     pub rpc_url: String,
@@ -138,25 +138,61 @@ pub struct AnchorConfig {
     pub chain_id: u64,
 }
 
-impl AnchorConfig {
-    /// Load configuration from environment variables
-    pub fn from_env() -> Option<Self> {
-        let rpc_url = std::env::var("L2_RPC_URL").ok()?;
-        let registry_address = std::env::var("SET_REGISTRY_ADDRESS")
-            .ok()
-            .and_then(|s| s.parse().ok())?;
-        let private_key = std::env::var("SEQUENCER_PRIVATE_KEY").ok()?;
-        let chain_id = std::env::var("L2_CHAIN_ID")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(84532001); // Default: Set Chain testnet
+impl std::fmt::Debug for AnchorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnchorConfig")
+            .field("rpc_url", &"<redacted>")
+            .field("registry_address", &self.registry_address)
+            .field("private_key", &"<redacted>")
+            .field("chain_id", &self.chain_id)
+            .finish()
+    }
+}
 
-        Some(Self {
+impl AnchorConfig {
+    /// Load configuration from environment variables.
+    ///
+    /// Returns `Ok(None)` only when anchoring is entirely unconfigured. A
+    /// partial or malformed configuration is an error so a requested anchor
+    /// worker cannot silently remain disabled.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        let rpc_url = std::env::var("L2_RPC_URL").ok();
+        let registry_address = std::env::var("SET_REGISTRY_ADDRESS").ok();
+        let private_key = std::env::var("SEQUENCER_PRIVATE_KEY").ok();
+
+        if rpc_url.is_none() && registry_address.is_none() && private_key.is_none() {
+            return Ok(None);
+        }
+
+        let rpc_url = rpc_url
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("L2_RPC_URL is required when anchoring is configured")
+            })?;
+        let registry_address = registry_address
+            .ok_or_else(|| {
+                anyhow::anyhow!("SET_REGISTRY_ADDRESS is required when anchoring is configured")
+            })?
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid SET_REGISTRY_ADDRESS: {e}"))?;
+        let private_key = private_key
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("SEQUENCER_PRIVATE_KEY is required when anchoring is configured")
+            })?;
+        let chain_id = match std::env::var("L2_CHAIN_ID") {
+            Ok(raw) => raw
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid L2_CHAIN_ID: '{raw}'"))?,
+            Err(_) => 84532001, // Default: Set Chain testnet
+        };
+
+        Ok(Some(Self {
             rpc_url,
             registry_address,
             private_key,
             chain_id,
-        })
+        }))
     }
 }
 
@@ -622,5 +658,39 @@ mod tests {
         let hash: Hash256 = [1u8; 32];
         let bytes = AnchorService::to_bytes32(&hash);
         assert_eq!(bytes.0, hash);
+    }
+
+    #[test]
+    fn anchor_config_debug_redacts_credentials() {
+        let config = AnchorConfig {
+            rpc_url: "https://user:rpc-secret@example.invalid/key?token=secret".to_string(),
+            registry_address: Address::ZERO,
+            private_key: "private-key-secret".to_string(),
+            chain_id: 1,
+        };
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("rpc-secret"));
+        assert!(!debug.contains("private-key-secret"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn anchor_config_rejects_partial_configuration() {
+        for name in [
+            "L2_RPC_URL",
+            "SET_REGISTRY_ADDRESS",
+            "SEQUENCER_PRIVATE_KEY",
+        ] {
+            std::env::remove_var(name);
+        }
+        std::env::set_var("L2_RPC_URL", "https://rpc.example.invalid");
+
+        let err = AnchorConfig::from_env()
+            .expect_err("partial anchoring configuration must not silently disable the worker");
+        assert!(err.to_string().contains("SET_REGISTRY_ADDRESS"));
+
+        std::env::remove_var("L2_RPC_URL");
     }
 }
