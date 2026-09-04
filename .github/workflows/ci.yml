@@ -654,7 +654,7 @@ jobs:
             -e API_KEY -e TENANT_ID -e STORE_ID -e AGENT_ID \
             -v "$PWD:/work" -w /work \
             grafana/k6:0.54.0 run \
-            --config load/profiles/ci.json \
+            --config "load/profiles/ci.json" \
             --summary-export load-smoke-summary.json \
             load/sequencer_ingest.js
 
