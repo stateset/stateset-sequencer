@@ -1,6 +1,6 @@
 {
   "name": "@stateset/sequencer-sdk",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "description": "Agent SDK and x402 payment CLI for StateSet Sequencer",
   "homepage": "https://github.com/stateset/stateset-sequencer#readme",
   "repository": {

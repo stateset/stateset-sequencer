@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-09-04
+
+### Fixed
+
+- Database-backed integration and coverage tests now run serially, preventing
+  projection-worker cases from discovering another concurrent test's
+  deliberately corrupted stream fixture.
+
 ## [0.8.3] - 2026-09-04
 
 ### Fixed

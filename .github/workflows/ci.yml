@@ -210,7 +210,7 @@ jobs:
         run: cargo test --locked --no-default-features --features "$CORE_FEATURES" --lib --bins
 
       - name: Run integration tests
-        run: cargo test --locked --no-default-features --features "$CORE_FEATURES,integration" --tests -- --include-ignored
+        run: cargo test --locked --no-default-features --features "$CORE_FEATURES,integration" --tests -- --include-ignored --test-threads=1
 
       - name: Run property tests
         run: cargo test --locked --no-default-features --features "$CORE_FEATURES" --test property_test
@@ -281,7 +281,7 @@ jobs:
         run: cargo test --locked --no-default-features --features "$CORE_FEATURES,stark" --lib --bins
 
       - name: Integration tests (stark)
-        run: cargo test --locked --no-default-features --features "$CORE_FEATURES,stark,integration" --tests -- --include-ignored
+        run: cargo test --locked --no-default-features --features "$CORE_FEATURES,stark,integration" --tests -- --include-ignored --test-threads=1
 
   coverage:
     name: Code Coverage
@@ -370,7 +370,7 @@ jobs:
             --exclude-files "benches/*" \
             --exclude-files "src/proto/*" \
             --timeout 600 \
-            -- --ignored
+            -- --ignored --test-threads=1
 
       - name: Check coverage threshold
         run: |
