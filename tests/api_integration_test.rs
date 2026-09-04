@@ -18,11 +18,13 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 use stateset_sequencer::auth::{
-    ApiKeyRecord, ApiKeyValidator, AuthMiddlewareState, Authenticator, Permissions, RateLimiter,
-    RequestLimits,
+    AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, ApiKeyRecord, ApiKeyValidator,
+    AuthMiddlewareState, Authenticator, Permissions, RateLimiter, RequestLimits,
 };
+use stateset_sequencer::crypto::AgentSigningKey;
 use stateset_sequencer::domain::{
-    AgentId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
+    AgentId, AgentKeyId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
+    VesEventEnvelope,
 };
 use stateset_sequencer::infra::{
     IngestService, PayloadEncryption, PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore,
@@ -1578,8 +1580,107 @@ async fn test_invalid_json_body_returns_bad_request() {
 }
 
 // ============================================================================
-// VES Commitment Tests
+// VES API Tests
 // ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_ves_read_endpoints_share_the_ingest_ledger() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let key_id = AgentKeyId::new(1);
+    let entity_id = format!("ord-{}", Uuid::new_v4());
+    let signing_key = AgentSigningKey::generate();
+    let registry = PgAgentKeyRegistry::new(pool.clone());
+    registry
+        .register_key(
+            &AgentKeyLookup::new(&tenant_id, &agent_id, key_id),
+            AgentKeyEntry::new(signing_key.public_key_bytes()),
+        )
+        .await
+        .unwrap();
+
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, false);
+
+    for version in 0..3_u64 {
+        let event = VesEventEnvelope::new_plaintext(
+            tenant_id.clone(),
+            store_id.clone(),
+            agent_id.clone(),
+            key_id,
+            EntityType::order(),
+            entity_id.clone(),
+            EventType::new("order.updated"),
+            json!({ "version": version + 1 }),
+            &signing_key,
+        )
+        .with_base_version(version);
+        let (status, body) = send_request(
+            &app,
+            Method::POST,
+            "/api/v1/ves/events/ingest",
+            Some(json!({ "agentId": agent_id.0, "events": [event] })),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "ingest response: {body}");
+        assert_eq!(body["eventsAccepted"], 1);
+    }
+
+    let scope = format!("tenant_id={}&store_id={}", tenant_id.0, store_id.0);
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/ves/head?{scope}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["head_sequence"], 3);
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/ves/events?{scope}&from=2&limit=1"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["next_sequence"], 3);
+    assert_eq!(body["head_sequence"], 3);
+    assert_eq!(body["has_more"], true);
+    assert_eq!(body["events"][0]["envelope"]["sequence_number"], 2);
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/ves/entities/order/{entity_id}?{scope}&from=1&limit=1"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["count"], 1);
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["current_version"], 3);
+    assert_eq!(body["has_more"], true);
+    assert_eq!(body["events"][0]["envelope"]["sequence_number"], 2);
+}
 
 #[tokio::test]
 #[ignore]

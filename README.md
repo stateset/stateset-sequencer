@@ -75,7 +75,7 @@ CLI Agent / AI Agent                 Sequencer                     PostgreSQL
        │                                │── INSERT ves_event ─────────▶│
        │                                │                              │
        │◀── IngestReceipt ─────────────│                              │
-       │    (sequence #, merkle proof)  │                              │
+       │    (sequence #, signed receipt)│                              │
 ```
 
 ## Quick Start
@@ -94,7 +94,7 @@ curl http://localhost:8080/ready
 
 # Example: Get head sequence (with bootstrap admin key)
 curl -H "Authorization: ApiKey dev_admin_key" \
-  "http://localhost:8080/api/v1/head?tenant_id=<uuid>&store_id=<uuid>"
+  "http://localhost:8080/api/v1/ves/head?tenant_id=<uuid>&store_id=<uuid>"
 ```
 
 ### Local Development
@@ -176,6 +176,18 @@ cargo test --locked --all-targets
 > repo is ever made private. The lint/test/coverage jobs build with the core feature
 > set (no `stark`) so they don't compile the private crates.
 
+## AI Agent SDK and MCP
+
+The Node.js agent SDK creates correctly canonicalized and signed VES events,
+performs idempotent retries, reads entity history, follows sequence cursors, and
+retrieves inclusion proofs. It also exports OpenAI-compatible function tools and
+a policy-constrained MCP stdio server. See [AI agent integration](docs/AGENT_INTEGRATION.md)
+and the [SDK guide](cli/README.md).
+
+Private signing keys remain inside the tool host and are never exposed to model
+context. Event-type allowlists and deterministic validation hooks run before an
+agent action is signed.
+
 ## API Endpoints
 
 ### VES Event Ingestion
@@ -186,19 +198,26 @@ Authorization: ApiKey <key>
 Content-Type: application/json
 
 {
+  "agentId": "uuid",
   "events": [
     {
+      "ves_version": 1,
       "event_id": "uuid",
       "tenant_id": "uuid",
       "store_id": "uuid",
+      "source_agent_id": "uuid",
+      "agent_key_id": 1,
       "entity_type": "order",
       "entity_id": "order-123",
       "event_type": "order.created",
+      "created_at": "2026-09-04T12:00:00.000Z",
+      "payload_kind": 0,
       "payload": { "customer_id": "cust-456", "total": 99.99 },
-      "base_version": 0,
-      "source_agent": "uuid",
-      "signature": "base64-encoded-ed25519-signature",
-      "created_at": "2025-01-01T00:00:00Z"
+      "payload_plain_hash": "0x<32-byte-hash>",
+      "payload_cipher_hash": "0x<32-zero-bytes>",
+      "agent_signature": "0x<64-byte-ed25519-signature>",
+      "command_id": "uuid",
+      "base_version": 0
     }
   ]
 }
@@ -208,16 +227,29 @@ Note: `events` must contain at least one event.
 **Response:**
 ```json
 {
+  "eventsAccepted": 1,
+  "eventsRejected": 0,
+  "headSequence": 42,
   "receipts": [
     {
-      "event_id": "uuid",
-      "sequence_number": 42,
-      "payload_hash": "sha256-hex",
-      "merkle_proof": { ... },
-      "sequencer_signature": "base64-encoded"
+      "eventId": "uuid",
+      "sequenceNumber": 42,
+      "receiptHash": "0x<32-byte-hash>",
+      "sequencerSignature": "0x<64-byte-ed25519-signature>"
     }
   ]
 }
+```
+
+### VES Reads
+
+```bash
+# Canonical stream head and bounded range
+GET /api/v1/ves/head?tenant_id=<uuid>&store_id=<uuid>
+GET /api/v1/ves/events?tenant_id=<uuid>&store_id=<uuid>&from=1&limit=100
+
+# Paged history for one entity
+GET /api/v1/ves/entities/{entity_type}/{entity_id}?tenant_id=<uuid>&store_id=<uuid>&from=0&limit=100
 ```
 
 ### VES Commitments
@@ -235,8 +267,8 @@ POST /api/v1/ves/commitments
   "sequence_end": 100
 }
 
-# Anchor commitment on-chain
-POST /api/v1/ves/commitments/{batch_id}/anchor
+# Anchor a commitment on-chain
+POST /api/v1/ves/anchor
 ```
 
 ### VES Proofs
@@ -260,28 +292,29 @@ POST /api/v1/ves/compliance-proofs
   "public_inputs": { ... }
 }
 
-# Get inclusion proof for an event
-GET /api/v1/ves/inclusion-proofs/{event_id}
+# Get and verify a sequence inclusion proof
+GET /api/v1/ves/proofs/{sequence_number}?tenant_id=<uuid>&store_id=<uuid>
+POST /api/v1/ves/proofs/verify
 ```
 
 ### Agent Key Management
 
 ```bash
 # Register agent public key
-POST /api/v1/agent-keys
+POST /api/v1/agents/keys
 {
-  "tenant_id": "uuid",
-  "agent_id": "uuid",
-  "public_key": "base64-encoded-ed25519-public-key",
-  "valid_from": "2025-01-01T00:00:00Z",
-  "valid_until": "2026-01-01T00:00:00Z"
+  "tenantId": "uuid",
+  "agentId": "uuid",
+  "keyId": 1,
+  "publicKey": "0x<32-byte-ed25519-public-key>",
+  "validFrom": "2026-01-01T00:00:00Z",
+  "validTo": "2027-01-01T00:00:00Z"
 }
 
-# List agent keys
-GET /api/v1/agent-keys?tenant_id=<uuid>&agent_id=<uuid>
-
-# Revoke agent key
-DELETE /api/v1/agent-keys/{key_id}
+# Read agent registration and manage its API credentials
+GET /api/v1/agents/{agent_id}
+GET /api/v1/agents/{agent_id}/api-keys
+DELETE /api/v1/agents/{agent_id}/api-keys/{key_prefix}
 ```
 
 ### Legacy Endpoints

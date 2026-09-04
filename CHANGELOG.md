@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-04
+
+### Added
+
+- A production Node.js VES client that performs Rust-compatible canonical
+  hashing, Ed25519 signing, authenticated idempotent ingestion, paged reads,
+  cursor polling, and inclusion-proof operations.
+- OpenAI-compatible function tools and a dependency-light MCP stdio server with
+  fail-closed event-type allowlists and optimistic-concurrency enforcement.
+- TypeScript declarations for the VES client, agent tools, MCP handler, and
+  existing x402 client exports.
+- Authenticated VES stream-head, range, and entity-history REST endpoints, plus
+  end-to-end coverage proving reads and writes use the same canonical ledger.
+
+### Changed
+
+- CI now tests and audits the agent SDK on Node.js 20.
+
 ## [0.5.1] - 2026-09-04
 
 ### Security

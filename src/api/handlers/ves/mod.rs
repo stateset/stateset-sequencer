@@ -2,6 +2,7 @@
 
 pub mod anchoring;
 pub mod commitments;
+pub mod events;
 pub mod inclusion_proofs;
 
 // STARK proof endpoints depend on the private stateset-stark workspace.
@@ -15,6 +16,7 @@ pub mod validity_proofs;
 // Re-export all handlers for convenience
 pub use anchoring::*;
 pub use commitments::*;
+pub use events::*;
 pub use inclusion_proofs::*;
 
 #[cfg(feature = "stark")]

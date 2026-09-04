@@ -2,6 +2,24 @@
 
 This guide explains how AI agents interact with the StateSet Sequencer using the **Verifiable Event Sync (VES)** protocol.
 
+## Production SDK and MCP
+
+The Node.js package in [`cli`](../cli/README.md) provides the production client
+for this protocol. It implements the same canonical payload and event-signing
+hashes as Rust, authenticated idempotent ingest, entity reads, sequence cursors,
+inclusion proofs, OpenAI-compatible function tools, and an MCP stdio server.
+
+Keep API credentials and signing keys in the trusted tool host, never in model
+context. Constrain MCP writes with `STATESET_ALLOWED_EVENT_TYPES`; if it is
+unset, the MCP server is read-only. Existing-entity mutations require
+`baseVersion` by default, and applications can install a deterministic
+`validateAction` hook for monetary limits, approval evidence, or other policy.
+
+The recommended agent loop is: read entity history, propose an action, validate
+outside the model, reuse one `commandId` across retries, submit with the observed
+`baseVersion`, persist the returned sequence cursor, and request an inclusion
+proof when independent audit evidence is required.
+
 ## Overview
 
 The StateSet Sequencer provides AI agents with:
@@ -78,25 +96,26 @@ openssl pkey -in agent_private.pem -pubout -out agent_public.pem
 
 # Register public key with sequencer
 curl -X POST https://sequencer.example.com/api/v1/agents/keys \
-  -H "Authorization: Bearer $API_KEY" \
+  -H "Authorization: ApiKey $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
-    "tenant_id": "550e8400-e29b-41d4-a716-446655440000",
-    "agent_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-    "key_id": 1,
-    "public_key": "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",
-    "valid_from": "2025-01-01T00:00:00Z",
-    "valid_to": "2026-01-01T00:00:00Z"
+    "tenantId": "550e8400-e29b-41d4-a716-446655440000",
+    "agentId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "keyId": 1,
+    "publicKey": "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29",
+    "validFrom": "2026-01-01T00:00:00Z",
+    "validTo": "2027-01-01T00:00:00Z"
   }'
 ```
 
 **Response:**
 ```json
 {
-  "status": "active",
-  "tenant_id": "550e8400-e29b-41d4-a716-446655440000",
-  "agent_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-  "key_id": 1
+  "success": true,
+  "tenantId": "550e8400-e29b-41d4-a716-446655440000",
+  "agentId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "keyId": 1,
+  "keyAlgorithm": 0
 }
 ```
 
@@ -154,7 +173,7 @@ Submit signed events via the ingest endpoint:
 
 ```bash
 curl -X POST https://sequencer.example.com/api/v1/ves/events/ingest \
-  -H "Authorization: Bearer $API_KEY" \
+  -H "Authorization: ApiKey $API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "agentId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
@@ -209,8 +228,8 @@ Agents fetch events they haven't seen yet:
 
 ```bash
 # Get events starting from sequence 40
-curl "https://sequencer.example.com/api/v1/events?tenant_id=550e8400...&store_id=660e8400...&from=40&limit=100" \
-  -H "Authorization: Bearer $API_KEY"
+curl "https://sequencer.example.com/api/v1/ves/events?tenant_id=550e8400...&store_id=660e8400...&from=40&limit=100" \
+  -H "Authorization: ApiKey $API_KEY"
 ```
 
 **Response:**
@@ -218,54 +237,31 @@ curl "https://sequencer.example.com/api/v1/events?tenant_id=550e8400...&store_id
 {
   "events": [
     {
-      "sequence_number": 40,
-      "event_id": "...",
-      "entity_type": "order",
-      "entity_id": "ORD-2024-001",
-      "event_type": "order.created",
-      "payload": {"customer_id": "CUST-123", "total": 99.99},
-      "source_agent": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-      "created_at": "2025-01-08T10:30:00Z"
-    },
-    {
-      "sequence_number": 41,
-      "event_id": "...",
-      "entity_type": "order",
-      "entity_id": "ORD-2024-001",
-      "event_type": "order.confirmed",
-      "payload": {"confirmed_at": "2025-01-08T10:35:00Z"},
-      "source_agent": "8d0f7780-8536-51ef-055c-f18ed2f01bf8",
-      "created_at": "2025-01-08T10:35:00Z"
+      "envelope": {
+        "sequence_number": 40,
+        "event_id": "...",
+        "entity_type": "order",
+        "entity_id": "ORD-2024-001",
+        "event_type": "order.created",
+        "payload": {"customer_id": "CUST-123", "total": 99.99},
+        "source_agent_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "created_at": "2026-09-04T10:30:00Z"
+      },
+      "sequenced_at": "2026-09-04T10:30:01Z"
     }
   ],
-  "count": 2,
-  "head_sequence": 42
+  "count": 1,
+  "next_sequence": 41,
+  "head_sequence": 42,
+  "has_more": true
 }
 ```
 
 ### 5. Sync State Management
 
-Agents track their synchronization position:
-
-```bash
-# Get current sync state
-curl "https://sequencer.example.com/api/v1/sync/state?agent_id=7c9e6679..." \
-  -H "Authorization: Bearer $API_KEY"
-```
-
-**Response:**
-```json
-{
-  "agent_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
-  "tenant_id": "550e8400-e29b-41d4-a716-446655440000",
-  "store_id": "660e8400-e29b-41d4-a716-446655440001",
-  "last_pushed_sequence": 42,
-  "last_pulled_sequence": 41,
-  "head_sequence": 42,
-  "last_sync_at": "2025-01-08T10:30:01Z",
-  "lag": 1
-}
-```
+REST consumers persist the response's `next_sequence` as their durable cursor
+and pass it as `from` on the next request. gRPC consumers can use `SyncStream`,
+which carries explicit acknowledgement and sync-state messages.
 
 ## Data Structures
 
@@ -311,24 +307,23 @@ curl "https://sequencer.example.com/api/v1/sync/state?agent_id=7c9e6679..." \
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/v1/agents/keys` | POST | Register a new agent public key |
-| `/api/v1/agents/keys` | GET | List keys for an agent |
-| `/api/v1/agents/keys/{key_id}` | DELETE | Revoke a key |
+| `/api/v1/agents/{agent_id}` | GET | Read an agent registration |
+| `/api/v1/agents/{agent_id}/api-keys` | GET/POST | List or create API credentials |
+| `/api/v1/agents/{agent_id}/api-keys/{key_prefix}` | DELETE | Revoke an API credential |
 
 ### Event Operations
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/api/v1/ves/events/ingest` | POST | Submit signed events |
-| `/api/v1/events` | GET | Fetch events from stream |
-| `/api/v1/events/{event_id}` | GET | Get single event by ID |
-| `/api/v1/head` | GET | Get current sequence head |
+| `/api/v1/ves/events` | GET | Fetch a bounded page from the VES stream |
+| `/api/v1/ves/head` | GET | Get the VES stream head |
+| `/api/v1/ves/entities/{entity_type}/{entity_id}` | GET | Read paged VES entity history |
+| `/api/v1/ves/proofs/{sequence_number}` | GET | Read an inclusion proof |
+| `/api/v1/ves/proofs/verify` | POST | Verify an inclusion proof |
 
-### Sync Operations
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/v1/sync/state` | GET | Get agent sync state |
-| `/api/v1/sync/state` | PUT | Update agent sync state |
+For durable bidirectional synchronization and sync-state updates, use the gRPC
+`SyncStream` API; the REST agent SDK uses explicit VES sequence cursors.
 
 ## Error Handling
 
@@ -438,111 +433,30 @@ AI assistants record actions and decisions as signed events for:
 
 ## Example: Complete Agent Implementation
 
-```python
-import hashlib
-import json
-import uuid
-from datetime import datetime
-from nacl.signing import SigningKey
-import requests
+```js
+import { randomUUID } from 'node:crypto';
+import { VesClient, loadVesPrivateKey } from '@stateset/x402-cli';
 
-class VesAgent:
-    def __init__(self, agent_id: str, private_key: bytes, sequencer_url: str):
-        self.agent_id = agent_id
-        self.signing_key = SigningKey(private_key)
-        self.sequencer_url = sequencer_url
-        self.key_id = 1
+const agent = new VesClient({
+  baseUrl: process.env.STATESET_SEQUENCER_URL,
+  tenantId: process.env.STATESET_TENANT_ID,
+  storeId: process.env.STATESET_STORE_ID,
+  agentId: process.env.STATESET_AGENT_ID,
+  apiKey: process.env.STATESET_API_KEY,
+  privateKey: loadVesPrivateKey(),
+});
 
-    def create_event(self, tenant_id: str, store_id: str,
-                     entity_type: str, entity_id: str,
-                     event_type: str, payload: dict,
-                     command_id: str = None) -> dict:
-        """Create and sign a VES event."""
+const current = await agent.getEntityHistory('order', 'ORD-2024-001');
+const result = await agent.recordAction({
+  entityType: 'order',
+  entityId: 'ORD-2024-001',
+  eventType: 'order.confirmed',
+  payload: { approvedBy: 'fulfillment-agent' },
+  commandId: randomUUID(),
+  baseVersion: current.current_version,
+});
 
-        event_id = str(uuid.uuid4())
-        created_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-        payload_json = json.dumps(payload, separators=(',', ':'), sort_keys=True)
-        payload_hash = hashlib.sha256(payload_json.encode()).hexdigest()
-
-        # Build signing hash
-        signing_data = self._build_signing_hash(
-            ves_version=1,
-            tenant_id=tenant_id,
-            store_id=store_id,
-            event_id=event_id,
-            entity_type=entity_type,
-            entity_id=entity_id,
-            event_type=event_type,
-            created_at=created_at,
-            payload_hash=payload_hash
-        )
-
-        # Sign
-        signature = self.signing_key.sign(signing_data).signature.hex()
-
-        return {
-            "ves_version": 1,
-            "event_id": event_id,
-            "tenant_id": tenant_id,
-            "store_id": store_id,
-            "source_agent_id": self.agent_id,
-            "agent_key_id": self.key_id,
-            "entity_type": entity_type,
-            "entity_id": entity_id,
-            "event_type": event_type,
-            "created_at": created_at,
-            "payload_kind": 0,
-            "payload": payload,
-            "payload_plain_hash": payload_hash,
-            "payload_cipher_hash": "0" * 64,
-            "agent_signature": signature,
-            "command_id": command_id
-        }
-
-    def push_events(self, events: list) -> dict:
-        """Push signed events to the sequencer."""
-        response = requests.post(
-            f"{self.sequencer_url}/api/v1/ves/events/ingest",
-            json={"agentId": self.agent_id, "events": events},
-            headers={"Authorization": f"Bearer {self.api_key}"}
-        )
-        return response.json()
-
-    def pull_events(self, tenant_id: str, store_id: str,
-                    from_seq: int = 0, limit: int = 100) -> list:
-        """Pull events from the sequencer."""
-        response = requests.get(
-            f"{self.sequencer_url}/api/v1/events",
-            params={
-                "tenant_id": tenant_id,
-                "store_id": store_id,
-                "from": from_seq,
-                "limit": limit
-            },
-            headers={"Authorization": f"Bearer {self.api_key}"}
-        )
-        return response.json()["events"]
-
-# Usage
-agent = VesAgent(
-    agent_id="7c9e6679-7425-40de-944b-e07fc1f90ae7",
-    private_key=bytes.fromhex("..."),
-    sequencer_url="https://sequencer.example.com"
-)
-
-# Create and push an event
-event = agent.create_event(
-    tenant_id="550e8400-e29b-41d4-a716-446655440000",
-    store_id="660e8400-e29b-41d4-a716-446655440001",
-    entity_type="order",
-    entity_id="ORD-2024-001",
-    event_type="order.created",
-    payload={"customer_id": "CUST-123", "total": 99.99},
-    command_id=str(uuid.uuid4())  # Idempotency key
-)
-
-result = agent.push_events([event])
-print(f"Event sequenced at: {result['sequenceStart']}")
+console.log(`Event sequenced at ${result.receipt.sequenceNumber}`);
 ```
 
 ## Troubleshooting

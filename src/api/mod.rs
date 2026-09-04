@@ -24,6 +24,12 @@ pub fn router() -> Router<AppState> {
         .route("/v1/events/ingest", post(handlers::ingest_events))
         // VES v1.0 endpoint with signature verification
         .route("/v1/ves/events/ingest", post(handlers::ingest_ves_events))
+        .route("/v1/ves/events", get(handlers::ves::list_ves_events))
+        .route("/v1/ves/head", get(handlers::ves::get_ves_head))
+        .route(
+            "/v1/ves/entities/:entity_type/:entity_id",
+            get(handlers::ves::get_ves_entity_history),
+        )
         // VES commitments + proofs
         .route(
             "/v1/ves/commitments",

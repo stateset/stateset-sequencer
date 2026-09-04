@@ -1,6 +1,11 @@
 /**
  * VES-CHAIN-1 AI Commerce Agent Demo
  *
+ * IMPORTANT: This is a chain-payment simulation and its `VesClient` keeps
+ * events in memory. It is not a production sequencer client. Use
+ * `examples/sequencer-agent-tools.mjs` or `cli/src/ves/client.js` for signed
+ * events that are actually submitted to StateSet Sequencer.
+ *
  * This demo shows an AI agent processing e-commerce orders and automatically
  * paying suppliers with USDC stablecoins on Solana, with full VES audit trail.
  *

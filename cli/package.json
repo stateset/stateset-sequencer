@@ -1,20 +1,43 @@
 {
   "name": "@stateset/x402-cli",
-  "version": "1.0.0",
-  "description": "x402 Payment Protocol CLI for StateSet Sequencer",
+  "version": "1.1.0",
+  "description": "Agent SDK and x402 payment CLI for StateSet Sequencer",
   "type": "module",
+  "files": [
+    "bin",
+    "src",
+    "README.md"
+  ],
   "bin": {
-    "stateset-x402": "./bin/stateset-x402.js"
+    "stateset-x402": "./bin/stateset-x402.js",
+    "stateset-agent-mcp": "./bin/stateset-agent-mcp.js"
   },
-  "main": "./src/x402/client.js",
+  "main": "./src/index.js",
+  "types": "./src/index.d.ts",
   "exports": {
-    ".": "./src/x402/client.js",
-    "./x402": "./src/x402/client.js"
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    },
+    "./ves": {
+      "types": "./src/ves/client.d.ts",
+      "import": "./src/ves/client.js"
+    },
+    "./x402": {
+      "types": "./src/x402/client.d.ts",
+      "import": "./src/x402/client.js"
+    },
+    "./agent-tools": {
+      "types": "./src/agent/toolkit.d.ts",
+      "import": "./src/agent/toolkit.js"
+    }
   },
   "scripts": {
     "test": "node --test"
   },
   "keywords": [
+    "ai-agents",
+    "ves",
     "x402",
     "payments",
     "stateset",
