@@ -370,7 +370,7 @@ jobs:
             --exclude-files "benches/*" \
             --exclude-files "src/proto/*" \
             --timeout 600 \
-            -- --ignored
+            -- --ignored --test-threads=1
 
       - name: Check coverage threshold
         run: |
