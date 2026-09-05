@@ -17,16 +17,17 @@
 //!    marking any payment the chain reported as `PaymentFailed` as `failed`.
 //!
 //! It is leader-elected via the shared advisory-lock election (see
-//! `server.rs` / [`crate::infra::spawn_elected_worker`]) so exactly one node
-//! settles at a time, and it is config-gated OFF BY DEFAULT (only runs when
+//! `server.rs` / [`crate::infra::spawn_elected_worker`]) to coordinate workers
+//! during normal operation, and it is config-gated OFF BY DEFAULT (only runs when
 //! [`crate::settlement::SettlementConfig::from_env`] returns `Ok(Some(_))`).
 //!
 //! ## Crash & double-settle safety
 //!
-//! A batch must never settle twice. Three independent guards ensure it cannot:
+//! A batch must never settle twice. The destination contract and reconciliation
+//! provide duplicate protection; leader election alone is not fencing:
 //!
-//! - **Leader election** — only one node runs this worker, so there is no
-//!   cross-node concurrency.
+//! - **Leader election** — reduces concurrent work, but a partitioned former
+//!   leader may still reach the chain before detecting loss of its database lease.
 //! - **On-chain contract** — `settleBatch` reverts `BatchAlreadySettled` for a
 //!   `batchId` whose `settledAt != 0`, and `settledIntents[intentId]` blocks any
 //!   individual payment from moving funds twice (even across batches).

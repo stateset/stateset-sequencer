@@ -30,13 +30,16 @@ The StateSet Sequencer is designed for high availability with multiple recovery 
 | Agent Key Registry | PostgreSQL | HIGH |
 | Commitments | PostgreSQL | HIGH |
 | Compliance Proofs | PostgreSQL | MEDIUM |
-| Compliance Proofs | MEDIUM |
 | Local Outboxes | SQLite | MEDIUM |
 | On-Chain Anchors | Ethereum L2 | LOW (verification only) |
 
 ---
 
 ## RTO/RPO Targets
+
+The recovery targets below are deployment objectives, not guarantees established
+by a local test. API availability and latency targets are maintained in
+[SLO.md](SLO.md).
 
 | Metric | Target | Description |
 |--------|--------|-------------|
@@ -55,6 +58,36 @@ The StateSet Sequencer is designed for high availability with multiple recovery 
 ---
 
 ## Backup Strategy
+
+### Automated local crash and restore drill
+
+Run `bash scripts/run_recovery_drill.sh` with Docker, jq, ripgrep, Rust/protoc, and the
+repository's pinned STARK dependency checkout available. The PostgreSQL image
+`postgres:16-alpine` must already be loaded; the drill never pulls an image.
+
+The script creates two labelled, loopback-only disposable databases. It verifies
+`fsync=on`, `full_page_writes=on`, and `synchronous_commit=on`, records 128 signed
+V2 events and signed receipts, holds an uncommitted counter change, and sends
+SIGKILL to its own source container. It checks restart recovery, then dumps and
+restores into its own fresh destination and repeats the checks. It accepts no
+external database URL and validates ownership before destructive operations.
+
+Checks cover payloads, agent keys, sequence heads, uncommitted transaction
+rollback, exact replay, receipt signatures, persisted commitments, and every
+inclusion proof. It materializes 64 orders before leaving another 64 events pending.
+Both recovered databases must preserve those documents, entity versions, and the
+checkpoint, then independently catch up to 128 and remain unchanged after a worker
+restart. The backup is captured before catch-up. This exercises recovery between
+completed projection batches, not a crash inside a projection write.
+Both containers and their volumes are removed on exit; logs,
+the synthetic acknowledgement oracle, backup, binary hash, and JSON results
+remain under the printed `/tmp/sequencer-recovery.*` directory. CI runs the same
+drill and uploads its evidence. `RECOVERY_TEST_BINARY` can select an already
+built fixture; the result records its SHA-256 hash.
+
+This verifies local PostgreSQL process-crash and logical-backup recovery only.
+It is not a host-power-loss, standby failover, WAL/PITR, or
+production RTO measurement. It does not simulate writes made after the backup.
 
 ### PostgreSQL Backups
 

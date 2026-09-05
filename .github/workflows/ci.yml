@@ -220,6 +220,18 @@ jobs:
       - name: Run property tests
         run: cargo test --locked --no-default-features --features "$CORE_FEATURES" --test property_test
 
+      - name: Verify crash and logical-backup recovery
+        run: bash scripts/run_recovery_drill.sh
+
+      - name: Upload recovery drill evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: recovery-drill-evidence
+          path: /tmp/sequencer-recovery.*/
+          if-no-files-found: ignore
+          retention-days: 7
+
   test-stark:
     name: Test (stark feature)
     runs-on: ubuntu-latest

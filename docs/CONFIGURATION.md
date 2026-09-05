@@ -112,10 +112,31 @@ global bucket and makes an IP allowlist meaningless.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `RATE_LIMIT_PER_MINUTE` | (unset) | Global per-tenant rate limit |
-| `RATE_LIMIT_MAX_ENTRIES` | `10000` | Max tracked rate limit entries |
+| `RATE_LIMIT_BACKEND` | `memory` | `memory` for per-process budgets, `postgres` for atomic cluster-wide budgets |
+| `RATE_LIMIT_PER_MINUTE` | (unset) | Tenant budget shared by HTTP/gRPC; cluster-wide when using `postgres` |
+| `RATE_LIMIT_MAX_ENTRIES` | `10000` | Max tracked entries; shared tenant and credential total in PostgreSQL mode |
 | `RATE_LIMIT_WINDOW_SECONDS` | `60` | Rate limit window duration |
 | `PUBLIC_AGENT_REGISTRATION_RATE_LIMIT_PER_MINUTE` | (unset) | Per-IP rate limit for public agent registration |
+
+For shared quotas, apply migration 023 and set `RATE_LIMIT_BACKEND=postgres`
+on **every** serving replica. Use the same window, capacity, and tenant limit
+on all replicas and point them at the same write database. Mixed memory/database
+deployments do not enforce a single budget. Existing credential-specific limits
+also use this backend; public-registration IP limits remain local.
+
+PostgreSQL windows use database time and atomic row locks. Expired entries can
+be reclaimed; live budgets are never evicted to admit new identities. Exhausted
+budgets or storage capacity return HTTP 429 / gRPC RESOURCE_EXHAUSTED. Database
+errors or admission waits exceeding one second fail closed with HTTP 503 / gRPC
+UNAVAILABLE, with no in-memory fallback. A timed-out request may consume a slot
+if its database outcome is ambiguous. Changing a live window's duration returns
+unavailable until expiry; coordinate configuration changes across replicas.
+Admission transactions also use a 750 ms lock timeout and 900 ms statement
+timeout to bound database-side waits; these settings do not leak to pooled sessions.
+
+This adds database writes to admission. Benchmark pool contention and latency
+before production rollout. Local limiter metrics count decisions for that
+process; shared storage utilization is in `sequencer_rate_limit_budgets`.
 | `PUBLIC_AGENT_REGISTRATION_MAX_ENTRIES` | `10000` | Max tracked public registration rate limit entries |
 | `PUBLIC_AGENT_REGISTRATION_WINDOW_SECONDS` | `60` | Public registration rate limit window duration |
 
@@ -141,6 +162,7 @@ global bucket and makes an IP allowlist meaningless.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VES_SEQUENCER_SIGNING_KEY` | (unset) | Ed25519 private key for receipt signing |
+| `REQUIRE_SIGNED_EXECUTION_CONTROLS` | `false` | Reject new V1 events; require V2 signatures binding command ID and base version. Enable after upgrading agents. Exact stored replays remain supported. |
 | `SCHEMA_VALIDATION_MODE` | `warn` | `disabled`, `warn`, or `strict` |
 
 ## On-Chain Anchoring
@@ -195,9 +217,16 @@ settles.
 
 ## Distributed / High Availability
 
-Several workers must run on exactly one node. Leader election via PostgreSQL
-advisory locks enforces that, with automatic failover when the leader dies. A
-single node wins instantly, so single-node behaviour is unchanged.
+Singleton workers use PostgreSQL advisory locks to elect one database lock
+holder. A standby can acquire the lock after the holder's session ends.
+Pool acquisition and lock/health probes are bounded by the election health
+interval (five seconds by default) and interrupted by shutdown. Supervisor
+cancellation aborts its owned worker.
+
+This does not fence external writes: a partitioned worker may still reach an
+external destination before lease loss is detected. Such writes require
+destination-enforced fencing or durable idempotency. See the remaining
+[production readiness gates](PRODUCTION_READINESS.md).
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -218,6 +247,7 @@ deployments, PostgreSQL advisory-lock election ensures one active worker.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PROJECTION_WORKER_ENABLED` | `true` | Enable durable production projections |
+| `PROJECTION_MAX_CONCURRENT_STREAMS` | `64` | Maximum active projection streams; each turn processes one batch before yielding capacity |
 | `PROJECTION_DISCOVERY_INTERVAL_MS` | `5000` | Interval for discovering new streams |
 | `PROJECTION_DISCOVERY_PAGE_SIZE` | `1000` | Keyset-pagination page size for stream discovery |
 | `PROJECTION_BATCH_SIZE` | `100` | Events read per stream iteration |
@@ -225,7 +255,7 @@ deployments, PostgreSQL advisory-lock election ensures one active worker.
 | `PROJECTION_CONTINUE_ON_ERROR` | `true` | Continue after a handler error (the event is sent to the DLQ) |
 | `PROJECTION_MAX_RETRIES` | `3` | Reserved projection retry budget |
 | `PROJECTION_RETRY_DELAY_MS` | `100` | Reserved projection retry delay |
-| `PROJECTION_POLL_INTERVAL_MS` | `100` | Idle stream poll interval |
+| `PROJECTION_POLL_INTERVAL_MS` | `100` | Idle poll interval for standalone continuous runners; the production scheduler uses discovery passes |
 
 ## STARK Proof Verification
 

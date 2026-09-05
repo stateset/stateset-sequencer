@@ -8,6 +8,7 @@ from .client import (
     compute_event_signing_hash,
     compute_payload_plain_hash,
     load_private_key,
+    verify_inclusion_proof_locally,
 )
 from .tools import SEQUENCER_TOOLS, create_async_tool_executor, create_tool_executor
 
@@ -22,4 +23,5 @@ __all__ = [
     "create_async_tool_executor",
     "create_tool_executor",
     "load_private_key",
+    "verify_inclusion_proof_locally",
 ]

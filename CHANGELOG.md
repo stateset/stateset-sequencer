@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-09-05
+
+### Added
+
+- Recovery drill coverage for persisted projection documents, entity versions,
+  checkpoint restoration, independent catch-up from 64 to 128 events after
+  crash/restore, and stable read models after worker restart.
+- Funded local-EVM settlement drill: real EIP-712 authorization, payer/payee
+  balance checks, fresh-service lost-record recovery without a new transaction,
+  a mined stale-batch revert, and cross-batch intent replay protection.
+- CI-backed disposable PostgreSQL crash/restore drill with durable settings,
+  an external signed-receipt oracle, an in-flight uncommitted counter change,
+  full event/proof checks, ownership-checked cleanup, and JSON evidence artifacts.
+- Optional PostgreSQL-backed tenant and credential rate limits shared across
+  HTTP/gRPC replicas (`RATE_LIMIT_BACKEND=postgres`), with bounded storage,
+  atomic database-time windows, and fail-closed one-second admission deadlines.
+- The STARK compliance REST regression now ingests a genuinely signed V2 event
+  before proving and verifying, replacing its synthetic-signature fixture.
+- V2 event signing binds command IDs and optimistic-concurrency versions,
+  including absence; REST, gRPC, and Merkle reconstruction support both V1 and
+  V2. SDKs default to V2 with explicit legacy opt-in. Servers can require V2
+  using `REQUIRE_SIGNED_EXECUTION_CONTROLS=true` after writers migrate.
+- Projection scheduling runs one batch per slot, capped by
+  `PROJECTION_MAX_CONCURRENT_STREAMS` (default 64). Stream failures retry on
+  subsequent discovery passes without stopping unrelated tenants.
+
+- Offline VES inclusion-proof verification in Node and Python with explicit
+  trusted root and leaf inputs, structural checks, and tampering tests.
+
+### Fixed
+
+- Supervisor cancellation aborts owned leader workers instead of detaching
+  them. Pool acquisition and lock/health probes are deadline- and
+  shutdown-aware; failure-injection tests cover session termination and abort.
+- HTTP and gRPC share the same per-process tenant quota; malformed gRPC
+  credentials in explicitly disabled-auth mode cannot bypass the bootstrap quota.
+- Leader-election database tests fail rather than silently skip when a
+  configured database is unavailable or CI requires database tests.
+- Shutdown waiters use sticky watch state to avoid lost notifications, including
+  late subscribers and repeated waits.
+- Leader health probes and cooperative worker shutdown have bounded waits;
+  lock-holding connections close instead of returning session locks to the pool.
+- Rate-limit storage saturation rejects new keys until capacity expires instead
+  of evicting live budgets. The default memory backend remains per process;
+  the optional PostgreSQL backend enforces shared budgets across replicas.
+- Node canonicalization rejects malformed Unicode, sparse arrays, cycles,
+  accessors, and custom object serialization before event signing.
+
 ## [0.8.5] - 2026-09-04
 
 ### Changed

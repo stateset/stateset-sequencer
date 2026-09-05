@@ -9,6 +9,11 @@ npm install @stateset/sequencer-sdk
 
 For repository development, run `npm ci && npm test` from `cli/`.
 
+The updated client defaults to V2 signatures, binding `commandId` and
+`baseVersion`. Upgrade the sequencer server before deploying this client.
+For an older server, explicitly set `signingVersion: 1` (execution controls are
+then unsigned). The client never silently downgrades signatures.
+
 ## Record a signed action
 
 ```js

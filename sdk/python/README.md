@@ -3,6 +3,11 @@
 Typed synchronous and asynchronous clients for signed, idempotent VES agent
 actions. Requires Python 3.10 or newer.
 
+The updated client defaults to V2 signatures, binding `command_id` and
+`base_version`. Upgrade the sequencer server before deploying this client.
+For an older server, explicitly set `signing_version=1` (execution controls are
+then unsigned). The client never silently downgrades signatures.
+
 ```bash
 pip install stateset-sequencer-sdk
 ```

@@ -220,6 +220,25 @@ impl ProjectionRunner {
         tenant_id: &TenantId,
         store_id: &StoreId,
     ) -> Result<(), SequencerError> {
+        self.run_internal(tenant_id, store_id, false).await
+    }
+
+    /// Process at most one batch and persist its checkpoint, then yield the
+    /// scheduler slot so idle or busy streams cannot monopolize capacity.
+    pub async fn run_slice(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+    ) -> Result<(), SequencerError> {
+        self.run_internal(tenant_id, store_id, true).await
+    }
+
+    async fn run_internal(
+        &self,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        single_batch: bool,
+    ) -> Result<(), SequencerError> {
         // Check if already running
         {
             let mut running = self.running.write().await;
@@ -261,6 +280,9 @@ impl ProjectionRunner {
                     .await?;
 
                 if events.is_empty() {
+                    if single_batch {
+                        break;
+                    }
                     // No more events, wait before polling again
                     tokio::time::sleep(tokio::time::Duration::from_millis(
                         self.config.poll_interval_ms,
@@ -326,6 +348,9 @@ impl ProjectionRunner {
                             from_sequence = event.sequence_number() + 1;
                         }
                     }
+                }
+                if single_batch {
+                    break;
                 }
             }
 

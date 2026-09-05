@@ -1,6 +1,6 @@
 [package]
 name = "stateset-sequencer"
-version = "0.8.5"
+version = "0.8.6"
 edition = "2021"
 rust-version = "1.90"
 authors = ["StateSet Core Infrastructure"]

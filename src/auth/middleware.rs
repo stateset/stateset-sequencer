@@ -122,6 +122,15 @@ pub struct AuthMiddlewareState {
     pub pool_monitor: Option<Arc<crate::infra::PoolMonitor>>,
 }
 
+/// One per-process tenant budget shared by HTTP and gRPC transports.
+pub fn tenant_rate_limit_key(tenant_id: &uuid::Uuid) -> String {
+    if tenant_id.is_nil() {
+        "bootstrap".to_string()
+    } else {
+        format!("tenant:{tenant_id}")
+    }
+}
+
 /// Derive a stable key for per-credential throttling from the presented auth
 /// header value.
 pub fn credential_rate_limit_key(auth_header: &str) -> Option<String> {
@@ -186,18 +195,18 @@ pub async fn auth_middleware(
     };
 
     if let Some(ref limiter) = state.rate_limiter {
-        let key = if context.tenant_id.is_nil() {
-            "bootstrap".to_string()
-        } else {
-            format!("tenant:{}", context.tenant_id)
-        };
-        if let Err(e) = limiter.check(&key) {
+        let key = tenant_rate_limit_key(&context.tenant_id);
+        if let Err(e) = limiter.check_async(&key).await {
             return auth_error_response(e);
         }
     }
 
     if let (Some(limit), Some(key)) = (context.rate_limit, credential_key.as_ref()) {
-        if let Err(e) = state.credential_rate_limiter.check_with_limit(key, limit) {
+        if let Err(e) = state
+            .credential_rate_limiter
+            .check_with_limit_async(key, limit)
+            .await
+        {
             return auth_error_response(e);
         }
     }
@@ -314,11 +323,12 @@ struct RateLimitEntry {
 /// Rate limiter for API requests with bounded storage
 ///
 /// Features:
-/// - Per-key rate limiting with sliding window
-/// - Bounded storage to prevent memory exhaustion (LRU-like eviction)
+/// - Per-key fixed windows, in memory or shared through PostgreSQL
+/// - Bounded storage; expired entries are reclaimed, new keys fail closed at capacity
 /// - Metrics integration for observability
 /// - Configurable window duration
 pub struct RateLimiter {
+    postgres: Option<sqlx::PgPool>,
     config: RateLimiterConfig,
     /// In-memory request counts with bounded size
     /// Keys: hash of (tenant_id or API key)
@@ -342,11 +352,73 @@ impl RateLimiter {
     /// Create a new rate limiter with full configuration
     pub fn with_config(config: RateLimiterConfig) -> Self {
         Self {
+            postgres: None,
             config,
             entries: std::sync::RwLock::new(std::collections::HashMap::new()),
             requests_allowed: std::sync::atomic::AtomicU64::new(0),
             requests_rejected: std::sync::atomic::AtomicU64::new(0),
             entries_evicted: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Share admission budgets across replicas using the migrated write database.
+    pub fn with_postgres_backend(mut self, pool: sqlx::PgPool) -> Result<Self, AuthError> {
+        if self.config.window_seconds == 0
+            || self.config.window_seconds > i32::MAX as u64
+            || self.config.max_entries == 0
+            || self.config.max_entries > i32::MAX as usize
+        {
+            return Err(AuthError::BackendUnavailable(
+                "invalid shared rate limit configuration".into(),
+            ));
+        }
+        self.postgres = Some(pool);
+        Ok(self)
+    }
+
+    pub async fn check_async(&self, key: &str) -> Result<(), AuthError> {
+        self.check_with_limit_async(key, self.config.requests_per_minute)
+            .await
+    }
+
+    pub async fn check_with_limit_async(&self, key: &str, limit: u32) -> Result<(), AuthError> {
+        let Some(pool) = &self.postgres else {
+            return self.check_with_limit(key, limit);
+        };
+        // The deadline includes pool wait, lock wait, and transaction commit.
+        // An ambiguous timeout may consume capacity, but must never grant it.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            async {
+                let mut tx = pool.begin().await?;
+                // Client cancellation alone need not stop a query on the server.
+                // Local settings expire with the transaction, not the pooled session.
+                sqlx::query("SELECT set_config('statement_timeout', '900ms', true), set_config('lock_timeout', '750ms', true)")
+                    .execute(&mut *tx).await?;
+                let allowed = sqlx::query_scalar::<_, bool>("SELECT sequencer_take_rate_limit($1, $2, $3, $4)")
+                .bind(ApiKeyValidator::hash_key(key))
+                .bind(i64::from(limit.max(1)))
+                .bind(self.config.window_seconds as i64)
+                .bind(self.config.max_entries as i64)
+                .fetch_one(&mut *tx).await?;
+                tx.commit().await?;
+                Ok::<bool, sqlx::Error>(allowed)
+            },
+        )
+        .await;
+        if matches!(result, Ok(Ok(true))) {
+            self.requests_allowed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        } else {
+            self.requests_rejected
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match result {
+                Ok(Ok(false)) => Err(AuthError::RateLimited),
+                _ => Err(AuthError::BackendUnavailable(
+                    "shared rate limiter unavailable".into(),
+                )),
+            }
         }
     }
 
@@ -357,19 +429,26 @@ impl RateLimiter {
 
     /// Check if request is allowed with a caller-provided request budget.
     pub fn check_with_limit(&self, key: &str, requests_per_minute: u32) -> Result<(), AuthError> {
+        if self.postgres.is_some() {
+            return Err(AuthError::BackendUnavailable(
+                "shared rate limiter requires async admission".into(),
+            ));
+        }
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let window_duration = std::time::Duration::from_secs(self.config.window_seconds);
         let requests_per_minute = requests_per_minute.max(1);
 
         // Evict expired entries and enforce max_entries limit
-        if entries.len() >= self.config.max_entries {
+        if !entries.contains_key(key) && entries.len() >= self.config.max_entries {
             self.evict_expired_entries(&mut entries, now, window_duration);
 
-            // If still at capacity, evict oldest entries (at least 10% or 1)
+            // Never discard a live budget: key churn must not reset an
+            // exhausted principal's allowance. Reject new keys until expiry.
             if entries.len() >= self.config.max_entries {
-                let evict_count = std::cmp::max(self.config.max_entries / 10, 1);
-                self.evict_oldest_entries(&mut entries, evict_count);
+                self.requests_rejected
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Err(AuthError::RateLimited);
             }
         }
 
@@ -415,39 +494,17 @@ impl RateLimiter {
         }
     }
 
-    /// Evict oldest entries to make room (simple LRU-like behavior)
-    fn evict_oldest_entries(
-        &self,
-        entries: &mut std::collections::HashMap<String, RateLimitEntry>,
-        count: usize,
-    ) {
-        // Find oldest entries by window_start time
-        let mut entries_vec: Vec<_> = entries.iter().collect();
-        entries_vec.sort_by_key(|(_, entry)| entry.window_start);
-
-        let keys_to_remove: Vec<String> = entries_vec
-            .iter()
-            .take(count)
-            .map(|(k, _)| (*k).clone())
-            .collect();
-
-        for key in &keys_to_remove {
-            entries.remove(key);
-        }
-
-        self.entries_evicted.fetch_add(
-            keys_to_remove.len() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
     /// Get remaining requests for a key
     pub fn remaining(&self, key: &str) -> u32 {
         self.remaining_with_limit(key, self.config.requests_per_minute)
     }
 
-    /// Get remaining requests for a key with a caller-provided request budget.
+    /// Local remaining capacity; returns zero for the shared backend because
+    /// local state cannot report an authoritative distributed balance.
     pub fn remaining_with_limit(&self, key: &str, requests_per_minute: u32) -> u32 {
+        if self.postgres.is_some() {
+            return 0;
+        }
         let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let now = std::time::Instant::now();
         let window_duration = std::time::Duration::from_secs(self.config.window_seconds);
@@ -484,7 +541,8 @@ impl RateLimiter {
         }
     }
 
-    /// Get metrics for this rate limiter
+    /// Process-local metrics. Entry counts/evictions describe only memory mode;
+    /// query sequencer_rate_limit_budgets for shared storage utilization.
     pub fn metrics(&self) -> RateLimiterMetrics {
         RateLimiterMetrics {
             requests_allowed: self
@@ -641,29 +699,33 @@ mod tests {
         };
         let limiter = RateLimiter::with_config(config);
 
-        // Create entries up to the limit and beyond
-        // Eviction happens when len >= max_entries before inserting
         for i in 0..20 {
             let key = format!("key-{}", i);
-            assert!(limiter.check(&key).is_ok());
+            assert_eq!(limiter.check(&key).is_ok(), i < 5);
         }
-
-        // Should have evicted entries to stay bounded
-        // After eviction, we may have slightly more than max_entries
-        // because eviction happens before insert, not after
-        let entry_count = limiter.entry_count();
-        assert!(
-            entry_count <= 6, // max_entries + 1 (just inserted)
-            "Entry count {} exceeds expected bound",
-            entry_count
-        );
-
+        assert_eq!(limiter.entry_count(), 5);
         let metrics = limiter.metrics();
-        // Should have evicted at least some entries (we created 20, max is 5)
-        assert!(
-            metrics.entries_evicted > 0,
-            "Expected some evictions, got 0"
-        );
+        assert_eq!(metrics.entries_evicted, 0);
+        assert_eq!(metrics.requests_rejected, 15);
+    }
+
+    #[test]
+    fn key_churn_cannot_reset_exhausted_budget() {
+        let limiter = RateLimiter::with_config(RateLimiterConfig {
+            requests_per_minute: 1,
+            max_entries: 1,
+            window_seconds: 60,
+        });
+        assert!(limiter.check("original").is_ok());
+        assert!(limiter.check("original").is_err());
+        assert!(limiter.check("new-key").is_err());
+        assert!(limiter.check("original").is_err());
+        {
+            let mut entries = limiter.entries.write().unwrap();
+            entries.get_mut("original").unwrap().window_start -= std::time::Duration::from_secs(61);
+        }
+        assert!(limiter.check("new-key").is_ok());
+        assert_eq!(limiter.entry_count(), 1);
     }
 
     #[test]

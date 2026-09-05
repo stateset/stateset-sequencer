@@ -43,6 +43,81 @@ async fn connect_db() -> Option<sqlx::PgPool> {
     common::connect_test_db(20).await
 }
 
+#[tokio::test]
+#[ignore]
+async fn v2_controls_survive_ingest_replay_and_commitment_reconstruction() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+    let tenant = TenantId::new();
+    let store = StoreId::new();
+    let agent = AgentId::new();
+    let key = AgentSigningKey::generate();
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    registry
+        .register_key(
+            &AgentKeyLookup::new(&tenant, &agent, AgentKeyId::default()),
+            AgentKeyEntry::new(key.public_key_bytes()),
+        )
+        .await
+        .unwrap();
+    let sequencer = VesSequencer::new(pool.clone(), registry).with_required_execution_binding(true);
+    let mut event = VesEventEnvelope::new_plaintext(
+        tenant,
+        store,
+        agent,
+        AgentKeyId::default(),
+        EntityType::order(),
+        "v2-order",
+        EventType::new("order.created"),
+        json!({"amount": 1}),
+        &key,
+    )
+    .with_command_id(Uuid::new_v4())
+    .with_base_version(0);
+    let legacy = sequencer.ingest(vec![event.clone()]).await.unwrap();
+    assert_eq!(legacy.events_accepted, 0);
+    assert!(matches!(
+        legacy.events_rejected[0].reason,
+        stateset_sequencer::infra::VesRejectionReason::UnsupportedVersion
+    ));
+    event.sign_execution_controls(&key);
+    let mut changed = event.clone();
+    changed.base_version = None;
+    let rejected = sequencer.ingest(vec![changed]).await.unwrap();
+    assert_eq!(rejected.events_accepted, 0);
+    assert!(matches!(
+        rejected.events_rejected[0].reason,
+        stateset_sequencer::infra::VesRejectionReason::InvalidSignature
+    ));
+    let first = sequencer.ingest(vec![event.clone()]).await.unwrap();
+    assert_eq!(first.events_accepted, 1);
+    let replay = sequencer.ingest(vec![event.clone()]).await.unwrap();
+    assert!(replay.events_rejected.is_empty());
+    assert_eq!(
+        first.receipts[0].receipt_hash,
+        replay.receipts[0].receipt_hash
+    );
+    let engine = PgVesCommitmentEngine::new(pool.clone());
+    let seq = first.receipts[0].sequence_number;
+    let leaves = engine
+        .leaf_hashes_for_range(&tenant, &store, seq, seq)
+        .await
+        .unwrap();
+    let reconstructed = engine
+        .leaf_hashes_for_range(&tenant, &store, seq, seq)
+        .await
+        .unwrap();
+    assert_eq!(leaves, reconstructed);
+    let commitment = engine
+        .create_commitment(&tenant, &store, (seq, seq))
+        .await
+        .unwrap();
+    let proof = engine.prove_inclusion(0, &leaves).unwrap();
+    assert!(engine.verify_inclusion(leaves[0], &proof, commitment.merkle_root));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn postgres_sequencer_concurrent_ingest_has_no_gaps() {
@@ -1434,10 +1509,6 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
     let store_id = Uuid::new_v4();
     let agent_id = Uuid::new_v4();
 
-    let event_id = Uuid::new_v4();
-    let created_at = chrono::Utc::now();
-    let created_at_str = created_at.to_rfc3339();
-
     // Plaintext event carrying a canonical integer minor-unit amount.
     //
     // A STARK compliance proof commits to an amount; the sequencer
@@ -1449,54 +1520,40 @@ async fn postgres_ves_compliance_proofs_rest_flow() {
     // test drives the full REST flow over the strong path, where the binding
     // is genuinely verified.
     let payload = json!({ "total_amount": 5_000u64 });
-    let payload_plain_hash = stateset_sequencer::crypto::payload_plain_hash(&payload).to_vec();
-    let payload_cipher_hash = vec![2u8; 32];
-    let event_signing_hash = vec![3u8; 32];
-    let agent_signature = vec![4u8; 64];
-
-    sqlx::query(
-        r#"
-        INSERT INTO ves_events (
-            event_id,
-            command_id,
-            ves_version,
-            tenant_id,
-            store_id,
-            source_agent_id,
-            agent_key_id,
-            entity_type,
-            entity_id,
-            event_type,
-            created_at,
-            created_at_str,
-            payload_kind,
-            payload,
-            payload_encrypted,
-            payload_plain_hash,
-            payload_cipher_hash,
-            event_signing_hash,
-            agent_signature,
-            sequence_number,
-            base_version
-        ) VALUES (
-            $1,NULL,1,$2,$3,$4,1,'order','ord-1','order.created',$5,$6,0,$7,NULL,$8,$9,$10,$11,1,NULL
+    // Exercise real V2 ingestion through STARK production and REST verification,
+    // rather than seeding synthetic hashes/signatures directly in the database.
+    let key = AgentSigningKey::generate();
+    let tenant = TenantId::from_uuid(tenant_id);
+    let agent = AgentId::from_uuid(agent_id);
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    registry
+        .register_key(
+            &AgentKeyLookup::new(&tenant, &agent, AgentKeyId::default()),
+            AgentKeyEntry::new(key.public_key_bytes()),
         )
-        "#,
+        .await
+        .unwrap();
+    let mut event = VesEventEnvelope::new_plaintext(
+        tenant,
+        StoreId::from_uuid(store_id),
+        agent,
+        AgentKeyId::default(),
+        EntityType::order(),
+        "ord-1",
+        EventType::new("order.created"),
+        payload,
+        &key,
     )
-    .bind(event_id)
-    .bind(tenant_id)
-    .bind(store_id)
-    .bind(agent_id)
-    .bind(created_at)
-    .bind(&created_at_str)
-    .bind(&payload)
-    .bind(payload_plain_hash)
-    .bind(payload_cipher_hash)
-    .bind(event_signing_hash)
-    .bind(agent_signature)
-    .execute(&pool)
-    .await
-    .unwrap();
+    .with_command_id(Uuid::new_v4())
+    .with_base_version(0);
+    event.sign_execution_controls(&key);
+    let event_id = event.event_id;
+    let ingested = VesSequencer::new(pool.clone(), registry)
+        .with_required_execution_binding(true)
+        .ingest(vec![event])
+        .await
+        .unwrap();
+    assert_eq!(ingested.events_accepted, 1);
 
     let payload_encryption_events = Arc::new(PayloadEncryption::disabled());
     let payload_encryption_proofs = Arc::new(PayloadEncryption::new(

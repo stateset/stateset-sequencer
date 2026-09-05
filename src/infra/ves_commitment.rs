@@ -132,6 +132,8 @@ pub struct PgVesCommitmentEngine {
 
 #[derive(sqlx::FromRow)]
 struct VesLeafRow {
+    command_id: Option<Uuid>,
+    base_version: Option<i64>,
     sequence_number: i64,
     event_signing_hash: Option<Vec<u8>>,
     agent_signature: Vec<u8>,
@@ -204,7 +206,25 @@ impl PgVesCommitmentEngine {
             payload_cipher_hash: &payload_cipher_hash,
         };
 
-        Ok(compute_event_signing_hash(&params))
+        let hash = compute_event_signing_hash(&params);
+        if row.ves_version == 2 {
+            let base_version = row
+                .base_version
+                .map(u64::try_from)
+                .transpose()
+                .map_err(|_| SequencerError::Internal("negative base_version".to_string()))?;
+            Ok(crate::crypto::bind_execution_controls(
+                &hash,
+                row.command_id.as_ref(),
+                base_version,
+            ))
+        } else if row.ves_version == 1 {
+            Ok(hash)
+        } else {
+            Err(SequencerError::Internal(
+                "unsupported event signing version".to_string(),
+            ))
+        }
     }
 
     pub async fn initialize(&self) -> Result<()> {
@@ -263,6 +283,8 @@ impl PgVesCommitmentEngine {
             SELECT
                 sequence_number,
                 event_signing_hash,
+                command_id,
+                base_version,
                 agent_signature,
                 ves_version,
                 event_id,
@@ -350,6 +372,8 @@ impl PgVesCommitmentEngine {
             SELECT
                 sequence_number,
                 event_signing_hash,
+                command_id,
+                base_version,
                 agent_signature,
                 ves_version,
                 event_id,
@@ -1219,6 +1243,39 @@ impl TryFrom<VesCommitmentRow> for VesBatchCommitment {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn v2_legacy_hash_reconstruction_matches_sdk_vector() {
+        let id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let row = super::VesLeafRow {
+            command_id: Some(id),
+            base_version: Some(0),
+            sequence_number: 1,
+            event_signing_hash: None,
+            agent_signature: vec![0; 64],
+            ves_version: 2,
+            event_id: id,
+            source_agent_id: id,
+            agent_key_id: 1,
+            entity_type: "order".into(),
+            entity_id: "o1".into(),
+            event_type: "order.created".into(),
+            created_at: chrono::Utc::now(),
+            created_at_str: Some("2026-09-05T00:00:00Z".into()),
+            payload_kind: 0,
+            payload_plain_hash: vec![0; 32],
+            payload_cipher_hash: vec![0; 32],
+        };
+        let hash = super::PgVesCommitmentEngine::event_signing_hash_from_row(
+            &crate::domain::TenantId::from_uuid(id),
+            &crate::domain::StoreId::from_uuid(id),
+            &row,
+        )
+        .unwrap();
+        assert_eq!(
+            hex::encode(hash),
+            "27dee9ebd0747eafc2b08121f144343627dfe1829a06f818eb23f0c50e048cc5"
+        );
+    }
     use super::*;
     use crate::crypto::{compute_node_hash, next_power_of_two, pad_leaf};
     use sqlx::postgres::PgPoolOptions;

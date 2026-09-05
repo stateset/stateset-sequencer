@@ -69,6 +69,33 @@ async fn projection_worker_materializes_and_checkpoints_new_stream() {
 
     let encryption = Arc::new(PayloadEncryption::disabled());
     let sequencer = PgSequencer::new(pool.clone(), encryption.clone());
+    // A corrupt stream must not terminate the worker or starve another tenant,
+    // even with a single scheduling slot.
+    let corrupt_tenant = TenantId::new();
+    let corrupt_store = StoreId::new();
+    let corrupt_agent = AgentId::new();
+    let first = create_test_event(
+        corrupt_tenant,
+        corrupt_store,
+        corrupt_agent,
+        "corrupt-first",
+    );
+    let first_id = first.event_id;
+    let second = create_test_event(
+        corrupt_tenant,
+        corrupt_store,
+        corrupt_agent,
+        "corrupt-second",
+    );
+    sequencer
+        .ingest(EventBatch::new(corrupt_agent, vec![first, second]))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM events WHERE event_id = $1")
+        .bind(first_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     let tenant_id = TenantId::new();
     let store_id = StoreId::new();
     let agent_id = AgentId::new();
@@ -94,6 +121,7 @@ async fn projection_worker_materializes_and_checkpoints_new_stream() {
 
     let event_store: Arc<dyn EventStore> = Arc::new(PgEventStore::new(pool.clone(), encryption));
     let config = ProjectionWorkerConfig {
+        max_concurrent_streams: 1,
         discovery_interval: std::time::Duration::from_millis(10),
         discovery_page_size: 100,
         runner: ProjectionRunnerConfig {
@@ -126,6 +154,11 @@ async fn projection_worker_materializes_and_checkpoints_new_stream() {
     .await
     .expect("projection worker did not materialize the event");
 
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        !task.is_finished(),
+        "corrupt stream must not terminate projection scheduling"
+    );
     control
         .send(ProjectionWorkerMessage::Shutdown)
         .await
@@ -191,6 +224,7 @@ async fn projection_worker_materializes_and_checkpoints_ves_stream() {
     let encryption = Arc::new(PayloadEncryption::disabled());
     let event_store: Arc<dyn EventStore> = Arc::new(PgEventStore::new(pool.clone(), encryption));
     let config = ProjectionWorkerConfig {
+        max_concurrent_streams: 2,
         discovery_interval: std::time::Duration::from_millis(10),
         discovery_page_size: 100,
         runner: ProjectionRunnerConfig {

@@ -23,6 +23,7 @@ use crate::projection::{
 
 #[derive(Debug, Clone)]
 pub struct ProjectionWorkerConfig {
+    pub max_concurrent_streams: usize,
     pub discovery_interval: Duration,
     pub discovery_page_size: usize,
     pub runner: ProjectionRunnerConfig,
@@ -31,6 +32,7 @@ pub struct ProjectionWorkerConfig {
 impl Default for ProjectionWorkerConfig {
     fn default() -> Self {
         Self {
+            max_concurrent_streams: 64,
             discovery_interval: Duration::from_secs(5),
             discovery_page_size: 1_000,
             runner: ProjectionRunnerConfig::default(),
@@ -42,6 +44,11 @@ impl ProjectionWorkerConfig {
     pub fn from_env() -> Result<Self, SequencerError> {
         let defaults = Self::default();
         Ok(Self {
+            max_concurrent_streams: usize::try_from(env_positive(
+                "PROJECTION_MAX_CONCURRENT_STREAMS",
+                defaults.max_concurrent_streams as u64,
+            )?)
+            .map_err(|_| config_error("PROJECTION_MAX_CONCURRENT_STREAMS", "does not fit usize"))?,
             discovery_interval: Duration::from_millis(env_positive(
                 "PROJECTION_DISCOVERY_INTERVAL_MS",
                 defaults.discovery_interval.as_millis() as u64,
@@ -139,13 +146,18 @@ pub fn spawn_projection_worker(
         let dlq = Arc::new(PgDeadLetterQueue::new(pool.clone()));
         let mut runners: HashMap<(String, Uuid, Uuid), Arc<ProjectionRunner>> = HashMap::new();
         let mut tasks = JoinSet::new();
+        let mut task_streams = HashMap::new();
         let mut discovery = tokio::time::interval(config.discovery_interval);
+        discovery.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut cursor: Option<(String, Uuid, Uuid)> = None;
 
         loop {
             tokio::select! {
                 _ = discovery.tick() => {
-                    let mut cursor: Option<(String, Uuid, Uuid)> = None;
                     loop {
+                        let available = config.max_concurrent_streams.saturating_sub(runners.len());
+                        if available == 0 { break; }
+                        let page_size = config.discovery_page_size.min(available);
                         let (after_source, after_tenant, after_store) = cursor
                             .as_ref()
                             .map(|(source, tenant, store)| (Some(source.as_str()), Some(*tenant), Some(*store)))
@@ -170,7 +182,7 @@ pub fn spawn_projection_worker(
                         .bind(after_source)
                         .bind(after_tenant)
                         .bind(after_store)
-                        .bind(i64::try_from(config.discovery_page_size).unwrap_or(i64::MAX))
+                        .bind(i64::try_from(page_size).unwrap_or(i64::MAX))
                         .fetch_all(&pool)
                         .await;
 
@@ -231,14 +243,16 @@ pub fn spawn_projection_worker(
                             let runner = Arc::new(runner);
                             runners.insert((source.clone(), tenant_uuid, store_uuid), runner.clone());
                             let task_source = source.clone();
-                            tasks.spawn(async move {
-                                let result = runner.run(&tenant_id, &store_id).await;
+                            let task = tasks.spawn(async move {
+                                let result = runner.run_slice(&tenant_id, &store_id).await;
                                 (task_source, tenant_uuid, store_uuid, result)
                             });
+                            task_streams.insert(task.id(), (source.clone(), tenant_uuid, store_uuid));
                             info!(source, tenant_id = %tenant_uuid, store_id = %store_uuid, "projection stream started");
                         }
 
-                        if page_len < config.discovery_page_size {
+                        if page_len < page_size {
+                            cursor = None;
                             break;
                         }
                     }
@@ -253,24 +267,25 @@ pub fn spawn_projection_worker(
                         return;
                     }
                 }
-                completed = tasks.join_next(), if !tasks.is_empty() => {
+                completed = tasks.join_next_with_id(), if !tasks.is_empty() => {
                     match completed {
-                        Some(Ok((source, tenant_id, store_id, Ok(())))) => {
-                            error!(source, %tenant_id, %store_id, "projection stream exited unexpectedly");
+                        Some(Ok((task_id, (source, tenant_id, store_id, Ok(()))))) => {
+                            task_streams.remove(&task_id);
+                            runners.remove(&(source, tenant_id, store_id));
                         }
-                        Some(Ok((source, tenant_id, store_id, Err(e)))) => {
+                        Some(Ok((task_id, (source, tenant_id, store_id, Err(e))))) => {
+                            task_streams.remove(&task_id);
+                            runners.remove(&(source.clone(), tenant_id, store_id));
                             error!(source, %tenant_id, %store_id, error = %e, "projection stream failed");
                         }
-                        Some(Err(e)) => error!(error = ?e, "projection stream task failed"),
+                        Some(Err(e)) => {
+                            if let Some(key) = task_streams.remove(&e.id()) { runners.remove(&key); }
+                            error!(error = ?e, "projection stream task failed");
+                        }
                         None => {}
                     }
-                    // Fail fast. The elected-worker supervisor will initiate a
-                    // coordinated process restart instead of silently losing a stream.
-                    for runner in runners.values() {
-                        runner.stop().await;
-                    }
-                    while tasks.join_next().await.is_some() {}
-                    return;
+                    // Failed streams retry on the next discovery pass without
+                    // terminating unrelated tenants or the serving process.
                 }
             }
         }

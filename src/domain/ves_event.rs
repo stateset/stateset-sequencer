@@ -31,7 +31,7 @@ pub struct VesEventEnvelope {
     // ========================================================================
     // VES Protocol Fields
     // ========================================================================
-    /// VES specification version (must be 1)
+    /// Event signing version: 1 (legacy) or 2 (signed execution controls).
     pub ves_version: u32,
 
     // ========================================================================
@@ -298,7 +298,25 @@ impl VesEventEnvelope {
             payload_cipher_hash: &self.payload_cipher_hash,
         };
 
-        compute_event_signing_hash(&params)
+        let hash = compute_event_signing_hash(&params);
+        if self.ves_version == 2 {
+            crate::crypto::bind_execution_controls(
+                &hash,
+                self.command_id.as_ref(),
+                self.base_version,
+            )
+        } else {
+            hash
+        }
+    }
+
+    /// Sign a V2 event with Ed25519 after setting its execution controls.
+    /// Replaces any previous PQC signature metadata with a legacy Ed25519 signature.
+    pub fn sign_execution_controls(&mut self, signing_key: &AgentSigningKey) {
+        self.ves_version = 2;
+        self.agent_signature_scheme = None;
+        self.agent_signature_bundle = None;
+        self.agent_signature = signing_key.sign(&self.compute_signing_hash());
     }
 
     /// Verify the agent signature
@@ -497,6 +515,46 @@ mod tests {
         // Wrong key should fail
         let wrong_verifying_key = wrong_key.public_key();
         assert!(envelope.verify_signature(&wrong_verifying_key).is_err());
+    }
+
+    #[test]
+    fn v2_signature_binds_execution_controls_and_version() {
+        let key = AgentSigningKey::generate();
+        let mut event = VesEventEnvelope::new_plaintext(
+            TenantId::new(),
+            StoreId::new(),
+            AgentId::new(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            "order-1",
+            EventType::from(EventType::ORDER_CREATED),
+            serde_json::json!({"test": true}),
+            &key,
+        );
+        event.ves_version = 2;
+        event.command_id = Some(Uuid::new_v4());
+        event.base_version = Some(0);
+        event.agent_signature = key.sign(&event.compute_signing_hash());
+        assert!(event.verify_signature(&key.public_key()).is_ok());
+        let mut mutations = Vec::new();
+        let mut changed = event.clone();
+        changed.command_id = None;
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.command_id = Some(Uuid::new_v4());
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.base_version = None;
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.base_version = Some(1);
+        mutations.push(changed);
+        let mut changed = event.clone();
+        changed.ves_version = 1;
+        mutations.push(changed);
+        for changed in mutations {
+            assert!(changed.verify_signature(&key.public_key()).is_err());
+        }
     }
 
     #[test]

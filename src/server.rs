@@ -1018,9 +1018,20 @@ pub async fn run() -> anyhow::Result<()> {
         }
     };
 
-    let rate_limiter = parse_optional_positive_u32("RATE_LIMIT_PER_MINUTE")?
-        .map(|rpm| Arc::new(RateLimiter::new(rpm)));
-    let credential_rate_limiter = Arc::new(RateLimiter::with_config(RateLimiterConfig::from_env()));
+    let tenant_rate_limit = parse_optional_positive_u32("RATE_LIMIT_PER_MINUTE")?;
+    let rate_limit_backend =
+        std::env::var("RATE_LIMIT_BACKEND").unwrap_or_else(|_| "memory".into());
+    anyhow::ensure!(
+        matches!(rate_limit_backend.as_str(), "memory" | "postgres"),
+        "RATE_LIMIT_BACKEND must be memory or postgres"
+    );
+    let mut rate_limit_config = RateLimiterConfig::default();
+    if let Some(capacity) = parse_optional_positive_usize("RATE_LIMIT_MAX_ENTRIES")? {
+        rate_limit_config.max_entries = capacity;
+    }
+    if let Some(window) = parse_optional_positive_u32("RATE_LIMIT_WINDOW_SECONDS")? {
+        rate_limit_config.window_seconds = u64::from(window);
+    }
 
     let public_registration_enabled = parse_bool_env("PUBLIC_AGENT_REGISTRATION_ENABLED", false)?;
 
@@ -1157,6 +1168,24 @@ pub async fn run() -> anyhow::Result<()> {
         info!("DB migrations skipped (DB_MIGRATE_ON_STARTUP=0)");
     }
 
+    let build_limiter = |config| -> anyhow::Result<Arc<RateLimiter>> {
+        let limiter = RateLimiter::with_config(config);
+        Ok(Arc::new(if rate_limit_backend == "postgres" {
+            limiter.with_postgres_backend(pool.clone())?
+        } else {
+            limiter
+        }))
+    };
+    let rate_limiter = tenant_rate_limit
+        .map(|rpm| {
+            let mut config = rate_limit_config.clone();
+            config.requests_per_minute = rpm;
+            build_limiter(config)
+        })
+        .transpose()?;
+    let credential_rate_limiter = build_limiter(rate_limit_config)?;
+    info!(backend = %rate_limit_backend, "Request rate limiter configured");
+
     let api_key_store = Arc::new(PgApiKeyStore::new(pool.clone()));
     if let Some(record) = &bootstrap_record {
         api_key_store
@@ -1250,6 +1279,10 @@ pub async fn run() -> anyhow::Result<()> {
     info!(security_profile = %security_profile, "VES security profile configured");
     let mut ves_sequencer = VesSequencer::new(pool.clone(), agent_key_registry.clone());
     let mut ves_sequencer_reader = VesSequencer::new(pool.clone(), agent_key_registry.clone());
+    let require_execution_binding = parse_bool_env("REQUIRE_SIGNED_EXECUTION_CONTROLS", false)?;
+    ves_sequencer = ves_sequencer.with_required_execution_binding(require_execution_binding);
+    ves_sequencer_reader =
+        ves_sequencer_reader.with_required_execution_binding(require_execution_binding);
     ves_sequencer = ves_sequencer.with_security_profile(security_profile.clone());
     ves_sequencer_reader = ves_sequencer_reader.with_security_profile(security_profile.clone());
     if let Some(sequencer_id) = load_ves_sequencer_id(secrets.as_ref())? {

@@ -4,6 +4,7 @@ export interface VesClientOptions {
   storeId: string;
   agentId: string;
   keyId?: number;
+  signingVersion?: 1 | 2;
   privateKey: Uint8Array;
   apiKey?: string;
   bearerToken?: string;
@@ -81,9 +82,13 @@ export class VesClient {
 }
 
 export function canonicalizeJson(value: unknown): string;
+/** Expected root and leaf must come from independently trusted data. */
+export function verifyInclusionProofLocally(proof: unknown, expectedRoot: string, expectedLeaf: string): boolean;
 export function computePayloadPlainHash(payload: unknown): Uint8Array;
 export function computeEventSigningHash(params: {
   vesVersion: number;
+  commandId?: string | null;
+  baseVersion?: number | null;
   tenantId: string;
   storeId: string;
   eventId: string;

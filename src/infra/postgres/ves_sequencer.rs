@@ -38,7 +38,7 @@ use crate::crypto::{
 };
 use crate::domain::{
     AgentId, AgentKeyId, EntityType, EventType, PayloadKind, SequencedVesEvent, StoreId, TenantId,
-    VesEventEnvelope, VES_VERSION, ZERO_HASH,
+    VesEventEnvelope, ZERO_HASH,
 };
 use crate::infra::{Result, SequencerError};
 
@@ -199,6 +199,7 @@ pub struct VesSequencer<R: AgentKeyRegistry> {
     sequencer_key_version: u32,
     /// Effective runtime security profile for ingest and receipt validation.
     security_profile: String,
+    require_signed_execution_controls: bool,
     /// Enforce strict formatting for VES hex/base64url fields
     strict_format_validation: bool,
     /// Server-side event capabilities shared by REST and gRPC ingestion.
@@ -397,6 +398,7 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             signing_config: None,
             sequencer_key_version: 0,
             security_profile: "legacy".to_string(),
+            require_signed_execution_controls: false,
             strict_format_validation: Self::strict_format_from_env(),
         }
     }
@@ -428,6 +430,11 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
     /// Set the runtime security profile used to validate ingest payloads.
     pub fn with_security_profile(mut self, profile: impl Into<String>) -> Self {
         self.security_profile = profile.into().trim().to_ascii_lowercase();
+        self
+    }
+
+    pub fn with_required_execution_binding(mut self, required: bool) -> Self {
+        self.require_signed_execution_controls = required;
         self
     }
 
@@ -894,14 +901,22 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
 
     /// Validate an event per VES v1.0 Section 9
     async fn validate_event(&self, event: &VesEventEnvelope) -> Option<VesRejectedEvent> {
+        if self.require_signed_execution_controls && event.ves_version != 2 {
+            return Some(VesRejectedEvent {
+                event_id: event.event_id,
+                reason: VesRejectionReason::UnsupportedVersion,
+                message: "VES event version 2 is required for signed execution controls"
+                    .to_string(),
+            });
+        }
         // 1. Validate VES version
-        if event.ves_version != VES_VERSION {
+        if !matches!(event.ves_version, 1 | 2) {
             return Some(VesRejectedEvent {
                 event_id: event.event_id,
                 reason: VesRejectionReason::UnsupportedVersion,
                 message: format!(
-                    "Expected VES version {}, got {}",
-                    VES_VERSION, event.ves_version
+                    "Expected VES event version 1 or 2, got {}",
+                    event.ves_version
                 ),
             });
         }
@@ -2119,6 +2134,7 @@ mod tests {
             signing_config: None,
             sequencer_key_version: 0,
             security_profile: "legacy".to_string(),
+            require_signed_execution_controls: false,
             strict_format_validation: strict_format,
         }
     }

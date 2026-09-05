@@ -62,6 +62,54 @@ def compute_payload_plain_hash(payload: Any) -> bytes:
     return hashlib.sha256(_PAYLOAD_DOMAIN + canonicalize_json(payload)).digest()
 
 
+def verify_inclusion_proof_locally(
+    proof: Mapping[str, Any], expected_root: str, expected_leaf: str
+) -> bool:
+    """Verify membership offline against independently trusted root/leaf hashes."""
+
+    def decode(value: Any) -> bytes:
+        if not isinstance(value, str):
+            raise TypeError("Expected a hexadecimal hash")
+        raw = value.removeprefix("0x")
+        if len(raw) != 64 or any(c not in "0123456789abcdefABCDEF" for c in raw):
+            raise ValueError("Expected a 32-byte hexadecimal hash")
+        return bytes.fromhex(raw)
+
+    try:
+        root, current = decode(expected_root), decode(expected_leaf)
+        if (
+            decode(proof["merkle_root"]) != root
+            or decode(proof["leaf_hash"]) != current
+        ):
+            return False
+        path, directions, index = (
+            proof["proof_path"],
+            proof["directions"],
+            proof["leaf_index"],
+        )
+        if (
+            type(index) is not int
+            or index < 0
+            or index > 2**53 - 1
+            or not isinstance(path, list)
+            or len(path) > 64
+            or not isinstance(directions, list)
+            or len(directions) != len(path)
+        ):
+            return False
+        for sibling_hash, direction in zip(path, directions):
+            left = index % 2 == 0
+            if type(direction) is not bool or direction != left:
+                return False
+            sibling = decode(sibling_hash)
+            children = current + sibling if left else sibling + current
+            current = hashlib.sha256(b"VES_NODE_V1" + children).digest()
+            index //= 2
+        return index == 0 and current == root
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return False
+
+
 def compute_event_signing_hash(
     *,
     ves_version: int,
@@ -77,9 +125,13 @@ def compute_event_signing_hash(
     payload_kind: int,
     payload_plain_hash: bytes,
     payload_cipher_hash: bytes,
+    command_id: str | None = None,
+    base_version: int | None = None,
 ) -> bytes:
     """Compute the domain-separated hash signed by a VES agent."""
 
+    if ves_version not in (1, 2):
+        raise ValueError("Unsupported signing version")
     body = b"".join(
         (
             _SIGNATURE_DOMAIN,
@@ -98,7 +150,18 @@ def compute_event_signing_hash(
             _hash_bytes(payload_cipher_hash, "payload_cipher_hash"),
         )
     )
-    return hashlib.sha256(body).digest()
+    event_hash = hashlib.sha256(body).digest()
+    if ves_version == 1:
+        return event_hash
+    if base_version is not None and (
+        type(base_version) is not int or not 0 <= base_version <= 2**53 - 1
+    ):
+        raise ValueError("base_version must be a non-negative safe integer")
+    command = b"\x00" if command_id is None else b"\x01" + uuid.UUID(command_id).bytes
+    base = (
+        b"\x00" if base_version is None else b"\x01" + struct.pack(">Q", base_version)
+    )
+    return hashlib.sha256(b"VES_EVENTSIG_V2" + event_hash + command + base).digest()
 
 
 def load_private_key(env_var: str = "VES_PRIVATE_KEY") -> bytes:
@@ -124,6 +187,7 @@ class _ClientBase:
         private_key: bytes,
         base_url: str = "http://localhost:8080",
         key_id: int = 1,
+        signing_version: int = 2,
         api_key: str | None = None,
         bearer_token: str | None = None,
         max_retries: int = 3,
@@ -142,6 +206,9 @@ class _ClientBase:
             raise ValueError("max_retries must be non-negative")
         self.base_url = base_url.rstrip("/")
         self.key_id = key_id
+        if signing_version not in (1, 2):
+            raise ValueError("Unsupported signing version")
+        self.signing_version = signing_version
         self._signing_key = Ed25519PrivateKey.from_private_bytes(private_key)
         self.api_key = api_key
         self.bearer_token = bearer_token
@@ -164,7 +231,9 @@ class _ClientBase:
         created_at = created_at or _utc_now()
         payload_hash = compute_payload_plain_hash(payload)
         signing_hash = compute_event_signing_hash(
-            ves_version=1,
+            ves_version=self.signing_version,
+            command_id=command_id,
+            base_version=base_version,
             tenant_id=self.tenant_id,
             store_id=self.store_id,
             event_id=event_id,
@@ -179,7 +248,7 @@ class _ClientBase:
             payload_cipher_hash=_ZERO_HASH,
         )
         event: JsonObject = {
-            "ves_version": 1,
+            "ves_version": self.signing_version,
             "event_id": event_id,
             "tenant_id": self.tenant_id,
             "store_id": self.store_id,

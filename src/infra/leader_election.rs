@@ -8,13 +8,17 @@
 //! background workers — anchoring Merkle roots to L2 and x402 batch sequencing —
 //! because duplicate runs waste gas and race with each other.
 //!
-//! This module elects exactly one node to run a given singleton worker using a
+//! This module elects one database lock holder for a given singleton worker using a
 //! PostgreSQL **session-level advisory lock** (`pg_try_advisory_lock`). The lock
 //! is held for the life of one dedicated connection and is released
 //! automatically by PostgreSQL when that connection drops — including when the
 //! leader node crashes — which gives failover for free: a standby acquires the
 //! lock on its next retry. Single-node deployments are unaffected: the lone node
 //! wins the lock immediately and behaves exactly as before.
+//!
+//! A database lease is not destination-enforced fencing: a partitioned worker
+//! may continue external I/O until loss is detected. External writes still need
+//! durable idempotency or fencing at their destination.
 //!
 //! Verification note: the advisory-lock acquisition and failover semantics
 //! require a live PostgreSQL and are exercised by the `tests/` integration suite
@@ -65,8 +69,8 @@ pub mod lock_keys {
     pub const PROOF_WORKER: i64 = 0x5354_5341_5f70_7266;
 }
 
-/// Run `spawn_worker` on exactly one node at a time, elected via a PostgreSQL
-/// advisory lock on `lock_key`.
+/// Run `spawn_worker` while holding a PostgreSQL advisory lock on `lock_key`.
+/// This is not a fencing guarantee for external side effects.
 ///
 /// Returns immediately with a `JoinHandle` for the supervising task. The worker
 /// is spawned only once this node holds leadership; followers idle and retry so
@@ -94,10 +98,17 @@ where
         while !shutdown.is_shutdown() {
             // A dedicated connection holds the advisory lock for as long as we
             // remain leader; dropping it (or losing the node) releases the lock.
-            let mut lease = match pool.acquire().await {
-                Ok(conn) => conn,
-                Err(e) => {
-                    warn!(worker = name, error = %e, "could not acquire lease connection; retrying");
+            let mut lease = match election_operation(
+                &shutdown,
+                config.health_interval,
+                pool.acquire(),
+            )
+            .await
+            {
+                None => return,
+                Some(Ok(Ok(conn))) => conn,
+                Some(result) => {
+                    warn!(worker = name, error = ?result, "could not acquire lease connection; retrying");
                     if sleep_or_shutdown(config.retry_interval, &shutdown).await {
                         return;
                     }
@@ -105,14 +116,26 @@ where
                 }
             };
 
-            let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
-                .bind(lock_key)
-                .fetch_one(&mut *lease)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!(worker = name, error = %e, "advisory lock probe failed; treating as follower");
+            // Even a failed/cancelled acquisition can have taken the lock on
+            // the server before the response was lost. Never recycle this
+            // session into the pool with unknown advisory-lock ownership.
+            lease.close_on_drop();
+            let acquired = election_operation(
+                &shutdown,
+                config.health_interval,
+                sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                    .bind(lock_key)
+                    .fetch_one(&mut *lease),
+            )
+            .await;
+            let acquired = match acquired {
+                None => return,
+                Some(Ok(Ok(acquired))) => acquired,
+                Some(result) => {
+                    warn!(worker = name, error = ?result, "advisory lock probe failed or timed out; treating as follower");
                     false
-                });
+                }
+            };
 
             if !acquired {
                 // Another node leads. Release this connection and retry later so
@@ -129,6 +152,9 @@ where
                 "acquired leadership; starting singleton worker"
             );
             let (mut task, stop) = spawn_worker();
+            // Dropping a JoinHandle detaches its task. Ensure cancellation or
+            // panic of this supervisor cannot leave a worker running unowned.
+            let _worker_guard = AbortWorkerOnDrop(task.abort_handle());
             let mut stop = Some(stop);
             let mut health = tokio::time::interval(config.health_interval);
 
@@ -137,13 +163,10 @@ where
                     _ = shutdown.wait() => {
                         info!(worker = name, "shutdown: stopping worker and releasing leadership");
                         if let Some(stop) = stop.take() {
-                            stop().await;
+                            stop_worker(&mut task, stop).await;
                         }
-                        let _ = task.await;
-                        let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
-                            .bind(lock_key)
-                            .execute(&mut *lease)
-                            .await;
+                        // close_on_drop releases the session lock without
+                        // waiting on an unresponsive database connection.
                         return;
                     }
                     join_result = &mut task => {
@@ -159,13 +182,22 @@ where
                         // The advisory lock lives on this connection; if the ping
                         // fails the lock is (or is about to be) gone, so step down
                         // hard rather than run a second leader's worker.
-                        if let Err(e) = sqlx::query("SELECT 1").execute(&mut *lease).await {
-                            error!(worker = name, error = %e, "lost lease connection while leader; triggering coordinated shutdown");
+                        let probe = election_operation(
+                            &shutdown, config.health_interval,
+                            sqlx::query("SELECT 1").execute(&mut *lease),
+                        ).await;
+                        if probe.is_none() {
                             if let Some(stop) = stop.take() {
-                                stop().await;
+                                stop_worker(&mut task, stop).await;
                             }
-                            let _ = task.await;
+                            return;
+                        }
+                        if !matches!(probe, Some(Ok(Ok(_)))) {
+                            error!(worker = name, "lost or timed out lease connection; triggering coordinated shutdown");
                             coordinator.shutdown().await;
+                            if let Some(stop) = stop.take() {
+                                stop_worker(&mut task, stop).await;
+                            }
                             return;
                         }
                     }
@@ -173,6 +205,44 @@ where
             }
         }
     })
+}
+
+struct AbortWorkerOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortWorkerOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Shutdown wins even if an operation is ready at the same time. Dropping a
+/// cancelled database query is safe here because its lease is close-on-drop.
+async fn election_operation<F: Future>(
+    shutdown: &ShutdownSignal,
+    deadline: Duration,
+    operation: F,
+) -> Option<Result<F::Output, tokio::time::error::Elapsed>> {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait() => None,
+        result = tokio::time::timeout(deadline, operation) => Some(result),
+    }
+}
+
+/// Give cooperative workers a bounded drain period, then cancel the task.
+async fn stop_worker<Stop, StopFut>(task: &mut JoinHandle<()>, stop: Stop)
+where
+    Stop: FnOnce() -> StopFut,
+    StopFut: Future<Output = ()>,
+{
+    let drained = tokio::time::timeout(Duration::from_secs(5), async {
+        stop().await;
+        let _ = (&mut *task).await;
+    })
+    .await;
+    if drained.is_err() {
+        task.abort();
+    }
 }
 
 /// Sleep for `dur`, returning `true` if a shutdown arrived first (caller stops).
@@ -186,6 +256,85 @@ async fn sleep_or_shutdown(dur: Duration, shutdown: &ShutdownSignal) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn election_operation_stops_during_shutdown() {
+        let coordinator = Arc::new(ShutdownCoordinator::new());
+        let signal = coordinator.signal();
+        let operation = tokio::spawn(async move {
+            election_operation(
+                &signal,
+                Duration::from_secs(3600),
+                std::future::pending::<()>(),
+            )
+            .await
+        });
+        coordinator.shutdown().await;
+        assert!(tokio::time::timeout(Duration::from_secs(1), operation)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn election_operation_times_out_and_prioritizes_shutdown() {
+        let coordinator = ShutdownCoordinator::new();
+        let signal = coordinator.signal();
+        assert!(election_operation(
+            &signal,
+            Duration::from_millis(10),
+            std::future::pending::<()>()
+        )
+        .await
+        .unwrap()
+        .is_err());
+        coordinator.shutdown().await;
+        assert!(
+            election_operation(&signal, Duration::from_secs(1), std::future::ready(()))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_supervisor_guard_cancels_worker() {
+        let worker = tokio::spawn(std::future::pending::<()>());
+        let guard = AbortWorkerOnDrop(worker.abort_handle());
+        drop(guard);
+        let error = tokio::time::timeout(Duration::from_secs(1), worker)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn unresponsive_stop_callback_is_bounded_and_worker_aborted() {
+        let mut task = tokio::spawn(std::future::pending::<()>());
+        tokio::time::timeout(
+            Duration::from_secs(7),
+            stop_worker(&mut task, || async {
+                std::future::pending::<()>().await;
+            }),
+        )
+        .await
+        .expect("stop callback must not block shutdown forever");
+        assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cooperative_worker_is_drained() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let mut task = tokio::spawn(async move {
+            let _ = rx.await;
+        });
+        stop_worker(&mut task, || async {
+            let _ = tx.send(());
+        })
+        .await;
+        assert!(task.is_finished());
+    }
 
     #[test]
     fn election_config_defaults_are_sane() {

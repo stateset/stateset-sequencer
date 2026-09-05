@@ -7,7 +7,6 @@
 //!   3. crash failover — closing the holder's *connection* auto-releases the
 //!      lock, so a standby can take over without any explicit handoff.
 
-use sqlx::postgres::PgPoolOptions;
 use sqlx::{Connection, PgConnection};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -17,9 +16,11 @@ use uuid::Uuid;
 
 use stateset_sequencer::infra::{spawn_elected_worker, ElectionConfig, ShutdownCoordinator};
 
+mod common;
+
 async fn connect() -> Option<PgConnection> {
-    let url = std::env::var("DATABASE_URL").ok()?;
-    PgConnection::connect(&url).await.ok()
+    let pool = common::connect_test_db(1).await?;
+    Some(pool.acquire().await.expect("acquire connection").detach())
 }
 
 /// A per-run key so parallel test runs (and the real worker keys) never collide.
@@ -117,15 +118,9 @@ async fn advisory_lock_auto_releases_when_holder_connection_drops() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn spawn_elected_worker_runs_on_exactly_one_node() {
-    let Ok(url) = std::env::var("DATABASE_URL") else {
-        eprintln!("DATABASE_URL not set; skipping");
+    let Some(pool) = common::connect_test_db(10).await else {
         return;
     };
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&url)
-        .await
-        .expect("connect pool");
 
     let key = unique_key();
     let cfg = ElectionConfig {
@@ -189,11 +184,130 @@ async fn spawn_elected_worker_runs_on_exactly_one_node() {
         coordinator.shutdown().await;
     }
     for handle in handles {
-        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        tokio::time::timeout(Duration::from_secs(7), handle)
+            .await
+            .expect("supervisor must stop")
+            .expect("supervisor must not panic");
     }
     assert_eq!(
         active.load(Ordering::SeqCst),
         0,
         "the worker must stop on shutdown"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn shutdown_interrupts_an_exhausted_election_pool() {
+    let Some(pool) = common::connect_test_db(1).await else {
+        return;
+    };
+    let _held_connection = pool.acquire().await.unwrap();
+    let coordinator = Arc::new(ShutdownCoordinator::new());
+    let supervisor = spawn_elected_worker(
+        "pool_exhausted",
+        unique_key(),
+        pool,
+        ElectionConfig::default(),
+        coordinator.signal(),
+        coordinator.clone(),
+        || {
+            panic!("worker must not start without a lease");
+            #[allow(unreachable_code)]
+            (tokio::spawn(async {}), || async {})
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    coordinator.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(1), supervisor)
+        .await
+        .expect("shutdown must interrupt pool acquisition")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn supervisor_abort_and_backend_loss_stop_worker_and_release_lease() {
+    for abort_supervisor in [true, false] {
+        let Some(pool) = common::connect_test_db(1).await else {
+            return;
+        };
+        let Some(mut observer) = connect().await else {
+            return;
+        };
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let key = unique_key();
+        let coordinator = Arc::new(ShutdownCoordinator::new());
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let supervisor = spawn_elected_worker(
+            "failure_injection",
+            key,
+            pool.clone(),
+            ElectionConfig {
+                retry_interval: Duration::from_millis(50),
+                health_interval: Duration::from_millis(100),
+            },
+            coordinator.signal(),
+            coordinator.clone(),
+            move || {
+                let (stopped_tx, stopped_rx) = tokio::sync::oneshot::channel::<()>();
+                started_tx.try_send(stopped_rx).unwrap();
+                let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+                let task = tokio::spawn(async move {
+                    // The receiver observes destruction even on cancellation.
+                    let _stopped = stopped_tx;
+                    if stop_rx.await.is_err() {
+                        // Deliberately ignore loss of the control sender. Only
+                        // supervisor-owned cancellation can stop this worker.
+                        std::future::pending::<()>().await;
+                    }
+                });
+                (task, move || async move {
+                    let _ = stop_tx.send(());
+                })
+            },
+        );
+        let stopped = tokio::time::timeout(Duration::from_secs(3), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !try_lock(&mut observer, key).await,
+            "leader must hold lease"
+        );
+        if abort_supervisor {
+            supervisor.abort();
+            assert!(supervisor.await.unwrap_err().is_cancelled());
+        } else {
+            let killed: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+                .bind(pid)
+                .fetch_one(&mut observer)
+                .await
+                .unwrap();
+            assert!(killed);
+            tokio::time::timeout(Duration::from_secs(2), supervisor)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                coordinator.signal().is_shutdown(),
+                "lease loss must trigger shutdown"
+            );
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), stopped)
+            .await
+            .expect("worker must not remain detached");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !try_lock(&mut observer, key).await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("standby must be able to take the released lease");
+        assert!(unlock(&mut observer, key).await);
+        pool.close().await;
+    }
 }

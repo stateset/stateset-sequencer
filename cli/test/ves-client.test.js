@@ -8,6 +8,7 @@ import {
   canonicalizeJson,
   computeEventSigningHash,
   computePayloadPlainHash,
+  verifyInclusionProofLocally,
 } from '../src/ves/client.js';
 import { createSequencerToolExecutor, sequencerTools } from '../src/agent/toolkit.js';
 import { createMcpRequestHandler } from '../src/agent/mcp.js';
@@ -19,6 +20,38 @@ const ids = {
   agentId: '80441726-74e2-430a-95ae-97ce21c6351b',
   commandId: '8af726e2-40e9-4cb6-b7d0-ea463765a9a7',
 };
+
+test('offline inclusion verification binds trusted root, leaf, and position', () => {
+  const root = '5186fbc7094f70b9fc71bcf269fda0530c1c2bd675de918ef39562a6f18752fd';
+  const leaf = '01'.repeat(32), sibling = '02'.repeat(32);
+  const proof = { merkle_root: root, leaf_hash: leaf, leaf_index: 0,
+    proof_path: [sibling], directions: [true] };
+  assert.equal(verifyInclusionProofLocally(proof, root, leaf), true);
+  assert.equal(verifyInclusionProofLocally({ ...proof, leaf_hash: sibling, leaf_index: 1,
+    proof_path: [leaf], directions: [false] }, root, sibling), true);
+  for (const changed of [{ directions: [false] }, { directions: [] }, { leaf_index: 2 },
+    { proof_path: [leaf] }, { leaf_hash: sibling }, { merkle_root: leaf },
+    { proof_path: Array(65).fill(sibling), directions: Array(65).fill(true) }]) {
+    assert.equal(verifyInclusionProofLocally({ ...proof, ...changed }, root, leaf), false);
+  }
+  assert.equal(verifyInclusionProofLocally(proof, sibling, leaf), false);
+  assert.equal(verifyInclusionProofLocally(proof, root, sibling), false);
+  assert.equal(verifyInclusionProofLocally(null, root, leaf), false);
+});
+
+test('canonicalization rejects malformed Unicode and non-JSON inputs', () => {
+  for (const value of ['\ud800', '\udfff', { ['\ud800']: 1 }, Array(2),
+    [undefined], new Date(), new Map(), { toJSON() { return 1; } }]) {
+    assert.throws(() => canonicalizeJson(value), TypeError);
+  }
+  const circular = {};
+  circular.self = circular;
+  assert.throws(() => canonicalizeJson(circular), /Circular/);
+  assert.throws(() => canonicalizeJson({ get value() { throw new Error('must not execute'); } }), /accessors/);
+  const shared = { value: '\ud83d\ude00' };
+  assert.equal(canonicalizeJson([shared, shared]), JSON.stringify([shared, shared]));
+  assert.equal(canonicalizeJson({ toJSON: 'ordinary key' }), '{"toJSON":"ordinary key"}');
+});
 
 test('event signing hash matches the Rust cross-platform vector', () => {
   const hash = computeEventSigningHash({
@@ -40,6 +73,20 @@ test('event signing hash matches the Rust cross-platform vector', () => {
   });
 
   assert.equal(bytesToHex(hash), 'e970dfc9ffc285c2c0ba59be5d9c653eee2d1ae4db9b7a02ea3cd62b8e7cf92b');
+});
+
+test('V2 signing matches the shared Rust and Python execution-control vector', () => {
+  const id = '11111111-1111-4111-8111-111111111111';
+  const params = { vesVersion: 2, tenantId: id, storeId: id, eventId: id, sourceAgentId: id,
+    agentKeyId: 1, entityType: 'order', entityId: 'o1', eventType: 'order.created',
+    createdAt: '2026-09-05T00:00:00Z', payloadKind: 0,
+    payloadPlainHash: new Uint8Array(32), payloadCipherHash: new Uint8Array(32), commandId: id, baseVersion: 0 };
+  assert.equal(bytesToHex(computeEventSigningHash(params)),
+    '27dee9ebd0747eafc2b08121f144343627dfe1829a06f818eb23f0c50e048cc5');
+  for (const change of [{baseVersion: undefined}, {baseVersion: 1}, {commandId: undefined}, {vesVersion: 1}]) {
+    assert.notDeepEqual(computeEventSigningHash({...params, ...change}), computeEventSigningHash(params));
+  }
+  assert.throws(() => computeEventSigningHash({...params, baseVersion: Number.MAX_SAFE_INTEGER + 1}), /safe integer/);
 });
 
 test('canonical payload hashing is independent of object insertion order', () => {
@@ -86,7 +133,9 @@ test('recordAction signs the event and authenticates an idempotent ingest', asyn
   });
 
   const signingHash = computeEventSigningHash({
-    vesVersion: 1,
+    vesVersion: event.ves_version,
+    commandId: event.command_id,
+    baseVersion: event.base_version,
     tenantId: ids.tenantId,
     storeId: ids.storeId,
     eventId: ids.eventId,
@@ -101,6 +150,19 @@ test('recordAction signs the event and authenticates an idempotent ingest', asyn
     payloadCipherHash: hexToBytes(event.payload_cipher_hash.slice(2)),
   });
   const publicKey = await ed.getPublicKeyAsync(privateKey);
+
+  for (const changed of [{ command_id: ids.eventId }, { command_id: undefined },
+    { base_version: 2 }, { base_version: undefined }, { ves_version: 1 }]) {
+    const altered = { ...event, ...changed };
+    const hash = computeEventSigningHash({
+      vesVersion: altered.ves_version, commandId: altered.command_id, baseVersion: altered.base_version,
+      tenantId: ids.tenantId, storeId: ids.storeId, eventId: ids.eventId, sourceAgentId: ids.agentId,
+      agentKeyId: 1, entityType: event.entity_type, entityId: event.entity_id,
+      eventType: event.event_type, createdAt: event.created_at, payloadKind: 0,
+      payloadPlainHash: hexToBytes(event.payload_plain_hash.slice(2)), payloadCipherHash: new Uint8Array(32),
+    });
+    assert.equal(await ed.verifyAsync(hexToBytes(event.agent_signature.slice(2)), hash, publicKey), false);
+  }
 
   assert.equal(
     await ed.verifyAsync(hexToBytes(event.agent_signature.slice(2)), signingHash, publicKey),

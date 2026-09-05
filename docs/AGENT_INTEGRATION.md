@@ -20,6 +20,59 @@ outside the model, reuse one `commandId` across retries, submit with the observe
 `baseVersion`, persist the returned sequence cursor, and request an inclusion
 proof when independent audit evidence is required.
 
+### Verify inclusion without trusting the verification endpoint
+
+Both SDKs expose a pure local verifier. Supply the expected root from a trusted
+commitment or verified on-chain anchor and the expected leaf computed from the
+event you intend to verify. Do not take either trust input from the same
+untrusted proof response.
+
+```javascript
+import { verifyInclusionProofLocally } from '@stateset/sequencer-sdk';
+const valid = verifyInclusionProofLocally(proof, trustedRootHex, expectedLeafHex);
+```
+
+```python
+from stateset_sequencer import verify_inclusion_proof_locally
+valid = verify_inclusion_proof_locally(proof, trusted_root_hex, expected_leaf_hex)
+```
+
+These functions validate VES_NODE_V1 Merkle membership, hash lengths, path
+lengths, direction bits, and leaf position. They return false for malformed or
+tampered proofs. They do not authenticate a commitment, verify a receipt
+signature, or establish finality of an on-chain anchor. Leaf indices above the
+JavaScript safe-integer range are rejected consistently in both SDKs.
+
+### Signing versions and migration
+
+VES v1 signatures bind event identity, payload hashes, and the fields specified
+by VES_EVENTSIG_V1. They do not bind `command_id` or `base_version`. Keep the
+submission path authenticated and trusted; do not treat those two fields as
+cryptographically authenticated agent intent.
+
+New Node and Python clients default to event signing version 2. V2 binds the
+values and presence of both execution controls. Upgrade the server before
+deploying these clients. For an older server, explicitly select
+`signingVersion: 1` (Node) or `signing_version=1` (Python); no automatic downgrade
+is performed. After all writers migrate, set
+`REQUIRE_SIGNED_EXECUTION_CONTROLS=true` to reject new V1 events. Existing exact
+replays can still return their stored receipts. Rust callers can set their
+controls then call `event.sign_execution_controls(&ed25519_key)` to sign V2.
+
+The V2 event signing hash is SHA-256 of the following concatenation:
+
+```
+UTF8("VES_EVENTSIG_V2") || V1Hash(ves_version=2) ||
+U8(command_present) || [UUID(command_id)] ||
+U8(base_present) || [U64_BE(base_version)]
+```
+
+Presence bytes are 0 or 1; bracketed bytes exist only when present. V1Hash uses
+the existing VES_EVENTSIG_V1 encoding, with its version field set to 2. The
+Merkle node/leaf and receipt formats are unchanged; they consume the resulting
+event hash. SDK numeric inputs remain limited to JavaScript's safe integer
+range for cross-language interoperability. Never change controls after signing.
+
 ## Overview
 
 The StateSet Sequencer provides AI agents with:

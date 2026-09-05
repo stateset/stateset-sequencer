@@ -237,6 +237,28 @@ pub fn compute_event_signing_hash(params: &EventSigningParams) -> Hash256 {
     hasher.finalize().into()
 }
 
+/// V2 binds execution controls without changing the V1 hash or Merkle format.
+/// SHA256("VES_EVENTSIG_V2" || V1Hash(version=2) || option(command UUID) ||
+/// option(base version U64_BE)). Options use a single 0/1 presence byte.
+pub fn bind_execution_controls(
+    event_hash: &Hash256,
+    command_id: Option<&uuid::Uuid>,
+    base_version: Option<u64>,
+) -> Hash256 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"VES_EVENTSIG_V2");
+    hasher.update(event_hash);
+    hasher.update([u8::from(command_id.is_some())]);
+    if let Some(command_id) = command_id {
+        hasher.update(command_id.as_bytes());
+    }
+    hasher.update([u8::from(base_version.is_some())]);
+    if let Some(base_version) = base_version {
+        hasher.update(base_version.to_be_bytes());
+    }
+    hasher.finalize().into()
+}
+
 /// Write a length-prefixed string directly into a hasher without allocating.
 /// Format: U32_BE(len) || UTF8_bytes
 #[inline]
@@ -625,6 +647,11 @@ mod tests {
 
     #[test]
     fn test_node_hash_with_domain() {
+        // Shared with both SDK offline-verifier tests.
+        assert_eq!(
+            hex::encode(compute_node_hash(&[1u8; 32], &[2u8; 32])),
+            "5186fbc7094f70b9fc71bcf269fda0530c1c2bd675de918ef39562a6f18752fd"
+        );
         let left = [1u8; 32];
         let right = [2u8; 32];
 
@@ -633,6 +660,34 @@ mod tests {
 
         // Different due to domain prefix
         assert_ne!(node, legacy);
+    }
+
+    #[test]
+    fn v2_shared_execution_control_vector() {
+        let id = uuid::Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let params = EventSigningParams {
+            ves_version: 2,
+            tenant_id: &id,
+            store_id: &id,
+            event_id: &id,
+            source_agent_id: &id,
+            agent_key_id: 1,
+            entity_type: "order",
+            entity_id: "o1",
+            event_type: "order.created",
+            created_at: "2026-09-05T00:00:00Z",
+            payload_kind: 0,
+            payload_plain_hash: &[0; 32],
+            payload_cipher_hash: &[0; 32],
+        };
+        assert_eq!(
+            hex::encode(bind_execution_controls(
+                &compute_event_signing_hash(&params),
+                Some(&id),
+                Some(0)
+            )),
+            "27dee9ebd0747eafc2b08121f144343627dfe1829a06f818eb23f0c50e048cc5"
+        );
     }
 
     #[test]

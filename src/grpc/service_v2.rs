@@ -427,7 +427,7 @@ impl SequencerServiceV2 {
         } else {
             proto.ves_version
         };
-        if ves_version != VES_VERSION {
+        if !matches!(ves_version, 1 | 2) {
             return Err(Status::invalid_argument("unsupported ves_version"));
         }
 

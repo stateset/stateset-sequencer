@@ -19,8 +19,8 @@
 //! # Rate Limiting
 //!
 //! Per-tenant rate limiting with configurable limits:
-//! - Sliding window algorithm
-//! - LRU eviction for bounded memory
+//! - Fixed windows shared by HTTP and gRPC; optional PostgreSQL cluster-wide budgets
+//! - Bounded memory; only expired budgets may be evicted
 //! - Configurable via `RATE_LIMIT_*` environment variables
 //!
 //! # Configuration

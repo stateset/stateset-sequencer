@@ -8,7 +8,10 @@ use std::sync::Arc;
 use tonic::{Request, Status};
 use tracing::{debug, warn};
 
-use crate::auth::{credential_rate_limit_key, AuthContext, AuthError, Authenticator, RateLimiter};
+use crate::auth::{
+    credential_rate_limit_key, tenant_rate_limit_key, AuthContext, AuthError, Authenticator,
+    RateLimiter,
+};
 
 /// gRPC authentication interceptor with optional rate limiting
 ///
@@ -59,7 +62,7 @@ impl GrpcAuthInterceptor {
                 }
                 Err(_) => {
                     debug!("Invalid authorization metadata encoding, auth not required; injecting bootstrap context");
-                    return Ok(Some(bootstrap_ctx));
+                    ""
                 }
             };
             credential_key = credential_rate_limit_key(auth_str);
@@ -81,7 +84,7 @@ impl GrpcAuthInterceptor {
                 }
                 Err(_) => {
                     debug!("Invalid x-api-key metadata encoding, auth not required; injecting bootstrap context");
-                    return Ok(Some(bootstrap_ctx));
+                    ""
                 }
             };
             credential_key = credential_rate_limit_key(key_str);
@@ -104,27 +107,35 @@ impl GrpcAuthInterceptor {
 
         // Apply rate limiting after successful authentication
         if let (Some(limiter), Some(ref ctx)) = (&self.rate_limiter, &auth_ctx) {
-            let key = format!("grpc:tenant:{}", ctx.tenant_id);
-            if let Err(AuthError::RateLimited) = limiter.check(&key) {
-                warn!(tenant_id = %ctx.tenant_id, "gRPC rate limit exceeded");
-                return Err(Status::resource_exhausted("rate limit exceeded"));
-            }
+            let key = tenant_rate_limit_key(&ctx.tenant_id);
+            Self::check_budget(limiter, &key, None)?;
         }
 
-        if let (Some(ctx), Some(limit), Some(key)) = (
+        if let (Some(_ctx), Some(limit), Some(key)) = (
             &auth_ctx,
             auth_ctx.as_ref().and_then(|ctx| ctx.rate_limit),
             credential_key.as_ref(),
         ) {
-            if let Err(AuthError::RateLimited) =
-                self.credential_rate_limiter.check_with_limit(key, limit)
-            {
-                warn!(tenant_id = %ctx.tenant_id, "gRPC credential rate limit exceeded");
-                return Err(Status::resource_exhausted("rate limit exceeded"));
-            }
+            Self::check_budget(&self.credential_rate_limiter, key, Some(limit))?;
         }
 
         Ok(auth_ctx)
+    }
+
+    fn check_budget(limiter: &RateLimiter, key: &str, limit: Option<u32>) -> Result<(), Status> {
+        let result = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                match limit {
+                    Some(limit) => limiter.check_with_limit_async(key, limit).await,
+                    None => limiter.check_async(key).await,
+                }
+            })
+        });
+        match result {
+            Ok(()) => Ok(()),
+            Err(AuthError::RateLimited) => Err(Status::resource_exhausted("rate limit exceeded")),
+            Err(_) => Err(Status::unavailable("rate limiter unavailable")),
+        }
     }
 
     fn authenticate_header(&self, header: &str) -> Result<Option<AuthContext>, Status> {
@@ -199,6 +210,90 @@ mod tests {
     use tonic::Code;
 
     use crate::auth::{ApiKeyRecord, ApiKeyValidator, Permissions};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_and_grpc_share_tenant_budget_in_both_directions() {
+        use crate::auth::{auth_middleware, AuthMiddlewareState};
+        use axum::{body::Body, http::StatusCode, routing::get, Router};
+        use tower::ServiceExt;
+
+        for grpc_first in [false, true] {
+            let api_key = "ss_test_shared_transport_budget";
+            let validator = Arc::new(ApiKeyValidator::new());
+            validator.register_key(ApiKeyRecord {
+                key_hash: ApiKeyValidator::hash_key(api_key),
+                tenant_id: uuid::Uuid::new_v4(),
+                store_ids: Vec::new(),
+                permissions: Permissions::read_only(),
+                agent_id: None,
+                active: true,
+                rate_limit: None,
+            });
+            let state = AuthMiddlewareState {
+                authenticator: Arc::new(Authenticator::new(validator)),
+                require_auth: true,
+                rate_limiter: Some(Arc::new(RateLimiter::new(1))),
+                credential_rate_limiter: Arc::new(RateLimiter::new(100)),
+                pool_monitor: None,
+            };
+            let interceptor = GrpcAuthInterceptor::new(
+                state.authenticator.clone(),
+                true,
+                state.rate_limiter.clone(),
+                state.credential_rate_limiter.clone(),
+            );
+            let app = Router::new()
+                .route("/", get(|| async { "ok" }))
+                .layer(axum::middleware::from_fn_with_state(state, auth_middleware));
+            let http_request = axum::http::Request::builder()
+                .uri("/")
+                .header("x-api-key", api_key)
+                .body(Body::empty())
+                .unwrap();
+            let mut grpc_request = Request::new(());
+            grpc_request
+                .metadata_mut()
+                .insert("x-api-key", api_key.parse().unwrap());
+            if grpc_first {
+                assert!(interceptor.authenticate(&grpc_request).is_ok());
+                assert_eq!(
+                    app.oneshot(http_request).await.unwrap().status(),
+                    StatusCode::TOO_MANY_REQUESTS
+                );
+            } else {
+                assert_eq!(
+                    app.oneshot(http_request).await.unwrap().status(),
+                    StatusCode::OK
+                );
+                assert_eq!(
+                    interceptor.authenticate(&grpc_request).unwrap_err().code(),
+                    Code::ResourceExhausted
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_metadata_cannot_bypass_bootstrap_budget() {
+        for header in ["authorization", "x-api-key"] {
+            let interceptor = GrpcAuthInterceptor::new(
+                Arc::new(Authenticator::new(Arc::new(ApiKeyValidator::new()))),
+                false,
+                Some(Arc::new(RateLimiter::new(1))),
+                Arc::new(RateLimiter::new(100)),
+            );
+            let mut request = Request::new(());
+            request.metadata_mut().insert(
+                header,
+                tonic::metadata::MetadataValue::try_from(&b"\xff"[..]).unwrap(),
+            );
+            assert!(interceptor.authenticate(&request).is_ok());
+            assert_eq!(
+                interceptor.authenticate(&request).unwrap_err().code(),
+                Code::ResourceExhausted
+            );
+        }
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn grpc_interceptor_enforces_per_credential_rate_limit() {

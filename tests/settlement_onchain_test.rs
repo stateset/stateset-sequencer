@@ -16,11 +16,12 @@
 //!   forge script script/DeployX402Test.s.sol:DeployX402TestScript \
 //!     --tc DeployX402TestScript --rpc-url http://127.0.0.1:8545 --broadcast
 //!
-//! The payment carries an empty authorization, which the contract's
+//! The baseline cases carry an empty authorization, which the contract's
 //! `SignatureChecker` rejects — so the payment is *skipped* (PaymentFailed) while
 //! the batch still settles. That is enough to prove the send path works without
 //! needing a full EIP-712 signature (the contract's auth logic is covered by the
-//! Foundry suite).
+//! Foundry suite). The opt-in funded fixture instead signs a real EIP-712
+//! authorization and verifies balances and destination-enforced replay guards.
 
 use std::str::FromStr;
 
@@ -28,6 +29,23 @@ use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::providers::ProviderBuilder;
 use alloy::signers::local::PrivateKeySigner;
 use stateset_sequencer::settlement::ISetPaymentBatch;
+
+alloy::sol! {
+    struct PaymentAuthorization {
+        bytes32 intentId;
+        address payer;
+        address payee;
+        address token;
+        uint256 amount;
+        uint64 nonce;
+        uint64 validAfter;
+        uint64 validBefore;
+    }
+    #[sol(rpc)]
+    interface TestToken {
+        function balanceOf(address account) external view returns (uint256);
+    }
+}
 
 fn env3() -> Option<(String, String, String)> {
     Some((
@@ -133,6 +151,20 @@ async fn settle_batch_send_path_settles_batch_and_skips_unauthorized_payment() {
 /// reverts with `BatchAlreadySettled` and this test would fail.
 #[tokio::test]
 async fn settle_batch_is_idempotent_across_a_lost_local_record() {
+    check_lost_record_replay(false).await;
+}
+
+/// Driven only by the loopback-only disposable EVM harness.
+#[tokio::test]
+async fn funded_settlement_is_replay_safe() {
+    if std::env::var("SEQUENCER_LOCAL_SETTLEMENT_DRILL").as_deref() != Ok("1") {
+        eprintln!("Run scripts/run_settlement_drill.sh for the funded replay drill");
+        return;
+    }
+    check_lost_record_replay(true).await;
+}
+
+async fn check_lost_record_replay(funded: bool) {
     use stateset_sequencer::domain::{
         AgentId, AgentKeyId, StoreId, TenantId, X402Asset, X402IntentStatus, X402Network,
         X402PaymentBatch, X402PaymentIntent,
@@ -143,22 +175,24 @@ async fn settle_batch_is_idempotent_across_a_lost_local_record() {
     let (rpc_url, pb_addr, key) = match env3() {
         Some(v) => v,
         None => {
+            assert!(!funded, "funded drill requires settlement configuration");
             eprintln!("settlement env not set; skipping on-chain idempotency test");
             return;
         }
     };
 
-    let service = SettlementService::new(SettlementConfig {
+    let service_config = SettlementConfig {
         rpc_url: rpc_url.clone(),
         contract_address: Address::from_str(&pb_addr).expect("valid contract address"),
         private_key: key.clone(),
         chain_id: 31337,
-    });
+    };
+    let service = SettlementService::new(service_config.clone());
 
     let tenant_id = TenantId::new();
     let store_id = StoreId::new();
     let now = chrono::Utc::now();
-    let intent = X402PaymentIntent {
+    let mut intent = X402PaymentIntent {
         intent_id: Uuid::new_v4(),
         x402_version: 1,
         status: X402IntentStatus::Batched,
@@ -197,6 +231,68 @@ async fn settle_batch_is_idempotent_across_a_lost_local_record() {
         updated_at: now,
     };
 
+    let probe = ProviderBuilder::new().connect_http(rpc_url.parse().expect("rpc url"));
+    let mut balances = None;
+    if funded {
+        use alloy::{providers::Provider, signers::SignerSync, sol_types::SolStruct};
+        let url: reqwest::Url = rpc_url.parse().unwrap();
+        assert!(
+            matches!(
+                url.host_str(),
+                Some("127.0.0.1") | Some("localhost") | Some("::1")
+            ),
+            "funded tests are loopback-only"
+        );
+        assert_eq!(
+            probe.get_chain_id().await.unwrap(),
+            31337,
+            "funded tests require local chain ID"
+        );
+        let payer: PrivateKeySigner = std::env::var("SETTLEMENT_TEST_PAYER_KEY")
+            .expect("test payer key")
+            .parse()
+            .unwrap();
+        let token: Address = std::env::var("SETTLEMENT_TEST_TOKEN_ADDRESS")
+            .expect("test token")
+            .parse()
+            .unwrap();
+        intent.payer_address = payer.address().to_string();
+        intent.token_address = Some(token.to_string());
+        intent.nonce = u64::from(rand::random::<u32>());
+        let mut id = [0u8; 32];
+        id[..16].copy_from_slice(intent.intent_id.as_bytes());
+        let payee: Address = intent.payee_address.parse().unwrap();
+        let authorization = PaymentAuthorization {
+            intentId: FixedBytes::from(id),
+            payer: payer.address(),
+            payee,
+            token,
+            amount: U256::from(intent.amount),
+            nonce: intent.nonce,
+            validAfter: intent.valid_after,
+            validBefore: intent.valid_until,
+        };
+        let domain = alloy::sol_types::eip712_domain! {
+            name: "SetPaymentBatch", version: "1", chain_id: 31337,
+            verifying_contract: Address::from_str(&pb_addr).unwrap(),
+        };
+        intent.eip712_authorization = Some(
+            payer
+                .sign_hash_sync(&authorization.eip712_signing_hash(&domain))
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        );
+        let contract = TestToken::new(token, probe.clone());
+        balances = Some((
+            token,
+            payer.address(),
+            payee,
+            contract.balanceOf(payer.address()).call().await.unwrap(),
+            contract.balanceOf(payee).call().await.unwrap(),
+        ));
+    }
+
     let mut batch = X402PaymentBatch::new(tenant_id, store_id, X402Network::SetChain);
     batch.add_payment(&intent);
     batch.merkle_root = Some([0x42u8; 32]);
@@ -217,6 +313,13 @@ async fn settle_batch_is_idempotent_across_a_lost_local_record() {
         first.tx_hash, [0u8; 32],
         "first attempt must have a tx hash"
     );
+    if funded {
+        assert_eq!(first.settled_ids, vec![intents[0].intent_id]);
+        assert!(
+            first.failed_ids.is_empty(),
+            "the test must actually transfer funds"
+        );
+    }
 
     // The settler's nonce is the ground truth for "did we send a transaction":
     // even a reverted transaction consumes one. The send-failure fallback in
@@ -224,7 +327,6 @@ async fn settle_batch_is_idempotent_across_a_lost_local_record() {
     // would pass with the pre-check removed -- after burning a mined revert
     // and two minutes of retries. The nonce must not move.
     let signer = PrivateKeySigner::from_str(key.trim_start_matches("0x")).expect("key");
-    let probe = ProviderBuilder::new().connect_http(rpc_url.parse().expect("rpc url"));
     let nonce_before = alloy::providers::Provider::get_transaction_count(&probe, signer.address())
         .await
         .expect("nonce");
@@ -239,7 +341,8 @@ async fn settle_batch_is_idempotent_across_a_lost_local_record() {
     // reconciles -- same answer, ~150s later, with the settlement worker's
     // entire tick (and every batch queued behind this one) stalled meanwhile.
     let started = std::time::Instant::now();
-    let second = service
+    let recovered_service = SettlementService::new(service_config);
+    let second = recovered_service
         .settle_batch(&batch, &intents)
         .await
         .expect("second attempt must reconcile, not fail");
@@ -260,6 +363,7 @@ async fn settle_batch_is_idempotent_across_a_lost_local_record() {
         second.failed_ids, first.failed_ids,
         "reconciled per-payment outcome must match the original"
     );
+    assert_eq!(second.settled_ids, first.settled_ids);
     let nonce_after = alloy::providers::Provider::get_transaction_count(&probe, signer.address())
         .await
         .expect("nonce");
@@ -267,4 +371,86 @@ async fn settle_batch_is_idempotent_across_a_lost_local_record() {
         nonce_after, nonce_before,
         "reconciliation must not submit any transaction, not even a reverting one"
     );
+    if let Some((token, payer, payee, payer_before, payee_before)) = balances {
+        let contract = TestToken::new(token, probe.clone());
+        let amount = U256::from(intents[0].amount);
+        assert_eq!(
+            contract.balanceOf(payer).call().await.unwrap(),
+            payer_before - amount
+        );
+        assert_eq!(
+            contract.balanceOf(payee).call().await.unwrap(),
+            payee_before + amount
+        );
+
+        // Bypass the service's pre-check, as a stale worker could. Force a
+        // mined transaction rather than allowing gas estimation to reject it.
+        let mut batch_bytes = [0u8; 32];
+        batch_bytes[..16].copy_from_slice(batch.batch_id.as_bytes());
+        let mut intent_bytes = [0u8; 32];
+        intent_bytes[..16].copy_from_slice(intents[0].intent_id.as_bytes());
+        let stale_provider = ProviderBuilder::new()
+            .wallet(alloy::network::EthereumWallet::from(signer))
+            .connect_http(rpc_url.parse().unwrap());
+        let destination =
+            ISetPaymentBatch::new(Address::from_str(&pb_addr).unwrap(), stale_provider);
+        let batch_id = FixedBytes::from(batch_bytes);
+        let recorded = destination.getBatch(batch_id).call().await.unwrap();
+        let duplicate_payment = ISetPaymentBatch::PaymentIntent {
+            intentId: FixedBytes::from(intent_bytes),
+            payer,
+            payee,
+            amount,
+            token,
+            nonce: intents[0].nonce,
+            validAfter: intents[0].valid_after,
+            validUntil: intents[0].valid_until,
+            signingHash: FixedBytes::from(intents[0].signing_hash),
+            authorization: Bytes::from(intents[0].eip712_authorization.clone().unwrap()),
+        };
+        let stale_receipt = destination
+            .settleBatch(
+                batch_id,
+                recorded.merkleRoot,
+                recorded.tenantStoreKey,
+                recorded.sequenceStart,
+                recorded.sequenceEnd,
+                vec![duplicate_payment],
+            )
+            .gas(500_000)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        assert!(
+            !stale_receipt.status(),
+            "destination must revert a stale duplicate batch"
+        );
+        assert_eq!(
+            contract.balanceOf(payer).call().await.unwrap(),
+            payer_before - amount
+        );
+        assert_eq!(
+            contract.balanceOf(payee).call().await.unwrap(),
+            payee_before + amount
+        );
+
+        // A second batch can bypass batch-ID deduplication but not the
+        // destination's per-intent replay protection. No second transfer.
+        let mut other_batch = batch.clone();
+        other_batch.batch_id = Uuid::new_v4();
+        let duplicate = service.settle_batch(&other_batch, &intents).await.unwrap();
+        assert!(!duplicate.already_settled);
+        assert_eq!(
+            contract.balanceOf(payer).call().await.unwrap(),
+            payer_before - amount
+        );
+        assert_eq!(
+            contract.balanceOf(payee).call().await.unwrap(),
+            payee_before + amount
+        );
+        println!("FUNDED_REPLAY_VERIFIED: one transfer; fresh-service retry sent no transaction; stale duplicate batch reverted on-chain; duplicate intent under a new batch moved no funds");
+    }
 }

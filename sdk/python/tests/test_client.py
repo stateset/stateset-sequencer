@@ -15,7 +15,47 @@ from stateset_sequencer import (
     compute_payload_plain_hash,
     create_async_tool_executor,
     create_tool_executor,
+    verify_inclusion_proof_locally,
 )
+
+
+def test_offline_inclusion_binds_trusted_root_leaf_and_position():
+    root = "5186fbc7094f70b9fc71bcf269fda0530c1c2bd675de918ef39562a6f18752fd"
+    leaf, sibling = "01" * 32, "02" * 32
+    proof = {
+        "merkle_root": root,
+        "leaf_hash": leaf,
+        "leaf_index": 0,
+        "proof_path": [sibling],
+        "directions": [True],
+    }
+    assert verify_inclusion_proof_locally(proof, root, leaf)
+    assert verify_inclusion_proof_locally(
+        {
+            **proof,
+            "leaf_hash": sibling,
+            "leaf_index": 1,
+            "proof_path": [leaf],
+            "directions": [False],
+        },
+        root,
+        sibling,
+    )
+    for change in [
+        {"directions": [False]},
+        {"directions": []},
+        {"leaf_index": 2},
+        {"directions": [1]},
+        {"leaf_index": True},
+        {"proof_path": [leaf]},
+        {"leaf_hash": sibling},
+        {"merkle_root": leaf},
+        {"proof_path": [sibling] * 65, "directions": [True] * 65},
+    ]:
+        assert not verify_inclusion_proof_locally({**proof, **change}, root, leaf)
+    assert not verify_inclusion_proof_locally(proof, sibling, leaf)
+    assert not verify_inclusion_proof_locally(proof, root, sibling)
+
 
 IDS = {
     "tenant_id": "64527dd3-a654-4410-9327-e58a1492ce77",
@@ -36,6 +76,41 @@ def options(**extra):
         "max_retries": 0,
         **extra,
     }
+
+
+def test_v2_execution_control_vector_and_mutations():
+    identity = "11111111-1111-4111-8111-111111111111"
+    params = {
+        "ves_version": 2,
+        "tenant_id": identity,
+        "store_id": identity,
+        "event_id": identity,
+        "source_agent_id": identity,
+        "agent_key_id": 1,
+        "entity_type": "order",
+        "entity_id": "o1",
+        "event_type": "order.created",
+        "created_at": "2026-09-05T00:00:00Z",
+        "payload_kind": 0,
+        "payload_plain_hash": bytes(32),
+        "payload_cipher_hash": bytes(32),
+        "command_id": identity,
+        "base_version": 0,
+    }
+    original = compute_event_signing_hash(**params)
+    assert (
+        original.hex()
+        == "27dee9ebd0747eafc2b08121f144343627dfe1829a06f818eb23f0c50e048cc5"
+    )
+    for change in [
+        {"base_version": None},
+        {"base_version": 1},
+        {"command_id": None},
+        {"ves_version": 1},
+    ]:
+        assert compute_event_signing_hash(**(params | change)) != original
+    with pytest.raises(ValueError, match="safe integer"):
+        compute_event_signing_hash(**(params | {"base_version": 2**53}))
 
 
 def test_signing_hash_matches_rust_and_node_vector():
@@ -108,7 +183,9 @@ def test_record_action_signs_and_authenticates_ingest():
     )
     event = result["event"]
     signing_hash = compute_event_signing_hash(
-        ves_version=1,
+        ves_version=event["ves_version"],
+        command_id=event.get("command_id"),
+        base_version=event.get("base_version"),
         tenant_id=IDS["tenant_id"],
         store_id=IDS["store_id"],
         event_id=IDS["event_id"],

@@ -27,8 +27,56 @@ export class SequencerApiError extends Error {
   }
 }
 
+/** Verify membership against independently trusted hashes, without HTTP calls. */
+export function verifyInclusionProofLocally(proof, expectedRoot, expectedLeaf) {
+  try {
+    const decode = (value) => {
+      if (typeof value !== 'string' || !/^(0x)?[a-fA-F0-9]{64}$/.test(value)) {
+        throw new TypeError('Expected a 32-byte hexadecimal hash');
+      }
+      return hexToBytes(value.replace(/^0x/, ''));
+    };
+    const root = bytesToHex(decode(expectedRoot));
+    let current = decode(expectedLeaf);
+    if (bytesToHex(decode(proof.leaf_hash)) !== bytesToHex(current) ||
+        bytesToHex(decode(proof.merkle_root)) !== root) return false;
+    if (!Number.isSafeInteger(proof.leaf_index) || proof.leaf_index < 0 ||
+        !Array.isArray(proof.proof_path) || proof.proof_path.length > 64 ||
+        !Array.isArray(proof.directions) || proof.directions.length !== proof.proof_path.length) return false;
+    let index = BigInt(proof.leaf_index);
+    for (let i = 0; i < proof.proof_path.length; i += 1) {
+      const left = index % 2n === 0n;
+      if (proof.directions[i] !== left) return false;
+      const sibling = decode(proof.proof_path[i]);
+      current = sha256(concatBytes(encoder.encode('VES_NODE_V1'),
+        ...(left ? [current, sibling] : [sibling, current])));
+      index /= 2n;
+    }
+    return index === 0n && bytesToHex(current) === root;
+  } catch {
+    return false;
+  }
+}
+
 /** RFC 8785-compatible JSON serialization for JSON-domain values. */
 export function canonicalizeJson(value) {
+  return canonicalizeValue(value, new Set());
+}
+
+function validateUnicode(value) {
+  for (let i = 0; i < value.length; i += 1) {
+    const code = value.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(++i);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) throw new TypeError('Unpaired Unicode surrogate');
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new TypeError('Unpaired Unicode surrogate');
+    }
+  }
+}
+
+function canonicalizeValue(value, ancestors) {
+  if (typeof value === 'string') validateUnicode(value);
   if (value === null || typeof value === 'boolean' || typeof value === 'string') {
     return JSON.stringify(value);
   }
@@ -36,14 +84,37 @@ export function canonicalizeJson(value) {
     if (!Number.isFinite(value)) throw new TypeError('JSON numbers must be finite');
     return JSON.stringify(value);
   }
-  if (Array.isArray(value)) {
-    return `[${value.map(canonicalizeJson).join(',')}]`;
-  }
   if (typeof value === 'object') {
-    return `{${Object.keys(value)
-      .sort()
-      .map((key) => `${JSON.stringify(key)}:${canonicalizeJson(value[key])}`)
-      .join(',')}}`;
+    if (ancestors.has(value)) throw new TypeError('Circular JSON value');
+    ancestors.add(value);
+    try {
+      if (Array.isArray(value)) {
+        const elements = [];
+        for (let i = 0; i < value.length; i += 1) {
+          if (!Object.hasOwn(value, i)) throw new TypeError('Sparse arrays are not JSON values');
+          const descriptor = Object.getOwnPropertyDescriptor(value, i);
+          if (!Object.hasOwn(descriptor, 'value')) throw new TypeError('JSON accessors are not supported');
+          elements.push(canonicalizeValue(descriptor.value, ancestors));
+        }
+        return `[${elements.join(',')}]`;
+      }
+      const prototype = Object.getPrototypeOf(value);
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw new TypeError('Only plain JSON objects are supported');
+      }
+      const toJSON = Object.getOwnPropertyDescriptor(value, 'toJSON');
+      if (toJSON && (!Object.hasOwn(toJSON, 'value') || typeof toJSON.value === 'function')) {
+        throw new TypeError('Custom JSON serialization is not supported');
+      }
+      return `{${Object.keys(value).sort().map((key) => {
+        validateUnicode(key);
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!Object.hasOwn(descriptor, 'value')) throw new TypeError('JSON accessors are not supported');
+        return `${JSON.stringify(key)}:${canonicalizeValue(descriptor.value, ancestors)}`;
+      }).join(',')}}`;
+    } finally {
+      ancestors.delete(value);
+    }
   }
   throw new TypeError(`Unsupported JSON value: ${typeof value}`);
 }
@@ -53,7 +124,8 @@ export function computePayloadPlainHash(payload) {
 }
 
 export function computeEventSigningHash(params) {
-  return sha256(
+  if (![1, 2].includes(params.vesVersion)) throw new TypeError('Unsupported signing version');
+  const hash = sha256(
     concatBytes(
       DOMAIN_EVENTSIG,
       u32be(params.vesVersion),
@@ -71,6 +143,19 @@ export function computeEventSigningHash(params) {
       params.payloadCipherHash,
     ),
   );
+  if (params.vesVersion === 1) return hash;
+  let base = new Uint8Array([0]);
+  if (params.baseVersion !== undefined && params.baseVersion !== null) {
+    if (!Number.isSafeInteger(params.baseVersion) || params.baseVersion < 0) {
+      throw new TypeError('baseVersion must be a non-negative safe integer');
+    }
+    base = new Uint8Array(9);
+    base[0] = 1;
+    new DataView(base.buffer).setBigUint64(1, BigInt(params.baseVersion), false);
+  }
+  const command = params.commandId == null ? new Uint8Array([0])
+    : concatBytes(new Uint8Array([1]), uuidBytes(params.commandId));
+  return sha256(concatBytes(encoder.encode('VES_EVENTSIG_V2'), hash, command, base));
 }
 
 export class VesClient {
@@ -88,6 +173,8 @@ export class VesClient {
     this.storeId = options.storeId;
     this.agentId = options.agentId;
     this.keyId = options.keyId ?? 1;
+    this.signingVersion = options.signingVersion ?? 2;
+    if (![1, 2].includes(this.signingVersion)) throw new TypeError('Unsupported signing version');
     if (!Number.isSafeInteger(this.keyId) || this.keyId < 0 || this.keyId > 0xffffffff) {
       throw new TypeError('keyId must be an unsigned 32-bit integer');
     }
@@ -108,7 +195,9 @@ export class VesClient {
     const createdAt = params.createdAt || new Date().toISOString();
     const payloadPlainHash = computePayloadPlainHash(params.payload);
     const signingHash = computeEventSigningHash({
-      vesVersion: 1,
+      vesVersion: this.signingVersion,
+      commandId: params.commandId,
+      baseVersion: params.baseVersion,
       tenantId: this.tenantId,
       storeId: this.storeId,
       eventId,
@@ -125,7 +214,7 @@ export class VesClient {
     const signature = await ed.signAsync(signingHash, this.privateKey);
 
     return compactObject({
-      ves_version: 1,
+      ves_version: this.signingVersion,
       event_id: eventId,
       tenant_id: this.tenantId,
       store_id: this.storeId,

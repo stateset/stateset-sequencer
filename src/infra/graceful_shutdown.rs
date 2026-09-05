@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::{broadcast, watch, Notify};
+use tokio::sync::{broadcast, watch};
 use tracing::{info, warn};
 
 /// Shutdown signal that can be cloned and shared
@@ -18,8 +18,6 @@ use tracing::{info, warn};
 pub struct ShutdownSignal {
     /// Whether shutdown has been initiated
     shutdown: Arc<AtomicBool>,
-    /// Notification for shutdown
-    notify: Arc<Notify>,
     /// Watch channel for shutdown state
     watch_rx: watch::Receiver<bool>,
 }
@@ -32,15 +30,18 @@ impl ShutdownSignal {
 
     /// Wait for shutdown signal
     pub async fn wait(&self) {
+        // Subscribe before checking the flag: a Notify waiter registered after
+        // notify_waiters() could otherwise miss shutdown permanently.
+        let mut receiver = self.watch_rx.clone();
         if self.is_shutdown() {
             return;
         }
-        self.notify.notified().await;
+        let _ = receiver.wait_for(|shutdown| *shutdown).await;
     }
 
     /// Get a future that completes when shutdown is signaled
     pub async fn recv(&mut self) {
-        let _ = self.watch_rx.changed().await;
+        self.wait().await;
     }
 }
 
@@ -111,8 +112,6 @@ impl<'a> Drop for RequestGuard<'a> {
 pub struct ShutdownCoordinator {
     /// Whether shutdown has been initiated
     shutdown: Arc<AtomicBool>,
-    /// Notification for shutdown
-    notify: Arc<Notify>,
     /// Watch channel sender
     watch_tx: watch::Sender<bool>,
     /// Broadcast channel for shutdown
@@ -131,7 +130,6 @@ impl ShutdownCoordinator {
 
         Self {
             shutdown: Arc::new(AtomicBool::new(false)),
-            notify: Arc::new(Notify::new()),
             watch_tx,
             broadcast_tx,
             request_tracker: Arc::new(RequestTracker::new()),
@@ -143,7 +141,6 @@ impl ShutdownCoordinator {
     pub fn signal(&self) -> ShutdownSignal {
         ShutdownSignal {
             shutdown: self.shutdown.clone(),
-            notify: self.notify.clone(),
             watch_rx: self.watch_tx.subscribe(),
         }
     }
@@ -177,8 +174,7 @@ impl ShutdownCoordinator {
         info!("Initiating graceful shutdown...");
 
         // Notify all waiters
-        self.notify.notify_waiters();
-        let _ = self.watch_tx.send(true);
+        self.watch_tx.send_replace(true);
         let _ = self.broadcast_tx.send(());
 
         // Run shutdown hooks
@@ -333,6 +329,28 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_waiters_and_late_subscribers_complete() {
+        let coordinator = ShutdownCoordinator::new();
+        let mut tasks = Vec::new();
+        for _ in 0..64 {
+            let signal = coordinator.signal();
+            tasks.push(tokio::spawn(async move { signal.wait().await }));
+        }
+        coordinator.shutdown().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let mut late = coordinator.signal();
+            late.wait().await;
+            late.recv().await;
+            late.recv().await;
+        })
+        .await
+        .expect("shutdown must be sticky for every subscriber");
+    }
 
     #[tokio::test]
     async fn test_shutdown_signal() {
