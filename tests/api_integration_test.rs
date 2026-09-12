@@ -2511,13 +2511,15 @@ async fn test_cross_tenant_event_list_denied() {
 // Signed Agent Key Directory Tests
 // ============================================================================
 
-/// A minimal Ed25519 receipt-signing configuration.
+/// A minimal Ed25519 receipt-signing configuration built from a caller-held key.
 ///
 /// `create_test_state` deliberately leaves `signing_config` unset so that the
 /// fail-closed path can be exercised; these directory tests opt in explicitly.
-fn test_sequencer_signing_config() -> SequencerSigningConfig {
+/// The key is passed in rather than generated here so a test can keep it and
+/// verify the directory signature the way a real client would.
+fn test_sequencer_signing_config(ed25519_key: &AgentSigningKey) -> SequencerSigningConfig {
     SequencerSigningConfig {
-        ed25519_key: Some(AgentSigningKey::generate()),
+        ed25519_key: Some(ed25519_key.clone()),
         #[cfg(feature = "pqc")]
         ml_dsa_65_seed: None,
         receipt_scheme: SignatureScheme::Ed25519,
@@ -2525,13 +2527,18 @@ fn test_sequencer_signing_config() -> SequencerSigningConfig {
 }
 
 /// Application state whose sequencer can sign the key directory.
-async fn create_test_state_with_signing_key(pool: sqlx::PgPool) -> AppState {
+///
+/// Returns the sequencer's signing key alongside the state so that a test can
+/// verify the emitted `directorySignature`.
+async fn create_test_state_with_signing_key(pool: sqlx::PgPool) -> (AppState, AgentSigningKey) {
+    let signing_key = AgentSigningKey::generate();
     let mut state = create_test_state(pool.clone()).await;
     let registry = state.agent_key_registry.clone();
     state.ves_sequencer = Arc::new(
-        VesSequencer::new(pool, registry).with_signing_config(test_sequencer_signing_config()),
+        VesSequencer::new(pool, registry)
+            .with_signing_config(test_sequencer_signing_config(&signing_key)),
     );
-    state
+    (state, signing_key)
 }
 
 fn signing_keys_uri(agent_id: Uuid, tenant_id: Uuid) -> String {
@@ -2554,7 +2561,7 @@ async fn test_signing_key_directory_readable_by_tenant_peer() {
     let author = Uuid::new_v4();
     let peer = Uuid::new_v4();
 
-    let state = create_test_state_with_signing_key(pool).await;
+    let (state, _sequencer_key) = create_test_state_with_signing_key(pool).await;
     state
         .agent_key_registry
         .register_key(
@@ -2613,7 +2620,7 @@ async fn test_signing_key_directory_refuses_cross_tenant_reads() {
     let other_tenant = Uuid::new_v4();
     let author = Uuid::new_v4();
 
-    let state = create_test_state_with_signing_key(pool).await;
+    let (state, _sequencer_key) = create_test_state_with_signing_key(pool).await;
     state
         .agent_key_registry
         .register_key(
@@ -2662,7 +2669,7 @@ async fn test_signing_key_directory_includes_revoked_and_expired_keys() {
     let tenant_id = Uuid::new_v4();
     let author = Uuid::new_v4();
 
-    let state = create_test_state_with_signing_key(pool).await;
+    let (state, _sequencer_key) = create_test_state_with_signing_key(pool).await;
     let registry = state.agent_key_registry.clone();
 
     let lookup = |key_id: u32| AgentKeyLookup {
@@ -2813,7 +2820,7 @@ async fn test_signing_key_directory_refuses_cross_tenant_admin() {
     let other_tenant = Uuid::new_v4();
     let author = Uuid::new_v4();
 
-    let state = create_test_state_with_signing_key(pool).await;
+    let (state, _sequencer_key) = create_test_state_with_signing_key(pool).await;
     state
         .agent_key_registry
         .register_key(
@@ -2845,5 +2852,123 @@ async fn test_signing_key_directory_refuses_cross_tenant_admin() {
         StatusCode::FORBIDDEN,
         "an admin scoped to another tenant must not read this tenant's keys: {:?}",
         body
+    );
+}
+
+/// The contract Task 5 (and any cross-language client) depends on:
+///
+/// ```text
+/// keydir_hash = SHA256( b"VES_KEYDIR_V1" || JCS(response minus directorySignature) )
+/// ```
+///
+/// verified against the sequencer's Ed25519 public key. This test is what keeps
+/// the signed preimage and the served response from drifting apart: if a field
+/// is ever added to the response but not to the signed body, the reconstructed
+/// preimage stops matching and this fails.
+#[tokio::test]
+#[ignore]
+async fn test_signing_key_directory_signature_verifies() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let author = Uuid::new_v4();
+    let peer = Uuid::new_v4();
+
+    let (state, sequencer_key) = create_test_state_with_signing_key(pool).await;
+    let registry = state.agent_key_registry.clone();
+
+    let lookup = |key_id: u32| AgentKeyLookup {
+        tenant_id,
+        agent_id: author,
+        key_id,
+    };
+    registry
+        .register_key(&lookup(1), AgentKeyEntry::new([3u8; 32]))
+        .await
+        .unwrap();
+    let mut second = AgentKeyEntry::new([4u8; 32]);
+    second.valid_from = Some(chrono::Utc::now() - chrono::Duration::days(2));
+    second.valid_to = Some(chrono::Utc::now() + chrono::Duration::days(2));
+    registry.register_key(&lookup(2), second).await.unwrap();
+
+    let (app, peer_key) = create_tenant_scoped_router(state, tenant_id, vec![], Some(peer));
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &signing_keys_uri(author, tenant_id),
+        None,
+        Some(&peer_key),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "peer read denied: {:?}", body);
+
+    // The wire contract: exactly these five top-level fields, no more, no less.
+    // A field added to the response but left out of the signed body would show
+    // up here first.
+    let mut field_names: Vec<&str> = body
+        .as_object()
+        .expect("response must be a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    field_names.sort_unstable();
+    assert_eq!(
+        field_names,
+        vec![
+            "agentId",
+            "directorySignature",
+            "keys",
+            "signedAt",
+            "tenantId"
+        ],
+        "the served field set changed: {:?}",
+        body
+    );
+
+    // Reconstruct the preimage exactly as a client would: the response with the
+    // signature removed, canonicalized per RFC 8785.
+    let mut preimage = body.clone();
+    let signature_value = preimage
+        .as_object_mut()
+        .unwrap()
+        .remove("directorySignature")
+        .expect("response must carry a directorySignature");
+    let signature_hex = signature_value.as_str().unwrap();
+    let signature_bytes = hex::decode(signature_hex.strip_prefix("0x").unwrap()).unwrap();
+    let signature: [u8; 64] = signature_bytes
+        .as_slice()
+        .try_into()
+        .expect("an Ed25519 directory signature must be 64 bytes");
+
+    let canonical = stateset_sequencer::crypto::canonicalize_json(&preimage);
+    let hash = stateset_sequencer::crypto::compute_key_directory_hash(canonical.as_bytes());
+
+    sequencer_key
+        .public_key()
+        .verify(&hash, &signature)
+        .expect("the directory signature must verify against the sequencer public key");
+
+    // And the signature must actually bind the contents: tampering with a
+    // served public key must break verification, or the directory guarantees
+    // nothing.
+    let mut tampered = preimage.clone();
+    tampered["keys"][0]["publicKey"] = serde_json::Value::String(format!("0x{}", "ff".repeat(32)));
+    let tampered_canonical = stateset_sequencer::crypto::canonicalize_json(&tampered);
+    let tampered_hash =
+        stateset_sequencer::crypto::compute_key_directory_hash(tampered_canonical.as_bytes());
+    assert!(
+        sequencer_key
+            .public_key()
+            .verify(&tampered_hash, &signature)
+            .is_err(),
+        "a tampered key directory must not verify"
     );
 }

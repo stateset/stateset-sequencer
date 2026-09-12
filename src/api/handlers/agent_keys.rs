@@ -7,9 +7,10 @@ use chrono::Utc;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
-use crate::api::auth_helpers::{ensure_admin, ensure_tenant_store};
+use crate::api::auth_helpers::{ensure_admin, ensure_read};
 use crate::api::types::{
-    AgentSigningKeyEntry, AgentSigningKeysQuery, AgentSigningKeysResponse, RegisterAgentKeyRequest,
+    AgentSigningKeyEntry, AgentSigningKeysBody, AgentSigningKeysQuery, AgentSigningKeysResponse,
+    RegisterAgentKeyRequest,
 };
 use crate::api::utils::internal_error;
 use crate::auth::{AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, AuthContextExt};
@@ -255,12 +256,15 @@ pub async fn list_agent_signing_keys(
 ) -> Result<Json<AgentSigningKeysResponse>, (StatusCode, String)> {
     // Tenant membership, not self-or-admin: peers must read each other's keys.
     //
-    // `ensure_tenant_store` is the crate-wide convention and waives the tenant
-    // check only for the bootstrap admin (admin permissions AND a nil tenant).
-    // A hand-rolled `!auth.is_admin()` escape hatch would let a tenant-scoped
-    // admin read another tenant's directory, since `is_admin()` is only the
-    // permission bit and carries no tenant.
-    ensure_tenant_store(&auth, query.tenant_id, Uuid::nil())?;
+    // `ensure_read` is the crate-wide convention for a tenant-scoped,
+    // store-agnostic read (see `schemas::list_schemas`): it checks the read bit
+    // and waives the tenant check only for the bootstrap admin (admin
+    // permissions AND a nil tenant). A hand-rolled `!auth.is_admin()` escape
+    // hatch would let a tenant-scoped admin read another tenant's directory,
+    // since `is_admin()` is only the permission bit and carries no tenant.
+    // The nil store id is deliberate: a key directory is agent-scoped, so a
+    // store-restricted key inside the tenant must still be able to read it.
+    ensure_read(&auth, query.tenant_id, Uuid::nil())?;
 
     // Fail closed: an unsigned key directory invites clients to trust key
     // material with no provenance, which is worse than having no directory.
@@ -293,14 +297,16 @@ pub async fn list_agent_signing_keys(
     // Deterministic order so the signed preimage is reproducible.
     keys.sort_by_key(|k| k.key_id);
 
-    let signed_at = Utc::now();
-    let body = serde_json::json!({
-        "agentId": agent_id,
-        "tenantId": query.tenant_id,
-        "keys": &keys,
-        "signedAt": signed_at,
-    });
-    let canonical = canonicalize_json(&body);
+    // Sign the response body itself, not a restatement of it: the preimage is
+    // `serde_json::to_value` of the very struct that is served, so the two
+    // cannot drift.
+    let body = AgentSigningKeysBody {
+        agent_id,
+        tenant_id: query.tenant_id,
+        keys,
+        signed_at: Utc::now(),
+    };
+    let canonical = canonicalize_json(&serde_json::to_value(&body).map_err(internal_error)?);
     let hash = compute_key_directory_hash(canonical.as_bytes());
     let (_scheme, signature, _bundle) =
         signing_config.sign_receipt(&hash).map_err(internal_error)?;
@@ -318,10 +324,7 @@ pub async fn list_agent_signing_keys(
     }
 
     Ok(Json(AgentSigningKeysResponse {
-        agent_id,
-        tenant_id: query.tenant_id,
-        keys,
-        signed_at,
+        body,
         directory_signature: format!("0x{}", hex::encode(signature)),
     }))
 }
