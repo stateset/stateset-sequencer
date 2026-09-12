@@ -7,7 +7,7 @@ use chrono::Utc;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
-use crate::api::auth_helpers::ensure_admin;
+use crate::api::auth_helpers::{ensure_admin, ensure_tenant_store};
 use crate::api::types::{
     AgentSigningKeyEntry, AgentSigningKeysQuery, AgentSigningKeysResponse, RegisterAgentKeyRequest,
 };
@@ -254,9 +254,13 @@ pub async fn list_agent_signing_keys(
     Query(query): Query<AgentSigningKeysQuery>,
 ) -> Result<Json<AgentSigningKeysResponse>, (StatusCode, String)> {
     // Tenant membership, not self-or-admin: peers must read each other's keys.
-    if auth.tenant_id != query.tenant_id && !auth.is_admin() {
-        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
-    }
+    //
+    // `ensure_tenant_store` is the crate-wide convention and waives the tenant
+    // check only for the bootstrap admin (admin permissions AND a nil tenant).
+    // A hand-rolled `!auth.is_admin()` escape hatch would let a tenant-scoped
+    // admin read another tenant's directory, since `is_admin()` is only the
+    // permission bit and carries no tenant.
+    ensure_tenant_store(&auth, query.tenant_id, Uuid::nil())?;
 
     // Fail closed: an unsigned key directory invites clients to trust key
     // material with no provenance, which is worse than having no directory.

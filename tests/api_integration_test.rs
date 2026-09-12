@@ -2754,3 +2754,96 @@ async fn test_signing_key_directory_unavailable_without_signing_key() {
         body
     );
 }
+
+/// A router whose only credential is an **admin** key scoped to `tenant_id`.
+///
+/// `create_tenant_scoped_router` mints `read_write` keys, so it cannot express
+/// the "admin of some *other* tenant" principal. `AuthContext::is_admin()` is
+/// only the permission bit and carries no tenant, so admin permissions alone
+/// must not cross a tenant boundary — only the bootstrap admin (nil tenant) may.
+fn create_tenant_admin_router(state: AppState, tenant_id: Uuid) -> (axum::Router<()>, String) {
+    let api_key_validator = Arc::new(ApiKeyValidator::new());
+
+    let test_key = format!("ss_test_tenant_admin_{}_{}", tenant_id, Uuid::new_v4());
+    let key_hash = ApiKeyValidator::hash_key(&test_key);
+    api_key_validator.register_key(ApiKeyRecord {
+        key_hash,
+        tenant_id,
+        store_ids: vec![],
+        permissions: Permissions::admin(),
+        agent_id: None,
+        active: true,
+        rate_limit: None,
+    });
+
+    let authenticator = Arc::new(Authenticator::new(api_key_validator));
+    let auth_state = AuthMiddlewareState {
+        authenticator,
+        require_auth: true,
+        rate_limiter: None,
+        credential_rate_limiter: Arc::new(RateLimiter::new(1000)),
+        pool_monitor: None,
+    };
+
+    let api = stateset_sequencer::api::router().layer(axum::middleware::from_fn_with_state(
+        auth_state,
+        stateset_sequencer::auth::auth_middleware,
+    ));
+
+    let router = axum::Router::new()
+        .nest("/api", api)
+        .with_state::<()>(state);
+
+    (router, test_key)
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_signing_key_directory_refuses_cross_tenant_admin() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let other_tenant = Uuid::new_v4();
+    let author = Uuid::new_v4();
+
+    let state = create_test_state_with_signing_key(pool).await;
+    state
+        .agent_key_registry
+        .register_key(
+            &AgentKeyLookup {
+                tenant_id,
+                agent_id: author,
+                key_id: 1,
+            },
+            AgentKeyEntry::new([7u8; 32]),
+        )
+        .await
+        .unwrap();
+
+    // Admin *of another tenant*. Only the bootstrap admin (nil tenant) may
+    // cross a tenant boundary; the admin permission bit alone must not.
+    let (app, other_tenant_admin_key) = create_tenant_admin_router(state, other_tenant);
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &signing_keys_uri(author, tenant_id),
+        None,
+        Some(&other_tenant_admin_key),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an admin scoped to another tenant must not read this tenant's keys: {:?}",
+        body
+    );
+}
