@@ -117,6 +117,10 @@ pub fn router() -> Router<AppState> {
         // Agent signing key management
         .route("/v1/agents/keys", post(handlers::register_agent_key))
         .route(
+            "/v1/agents/:agent_id/signing-keys",
+            get(handlers::list_agent_signing_keys),
+        )
+        .route(
             "/v1/agents/:agent_id/policy",
             get(handlers::get_agent_policy),
         )

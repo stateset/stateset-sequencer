@@ -443,6 +443,17 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         &self.security_profile
     }
 
+    /// Access the receipt signing configuration, if one was supplied.
+    ///
+    /// Returns `None` when `VES_SEQUENCER_SIGNING_KEY` is unset. Callers that
+    /// must produce a signature are expected to fail closed rather than emit
+    /// unsigned output.
+    pub const fn signing_config(
+        &self,
+    ) -> Option<&crate::crypto::pqc_signing::SequencerSigningConfig> {
+        self.signing_config.as_ref()
+    }
+
     /// Access policies for administrative API operations.
     pub fn agent_policy_store(&self) -> &PgAgentEventPolicyStore {
         &self.agent_policy_store
@@ -2639,5 +2650,15 @@ mod tests {
         assert!(!VesSequencer::<InMemoryAgentKeyRegistry>::is_exact_replay(
             &existing, &replay
         ));
+    }
+
+    #[tokio::test]
+    async fn signing_config_accessor_reflects_configuration() {
+        let registry = Arc::new(InMemoryAgentKeyRegistry::new());
+        let sequencer = sequencer(registry, false);
+        assert!(
+            sequencer.signing_config().is_none(),
+            "a sequencer with no signing key must report None"
+        );
     }
 }

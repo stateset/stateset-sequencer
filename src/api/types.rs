@@ -1,5 +1,6 @@
 //! Shared request and response types for REST API handlers.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -224,6 +225,55 @@ pub struct ProofOfPossessionBundleRequest {
     pub ed25519_pop: Option<String>,
     /// Hex-encoded ML-DSA-65 proof-of-possession signature.
     pub ml_dsa_65_pop: Option<String>,
+}
+
+/// Query for `GET /api/v1/agents/:agent_id/signing-keys`.
+#[derive(Debug, Deserialize)]
+pub struct AgentSigningKeysQuery {
+    pub tenant_id: Uuid,
+}
+
+/// One registered signing key, as served by the directory.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSigningKeyEntry {
+    pub key_id: u32,
+    pub algorithm: String,
+    pub public_key: String,
+    pub public_key_bundle: Option<serde_json::Value>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// The signed body of a key-directory response.
+///
+/// This struct *is* the signature preimage:
+/// `SHA256(DOMAIN_KEYDIR || JCS(this))`. It exists as a type rather than an
+/// ad-hoc `json!` literal in the handler so that the signed body and the served
+/// response cannot drift apart: [`AgentSigningKeysResponse`] flattens it, so a
+/// field added here is signed and served, and there is no way to add one to the
+/// response that lands outside the signature without deliberately putting it
+/// beside `directory_signature`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSigningKeysBody {
+    pub agent_id: Uuid,
+    pub tenant_id: Uuid,
+    pub keys: Vec<AgentSigningKeyEntry>,
+    pub signed_at: DateTime<Utc>,
+}
+
+/// Signed key-directory response: the signed body plus its signature.
+///
+/// Flattened, so the wire shape is the body's fields alongside
+/// `directorySignature` at the top level.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentSigningKeysResponse {
+    #[serde(flatten)]
+    pub body: AgentSigningKeysBody,
+    pub directory_signature: String,
 }
 
 // ============================================================================
