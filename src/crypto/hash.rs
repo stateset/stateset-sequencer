@@ -55,6 +55,9 @@ pub const DOMAIN_STREAM: &[u8] = b"VES_STREAM_V1";
 /// Domain prefix for sequencer receipt
 pub const DOMAIN_RECEIPT: &[u8] = b"VES_RECEIPT_V1";
 
+/// Domain separator for signed agent key-directory responses.
+pub const DOMAIN_KEYDIR: &[u8] = b"VES_KEYDIR_V1";
+
 /// Domain prefix for commitment-chain state root
 pub const DOMAIN_STATE_ROOT: &[u8] = b"VES_STATE_ROOT_V1";
 
@@ -427,6 +430,21 @@ pub fn compute_receipt_hash(
     hasher.update(event_id.as_bytes());
     hasher.update(u64_be(sequence_number));
     hasher.update(event_signing_hash);
+    hasher.finalize().into()
+}
+
+/// Hash a canonical-JSON key directory body under the keydir domain.
+///
+/// ```text
+/// keydir_hash = SHA256(b"VES_KEYDIR_V1" || JCS(body))
+/// ```
+///
+/// The caller supplies already-canonicalized JSON so the JS client can
+/// reproduce the preimage byte-for-byte with its own `canonicalizeJson`.
+pub fn compute_key_directory_hash(canonical_json: &[u8]) -> Hash256 {
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN_KEYDIR);
+    hasher.update(canonical_json);
     hasher.finalize().into()
 }
 

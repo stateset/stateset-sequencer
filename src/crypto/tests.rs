@@ -788,4 +788,23 @@ mod compatibility_tests {
         assert_eq!(DOMAIN_RECEIPT, b"VES_RECEIPT_V1");
         assert_eq!(DOMAIN_STATE_ROOT, b"VES_STATE_ROOT_V1");
     }
+
+    #[test]
+    fn keydir_domain_tag_is_stable() {
+        assert_eq!(DOMAIN_KEYDIR, b"VES_KEYDIR_V1");
+    }
+
+    #[test]
+    fn key_directory_hash_is_domain_separated() {
+        let body = br#"{"agentId":"a"}"#;
+
+        // The domain prefix must actually participate: hashing the same bytes
+        // without it must not collide.
+        let with_domain = compute_key_directory_hash(body);
+        let plain = sha256(body);
+        assert_ne!(with_domain, plain);
+
+        // And it must be deterministic.
+        assert_eq!(with_domain, compute_key_directory_hash(body));
+    }
 }
