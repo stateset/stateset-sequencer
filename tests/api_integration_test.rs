@@ -21,7 +21,7 @@ use stateset_sequencer::auth::{
     AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, ApiKeyRecord, ApiKeyValidator,
     AuthMiddlewareState, Authenticator, Permissions, RateLimiter, RequestLimits,
 };
-use stateset_sequencer::crypto::AgentSigningKey;
+use stateset_sequencer::crypto::{AgentSigningKey, SequencerSigningConfig, SignatureScheme};
 use stateset_sequencer::domain::{
     AgentId, AgentKeyId, EntityType, EventBatch, EventEnvelope, EventType, StoreId, TenantId,
     VesEventEnvelope,
@@ -2503,6 +2503,254 @@ async fn test_cross_tenant_event_list_denied() {
         status,
         StatusCode::FORBIDDEN,
         "Cross-tenant event listing should be denied: {:?}",
+        body
+    );
+}
+
+// ============================================================================
+// Signed Agent Key Directory Tests
+// ============================================================================
+
+/// A minimal Ed25519 receipt-signing configuration.
+///
+/// `create_test_state` deliberately leaves `signing_config` unset so that the
+/// fail-closed path can be exercised; these directory tests opt in explicitly.
+fn test_sequencer_signing_config() -> SequencerSigningConfig {
+    SequencerSigningConfig {
+        ed25519_key: Some(AgentSigningKey::generate()),
+        #[cfg(feature = "pqc")]
+        ml_dsa_65_seed: None,
+        receipt_scheme: SignatureScheme::Ed25519,
+    }
+}
+
+/// Application state whose sequencer can sign the key directory.
+async fn create_test_state_with_signing_key(pool: sqlx::PgPool) -> AppState {
+    let mut state = create_test_state(pool.clone()).await;
+    let registry = state.agent_key_registry.clone();
+    state.ves_sequencer = Arc::new(
+        VesSequencer::new(pool, registry).with_signing_config(test_sequencer_signing_config()),
+    );
+    state
+}
+
+fn signing_keys_uri(agent_id: Uuid, tenant_id: Uuid) -> String {
+    format!("/api/v1/agents/{agent_id}/signing-keys?tenant_id={tenant_id}")
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_signing_key_directory_readable_by_tenant_peer() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let author = Uuid::new_v4();
+    let peer = Uuid::new_v4();
+
+    let state = create_test_state_with_signing_key(pool).await;
+    state
+        .agent_key_registry
+        .register_key(
+            &AgentKeyLookup {
+                tenant_id,
+                agent_id: author,
+                key_id: 1,
+            },
+            AgentKeyEntry::new([7u8; 32]),
+        )
+        .await
+        .unwrap();
+
+    // A *different* agent in the same tenant must be able to read it —
+    // that is the entire point of the endpoint.
+    let (app, peer_key) = create_tenant_scoped_router(state, tenant_id, vec![], Some(peer));
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &signing_keys_uri(author, tenant_id),
+        None,
+        Some(&peer_key),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "peer read denied: {:?}", body);
+    assert_eq!(body["agentId"], author.to_string());
+    assert_eq!(body["tenantId"], tenant_id.to_string());
+    let keys = body["keys"].as_array().unwrap();
+    assert_eq!(keys.len(), 1, "expected one registered key: {:?}", body);
+    assert_eq!(keys[0]["keyId"], 1);
+    assert!(
+        body["directorySignature"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("0x"),
+        "the response must be signed: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_signing_key_directory_refuses_cross_tenant_reads() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let other_tenant = Uuid::new_v4();
+    let author = Uuid::new_v4();
+
+    let state = create_test_state_with_signing_key(pool).await;
+    state
+        .agent_key_registry
+        .register_key(
+            &AgentKeyLookup {
+                tenant_id,
+                agent_id: author,
+                key_id: 1,
+            },
+            AgentKeyEntry::new([7u8; 32]),
+        )
+        .await
+        .unwrap();
+
+    let (app, outsider_key) =
+        create_tenant_scoped_router(state, other_tenant, vec![], Some(Uuid::new_v4()));
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &signing_keys_uri(author, tenant_id),
+        None,
+        Some(&outsider_key),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "an agent from another tenant must not read this tenant's keys: {:?}",
+        body
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_signing_key_directory_includes_revoked_and_expired_keys() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let author = Uuid::new_v4();
+
+    let state = create_test_state_with_signing_key(pool).await;
+    let registry = state.agent_key_registry.clone();
+
+    let lookup = |key_id: u32| AgentKeyLookup {
+        tenant_id,
+        agent_id: author,
+        key_id,
+    };
+
+    registry
+        .register_key(&lookup(1), AgentKeyEntry::new([1u8; 32]))
+        .await
+        .unwrap();
+
+    let mut expired = AgentKeyEntry::new([2u8; 32]);
+    expired.valid_from = Some(chrono::Utc::now() - chrono::Duration::days(30));
+    expired.valid_to = Some(chrono::Utc::now() - chrono::Duration::days(1));
+    registry.register_key(&lookup(2), expired).await.unwrap();
+
+    registry.revoke_key(&lookup(1)).await.unwrap();
+
+    let app = create_test_router(state, true);
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &signing_keys_uri(author, tenant_id),
+        None,
+        Some("ss_test_integration_key_12345"),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "admin read denied: {:?}", body);
+    let keys = body["keys"].as_array().unwrap();
+    assert_eq!(
+        keys.len(),
+        2,
+        "history must be served, not just active keys: {:?}",
+        body
+    );
+
+    let revoked = keys.iter().find(|k| k["keyId"] == 1).unwrap();
+    assert!(
+        !revoked["revokedAt"].is_null(),
+        "a revoked key must still be served, marked revoked, so historical \
+         events signed by it can be verified: {:?}",
+        revoked
+    );
+
+    let expired = keys.iter().find(|k| k["keyId"] == 2).unwrap();
+    assert!(
+        !expired["validTo"].is_null(),
+        "an expired key must still be served with its validity window so the \
+         client can decide whether an event falls inside it: {:?}",
+        expired
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_signing_key_directory_unavailable_without_signing_key() {
+    let Some(pool) = connect_db().await else {
+        eprintln!("DATABASE_URL not set; skipping");
+        return;
+    };
+
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = Uuid::new_v4();
+    let author = Uuid::new_v4();
+
+    // `create_test_state` leaves the sequencer signing config unset.
+    let state = create_test_state(pool).await;
+    let app = create_test_router(state, true);
+
+    let (status, body) = send_request(
+        &app,
+        Method::GET,
+        &signing_keys_uri(author, tenant_id),
+        None,
+        Some("ss_test_integration_key_12345"),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "an unsigned key directory must not be served at all: {:?}",
         body
     );
 }

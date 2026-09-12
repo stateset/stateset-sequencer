@@ -1,19 +1,23 @@
 //! Agent key management handlers.
 
-use axum::extract::{Extension, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use chrono::Utc;
 use tracing::{info, instrument};
 use uuid::Uuid;
 
 use crate::api::auth_helpers::ensure_admin;
-use crate::api::types::RegisterAgentKeyRequest;
+use crate::api::types::{
+    AgentSigningKeyEntry, AgentSigningKeysQuery, AgentSigningKeysResponse, RegisterAgentKeyRequest,
+};
 use crate::api::utils::internal_error;
 use crate::auth::{AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, AuthContextExt};
 use crate::crypto::pqc_signing::{
     validate_key_algorithm_for_profile, verify_proof_of_possession, KeyAlgorithm,
     ParsedSignatureBundle, PublicKeyBundle,
 };
+use crate::crypto::{canonicalize_json, compute_key_directory_hash, public_key_to_hex};
 use crate::server::AppState;
 
 /// Decode a hex string (with optional "0x" prefix) into bytes.
@@ -233,4 +237,87 @@ pub async fn register_agent_key(
         "keyAlgorithm": request.key_algorithm.unwrap_or(0),
         "message": "Agent key registered successfully"
     })))
+}
+
+/// GET /api/v1/agents/:agent_id/signing-keys - Signed peer key directory.
+///
+/// Readable by any authenticated agent within the same tenant. Serves the
+/// agent's full key history — including revoked and expired keys, each with
+/// its validity window — so that peers can verify events signed by a key that
+/// has since rotated. The client, not the server, decides whether a given
+/// event falls inside its key's window.
+#[instrument(skip(state, auth), fields(tenant_id = %query.tenant_id, agent_id = %agent_id))]
+pub async fn list_agent_signing_keys(
+    State(state): State<AppState>,
+    Extension(AuthContextExt(auth)): Extension<AuthContextExt>,
+    Path(agent_id): Path<Uuid>,
+    Query(query): Query<AgentSigningKeysQuery>,
+) -> Result<Json<AgentSigningKeysResponse>, (StatusCode, String)> {
+    // Tenant membership, not self-or-admin: peers must read each other's keys.
+    if auth.tenant_id != query.tenant_id && !auth.is_admin() {
+        return Err((StatusCode::FORBIDDEN, "Access denied".to_string()));
+    }
+
+    // Fail closed: an unsigned key directory invites clients to trust key
+    // material with no provenance, which is worse than having no directory.
+    let signing_config = state.ves_sequencer.signing_config().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Key directory unavailable: sequencer signing key not configured".to_string(),
+    ))?;
+
+    let entries = state
+        .agent_key_registry
+        .list_agent_keys(&query.tenant_id, &agent_id)
+        .await
+        .map_err(internal_error)?;
+
+    let mut keys: Vec<AgentSigningKeyEntry> = entries
+        .into_iter()
+        .map(|(key_id, entry)| AgentSigningKeyEntry {
+            key_id,
+            algorithm: format!("{:?}", entry.key_algorithm).to_lowercase(),
+            public_key: public_key_to_hex(&entry.public_key),
+            public_key_bundle: entry
+                .public_key_bundle
+                .as_ref()
+                .map(|b| serde_json::to_value(b).unwrap_or(serde_json::Value::Null)),
+            valid_from: entry.valid_from,
+            valid_to: entry.valid_to,
+            revoked_at: entry.revoked_at,
+        })
+        .collect();
+    // Deterministic order so the signed preimage is reproducible.
+    keys.sort_by_key(|k| k.key_id);
+
+    let signed_at = Utc::now();
+    let body = serde_json::json!({
+        "agentId": agent_id,
+        "tenantId": query.tenant_id,
+        "keys": &keys,
+        "signedAt": signed_at,
+    });
+    let canonical = canonicalize_json(&body);
+    let hash = compute_key_directory_hash(canonical.as_bytes());
+    let (_scheme, signature, _bundle) =
+        signing_config.sign_receipt(&hash).map_err(internal_error)?;
+
+    // `sign_receipt` returns an empty legacy signature under the PQC-strict
+    // profile, where the signature lives in the bundle instead. Serving that as
+    // `"0x"` would be an unsigned directory wearing a signature field, so fail
+    // closed here too rather than emit one.
+    if signature.is_empty() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Key directory unavailable: sequencer signing scheme produces no directory signature"
+                .to_string(),
+        ));
+    }
+
+    Ok(Json(AgentSigningKeysResponse {
+        agent_id,
+        tenant_id: query.tenant_id,
+        keys,
+        signed_at,
+        directory_signature: format!("0x{}", hex::encode(signature)),
+    }))
 }
