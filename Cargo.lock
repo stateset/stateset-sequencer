@@ -5759,7 +5759,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stateset-sequencer"
-version = "0.8.6"
+version = "0.9.0"
 dependencies = [
  "aes-gcm",
  "alloy",
@@ -6610,7 +6610,8 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "ves-stark-air"
-version = "0.5.0"
+version = "0.9.0"
+source = "git+https://github.com/stateset/stateset-starks.git?rev=4209d2623750242d680abc21d13f39ab80791c2b#4209d2623750242d680abc21d13f39ab80791c2b"
 dependencies = [
  "serde",
  "thiserror",
@@ -6622,7 +6623,8 @@ dependencies = [
 
 [[package]]
 name = "ves-stark-batch"
-version = "0.5.0"
+version = "0.9.0"
+source = "git+https://github.com/stateset/stateset-starks.git?rev=4209d2623750242d680abc21d13f39ab80791c2b#4209d2623750242d680abc21d13f39ab80791c2b"
 dependencies = [
  "hex",
  "rayon",
@@ -6645,7 +6647,8 @@ dependencies = [
 
 [[package]]
 name = "ves-stark-primitives"
-version = "0.5.0"
+version = "0.9.0"
+source = "git+https://github.com/stateset/stateset-starks.git?rev=4209d2623750242d680abc21d13f39ab80791c2b#4209d2623750242d680abc21d13f39ab80791c2b"
 dependencies = [
  "hex",
  "serde",
@@ -6661,7 +6664,8 @@ dependencies = [
 
 [[package]]
 name = "ves-stark-prover"
-version = "0.5.0"
+version = "0.9.0"
+source = "git+https://github.com/stateset/stateset-starks.git?rev=4209d2623750242d680abc21d13f39ab80791c2b#4209d2623750242d680abc21d13f39ab80791c2b"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.2.16",
@@ -6684,7 +6688,8 @@ dependencies = [
 
 [[package]]
 name = "ves-stark-verifier"
-version = "0.5.0"
+version = "0.9.0"
+source = "git+https://github.com/stateset/stateset-starks.git?rev=4209d2623750242d680abc21d13f39ab80791c2b#4209d2623750242d680abc21d13f39ab80791c2b"
 dependencies = [
  "hex",
  "js-sys",

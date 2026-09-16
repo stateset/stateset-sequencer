@@ -135,3 +135,72 @@ fn lib_denies_unwrap_and_expect_in_production_code() {
         "src/lib.rs must deny clippy::unwrap_used and clippy::expect_used"
     );
 }
+
+/// STARK crates must be pinned git dependencies, never sibling path deps.
+///
+/// Cargo resolves every path dependency even when the feature enabling it is
+/// off, so `ves-stark-* = { path = "../stateset-stark/..." }` once forced a
+/// sibling checkout for *every* build, including `--no-default-features
+/// --features pqc` on a clean checkout. Optional git dependencies are only
+/// fetched when the `stark` feature enables them. The git pin must match
+/// `STARK_REF` in CI so the upgrade stays deliberate and atomic.
+#[test]
+fn stark_deps_are_pinned_git_not_sibling_paths() {
+    let manifest = fs::read_to_string("Cargo.toml").expect("Cargo.toml");
+    // Only active (non-comment) manifest lines matter: prose may mention the
+    // old layout, but no dependency may resolve through it.
+    for line in manifest.lines() {
+        let active = line.split('#').next().unwrap_or("");
+        assert!(
+            !(active.contains("path") && active.contains("stateset-stark")),
+            "Cargo.toml must not path-depend on a stateset-stark checkout; use \
+             pinned git dependencies so pqc-only builds work on a clean checkout: {line}"
+        );
+    }
+
+    let ci = fs::read_to_string(".github/workflows/ci.yml").expect("ci.yml");
+    let stark_ref = ci
+        .lines()
+        .find_map(|l| {
+            let (_, v) = l.trim_start().strip_prefix("STARK_REF:")?.split_once('"')?;
+            v.split('"').next()
+        })
+        .expect("STARK_REF pin in ci.yml");
+
+    let mut git_pins = 0;
+    for line in manifest
+        .lines()
+        .filter(|l| l.trim_start().starts_with("ves-stark-"))
+    {
+        assert!(
+            line.contains("git = \"https://github.com/stateset/stateset-starks.git\""),
+            "each ves-stark-* dep must come from the stateset-starks git repo: {line}"
+        );
+        assert!(
+            line.contains(&format!("rev = \"{stark_ref}\"")),
+            "each ves-stark-* dep must pin rev = STARK_REF ({stark_ref}): {line}"
+        );
+        git_pins += 1;
+    }
+    assert_eq!(git_pins, 4, "expected 4 ves-stark-* deps in Cargo.toml");
+
+    // Path dependencies leave no `source` in the lockfile; git ones must.
+    let lock = fs::read_to_string("Cargo.lock").expect("Cargo.lock");
+    for name in [
+        "ves-stark-verifier",
+        "ves-stark-primitives",
+        "ves-stark-batch",
+        "ves-stark-prover",
+        "ves-stark-air",
+    ] {
+        let entry = lock
+            .split("[[package]]")
+            .find(|e| e.contains(&format!("name = \"{name}\"")))
+            .unwrap_or_else(|| panic!("Cargo.lock must contain {name}"));
+        assert!(
+            entry.contains("source = \"git+https://github.com/stateset/stateset-starks.git")
+                && entry.contains(stark_ref),
+            "Cargo.lock must resolve {name} from the stateset-starks git pin ({stark_ref})"
+        );
+    }
+}

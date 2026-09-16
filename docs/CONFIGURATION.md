@@ -251,11 +251,25 @@ deployments, PostgreSQL advisory-lock election ensures one active worker.
 | `PROJECTION_DISCOVERY_INTERVAL_MS` | `5000` | Interval for discovering new streams |
 | `PROJECTION_DISCOVERY_PAGE_SIZE` | `1000` | Keyset-pagination page size for stream discovery |
 | `PROJECTION_BATCH_SIZE` | `100` | Events read per stream iteration |
-| `PROJECTION_CHECKPOINT_INTERVAL` | `100` | Applied/skipped events between durable checkpoints |
-| `PROJECTION_CONTINUE_ON_ERROR` | `true` | Continue after a handler error (the event is sent to the DLQ) |
+| `PROJECTION_CHECKPOINT_INTERVAL` | `100` | Events between checkpoint updates within a batch; production durability occurs at batch commit |
+| `PROJECTION_CONTINUE_ON_ERROR` | `true` | Legacy nontransactional runners only; production batches always roll back on infrastructure/handler errors |
 | `PROJECTION_MAX_RETRIES` | `3` | Reserved projection retry budget |
 | `PROJECTION_RETRY_DELAY_MS` | `100` | Reserved projection retry delay |
 | `PROJECTION_POLL_INTERVAL_MS` | `100` | Idle poll interval for standalone continuous runners; the production scheduler uses discovery passes |
+
+Production projection batches commit documents, entity versions, rejection/DLQ
+records, and checkpoints in one PostgreSQL transaction. Workers lock a per-ledger,
+per-tenant/store checkpoint row before reading state; competing workers serialize
+and resume from the last committed checkpoint. A failed batch retries on a later
+discovery pass without advancing its checkpoint. Business rejections still commit
+their audit/DLQ records and advance the checkpoint.
+
+Transaction-local safeguards bound lock waits to 2 seconds, statements to 10
+seconds, and idle transactions to 30 seconds. Larger batches hold a stream lock
+longer; tune batch size and concurrency against measured lag and database load.
+External side effects must not be performed inside a domain projector: a database
+rollback cannot undo an external write. Direct standalone adapter users do not
+automatically receive the production worker's transaction boundary.
 
 ## STARK Proof Verification
 

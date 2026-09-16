@@ -14,7 +14,8 @@ use crate::domain::{StoreId, TenantId};
 use crate::infra::{
     EventStore, PgAgentKeyRegistry, PgDeadLetterQueue, PgProjectionCheckpointStore,
     PgProjectionDocumentStore, PgProjectionEventSource, PgProjectionRejectionSink,
-    PgProjectionVersionStore, PgVesProjectionEventSource, SequencerError, VesSequencer,
+    PgProjectionTransaction, PgProjectionVersionStore, PgVesProjectionEventSource, SequencerError,
+    VesSequencer,
 };
 use crate::projection::{
     CheckpointStore, CustomerProjector, EntityVersionStore, EventSource, InventoryProjector,
@@ -142,8 +143,6 @@ pub fn spawn_projection_worker(
     let (control_tx, mut control_rx) = mpsc::channel(1);
 
     let task = tokio::spawn(async move {
-        let rejections = Arc::new(PgProjectionRejectionSink::new(pool.clone()));
-        let dlq = Arc::new(PgDeadLetterQueue::new(pool.clone()));
         let mut runners: HashMap<(String, Uuid, Uuid), Arc<ProjectionRunner>> = HashMap::new();
         let mut tasks = JoinSet::new();
         let mut task_streams = HashMap::new();
@@ -203,27 +202,33 @@ pub fn spawn_projection_worker(
 
                             let tenant_id = TenantId::from_uuid(tenant_uuid);
                             let store_id = StoreId::from_uuid(store_uuid);
+                            let source_reader: Arc<dyn EventSource> = if source == "ves" {
+                                let Some(ves) = ves_sequencer.as_ref() else { continue; };
+                                Arc::new(PgVesProjectionEventSource::new(ves.clone()))
+                            } else {
+                                Arc::new(PgProjectionEventSource::new(event_store.clone()))
+                            };
+                            let transaction = Arc::new(PgProjectionTransaction::new(pool.clone(), source == "ves", source_reader, config.runner.batch_size));
+                            let rejections = Arc::new(PgProjectionRejectionSink::new(pool.clone()).in_transaction(transaction.clone()));
+                            let dlq = Arc::new(PgDeadLetterQueue::new(pool.clone()).with_enqueue_transaction(transaction.clone()));
                             let (event_source, checkpoints, versions, documents): ProjectionStores =
                                 if source == "ves" {
-                                let Some(ves) = ves_sequencer.as_ref() else {
-                                    continue;
-                                };
                                 (
-                                    Arc::new(PgVesProjectionEventSource::new(ves.clone())),
-                                    Arc::new(PgProjectionCheckpointStore::new_ves(pool.clone())),
-                                    Arc::new(PgProjectionVersionStore::new_ves(pool.clone())),
+                                    transaction.clone(),
+                                    Arc::new(PgProjectionCheckpointStore::new_ves(pool.clone()).in_transaction(transaction.clone())),
+                                    Arc::new(PgProjectionVersionStore::new_ves(pool.clone()).in_transaction(transaction.clone())),
                                     Arc::new(PgProjectionDocumentStore::new_ves(
                                         pool.clone(), tenant_id, store_id,
-                                    )),
+                                    ).in_transaction(transaction.clone())),
                                 )
                             } else {
                                 (
-                                    Arc::new(PgProjectionEventSource::new(event_store.clone())),
-                                    Arc::new(PgProjectionCheckpointStore::new(pool.clone())),
-                                    Arc::new(PgProjectionVersionStore::new(pool.clone())),
+                                    transaction.clone(),
+                                    Arc::new(PgProjectionCheckpointStore::new(pool.clone()).in_transaction(transaction.clone())),
+                                    Arc::new(PgProjectionVersionStore::new(pool.clone()).in_transaction(transaction.clone())),
                                     Arc::new(PgProjectionDocumentStore::new(
                                         pool.clone(), tenant_id, store_id,
-                                    )),
+                                    ).in_transaction(transaction.clone())),
                                 )
                             };
                             let mut runner = ProjectionRunner::new(
@@ -233,7 +238,8 @@ pub fn spawn_projection_worker(
                                 versions,
                                 rejections.clone(),
                             )
-                            .with_dead_letter_queue(dlq.clone());
+                            .with_dead_letter_queue(dlq)
+                            .with_batch_transaction(transaction);
                             runner.register_projector(Arc::new(OrderProjector::new(documents.clone())));
                             runner.register_projector(Arc::new(InventoryProjector::new(documents.clone())));
                             runner.register_projector(Arc::new(ProductProjector::new(documents.clone())));

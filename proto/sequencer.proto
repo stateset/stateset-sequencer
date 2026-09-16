@@ -5,11 +5,31 @@ package stateset.sequencer.v1;
 import "google/protobuf/timestamp.proto";
 
 // ============================================================================
-// StateSet Sequencer gRPC Service
+// StateSet Sequencer gRPC Service v1 — FORMALLY DEPRECATED
 // ============================================================================
+//
+// DEPRECATION NOTICE: the entire `stateset.sequencer.v1` service is
+// deprecated in favor of `stateset.sequencer.v2` (proto/sequencer_v2.proto,
+// service `stateset.sequencer.v2.Sequencer` + `KeyManagement`), which carries
+// the full VES v1.0 protocol (signed envelopes, entity cursors, sync state,
+// server-side and bidirectional streaming, key management).
+//
+// Migration map (v1 RPC -> v2 RPC):
+//   Push             -> Push
+//   Pull             -> PullEvents (unary) / StreamEvents (streaming)
+//   GetHead          -> GetSyncState
+//   GetInclusionProof -> GetInclusionProof
+//   GetCommitment    -> GetCommitment
+//   GetEntityHistory -> GetEntityHistory
+//
+// Every v1 RPC logs a server-side deprecation warning and returns the
+// `x-sequencer-v1-deprecated: true` / `x-sequencer-successor` response
+// metadata. Planned removal: 2027-03-01. New integrations must use v2.
 
 // The Sequencer service provides verifiable event sync operations
 service Sequencer {
+  option deprecated = true;
+
   // Push a batch of events for sequencing
   rpc Push(PushRequest) returns (PushResponse);
 

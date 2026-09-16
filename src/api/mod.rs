@@ -147,6 +147,11 @@ pub fn router() -> Router<AppState> {
         )
         // x402 payment protocol
         .nest("/v1/x402", handlers::x402_router())
+        // Formal v1 deprecation: legacy pre-VES responses carry
+        // `Deprecation`/`Sunset`/`Link` headers (see `middleware::deprecation`).
+        .layer(axum::middleware::from_fn(
+            middleware::v1_deprecation_middleware,
+        ))
 }
 
 /// Router for payment-gated (HTTP 402) premium endpoints.

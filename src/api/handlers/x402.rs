@@ -54,6 +54,70 @@ const X402_MAX_DESCRIPTION_LEN: usize = 8192;
 /// single settleBatch calldata from being griefed into an unsubmittable size.
 const X402_MAX_AUTHORIZATION_LEN: usize = 2048;
 
+fn resolve_client_intent_id(
+    client_id: Option<Uuid>,
+    has_authorization: bool,
+) -> Result<Uuid, ApiError> {
+    match client_id {
+        Some(id) if id.is_nil() => Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "intent_id cannot be nil",
+        )),
+        Some(id) => Ok(id),
+        None if has_authorization => Err(ApiError::new(
+            ErrorCode::InvalidFieldValue,
+            "intent_id is required before signing eip712_authorization",
+        )),
+        None => Ok(Uuid::new_v4()),
+    }
+}
+
+fn validate_payment_replay(
+    existing: &X402PaymentIntent,
+    proposed: &X402PaymentIntent,
+    client_id: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let same = client_id.is_none_or(|id| id == existing.intent_id)
+        && existing.tenant_id == proposed.tenant_id
+        && existing.store_id == proposed.store_id
+        && existing.source_agent_id == proposed.source_agent_id
+        && existing.agent_key_id == proposed.agent_key_id
+        && existing.payer_address == proposed.payer_address
+        && existing.payee_address == proposed.payee_address
+        && existing.amount == proposed.amount
+        && existing.asset == proposed.asset
+        && existing.network == proposed.network
+        && existing.chain_id == proposed.chain_id
+        && existing.token_address == proposed.token_address
+        && existing.nonce == proposed.nonce
+        && existing.valid_after == proposed.valid_after
+        && existing.valid_until == proposed.valid_until
+        && existing.signing_hash == proposed.signing_hash
+        && existing.payer_signature == proposed.payer_signature
+        && existing.payer_public_key == proposed.payer_public_key
+        && existing.eip712_authorization == proposed.eip712_authorization
+        && existing.resource_uri == proposed.resource_uri
+        && existing.description == proposed.description
+        && existing.order_id == proposed.order_id
+        && existing.merchant_id == proposed.merchant_id
+        && existing.metadata == proposed.metadata;
+    if !same {
+        return Err(ApiError::new(
+            ErrorCode::VersionConflict,
+            "payment idempotency key is bound to different intent terms",
+        ));
+    }
+    Ok(())
+}
+
+async fn payment_capabilities() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "features": ["x402.client_intent_id.v1"],
+        "intent_id_encoding": "uuid-prefix-zero-pad-bytes32",
+        "settlement_authorization_validation": "on-chain"
+    }))
+}
+
 // =============================================================================
 // Submit Payment Intent
 // =============================================================================
@@ -132,6 +196,9 @@ pub(crate) async fn verify_and_sequence_payment(
     let store_id = StoreId::from_uuid(payload.store_id);
     let amount = payload.amount;
     let now_unix = Utc::now().timestamp() as u64;
+    let client_intent_id = payload.intent_id;
+    let intent_id =
+        resolve_client_intent_id(client_intent_id, payload.eip712_authorization.is_some())?;
 
     if payload.tenant_id.is_nil() {
         return Err(ApiError::new(
@@ -280,27 +347,6 @@ pub(crate) async fn verify_and_sequence_payment(
         None
     };
 
-    // Check for duplicate via idempotency key
-    if let Some(ref key) = payload.idempotency_key {
-        if let Ok(Some(existing)) = x402_repository
-            .get_intent_by_idempotency(&tenant_id, &store_id, key)
-            .await
-        {
-            debug!(
-                idempotency_key = %key,
-                intent_id = %existing.intent_id,
-                "Returning existing intent for idempotency key"
-            );
-            return Ok(SubmitX402PaymentResponse {
-                intent_id: existing.intent_id,
-                status: existing.status,
-                sequence_number: existing.sequence_number,
-                sequenced_at: existing.sequenced_at,
-                batch_id: existing.batch_id,
-            });
-        }
-    }
-
     // Compute expected signing hash
     let expected_hash = PgX402Repository::compute_signing_hash(
         &payload.payer_address,
@@ -366,7 +412,6 @@ pub(crate) async fn verify_and_sequence_payment(
     }
 
     // Create the payment intent
-    let intent_id = Uuid::new_v4();
     let now = Utc::now();
 
     let intent = X402PaymentIntent {
@@ -418,6 +463,26 @@ pub(crate) async fn verify_and_sequence_payment(
             format!("Failed to start transaction: {}", e),
         )
     })?;
+
+    // Authenticate first, then serialize same-key submissions and compare the
+    // complete immutable request inside the insertion transaction. A failed
+    // lookup must never be treated as absence.
+    if let Some(ref key) = intent.idempotency_key {
+        if let Some(existing) = x402_repository
+            .get_intent_by_idempotency_locked_tx(&mut tx, &tenant_id, &store_id, key)
+            .await
+            .map_err(ApiError::from)?
+        {
+            validate_payment_replay(&existing, &intent, client_intent_id)?;
+            return Ok(SubmitX402PaymentResponse {
+                intent_id: existing.intent_id,
+                status: existing.status,
+                sequence_number: existing.sequence_number,
+                sequenced_at: existing.sequenced_at,
+                batch_id: existing.batch_id,
+            });
+        }
+    }
 
     x402_repository
         .insert_intent_tx(&mut tx, &intent)
@@ -1302,6 +1367,7 @@ use axum::{
 /// Create the x402 payment router
 pub fn x402_router() -> Router<AppState> {
     Router::new()
+        .route("/capabilities", get(payment_capabilities))
         .route("/payments", post(submit_payment_intent))
         .route("/payments", get(list_payment_intents))
         .route("/payments/:intent_id", get(get_payment_intent))
@@ -1318,6 +1384,93 @@ pub fn x402_router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_identity_is_known_before_authorization() {
+        let id = Uuid::new_v4();
+        assert_eq!(resolve_client_intent_id(Some(id), true).unwrap(), id);
+        assert_eq!(resolve_client_intent_id(Some(id), false).unwrap(), id);
+        assert!(resolve_client_intent_id(None, true).is_err());
+        assert!(resolve_client_intent_id(Some(Uuid::nil()), false).is_err());
+        assert!(resolve_client_intent_id(Some(Uuid::nil()), true).is_err());
+        assert!(!resolve_client_intent_id(None, false).unwrap().is_nil());
+    }
+
+    #[tokio::test]
+    async fn advertised_identity_does_not_claim_admission_signature_verification() {
+        let Json(value) = payment_capabilities().await;
+        assert_eq!(value["features"][0], "x402.client_intent_id.v1");
+        assert_eq!(value["intent_id_encoding"], "uuid-prefix-zero-pad-bytes32");
+        assert_eq!(value["settlement_authorization_validation"], "on-chain");
+    }
+
+    fn replay_fixture() -> X402PaymentIntent {
+        X402PaymentIntent {
+            intent_id: Uuid::new_v4(),
+            x402_version: 1,
+            status: X402IntentStatus::Pending,
+            tenant_id: TenantId::new(),
+            store_id: StoreId::new(),
+            source_agent_id: AgentId::new(),
+            agent_key_id: AgentKeyId::new(1),
+            payer_address: "payer".into(),
+            payee_address: "payee".into(),
+            amount: 1_000_000,
+            asset: crate::domain::X402Asset::Usdc,
+            network: X402Network::SetChain,
+            chain_id: 84532001,
+            token_address: Some("token".into()),
+            created_at_unix: 1_700_000_000,
+            valid_until: 1_700_100_000,
+            valid_after: 0,
+            nonce: 42,
+            idempotency_key: Some("purchase-1".into()),
+            eip712_authorization: Some(vec![0xab; 65]),
+            resource_uri: None,
+            description: None,
+            order_id: None,
+            merchant_id: None,
+            signing_hash: [7; 32],
+            payer_signature: [9; 64],
+            payer_public_key: None,
+            sequence_number: None,
+            sequenced_at: None,
+            batch_id: None,
+            tx_hash: None,
+            block_number: None,
+            settled_at: None,
+            metadata: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn retries_bind_identity_and_immutable_terms() {
+        let existing = replay_fixture();
+        assert!(validate_payment_replay(&existing, &existing, Some(existing.intent_id)).is_ok());
+        assert!(validate_payment_replay(&existing, &existing, Some(Uuid::new_v4())).is_err());
+        let mut legacy = existing.clone();
+        legacy.intent_id = Uuid::new_v4();
+        assert!(validate_payment_replay(&existing, &legacy, None).is_ok());
+        let mutations: Vec<Box<dyn Fn(&mut X402PaymentIntent)>> = vec![
+            Box::new(|p| p.amount += 1),
+            Box::new(|p| p.payee_address = "other".into()),
+            Box::new(|p| p.nonce += 1),
+            Box::new(|p| p.valid_until += 1),
+            Box::new(|p| p.valid_after += 1),
+            Box::new(|p| p.source_agent_id = AgentId::new()),
+            Box::new(|p| p.eip712_authorization = None),
+            Box::new(|p| p.metadata = Some(serde_json::json!({"changed": true}))),
+        ];
+        for mutate in mutations {
+            let mut changed = existing.clone();
+            mutate(&mut changed);
+            assert!(
+                validate_payment_replay(&existing, &changed, Some(existing.intent_id)).is_err()
+            );
+        }
+    }
 
     #[test]
     fn test_parse_hash256() {
@@ -1360,5 +1513,74 @@ mod tests {
         assert!(validate_hex_string("0x", "address", X402_MAX_ADDRESS_LEN).is_err());
         assert!(validate_hex_string("0xxyz", "address", X402_MAX_ADDRESS_LEN).is_err());
         assert!(validate_hex_string("abc", "address", X402_MAX_ADDRESS_LEN).is_err());
+    }
+
+    #[test]
+    fn test_parse_eip712_authorization_valid_shapes() {
+        let expected = vec![0xab, 0x12];
+        assert_eq!(parse_eip712_authorization("0xab12").unwrap(), expected);
+        assert_eq!(parse_eip712_authorization("ab12").unwrap(), expected);
+        assert_eq!(parse_eip712_authorization("  0xab12  ").unwrap(), expected);
+    }
+
+    #[test]
+    fn test_parse_eip712_authorization_rejects_empty() {
+        assert!(parse_eip712_authorization("").is_err());
+        assert!(parse_eip712_authorization("   ").is_err());
+        assert!(parse_eip712_authorization("0x").is_err());
+        assert!(parse_eip712_authorization("0x   ").is_err());
+    }
+
+    #[test]
+    fn test_parse_eip712_authorization_rejects_odd_length() {
+        let err = parse_eip712_authorization("0xabc").unwrap_err();
+        assert!(err.error.message.contains("even"));
+    }
+
+    #[test]
+    fn test_parse_eip712_authorization_rejects_invalid_hex() {
+        let err = parse_eip712_authorization("0xzzzz").unwrap_err();
+        assert!(err
+            .error
+            .message
+            .contains("Invalid eip712_authorization hex"));
+    }
+
+    #[test]
+    fn test_parse_eip712_authorization_bounds_blob_size() {
+        let oversized = "0x".to_owned() + &"ab".repeat(X402_MAX_AUTHORIZATION_LEN + 1);
+        let err = parse_eip712_authorization(&oversized).unwrap_err();
+        assert!(err.error.message.contains("exceeds maximum"));
+        let at_limit = "0x".to_owned() + &"ab".repeat(X402_MAX_AUTHORIZATION_LEN);
+        assert_eq!(
+            parse_eip712_authorization(&at_limit).unwrap().len(),
+            X402_MAX_AUTHORIZATION_LEN
+        );
+    }
+
+    #[test]
+    fn test_parse_signature64_ethereum_65_bytes() {
+        let sig65 = "0x".to_owned() + &"04".repeat(64) + "1b";
+        let parsed = parse_signature64(&sig65).unwrap();
+        assert_eq!(parsed, [0x04; 64]);
+    }
+
+    #[test]
+    fn test_parse_signature64_rejects_wrong_length() {
+        let short = "0x".to_owned() + &"05".repeat(32);
+        assert!(parse_signature64(&short).is_err());
+        assert!(parse_signature64("0xzzzz").is_err());
+    }
+
+    #[test]
+    fn test_validate_hex_string_rejects_too_long() {
+        let long = "0x".to_owned() + &"ab".repeat(100);
+        assert!(validate_hex_string(&long, "address", X402_MAX_ADDRESS_LEN).is_err());
+    }
+
+    #[test]
+    fn test_validate_length_rejects_blank() {
+        assert!(validate_length("   ", "field", 4).is_err());
+        assert!(validate_length("  ", "field", 4).is_err());
     }
 }

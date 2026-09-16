@@ -70,6 +70,9 @@ echo "Recovery drill artifacts: $drill_dir"
 start_database "$drill_source"
 wait_database "$drill_source"
 fixture "$drill_source" seed | tee "$drill_dir/seed.log"
+[[ "$(rg -c '^PROJECTION_ATOMICITY_VERIFIED:' "$drill_dir/seed.log")" == 2 ]] || {
+  echo "Both in-flight projection rollback checks must run" >&2; exit 1;
+}
 fixture "$drill_source" verify | tee "$drill_dir/baseline.log"
 
 # Leave a deliberately wrong sequence head uncommitted when the database dies.
@@ -125,6 +128,8 @@ jq -n --arg image "$drill_image" --arg commit "$(git rev-parse HEAD)" \
     verified:["event payloads", "agent key", "sequence head", "uncommitted counter rollback", "idempotent replay",
       "signed receipts", "persisted commitment", "all inclusion proofs",
       "projection checkpoint and document restore", "projection catch-up 64 to 128", "projection worker restart without duplicate application"],
-    scope:"local process crash between projection batches and logical backup; recovery timings exclude projection catch-up; not host failure, PITR, HA failover or production RTO"}' \
+    projection_faults:["backend termination after document write", "backend termination after version write"],
+    competing_projection_workers:2,
+    scope:"local process crash, interrupted projection transactions, and logical backup; recovery timings exclude projection catch-up; not host failure, PITR, HA failover or production RTO"}' \
   | tee "$drill_dir/result.json"
 echo "Passed. Owned containers/volumes will be removed; evidence remains in $drill_dir"

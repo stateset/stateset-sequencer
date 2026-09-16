@@ -1125,4 +1125,177 @@ mod tests {
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("source_agent_id"));
     }
+
+    #[test]
+    fn batch_limit_accepts_up_to_max_and_rejects_over() {
+        let limits = RequestLimits {
+            max_events_per_batch: 2,
+            ..RequestLimits::default()
+        };
+        assert!(enforce_batch_limit(&limits, 0).is_ok());
+        assert!(enforce_batch_limit(&limits, 2).is_ok());
+        let err = enforce_batch_limit(&limits, 3).unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(err.1.contains("max_events_per_batch"));
+    }
+
+    #[test]
+    fn payload_limit_accepts_up_to_max_and_rejects_over() {
+        let limits = RequestLimits {
+            max_event_payload_size: 8,
+            ..RequestLimits::default()
+        };
+        let event_id = Uuid::new_v4();
+        assert!(enforce_payload_limit(&limits, event_id, 8).is_ok());
+        let err = enforce_payload_limit(&limits, event_id, 9).unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(err.1.contains("max_event_payload_size"));
+    }
+
+    #[test]
+    fn string_field_limits_accept_valid_fields() {
+        assert!(
+            enforce_string_field_limits(Uuid::new_v4(), "order", "order-123", "order.created")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn string_field_limits_reject_empty_or_overlong() {
+        let err = enforce_string_field_limits(Uuid::new_v4(), "", "order-123", "order.created")
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("entity_type"));
+
+        let err =
+            enforce_string_field_limits(Uuid::new_v4(), "order", &"x".repeat(513), "order.created")
+                .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("entity_id"));
+
+        let err =
+            enforce_string_field_limits(Uuid::new_v4(), "order", "order-123", "").unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("event_type"));
+    }
+
+    fn legacy_event_for_agent(agent_id: Uuid) -> EventEnvelope {
+        EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-123",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({ "amount": 100 }),
+            AgentId(agent_id),
+        )
+    }
+
+    #[test]
+    fn legacy_limits_accept_empty_and_single_event() {
+        let limits = RequestLimits::default();
+        assert!(enforce_legacy_limits(&limits, &[]).is_ok());
+        let event = legacy_event_for_agent(Uuid::new_v4());
+        assert!(enforce_legacy_limits(&limits, &[event]).is_ok());
+    }
+
+    #[test]
+    fn legacy_limits_reject_over_batch_and_bad_fields() {
+        let tight = RequestLimits {
+            max_events_per_batch: 2,
+            ..RequestLimits::default()
+        };
+        let events = vec![
+            legacy_event_for_agent(Uuid::new_v4()),
+            legacy_event_for_agent(Uuid::new_v4()),
+            legacy_event_for_agent(Uuid::new_v4()),
+        ];
+        let err = enforce_legacy_limits(&tight, &events).unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let tiny = RequestLimits {
+            max_event_payload_size: 1,
+            ..RequestLimits::default()
+        };
+        let err =
+            enforce_legacy_limits(&tiny, &[legacy_event_for_agent(Uuid::new_v4())]).unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+
+        let bad = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "",
+            EventType::from(EventType::ORDER_CREATED),
+            json!({ "amount": 100 }),
+            AgentId(Uuid::new_v4()),
+        );
+        let err = enforce_legacy_limits(&RequestLimits::default(), &[bad]).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn ves_limits_accept_empty_and_plaintext() {
+        let limits = RequestLimits::default();
+        assert!(enforce_ves_limits(&limits, &[]).is_ok());
+        let signing_key = AgentSigningKey::generate();
+        let event = build_plaintext_event(&signing_key);
+        assert!(enforce_ves_limits(&limits, &[event]).is_ok());
+    }
+
+    #[test]
+    fn ves_limits_reject_missing_plaintext_payload() {
+        let signing_key = AgentSigningKey::generate();
+        let mut event = build_plaintext_event(&signing_key);
+        event.payload = None;
+        let err = enforce_ves_limits(&RequestLimits::default(), &[event]).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("missing payload for plaintext"));
+    }
+
+    #[test]
+    fn ves_limits_accept_encrypted() {
+        let signing_key = AgentSigningKey::generate();
+        let event = build_encrypted_event(&signing_key);
+        assert!(enforce_ves_limits(&RequestLimits::default(), &[event]).is_ok());
+    }
+
+    #[test]
+    fn ves_limits_reject_missing_encrypted_payload() {
+        let signing_key = AgentSigningKey::generate();
+        let mut event = build_encrypted_event(&signing_key);
+        event.payload_encrypted = None;
+        let err = enforce_ves_limits(&RequestLimits::default(), &[event]).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("missing payload_encrypted"));
+    }
+
+    #[test]
+    fn ves_limits_reject_over_batch() {
+        let signing_key = AgentSigningKey::generate();
+        let events = vec![
+            build_plaintext_event(&signing_key),
+            build_plaintext_event(&signing_key),
+        ];
+        let tight = RequestLimits {
+            max_events_per_batch: 1,
+            ..RequestLimits::default()
+        };
+        let err = enforce_ves_limits(&tight, &events).unwrap_err();
+        assert_eq!(err.0, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn matching_source_agents_are_accepted() {
+        let agent_id = Uuid::new_v4();
+        let event = legacy_event_for_agent(agent_id);
+        assert!(ensure_legacy_source_agents_match_request_agent(&[event], agent_id).is_ok());
+        assert!(ensure_legacy_source_agents_match_request_agent(&[], agent_id).is_ok());
+
+        let signing_key = AgentSigningKey::generate();
+        let mut ves_event = build_plaintext_event(&signing_key);
+        ves_event.source_agent_id = AgentId(agent_id);
+        assert!(ensure_ves_source_agents_match_request_agent(&[ves_event], agent_id).is_ok());
+        assert!(ensure_ves_source_agents_match_request_agent(&[], agent_id).is_ok());
+    }
 }

@@ -12,7 +12,9 @@ use crate::crypto::{
     compute_event_signing_hash, compute_leaf_hash, compute_node_hash, compute_stream_id,
     compute_ves_state_root, next_power_of_two, pad_leaf, EventSigningParams, LeafHashParams,
 };
-use crate::domain::{Hash256, MerkleProof, StoreId, TenantId, VesBatchCommitment};
+use crate::domain::{
+    Hash256, MerkleProof, StoreId, TenantId, VesBatchCommitment, VesBatchCommitmentParams,
+};
 use crate::infra::{Result, SequencerError};
 
 /// Pure VES Merkle tree operations.
@@ -541,15 +543,17 @@ impl PgVesCommitmentEngine {
         );
 
         Ok(VesBatchCommitment::new_with_state_roots(
-            *tenant_id,
-            *store_id,
-            tree_depth,
-            leaves.len() as u32,
-            padded_leaf_count as u32,
-            merkle_root,
-            prev_state_root,
-            new_state_root,
-            sequence_range,
+            VesBatchCommitmentParams {
+                tenant_id: *tenant_id,
+                store_id: *store_id,
+                tree_depth,
+                leaf_count: leaves.len() as u32,
+                padded_leaf_count: padded_leaf_count as u32,
+                merkle_root,
+                prev_state_root,
+                new_state_root,
+                sequence_range,
+            },
         ))
     }
 
@@ -673,17 +677,17 @@ impl PgVesCommitmentEngine {
             leaves.len() as u32,
         );
 
-        let commitment = VesBatchCommitment::new_with_state_roots(
-            *tenant_id,
-            *store_id,
+        let commitment = VesBatchCommitment::new_with_state_roots(VesBatchCommitmentParams {
+            tenant_id: *tenant_id,
+            store_id: *store_id,
             tree_depth,
-            leaves.len() as u32,
-            padded_leaf_count as u32,
+            leaf_count: leaves.len() as u32,
+            padded_leaf_count: padded_leaf_count as u32,
             merkle_root,
             prev_state_root,
             new_state_root,
             sequence_range,
-        );
+        });
 
         sqlx::query(
             r#"
@@ -1695,6 +1699,212 @@ mod tests {
         assert!(commitment.chain_tx_hash.is_none());
         assert!(commitment.chain_block_number.is_none());
         assert!(commitment.anchored_at.is_none());
+    }
+
+    // ========================================================================
+    // event_signing_hash_from_row Tests
+    //
+    // The DB-backed range methods cannot run without Postgres, but the row →
+    // hash reconstruction is pure: these tests pin every branch of it
+    // (stored-hash fast path, recompute for v1/v2, and each rejection).
+    // ========================================================================
+
+    fn ves_leaf_row(id: Uuid) -> super::VesLeafRow {
+        super::VesLeafRow {
+            command_id: Some(id),
+            base_version: Some(0),
+            sequence_number: 1,
+            event_signing_hash: None,
+            agent_signature: vec![0; 64],
+            ves_version: 2,
+            event_id: id,
+            source_agent_id: id,
+            agent_key_id: 1,
+            entity_type: "order".into(),
+            entity_id: "o1".into(),
+            event_type: "order.created".into(),
+            created_at: chrono::Utc::now(),
+            created_at_str: Some("2026-09-05T00:00:00Z".into()),
+            payload_kind: 0,
+            payload_plain_hash: vec![0; 32],
+            payload_cipher_hash: vec![0; 32],
+        }
+    }
+
+    fn ves_row_ids() -> (TenantId, StoreId, Uuid) {
+        let id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        (TenantId::from_uuid(id), StoreId::from_uuid(id), id)
+    }
+
+    #[test]
+    fn stored_event_signing_hash_is_used_verbatim() {
+        let (tenant_id, store_id, id) = ves_row_ids();
+        let mut row = ves_leaf_row(id);
+        row.event_signing_hash = Some(vec![9u8; 32]);
+        let hash =
+            super::PgVesCommitmentEngine::event_signing_hash_from_row(&tenant_id, &store_id, &row)
+                .unwrap();
+        assert_eq!(hash, [9u8; 32]);
+    }
+
+    #[test]
+    fn stored_event_signing_hash_with_bad_length_is_rejected() {
+        let (tenant_id, store_id, id) = ves_row_ids();
+        let mut row = ves_leaf_row(id);
+        row.event_signing_hash = Some(vec![1u8; 31]);
+        let err =
+            super::PgVesCommitmentEngine::event_signing_hash_from_row(&tenant_id, &store_id, &row)
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid event_signing_hash length"));
+    }
+
+    #[test]
+    fn empty_stored_hash_falls_back_to_recompute() {
+        let (tenant_id, store_id, id) = ves_row_ids();
+        let mut row = ves_leaf_row(id);
+        row.event_signing_hash = Some(Vec::new());
+        row.ves_version = 1;
+        assert!(super::PgVesCommitmentEngine::event_signing_hash_from_row(
+            &tenant_id, &store_id, &row
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn v1_recompute_matches_direct_computation() {
+        let (tenant_id, store_id, id) = ves_row_ids();
+        let mut row = ves_leaf_row(id);
+        row.ves_version = 1;
+        let hash =
+            super::PgVesCommitmentEngine::event_signing_hash_from_row(&tenant_id, &store_id, &row)
+                .unwrap();
+        let plain = [0u8; 32];
+        let cipher = [0u8; 32];
+        let expected = compute_event_signing_hash(&EventSigningParams {
+            ves_version: 1,
+            tenant_id: &tenant_id.0,
+            store_id: &store_id.0,
+            event_id: &id,
+            source_agent_id: &id,
+            agent_key_id: 1,
+            entity_type: "order",
+            entity_id: "o1",
+            event_type: "order.created",
+            created_at: "2026-09-05T00:00:00Z",
+            payload_kind: 0,
+            payload_plain_hash: &plain,
+            payload_cipher_hash: &cipher,
+        });
+        assert_eq!(hash, expected);
+    }
+
+    #[test]
+    fn invalid_payload_kind_is_rejected() {
+        let (tenant_id, store_id, id) = ves_row_ids();
+        let mut row = ves_leaf_row(id);
+        row.payload_kind = 7;
+        let err =
+            super::PgVesCommitmentEngine::event_signing_hash_from_row(&tenant_id, &store_id, &row)
+                .unwrap_err();
+        assert!(err.to_string().contains("invalid payload_kind"));
+    }
+
+    #[test]
+    fn invalid_plain_hash_length_is_rejected() {
+        let (tenant_id, store_id, id) = ves_row_ids();
+        let mut row = ves_leaf_row(id);
+        row.payload_plain_hash = vec![0u8; 31];
+        let err =
+            super::PgVesCommitmentEngine::event_signing_hash_from_row(&tenant_id, &store_id, &row)
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid payload_plain_hash length"));
+    }
+
+    #[test]
+    fn invalid_cipher_hash_length_is_rejected() {
+        let (tenant_id, store_id, id) = ves_row_ids();
+        let mut row = ves_leaf_row(id);
+        row.payload_cipher_hash = vec![0u8; 31];
+        let err =
+            super::PgVesCommitmentEngine::event_signing_hash_from_row(&tenant_id, &store_id, &row)
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid payload_cipher_hash length"));
+    }
+
+    #[test]
+    fn negative_base_version_is_rejected() {
+        let (tenant_id, store_id, id) = ves_row_ids();
+        let mut row = ves_leaf_row(id);
+        row.base_version = Some(-1);
+        let err =
+            super::PgVesCommitmentEngine::event_signing_hash_from_row(&tenant_id, &store_id, &row)
+                .unwrap_err();
+        assert!(err.to_string().contains("negative base_version"));
+    }
+
+    #[test]
+    fn unsupported_signing_version_is_rejected() {
+        let (tenant_id, store_id, id) = ves_row_ids();
+        let mut row = ves_leaf_row(id);
+        row.ves_version = 3;
+        let err =
+            super::PgVesCommitmentEngine::event_signing_hash_from_row(&tenant_id, &store_id, &row)
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unsupported event signing version"));
+    }
+
+    fn valid_commitment_row() -> super::VesCommitmentRow {
+        super::VesCommitmentRow {
+            batch_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            store_id: Uuid::new_v4(),
+            ves_version: 1,
+            tree_depth: 3,
+            leaf_count: 5,
+            padded_leaf_count: 8,
+            merkle_root: vec![1u8; 32],
+            prev_state_root: vec![2u8; 32],
+            new_state_root: vec![3u8; 32],
+            sequence_start: 10,
+            sequence_end: 14,
+            committed_at: Utc::now(),
+            chain_id: None,
+            chain_tx_hash: None,
+            chain_block_number: None,
+            anchored_at: None,
+        }
+    }
+
+    #[test]
+    fn ves_commitment_row_conversion_invalid_prev_state_root() {
+        let mut row = valid_commitment_row();
+        row.prev_state_root = vec![2u8; 31];
+        let result = VesBatchCommitment::try_from(row);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ves_commitment_row_conversion_invalid_new_state_root() {
+        let mut row = valid_commitment_row();
+        row.new_state_root = vec![3u8; 31];
+        let result = VesBatchCommitment::try_from(row);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn ves_commitment_row_conversion_invalid_chain_tx_hash() {
+        let mut row = valid_commitment_row();
+        row.chain_tx_hash = Some(vec![4u8; 31]);
+        let result = VesBatchCommitment::try_from(row);
+        assert!(result.is_err());
     }
 
     // ========================================================================

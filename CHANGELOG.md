@@ -5,7 +5,33 @@ All notable changes to stateset-sequencer will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-09-16
+
+### Changed
+
+- Split `src/server.rs` and `src/grpc/service_v2.rs` into focused modules
+  (`server/{config,grpc,router,state,workers}`, `service_v2/{convert,keys,sequencer}`)
+  with identical behavior.
+- STARK crates are now pinned git dependencies instead of sibling path
+  dependencies, so the core sequencer builds without a STARK checkout.
+  `VesBatchCommitment::new_with_state_roots` now takes a
+  `VesBatchCommitmentParams` struct instead of positional roots.
+- gRPC v1 is formally deprecated (docs plus response headers/logs); a
+  maintained drift-gate test pins REST/gRPC/OpenAPI parity.
+- Added an SQLite outbox round-trip parity test covering every
+  ingest-critical field; removed the obsolete STARK fetch from the
+  performance workflow.
+
 ## [Unreleased]
+
+### Fixed
+
+- Production projection batches now use one PostgreSQL transaction for documents,
+  versions, checkpoints, rejection records, and DLQ enqueues. Per-stream row locks
+  serialize competing workers; failed writes roll back instead of being skipped.
+- Python SDK requires `cryptography>=50.0.1,<51`, replacing the vulnerable
+  dependency range. Build/test tooling also requires patched setuptools and
+  pytest releases. CI now audits Python dependencies without advisory ignores.
 
 ## [0.8.6] - 2026-09-05
 

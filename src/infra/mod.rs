@@ -73,8 +73,8 @@ pub use postgres::{
     spawn_x402_nonce_cleanup, AgentCursor, AgentEventPolicy, PgAgentCursorStore,
     PgAgentEventPolicyStore, PgAgentKeyRegistry, PgEventStore, PgProjectionCheckpointStore,
     PgProjectionDocumentStore, PgProjectionEventSource, PgProjectionRejectionSink,
-    PgProjectionVersionStore, PgSchemaStore, PgSequencer, PgVesProjectionEventSource,
-    PgX402Repository, VesRejectionReason, VesSequencer,
+    PgProjectionTransaction, PgProjectionVersionStore, PgSchemaStore, PgSequencer,
+    PgVesProjectionEventSource, PgX402Repository, VesRejectionReason, VesSequencer,
 };
 pub use projection_worker::{
     spawn_projection_worker, ProjectionWorkerConfig, ProjectionWorkerMessage,

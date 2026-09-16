@@ -512,7 +512,18 @@ pub async fn verify_proof(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let proof = MerkleProof::new(leaf_hash, proof_path, request.leaf_index);
+    let proof = match request.leaf_count {
+        Some(count) => {
+            MerkleProof::with_leaf_count(leaf_hash, proof_path, request.leaf_index, count).ok_or(
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid leaf count, index, or proof path length".to_string(),
+                ),
+            )?
+        }
+        // Older callers keep the complete-tree direction convention.
+        None => MerkleProof::new(leaf_hash, proof_path, request.leaf_index),
+    };
 
     let valid = state
         .commitment_reader

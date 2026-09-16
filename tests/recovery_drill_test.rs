@@ -66,16 +66,32 @@ async fn projection_snapshot(
         assert_eq!(document["order_id"], *id);
         assert_eq!(document["customer_id"], "recovery-customer");
         assert_eq!(document["currency"], "CAD");
+        let index: u64 = id.strip_prefix("recovery-").unwrap().parse().unwrap();
+        assert_eq!(document["total_amount"].as_f64(), Some(index as f64));
+    }
+    for table in ["rejected_events_log", "dead_letter_events"] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE tenant_id=$1 AND store_id=$2"
+        ))
+        .bind(tenant.0)
+        .bind(store.0)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 0,
+            "valid events must not produce spurious rejections"
+        );
     }
     documents
 }
 
-async fn project_to(
+fn spawn_test_projection(
     pool: &sqlx::PgPool,
     sequencer: Arc<VesSequencer<PgAgentKeyRegistry>>,
-    tenant: TenantId,
-    store: StoreId,
-    expected: i64,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::Sender<ProjectionWorkerMessage>,
 ) {
     let event_store: Arc<dyn EventStore> = Arc::new(PgEventStore::new(
         pool.clone(),
@@ -92,12 +108,24 @@ async fn project_to(
             ..Default::default()
         },
     };
-    let (task, control) = stateset_sequencer::infra::spawn_projection_worker(
+    stateset_sequencer::infra::spawn_projection_worker(
         config,
         pool.clone(),
         event_store,
         Some(sequencer),
-    );
+    )
+}
+
+async fn project_to(
+    pool: &sqlx::PgPool,
+    sequencer: Arc<VesSequencer<PgAgentKeyRegistry>>,
+    tenant: TenantId,
+    store: StoreId,
+    expected: i64,
+) {
+    // Two independent schedulers deliberately race for the same stream.
+    let (task, control) = spawn_test_projection(pool, sequencer.clone());
+    let (other_task, other_control) = spawn_test_projection(pool, sequencer);
     let result = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let checkpoint: Option<i64> = sqlx::query_scalar("SELECT last_projected_sequence FROM ves_projection_checkpoints WHERE tenant_id=$1 AND store_id=$2")
@@ -112,11 +140,105 @@ async fn project_to(
         .send(ProjectionWorkerMessage::Shutdown)
         .await
         .unwrap();
+    other_control
+        .send(ProjectionWorkerMessage::Shutdown)
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .unwrap()
         .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), other_task)
+        .await
+        .unwrap()
+        .unwrap();
     result.expect("projection catch-up deadline");
+}
+
+async fn interrupt_projection_write(
+    pool: &sqlx::PgPool,
+    sequencer: Arc<VesSequencer<PgAgentKeyRegistry>>,
+    tenant: TenantId,
+    store: StoreId,
+    before_checkpoint: bool,
+) {
+    // Only used inside the drill's owned, disposable database. Pause after
+    // documents (and optionally versions) have been written but not committed.
+    let (table, operation) = if before_checkpoint {
+        ("ves_projection_checkpoints", "UPDATE")
+    } else {
+        ("ves_projection_entity_versions", "INSERT")
+    };
+    sqlx::query(&format!("CREATE FUNCTION recovery_projection_pause() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.tenant_id = '{}'::uuid AND NEW.store_id = '{}'::uuid THEN PERFORM pg_sleep(60); END IF; RETURN NEW; END $$", tenant.0, store.0))
+        .execute(pool).await.unwrap();
+    sqlx::query(&format!("CREATE TRIGGER recovery_projection_pause BEFORE {operation} ON {table} FOR EACH ROW EXECUTE FUNCTION recovery_projection_pause()"))
+        .execute(pool).await.unwrap();
+    let (task, control) = spawn_test_projection(pool, sequencer);
+    let backend = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let pid: Option<i32> = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE datname=current_database() AND wait_event='PgSleep' AND query LIKE $1")
+                .bind(format!("%{table}%")).fetch_optional(pool).await.unwrap();
+            if let Some(pid) = pid { break pid; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("projection did not reach the injected write boundary");
+    for table in [
+        "ves_projection_documents",
+        "ves_projection_entity_versions",
+        "ves_projection_checkpoints",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE tenant_id=$1 AND store_id=$2"
+        ))
+        .bind(tenant.0)
+        .bind(store.0)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "uncommitted projection state leaked from {table}");
+    }
+    control
+        .send(ProjectionWorkerMessage::Shutdown)
+        .await
+        .unwrap();
+    let terminated: bool = sqlx::query_scalar("SELECT pg_terminate_backend($1)")
+        .bind(backend)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert!(terminated);
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .unwrap()
+        .unwrap();
+    sqlx::query(&format!(
+        "DROP TRIGGER recovery_projection_pause ON {table}"
+    ))
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP FUNCTION recovery_projection_pause()")
+        .execute(pool)
+        .await
+        .unwrap();
+    for table in [
+        "ves_projection_documents",
+        "ves_projection_entity_versions",
+        "ves_projection_checkpoints",
+        "rejected_events_log",
+        "dead_letter_events",
+    ] {
+        let count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*) FROM {table} WHERE tenant_id=$1 AND store_id=$2"
+        ))
+        .bind(tenant.0)
+        .bind(store.0)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(count, 0, "partial projection state survived in {table}");
+    }
+    println!("PROJECTION_ATOMICITY_VERIFIED: backend termination before {table}");
 }
 
 #[tokio::test]
@@ -187,6 +309,8 @@ async fn recovery_fixture() {
         let mut accepted = sequencer.ingest(events[..64].to_vec()).await.unwrap();
         assert!(accepted.events_rejected.is_empty());
         assert_eq!(accepted.events_accepted, 64);
+        interrupt_projection_write(&pool, sequencer.clone(), tenant, store, false).await;
+        interrupt_projection_write(&pool, sequencer.clone(), tenant, store, true).await;
         project_to(&pool, sequencer.clone(), tenant, store, 64).await;
         let projection_documents = projection_snapshot(&pool, tenant, store, 64).await;
         let tail = sequencer.ingest(events[64..].to_vec()).await.unwrap();

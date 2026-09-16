@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use super::projection_transaction::{projection_connection, PgProjectionTransaction};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use sqlx::PgPool;
@@ -141,16 +142,30 @@ impl EventSource for PgVesProjectionEventSource {
 /// Durable per-stream checkpoints.
 pub struct PgProjectionCheckpointStore {
     pool: PgPool,
+    transaction: Option<Arc<PgProjectionTransaction>>,
     ves: bool,
 }
 
 impl PgProjectionCheckpointStore {
+    pub(crate) fn in_transaction(mut self, transaction: Arc<PgProjectionTransaction>) -> Self {
+        self.transaction = Some(transaction);
+        self
+    }
+
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, ves: false }
+        Self {
+            pool,
+            ves: false,
+            transaction: None,
+        }
     }
 
     pub fn new_ves(pool: PgPool) -> Self {
-        Self { pool, ves: true }
+        Self {
+            pool,
+            ves: true,
+            transaction: None,
+        }
     }
 }
 
@@ -169,7 +184,9 @@ impl CheckpointStore for PgProjectionCheckpointStore {
         let row: Option<(i64, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(query)
             .bind(tenant_id.0)
             .bind(store_id.0)
-            .fetch_optional(&self.pool)
+            .fetch_optional(
+                &mut *projection_connection(&self.pool, self.transaction.as_deref()).await?,
+            )
             .await?;
 
         row.map(|(sequence, updated_at)| {
@@ -218,7 +235,7 @@ impl CheckpointStore for PgProjectionCheckpointStore {
             .bind(tenant_id.0)
             .bind(store_id.0)
             .bind(encode_u64(sequence, "projection checkpoint")?)
-            .execute(&self.pool)
+            .execute(&mut *projection_connection(&self.pool, self.transaction.as_deref()).await?)
             .await?;
         Ok(())
     }
@@ -227,16 +244,30 @@ impl CheckpointStore for PgProjectionCheckpointStore {
 /// Projection-only entity versions; intentionally separate from sequencing OCC.
 pub struct PgProjectionVersionStore {
     pool: PgPool,
+    transaction: Option<Arc<PgProjectionTransaction>>,
     ves: bool,
 }
 
 impl PgProjectionVersionStore {
+    pub(crate) fn in_transaction(mut self, transaction: Arc<PgProjectionTransaction>) -> Self {
+        self.transaction = Some(transaction);
+        self
+    }
+
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, ves: false }
+        Self {
+            pool,
+            ves: false,
+            transaction: None,
+        }
     }
 
     pub fn new_ves(pool: PgPool) -> Self {
-        Self { pool, ves: true }
+        Self {
+            pool,
+            ves: true,
+            transaction: None,
+        }
     }
 }
 
@@ -259,7 +290,9 @@ impl EntityVersionStore for PgProjectionVersionStore {
             .bind(store_id.0)
             .bind(entity_type)
             .bind(entity_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(
+                &mut *projection_connection(&self.pool, self.transaction.as_deref()).await?,
+            )
             .await?;
         value
             .map(|v| decode_u64(v, "projection entity version"))
@@ -297,7 +330,7 @@ impl EntityVersionStore for PgProjectionVersionStore {
             .bind(entity_type)
             .bind(entity_id)
             .bind(encode_u64(version, "projection entity version")?)
-            .execute(&self.pool)
+            .execute(&mut *projection_connection(&self.pool, self.transaction.as_deref()).await?)
             .await?;
         Ok(())
     }
@@ -336,7 +369,10 @@ impl EntityVersionStore for PgProjectionVersionStore {
                     .bind(entity_id)
                     .bind(new_version)
                     .bind(encode_u64(expected, "expected projection entity version")?)
-                    .execute(&self.pool)
+                    .execute(
+                        &mut *projection_connection(&self.pool, self.transaction.as_deref())
+                            .await?,
+                    )
                     .await?
                     .rows_affected()
             }
@@ -362,7 +398,10 @@ impl EntityVersionStore for PgProjectionVersionStore {
                     .bind(entity_type)
                     .bind(entity_id)
                     .bind(new_version)
-                    .execute(&self.pool)
+                    .execute(
+                        &mut *projection_connection(&self.pool, self.transaction.as_deref())
+                            .await?,
+                    )
                     .await?
                     .rows_affected()
             }
@@ -374,11 +413,20 @@ impl EntityVersionStore for PgProjectionVersionStore {
 /// Persists projection rejections for audit and operations.
 pub struct PgProjectionRejectionSink {
     pool: PgPool,
+    transaction: Option<Arc<PgProjectionTransaction>>,
 }
 
 impl PgProjectionRejectionSink {
+    pub(crate) fn in_transaction(mut self, transaction: Arc<PgProjectionTransaction>) -> Self {
+        self.transaction = Some(transaction);
+        self
+    }
+
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            transaction: None,
+        }
     }
 }
 
@@ -416,7 +464,7 @@ impl RejectionSink for PgProjectionRejectionSink {
                 .map(|v| encode_u64(v, "actual version"))
                 .transpose()?,
         )
-        .execute(&self.pool)
+        .execute(&mut *projection_connection(&self.pool, self.transaction.as_deref()).await?)
         .await?;
         Ok(())
     }
@@ -425,15 +473,22 @@ impl RejectionSink for PgProjectionRejectionSink {
 /// Tenant/store-scoped JSONB document store used by all built-in projectors.
 pub struct PgProjectionDocumentStore {
     pool: PgPool,
+    transaction: Option<Arc<PgProjectionTransaction>>,
     tenant_id: TenantId,
     store_id: StoreId,
     ves: bool,
 }
 
 impl PgProjectionDocumentStore {
+    pub(crate) fn in_transaction(mut self, transaction: Arc<PgProjectionTransaction>) -> Self {
+        self.transaction = Some(transaction);
+        self
+    }
+
     pub fn new(pool: PgPool, tenant_id: TenantId, store_id: StoreId) -> Self {
         Self {
             pool,
+            transaction: None,
             tenant_id,
             store_id,
             ves: false,
@@ -443,6 +498,7 @@ impl PgProjectionDocumentStore {
     pub fn new_ves(pool: PgPool, tenant_id: TenantId, store_id: StoreId) -> Self {
         Self {
             pool,
+            transaction: None,
             tenant_id,
             store_id,
             ves: true,
@@ -464,7 +520,9 @@ impl PgProjectionDocumentStore {
             .bind(self.store_id.0)
             .bind(entity_type)
             .bind(entity_id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(
+                &mut *projection_connection(&self.pool, self.transaction.as_deref()).await?,
+            )
             .await?;
         document
             .map(|value| {
@@ -514,7 +572,7 @@ impl PgProjectionDocumentStore {
             .bind(entity_id)
             .bind(document)
             .bind(encode_u64(version, "projection document version")?)
-            .execute(&self.pool)
+            .execute(&mut *projection_connection(&self.pool, self.transaction.as_deref()).await?)
             .await?;
         Ok(())
     }
@@ -530,7 +588,7 @@ impl PgProjectionDocumentStore {
             .bind(self.store_id.0)
             .bind(entity_type)
             .bind(entity_id)
-            .execute(&self.pool)
+            .execute(&mut *projection_connection(&self.pool, self.transaction.as_deref()).await?)
             .await?;
         Ok(())
     }

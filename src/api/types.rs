@@ -308,6 +308,9 @@ pub struct CommitAndAnchorVesRequest {
 /// Request body for proof verification.
 #[derive(Debug, Deserialize)]
 pub struct VerifyProofRequest {
+    /// Total leaves in the committed tree; required for promoted odd nodes.
+    #[serde(default)]
+    pub leaf_count: Option<usize>,
     pub leaf_hash: String,
     pub events_root: String,
     pub proof_path: Vec<String>,

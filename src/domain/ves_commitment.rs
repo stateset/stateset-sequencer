@@ -55,6 +55,20 @@ pub struct VesBatchCommitment {
     pub anchored_at: Option<DateTime<Utc>>,
 }
 
+/// Named parameters for [`VesBatchCommitment::new_with_state_roots`].
+#[derive(Debug, Clone)]
+pub struct VesBatchCommitmentParams {
+    pub tenant_id: TenantId,
+    pub store_id: StoreId,
+    pub tree_depth: u32,
+    pub leaf_count: u32,
+    pub padded_leaf_count: u32,
+    pub merkle_root: Hash256,
+    pub prev_state_root: Hash256,
+    pub new_state_root: Hash256,
+    pub sequence_range: (u64, u64),
+}
+
 impl VesBatchCommitment {
     pub fn new(
         tenant_id: TenantId,
@@ -65,47 +79,37 @@ impl VesBatchCommitment {
         merkle_root: Hash256,
         sequence_range: (u64, u64),
     ) -> Self {
-        Self::new_with_state_roots(
+        Self::new_with_state_roots(VesBatchCommitmentParams {
             tenant_id,
             store_id,
             tree_depth,
             leaf_count,
             padded_leaf_count,
             merkle_root,
-            [0u8; 32],
-            [0u8; 32],
+            prev_state_root: [0u8; 32],
+            new_state_root: [0u8; 32],
             sequence_range,
-        )
+        })
     }
 
-    /// Create a new batch commitment with explicit state roots.
+    /// Parameters for [`Self::new_with_state_roots`].
     ///
-    /// Note: This function takes many parameters by design - each represents
-    /// a distinct field in the VES commitment structure.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_state_roots(
-        tenant_id: TenantId,
-        store_id: StoreId,
-        tree_depth: u32,
-        leaf_count: u32,
-        padded_leaf_count: u32,
-        merkle_root: Hash256,
-        prev_state_root: Hash256,
-        new_state_root: Hash256,
-        sequence_range: (u64, u64),
-    ) -> Self {
+    /// A struct (instead of positional arguments) because the three Merkle
+    /// roots and the two counts are all the same types adjacently — named
+    /// fields make a silent swap a compile error instead of a wrong proof.
+    pub fn new_with_state_roots(params: VesBatchCommitmentParams) -> Self {
         Self {
             batch_id: Uuid::new_v4(),
-            tenant_id,
-            store_id,
+            tenant_id: params.tenant_id,
+            store_id: params.store_id,
             ves_version: super::VES_VERSION,
-            tree_depth,
-            leaf_count,
-            padded_leaf_count,
-            merkle_root,
-            prev_state_root,
-            new_state_root,
-            sequence_range,
+            tree_depth: params.tree_depth,
+            leaf_count: params.leaf_count,
+            padded_leaf_count: params.padded_leaf_count,
+            merkle_root: params.merkle_root,
+            prev_state_root: params.prev_state_root,
+            new_state_root: params.new_state_root,
+            sequence_range: params.sequence_range,
             committed_at: Utc::now(),
             chain_id: None,
             chain_tx_hash: None,

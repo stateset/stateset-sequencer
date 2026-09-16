@@ -135,12 +135,11 @@ one "off" changed nothing about the resulting binary. They were removed rather
 than left as no-ops.
 
 **The `stark` feature** depends on the `ves-stark-*` crates in the separate
-[`stateset-starks`](https://github.com/stateset/stateset-starks) workspace, expected
-at `../stateset-stark`. They are **path dependencies that cargo must resolve even
-when the feature is off**, so that checkout must be present to build at all.
+[`stateset-starks`](https://github.com/stateset/stateset-starks) repository. They are
+**pinned git dependencies that cargo fetches only when the feature is on**, so no
+local checkout is needed for anything else.
 
-To build/test the core sequencer **without** the STARK proof endpoints (e.g. if
-you don't have `stateset-stark` checked out alongside this repo, the proof
+To build/test the core sequencer **without** the STARK proof endpoints (the proof
 endpoints are simply not mounted):
 
 ```bash
@@ -149,32 +148,33 @@ cargo build --no-default-features --features pqc
 
 ### Upgrading the STARK dependency
 
-`stateset-stark` is a **path dependency on a separate repository**, so its
-commits are not captured by this repo's `Cargo.lock` on their own. CI pins it to
-an exact commit via the `STARK_REF` variable in `.github/workflows/ci.yml`.
+The `ves-stark-*` crates are **pinned git dependencies** on the separate
+[`stateset-starks`](https://github.com/stateset/stateset-starks) repository
+(note the trailing `s`). CI records the same commit in the `STARK_REF`
+variable in `.github/workflows/ci.yml`, and `tests/source_invariants_test.rs`
+asserts the two pins match.
 
-Tracking its default branch instead meant every upstream commit silently
+Tracking its default branch instead would mean every upstream commit silently
 invalidated `Cargo.lock` and turned every `--locked` CI job red, with no change
 in this repository. Upgrade deliberately, in a single commit:
 
 ```bash
-# 1. Move the local checkout to the commit you want
-git -C ../stateset-stark checkout <new-sha>
-
-# 2. Re-resolve the ves-stark-* crates
+# 1. Move the `rev` pins in Cargo.toml to the commit you want
+# 2. Re-resolve the ves-stark-* crates onto the new pin
 cargo update -p ves-stark-prover -p ves-stark-verifier \
              -p ves-stark-primitives -p ves-stark-batch
 
-# 3. Verify, then commit Cargo.lock and the new STARK_REF together
+# 3. Move STARK_REF in .github/workflows/ci.yml to the same commit
+
+# 4. Verify, then commit Cargo.toml, Cargo.lock and the new STARK_REF together
 cargo test --locked --all-targets
 ```
 
-> **CI note:** CI fetches the `ves-stark-*` crates from the public
+> **CI note:** cargo fetches the `ves-stark-*` crates itself from the public
 > [`stateset/stateset-starks`](https://github.com/stateset/stateset-starks)
-> repository (note the trailing `s`) at the commit pinned by `STARK_REF`. No
-> secret is required; a `STARK_REPO_TOKEN` repository secret is honoured if the
-> repo is ever made private. The lint/test/coverage jobs build with the core feature
-> set (no `stark`) so they don't compile the private crates.
+> repository at the pinned commit. No checkout step and no secret is required.
+> The lint/test/coverage jobs build with the core feature set (no `stark`), so
+> they neither fetch nor compile the STARK crates.
 
 ## AI Agent SDKs and MCP
 

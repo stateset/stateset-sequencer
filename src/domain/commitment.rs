@@ -103,6 +103,37 @@ pub struct MerkleProof {
 }
 
 impl MerkleProof {
+    /// Reconstruct directions only at levels with a sibling. Odd trailing nodes
+    /// are promoted unchanged by rs_merkle and consume no proof element.
+    pub fn with_leaf_count(
+        leaf_hash: Hash256,
+        proof_path: Vec<Hash256>,
+        leaf_index: usize,
+        leaf_count: usize,
+    ) -> Option<Self> {
+        if leaf_count == 0 || leaf_index >= leaf_count {
+            return None;
+        }
+        let (mut index, mut width) = (leaf_index, leaf_count);
+        let mut directions = Vec::new();
+        while width > 1 {
+            if index % 2 == 1 || index + 1 < width {
+                directions.push(index % 2 == 0);
+            }
+            index /= 2;
+            width = width / 2 + width % 2;
+        }
+        if directions.len() != proof_path.len() {
+            return None;
+        }
+        Some(Self {
+            leaf_hash,
+            proof_path,
+            leaf_index,
+            directions,
+        })
+    }
+
     pub fn new(leaf_hash: Hash256, proof_path: Vec<Hash256>, leaf_index: usize) -> Self {
         // Compute directions from leaf index
         let mut directions = Vec::with_capacity(proof_path.len());
@@ -243,5 +274,61 @@ mod tests {
         // Second bit: 1 -> right child -> direction false
         assert_eq!(proof.directions.len(), 2);
         assert_eq!(proof.directions, vec![true, false]);
+    }
+}
+
+#[cfg(test)]
+mod promoted_node_tests {
+    use super::*;
+    use rs_merkle::{algorithms::Sha256, Hasher, MerkleTree};
+
+    #[test]
+    fn every_leaf_of_even_and_uneven_trees_has_correct_directions() {
+        for count in 1..=65 {
+            let leaves: Vec<_> = (0..count)
+                .map(|i: usize| Sha256::hash(&i.to_be_bytes()))
+                .collect();
+            let tree = MerkleTree::<Sha256>::from_leaves(&leaves);
+            for index in 0..count {
+                let path = tree.proof(&[index]).proof_hashes().to_vec();
+                let proof = MerkleProof::with_leaf_count(leaves[index], path.clone(), index, count)
+                    .unwrap();
+                let rebuild = |leaf| {
+                    proof.proof_path.iter().zip(&proof.directions).fold(
+                        leaf,
+                        |node, (sibling, left)| {
+                            let bytes = if *left {
+                                [node, *sibling].concat()
+                            } else {
+                                [*sibling, node].concat()
+                            };
+                            Sha256::hash(&bytes)
+                        },
+                    )
+                };
+                assert_eq!(
+                    Some(rebuild(leaves[index])),
+                    tree.root(),
+                    "count={count}, index={index}"
+                );
+                let mut altered = leaves[index];
+                altered[0] ^= 1;
+                assert_ne!(Some(rebuild(altered)), tree.root());
+                let mut extra = path.clone();
+                extra.push([0; 32]);
+                assert!(MerkleProof::with_leaf_count(leaves[index], extra, index, count).is_none());
+                if !path.is_empty() {
+                    assert!(MerkleProof::with_leaf_count(
+                        leaves[index],
+                        path[1..].to_vec(),
+                        index,
+                        count
+                    )
+                    .is_none());
+                }
+            }
+        }
+        assert!(MerkleProof::with_leaf_count([0; 32], vec![], 0, 0).is_none());
+        assert!(MerkleProof::with_leaf_count([0; 32], vec![], 3, 3).is_none());
     }
 }

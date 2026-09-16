@@ -382,6 +382,30 @@ impl PgX402Repository {
         row.map(Self::row_to_intent).transpose()
     }
 
+    /// Serialize same-key admission and read its committed intent using the
+    /// caller's transaction (also works with a single-connection pool).
+    pub async fn get_intent_by_idempotency_locked_tx(
+        &self,
+        tx: &mut Transaction<'_, Postgres>,
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        idempotency_key: &str,
+    ) -> Result<Option<X402PaymentIntent>> {
+        let lock_key = format!(
+            "x402-admission:{}:{}:{}",
+            tenant_id.0, store_id.0, idempotency_key
+        );
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lock_key)
+            .execute(&mut **tx)
+            .await?;
+        let row: Option<X402IntentRow> = sqlx::query_as(
+            "SELECT * FROM x402_payment_intents WHERE tenant_id=$1 AND store_id=$2 AND idempotency_key=$3"
+        ).bind(tenant_id.0).bind(store_id.0).bind(idempotency_key)
+            .fetch_optional(&mut **tx).await?;
+        row.map(Self::row_to_intent).transpose()
+    }
+
     /// Check if nonce has been used for a payer
     pub async fn is_nonce_used(
         &self,

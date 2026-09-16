@@ -20,6 +20,33 @@ Authorization: Bearer <your-api-key>
 
 **Metrics:** `/metrics` requires an admin API key.
 
+## Legacy v1 Deprecation
+
+The pre-VES **legacy v1 surface is formally deprecated** (planned removal:
+2027-03-01) in favor of the VES `/v1/ves/*` endpoints and the gRPC
+`stateset.sequencer.v2` service. New integrations must use the current
+surface; every legacy call emits a server-side deprecation warning log.
+
+| Legacy (deprecated) | Successor |
+|---|---|
+| `POST /v1/events/ingest` | `POST /v1/ves/events/ingest` |
+| `GET /v1/events` | `GET /v1/ves/events` |
+| `GET /v1/head` | `GET /v1/ves/head` |
+| `GET/POST /v1/commitments`, `GET /v1/commitments/:batch_id` | `GET/POST /v1/ves/commitments`, `GET /v1/ves/commitments/:batch_id` |
+| `GET /v1/proofs/:sequence_number`, `POST /v1/proofs/verify` | `GET /v1/ves/proofs/:sequence_number`, `POST /v1/ves/proofs/verify` |
+| `GET /v1/entities/:entity_type/:entity_id` | `GET /v1/ves/entities/:entity_type/:entity_id` |
+| `GET /v1/projections/:entity_type/:entity_id` | `GET /v1/ves/entities/:entity_type/:entity_id` (reduce locally) |
+| `POST /v1/anchor`, `GET /v1/anchor/status`, `GET /v1/anchor/:batch_id/verify` | `POST /v1/ves/anchor`, `GET /v1/ves/anchor/:batch_id/verify` |
+| gRPC `stateset.sequencer.v1` (`Push`, `Pull`, `GetHead`, `GetInclusionProof`, `GetCommitment`, `GetEntityHistory`) | gRPC `stateset.sequencer.v2` (`Push`, `PullEvents`/`StreamEvents`, `GetSyncState`, `GetInclusionProof`, `GetCommitment`, `GetEntityHistory`) |
+
+Every legacy REST response carries `Deprecation: true`,
+`Sunset: Mon, 01 Mar 2027 00:00:00 GMT` and
+`Link: ...; rel="successor-version"` headers (see
+`src/api/middleware/deprecation.rs`). Every gRPC v1 response carries
+`x-sequencer-v1-deprecated: true` and `x-sequencer-successor` metadata (see
+`src/grpc/service.rs`). The full machine-checked route/proto inventory lives
+in `tests/api_drift_gate_test.rs`.
+
 ## Admin Dashboard
 
 The admin dashboard UI is available at:

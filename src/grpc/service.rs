@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::auth::AuthContext;
@@ -73,6 +73,15 @@ const MAX_GRPC_BATCH_SIZE: usize = 1000;
 /// the v1 path cannot be coerced into materializing and serializing an entire
 /// multi-million-event entity history into one response.
 const MAX_ENTITY_HISTORY: usize = crate::domain::MAX_ENTITY_HISTORY_PAGE as usize;
+
+/// gRPC metadata key marking a response as served by the deprecated v1 API.
+const V1_DEPRECATED_METADATA: &str = "x-sequencer-v1-deprecated";
+
+/// gRPC metadata key pointing v1 callers at the supported successor service.
+const V1_SUCCESSOR_METADATA: &str = "x-sequencer-successor";
+
+/// Successor service for every deprecated v1 RPC.
+const V1_SUCCESSOR_SERVICE: &str = "stateset.sequencer.v2.Sequencer";
 
 /// gRPC Sequencer service implementation
 pub struct SequencerService {
@@ -275,7 +284,7 @@ impl SequencerService {
                     }),
                     commitment: Some(Self::to_proto_commitment(commitment)),
                 };
-                return Ok(Response::new(proof_response));
+                return Ok(Self::v1_response("GetInclusionProof", proof_response));
             }
         }
 
@@ -300,7 +309,7 @@ impl SequencerService {
                     }),
                     commitment: Some(Self::to_proto_commitment(commitment)),
                 };
-                return Ok(Response::new(proof_response));
+                return Ok(Self::v1_response("GetInclusionProof", proof_response));
             }
         }
 
@@ -327,7 +336,7 @@ impl SequencerService {
                         }),
                         commitment: Some(Self::to_proto_commitment(commitment)),
                     };
-                    return Ok(Response::new(proof_response));
+                    return Ok(Self::v1_response("GetInclusionProof", proof_response));
                 }
             }
         }
@@ -354,7 +363,7 @@ impl SequencerService {
             commitment: Some(Self::to_proto_commitment(commitment)),
         };
 
-        Ok(Response::new(proof_response))
+        Ok(Self::v1_response("GetInclusionProof", proof_response))
     }
 
     /// Convert proto event to domain event envelope
@@ -444,6 +453,29 @@ impl SequencerService {
                 Some(proto.signature.clone())
             },
         })
+    }
+
+    /// Wrap a v1 payload in its formally-deprecated response envelope.
+    ///
+    /// Every v1 RPC is deprecated in favor of `stateset.sequencer.v2`: the
+    /// call is logged so operators can find remaining v1 callers, and the
+    /// response carries machine-readable deprecation/successor metadata.
+    fn v1_response<T>(rpc: &'static str, inner: T) -> Response<T> {
+        warn!(
+            rpc,
+            successor = V1_SUCCESSOR_SERVICE,
+            "legacy gRPC v1 RPC called; migrate to stateset.sequencer.v2"
+        );
+        let mut response = Response::new(inner);
+        response.metadata_mut().insert(
+            V1_DEPRECATED_METADATA,
+            tonic::metadata::MetadataValue::from_static("true"),
+        );
+        response.metadata_mut().insert(
+            V1_SUCCESSOR_METADATA,
+            tonic::metadata::MetadataValue::from_static(V1_SUCCESSOR_SERVICE),
+        );
+        response
     }
 
     /// Convert domain commitment to proto commitment
@@ -561,15 +593,18 @@ impl SequencerTrait for SequencerService {
                     },
                 };
 
-                Ok(Response::new(PushResponse {
-                    batch_id: receipt.batch_id.to_string(),
-                    events_accepted: receipt.events_accepted,
-                    events_rejected: rejected,
-                    assigned_sequence_start: receipt.assigned_sequence_start.unwrap_or(0),
-                    assigned_sequence_end: receipt.assigned_sequence_end.unwrap_or(0),
-                    head_sequence: receipt.head_sequence,
-                    commitment,
-                }))
+                Ok(Self::v1_response(
+                    "Push",
+                    PushResponse {
+                        batch_id: receipt.batch_id.to_string(),
+                        events_accepted: receipt.events_accepted,
+                        events_rejected: rejected,
+                        assigned_sequence_start: receipt.assigned_sequence_start.unwrap_or(0),
+                        assigned_sequence_end: receipt.assigned_sequence_end.unwrap_or(0),
+                        head_sequence: receipt.head_sequence,
+                        commitment,
+                    },
+                ))
             }
             Err(e) => {
                 error!(error = %e, "Push failed");
@@ -699,7 +734,10 @@ impl SequencerTrait for SequencerService {
             }
         });
 
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(Self::v1_response(
+            "Pull",
+            Box::pin(ReceiverStream::new(rx)) as Self::PullStream,
+        ))
     }
 
     /// Get the current head sequence number
@@ -798,10 +836,13 @@ impl SequencerTrait for SequencerService {
 
         let latest_commitment = latest_commitment.map(|c| Self::to_proto_commitment(&c));
 
-        Ok(Response::new(GetHeadResponse {
-            head_sequence: head,
-            latest_commitment,
-        }))
+        Ok(Self::v1_response(
+            "GetHead",
+            GetHeadResponse {
+                head_sequence: head,
+                latest_commitment,
+            },
+        ))
     }
 
     /// Get Merkle inclusion proof for an event
@@ -1014,9 +1055,12 @@ impl SequencerTrait for SequencerService {
 
         Self::authorize_tenant_store(&auth_ctx, &commitment.tenant_id, &commitment.store_id)?;
 
-        Ok(Response::new(GetCommitmentResponse {
-            commitment: Some(Self::to_proto_commitment(&commitment)),
-        }))
+        Ok(Self::v1_response(
+            "GetCommitment",
+            GetCommitmentResponse {
+                commitment: Some(Self::to_proto_commitment(&commitment)),
+            },
+        ))
     }
 
     /// Get entity event history
@@ -1098,9 +1142,12 @@ impl SequencerTrait for SequencerService {
         let proto_events: Vec<SequencedEvent> =
             page.events.iter().map(Self::to_proto_event).collect();
 
-        Ok(Response::new(GetEntityHistoryResponse {
-            events: proto_events,
-            current_version: page.total,
-        }))
+        Ok(Self::v1_response(
+            "GetEntityHistory",
+            GetEntityHistoryResponse {
+                events: proto_events,
+                current_version: page.total,
+            },
+        ))
     }
 }

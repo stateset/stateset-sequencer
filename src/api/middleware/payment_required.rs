@@ -437,6 +437,7 @@ mod tests {
 
     fn test_payment(config: &PaymentRequiredConfig) -> SubmitX402PaymentRequest {
         SubmitX402PaymentRequest {
+            intent_id: None,
             tenant_id: Uuid::new_v4(),
             store_id: Uuid::new_v4(),
             agent_id: Uuid::new_v4(),

@@ -770,6 +770,11 @@ pub struct X402PaymentReceiptHeader {
 /// Request to submit an x402 payment intent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitX402PaymentRequest {
+    /// Client-reserved identity for pre-signed on-chain payer authorization.
+    /// When omitted, legacy unsigned settlement requests receive a server UUID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_id: Option<Uuid>,
+
     /// Tenant ID
     pub tenant_id: Uuid,
 

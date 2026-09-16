@@ -1,6 +1,6 @@
 [package]
 name = "stateset-sequencer"
-version = "0.8.6"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.90"
 authors = ["StateSet Core Infrastructure"]
@@ -120,16 +120,24 @@ tower-http = { version = "0.6", features = ["compression-gzip", "cors", "timeout
 hex = "0.4"
 
 # StateSet STARK (Winterfell) verification.
-# Optional + behind the `stark` feature: these crates live in the separate,
-# private `stateset-stark` workspace, so gating them lets the core sequencer
-# build and be tested (e.g. in CI) without that dependency. `ves-stark-prover`
-# is only used by tests but is declared here (not in dev-dependencies, which
-# cannot be optional) so `cargo test` without the `stark` feature does not pull
-# the private repo.
-ves-stark-verifier = { path = "../stateset-stark/crates/ves-stark-verifier", optional = true }
-ves-stark-primitives = { path = "../stateset-stark/crates/ves-stark-primitives", optional = true }
-ves-stark-batch = { path = "../stateset-stark/crates/ves-stark-batch", optional = true }
-ves-stark-prover = { path = "../stateset-stark/crates/ves-stark-prover", optional = true }
+# Optional + behind the `stark` feature. These crates live in the separate
+# `stateset-starks` repository and are fetched from git at the pinned `rev`
+# below — deliberately NOT path dependencies on a `../stateset-stark`
+# checkout: cargo must resolve every path dependency even when the feature
+# that enables it is off, so a sibling checkout used to be required to build
+# anything at all (including `--no-default-features --features pqc` on a
+# clean checkout). Optional git dependencies are only fetched when the
+# `stark` feature enables them, so the core sequencer builds and tests with
+# no STARK sources on disk. `ves-stark-prover` is only used by tests but is
+# declared here (not in dev-dependencies, which cannot be optional) so
+# `cargo test` without the `stark` feature does not pull the STARK repo.
+# Keep the pin in sync with `STARK_REF` in `.github/workflows/ci.yml`, and
+# re-resolve the lockfile (`cargo update -p ves-stark-...`) in the same
+# commit, so a STARK upgrade is always deliberate and atomic.
+ves-stark-verifier = { git = "https://github.com/stateset/stateset-starks.git", rev = "4209d2623750242d680abc21d13f39ab80791c2b", optional = true }
+ves-stark-primitives = { git = "https://github.com/stateset/stateset-starks.git", rev = "4209d2623750242d680abc21d13f39ab80791c2b", optional = true }
+ves-stark-batch = { git = "https://github.com/stateset/stateset-starks.git", rev = "4209d2623750242d680abc21d13f39ab80791c2b", optional = true }
+ves-stark-prover = { git = "https://github.com/stateset/stateset-starks.git", rev = "4209d2623750242d680abc21d13f39ab80791c2b", optional = true }
 
 # Ethereum/EVM interaction
 # Explicit feature set (not "full") so the HTTP transport uses rustls instead of

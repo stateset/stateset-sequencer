@@ -1434,4 +1434,239 @@ mod tests {
         assert!(stats.get("ves_proofs").is_some());
         assert!(stats.get("agent_keys").is_some());
     }
+
+    /// Backdate an entry's creation time without wall-clock sleeps, so
+    /// TTL/refresh behaviour stays deterministic under instrumentation.
+    async fn backdate<K, V>(cache: &LruCache<K, V>, key: &K, age: Duration)
+    where
+        K: Eq + Hash + Clone,
+        V: Clone,
+    {
+        let mut entries = cache.entries.write().await;
+        if let Some(entry) = entries.get_mut(key) {
+            entry.created_at = Instant::now() - age;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_lru_cache_remove() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(60));
+        cache.insert("key".to_string(), 100).await;
+        assert_eq!(cache.remove(&"key".to_string()).await, Some(100));
+        assert_eq!(cache.get(&"key".to_string()).await, None);
+        assert_eq!(cache.remove(&"key".to_string()).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_lru_cache_clear_len_is_empty() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(60));
+        assert!(cache.is_empty().await);
+        assert_eq!(cache.len().await, 0);
+        cache.insert("a".to_string(), 1).await;
+        cache.insert("b".to_string(), 2).await;
+        assert_eq!(cache.len().await, 2);
+        assert!(!cache.is_empty().await);
+        cache.clear().await;
+        assert!(cache.is_empty().await);
+        assert_eq!(cache.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_hit_rate_without_lookups_is_zero() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(60));
+        assert_eq!(cache.stats().hit_rate(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_expired_entry_counts_expiration() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(1));
+        cache.insert("old".to_string(), 1).await;
+        // Default max_stale_age is 60s: age past ttl + grace is fully expired.
+        backdate(&cache, &"old".to_string(), Duration::from_secs(62)).await;
+        assert_eq!(cache.get(&"old".to_string()).await, None);
+        assert_eq!(cache.stats().expirations(), 1);
+        assert_eq!(cache.stats().misses(), 1);
+        assert_eq!(cache.stats().hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_needs_refresh_false_cases() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(60));
+        assert!(!cache.needs_refresh(&"missing".to_string()).await);
+        cache.insert("fresh".to_string(), 1).await;
+        assert!(!cache.needs_refresh(&"fresh".to_string()).await);
+    }
+
+    #[tokio::test]
+    async fn test_needs_refresh_true_for_aged_entry() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(1));
+        cache.insert("aging".to_string(), 1).await;
+        // Threshold is 75% of a 1s TTL: 800ms is past it but within the TTL.
+        backdate(&cache, &"aging".to_string(), Duration::from_millis(800)).await;
+        assert!(cache.needs_refresh(&"aging".to_string()).await);
+    }
+
+    #[tokio::test]
+    async fn test_get_with_refresh_check_fresh_needs_no_refresh() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(60));
+        cache.insert("k".to_string(), 7).await;
+        let (value, needs_refresh) = cache.get_with_refresh_check(&"k".to_string()).await;
+        assert_eq!(value, Some(7));
+        assert!(!needs_refresh);
+    }
+
+    #[tokio::test]
+    async fn test_get_with_refresh_check_aged_requests_refresh() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(1));
+        cache.insert("k".to_string(), 7).await;
+        // Past the 75% refresh threshold but still within the TTL: served
+        // fresh while a background refresh is requested (refresh-ahead).
+        backdate(&cache, &"k".to_string(), Duration::from_millis(800)).await;
+        let (value, needs_refresh) = cache.get_with_refresh_check(&"k".to_string()).await;
+        assert_eq!(value, Some(7));
+        assert!(needs_refresh);
+        assert_eq!(cache.stats().background_refreshes(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_with_refresh_check_stale_serves_without_refresh() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(1));
+        cache.insert("k".to_string(), 7).await;
+        // Past the TTL but within the stale grace period: served stale, and
+        // no refresh-ahead is requested for an already-stale entry.
+        backdate(&cache, &"k".to_string(), Duration::from_millis(1200)).await;
+        let (value, needs_refresh) = cache.get_with_refresh_check(&"k".to_string()).await;
+        assert_eq!(value, Some(7));
+        assert!(!needs_refresh);
+        assert_eq!(cache.stats().stale_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_success_inserts_value() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(60));
+        cache
+            .refresh("k".to_string(), || async { Ok::<i32, String>(7) })
+            .await
+            .unwrap();
+        assert_eq!(cache.get(&"k".to_string()).await, Some(7));
+        assert_eq!(cache.stats().refresh_failures(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_failure_counts_and_propagates() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(60));
+        let err = cache
+            .refresh("k".to_string(), || async {
+                Err::<i32, String>("boom".to_string())
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err, "boom");
+        assert_eq!(cache.stats().refresh_failures(), 1);
+        assert_eq!(cache.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_expired_keeps_fresh_entries() {
+        let cache: LruCache<String, i32> = LruCache::new(10, Duration::from_secs(1));
+        cache.insert("old".to_string(), 1).await;
+        cache.insert("fresh".to_string(), 2).await;
+        backdate(&cache, &"old".to_string(), Duration::from_secs(62)).await;
+        cache.cleanup_expired().await;
+        assert_eq!(cache.len().await, 1);
+        assert_eq!(cache.stats().expirations(), 1);
+        assert_eq!(cache.get(&"fresh".to_string()).await, Some(2));
+        assert_eq!(cache.get(&"old".to_string()).await, None);
+    }
+
+    fn test_batch_commitment(sequence_range: (u64, u64)) -> BatchCommitment {
+        BatchCommitment {
+            batch_id: Uuid::new_v4(),
+            tenant_id: TenantId::from_uuid(Uuid::new_v4()),
+            store_id: StoreId::from_uuid(Uuid::new_v4()),
+            prev_state_root: [0u8; 32],
+            new_state_root: [1u8; 32],
+            events_root: [2u8; 32],
+            event_count: 10,
+            sequence_range,
+            committed_at: chrono::Utc::now(),
+            chain_tx_hash: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commitment_cache_latest_tracks_highest_sequence() {
+        let cache = CommitmentCache::default();
+        let first = test_batch_commitment((1, 10));
+        cache.insert(first.clone(), [3u8; 32]).await;
+
+        // An older batch must not displace the latest pointer.
+        let mut older = test_batch_commitment((1, 5));
+        older.tenant_id = first.tenant_id.clone();
+        older.store_id = first.store_id.clone();
+        cache.insert(older, [4u8; 32]).await;
+
+        let latest = cache
+            .get_latest(&first.tenant_id.0, &first.store_id.0)
+            .await
+            .unwrap();
+        assert_eq!(latest.commitment.batch_id, first.batch_id);
+    }
+
+    #[tokio::test]
+    async fn test_commitment_cache_invalidate() {
+        let cache = CommitmentCache::default();
+        let commitment = test_batch_commitment((1, 10));
+        cache.insert(commitment.clone(), [3u8; 32]).await;
+        assert!(cache.get_by_batch_id(&commitment.batch_id).await.is_some());
+        cache.invalidate(&commitment.batch_id).await;
+        assert!(cache.get_by_batch_id(&commitment.batch_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_commitment_cache_miss_locks_acquire_and_release() {
+        let cache = CommitmentCache::default();
+        let batch_id = Uuid::new_v4();
+        let (cached, acquired) = cache.get_by_batch_id_with_lock(&batch_id).await;
+        assert!(cached.is_none());
+        assert!(acquired);
+        // A live lock is exclusive until released.
+        let (_, again) = cache.get_by_batch_id_with_lock(&batch_id).await;
+        assert!(!again);
+        cache.release_batch_id_lock(&batch_id).await;
+        let (_, retaken) = cache.get_by_batch_id_with_lock(&batch_id).await;
+        assert!(retaken);
+        cache.release_batch_id_lock(&batch_id).await;
+
+        let tenant_id = Uuid::new_v4();
+        let store_id = Uuid::new_v4();
+        let (latest, latest_acquired) = cache.get_latest_with_lock(&tenant_id, &store_id).await;
+        assert!(latest.is_none());
+        assert!(latest_acquired);
+        cache.release_latest_lock(&tenant_id, &store_id).await;
+    }
+
+    #[tokio::test]
+    async fn test_ves_commitment_cache_insert_get_latest_invalidate() {
+        let cache = VesCommitmentCache::default();
+        let commitment = VesBatchCommitment::new(
+            TenantId::from_uuid(Uuid::new_v4()),
+            StoreId::from_uuid(Uuid::new_v4()),
+            3,
+            5,
+            8,
+            [1u8; 32],
+            (10, 14),
+        );
+        cache.insert(commitment.clone()).await;
+        let cached = cache.get_by_batch_id(&commitment.batch_id).await.unwrap();
+        assert_eq!(cached.batch_id, commitment.batch_id);
+        let latest = cache
+            .get_latest(&commitment.tenant_id.0, &commitment.store_id.0)
+            .await
+            .unwrap();
+        assert_eq!(latest.batch_id, commitment.batch_id);
+        cache.invalidate(&commitment.batch_id).await;
+        assert!(cache.get_by_batch_id(&commitment.batch_id).await.is_none());
+    }
 }

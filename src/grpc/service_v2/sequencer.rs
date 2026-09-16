@@ -1,9 +1,25 @@
-//! gRPC Sequencer v2 service implementation
+//! gRPC Sequencer v2 service: event push/pull/stream/sync.
 //!
 //! Implements the VES v1.0 Protocol with bidirectional streaming support.
+//! Stateless conversions live in [`super::convert`]; shared service limits in
+//! [`super`].
 #![allow(clippy::result_large_err)]
 
-use chrono::{DateTime, Utc};
+use super::convert;
+use super::{MAX_ENTITY_HISTORY, MAX_GRPC_BATCH_SIZE};
+use crate::auth::AuthContext;
+use crate::domain::{EntityType, StoreId, TenantId};
+use crate::infra::{
+    CacheManager, PgAgentKeyRegistry, PgVesCommitmentEngine, VesSequencer, CACHE_STAMPEDE_DELAY,
+};
+use crate::proto::v2::{
+    self, sequencer_server::Sequencer as SequencerTrait, BatchCommitment, GetCommitmentRequest,
+    GetEntityHistoryRequest, GetEntityHistoryResponse, GetInclusionProofRequest,
+    GetInclusionProofResponse, GetSyncStateRequest, HealthResponse, InclusionProof,
+    PullEventsRequest, PullEventsResponse, PushRequest, PushResponse, RejectedEvent,
+    SequencedEvent, StreamEventsRequest, SubscribeEntityRequest, SyncMessage, SyncState,
+};
+use chrono::Utc;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -13,70 +29,6 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
-
-use crate::auth::{
-    AgentKeyEntry, AgentKeyError, AgentKeyLookup, AgentKeyRegistry, AuthContext,
-    KeyStatus as DomainKeyStatus,
-};
-use crate::crypto::pqc_signing::{
-    verify_proof_of_possession, KeyAlgorithm as DomainKeyAlgorithm, ParsedSignatureBundle,
-    PublicKeyBundle as DomainPublicKeyBundle, SignatureScheme as DomainSignatureScheme,
-};
-use crate::crypto::{
-    base64_url_decode, base64_url_encode, compute_cipher_hash_from_encrypted, compute_payload_aad,
-    compute_receipt_hash, payload_plain_hash, HpkeParams, PayloadAadParams, PayloadEncrypted,
-    Recipient, NONCE_SIZE, TAG_SIZE,
-};
-use crate::domain::{
-    AgentId, AgentKeyId, EntityType, EventType, PayloadKind, SequencedVesEvent, StoreId, TenantId,
-    VesBatchCommitment, VesEventEnvelope, VES_VERSION, ZERO_HASH,
-};
-use crate::infra::{
-    postgres::VesRejectionReason, CacheManager, PgAgentKeyRegistry, PgVesCommitmentEngine,
-    VesSequencer, CACHE_STAMPEDE_DELAY,
-};
-use crate::proto::v2::{
-    self,
-    key_management_server::KeyManagement as KeyManagementTrait,
-    sequencer_server::Sequencer as SequencerTrait,
-    BatchCommitment,
-    EventEnvelope,
-    // Key management types
-    GetAgentKeysRequest,
-    GetAgentKeysResponse,
-    GetCommitmentRequest,
-    GetEntityHistoryRequest,
-    GetEntityHistoryResponse,
-    GetInclusionProofRequest,
-    GetInclusionProofResponse,
-    GetSyncStateRequest,
-    HealthResponse,
-    InclusionProof,
-    KeyType,
-    // PQC types
-    PublicKeyBundle as ProtoPublicKeyBundle,
-    PullEventsRequest,
-    PullEventsResponse,
-    PushRequest,
-    PushResponse,
-    RegisterKeyRequest,
-    RegisterKeyResponse,
-    RejectedEvent,
-    RejectionReason,
-    RevokeKeyRequest,
-    RevokeKeyResponse,
-    SequencedEvent,
-    SignatureBundle,
-    StreamEventsRequest,
-    SubscribeEntityRequest,
-    SyncMessage,
-    SyncState,
-};
-
-/// Maximum events allowed in a single gRPC push request.
-const MAX_GRPC_BATCH_SIZE: usize = 1000;
-/// Maximum entity history events returned per request.
-const MAX_ENTITY_HISTORY: usize = crate::domain::MAX_ENTITY_HISTORY_PAGE as usize;
 
 /// gRPC Sequencer v2 service implementation
 pub struct SequencerServiceV2 {
@@ -147,522 +99,6 @@ impl SequencerServiceV2 {
         Ok(())
     }
 
-    fn map_rejection_reason(reason: &VesRejectionReason) -> RejectionReason {
-        match reason {
-            VesRejectionReason::DuplicateEventId => RejectionReason::DuplicateEvent,
-            VesRejectionReason::DuplicateCommandId => RejectionReason::DuplicateCommand,
-            VesRejectionReason::InvalidPayloadHash | VesRejectionReason::InvalidCipherHash => {
-                RejectionReason::InvalidHash
-            }
-            VesRejectionReason::InvalidSignature => RejectionReason::InvalidSignature,
-            VesRejectionReason::AgentKeyInvalid(message) => {
-                if message.to_ascii_lowercase().contains("revoked") {
-                    RejectionReason::RevokedKey
-                } else {
-                    RejectionReason::UnknownKey
-                }
-            }
-            VesRejectionReason::UnsupportedVersion | VesRejectionReason::SchemaValidation(_) => {
-                RejectionReason::InvalidFormat
-            }
-            VesRejectionReason::PolicyViolation(_) => RejectionReason::PolicyViolation,
-            VesRejectionReason::VersionConflict { .. } => RejectionReason::VersionConflict,
-        }
-    }
-
-    /// Validate an acknowledgement without confusing individually completed
-    /// events with the highest contiguous durable checkpoint.
-    fn durable_ack_sequence(ack: &v2::EventAck, head: u64) -> Result<u64, Status> {
-        let highest_referenced_sequence = ack
-            .sequence_numbers
-            .iter()
-            .copied()
-            .chain(std::iter::once(ack.agent_head_sequence))
-            .max()
-            .unwrap_or(0);
-        if highest_referenced_sequence > head {
-            return Err(Status::invalid_argument(
-                "acknowledged sequences cannot exceed the stream head",
-            ));
-        }
-        Ok(ack.agent_head_sequence)
-    }
-
-    fn timestamp_to_rfc3339(ts: &prost_types::Timestamp) -> Result<String, Status> {
-        if ts.nanos < 0 || ts.nanos > 999_999_999 {
-            return Err(Status::invalid_argument("invalid created_at nanos"));
-        }
-        let dt = DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
-            .ok_or_else(|| Status::invalid_argument("invalid created_at timestamp"))?;
-        Ok(dt.to_rfc3339())
-    }
-
-    fn rfc3339_to_timestamp(value: &str) -> Result<prost_types::Timestamp, Status> {
-        let dt = DateTime::parse_from_rfc3339(value).map_err(|e| {
-            tracing::error!("invalid created_at: {e}");
-            Status::internal("internal error")
-        })?;
-        let dt = dt.with_timezone(&Utc);
-        Ok(prost_types::Timestamp {
-            seconds: dt.timestamp(),
-            nanos: dt.timestamp_subsec_nanos() as i32,
-        })
-    }
-
-    fn payload_kind_from_proto(value: i32) -> Result<PayloadKind, Status> {
-        match v2::PayloadKind::try_from(value).unwrap_or(v2::PayloadKind::Unspecified) {
-            v2::PayloadKind::Plaintext => Ok(PayloadKind::Plaintext),
-            v2::PayloadKind::Encrypted => Ok(PayloadKind::Encrypted),
-            v2::PayloadKind::Unspecified => Err(Status::invalid_argument("payload_kind required")),
-        }
-    }
-
-    fn encrypted_from_proto(payload: &v2::EncryptedPayload) -> Result<PayloadEncrypted, Status> {
-        let enc_version = if payload.enc_version == 0 {
-            1
-        } else {
-            payload.enc_version
-        };
-        if enc_version != 1 {
-            return Err(Status::invalid_argument("enc_version must be 1"));
-        }
-        if payload.nonce.len() != NONCE_SIZE {
-            return Err(Status::invalid_argument("nonce must be 12 bytes"));
-        }
-        if payload.tag.len() != TAG_SIZE {
-            return Err(Status::invalid_argument("tag must be 16 bytes"));
-        }
-
-        let hpke = payload
-            .hpke
-            .as_ref()
-            .map(|params| HpkeParams {
-                mode: params.mode.clone(),
-                kem: params.kem.clone(),
-                kdf: params.kdf.clone(),
-                aead: params.aead.clone(),
-            })
-            .unwrap_or_default();
-
-        let recipients = payload
-            .recipients
-            .iter()
-            .map(|recipient| Recipient {
-                recipient_kid: recipient.recipient_kid,
-                enc_b64u: base64_url_encode(&recipient.ephemeral_public_key),
-                ct_b64u: base64_url_encode(&recipient.wrapped_dek),
-            })
-            .collect();
-
-        Ok(PayloadEncrypted {
-            enc_version,
-            aead: payload.aead.clone(),
-            nonce_b64u: base64_url_encode(&payload.nonce),
-            ciphertext_b64u: base64_url_encode(&payload.ciphertext),
-            tag_b64u: base64_url_encode(&payload.tag),
-            hpke,
-            recipients,
-        })
-    }
-
-    fn encrypted_to_proto(payload: &PayloadEncrypted) -> Result<v2::EncryptedPayload, Status> {
-        let nonce = base64_url_decode(&payload.nonce_b64u)
-            .map_err(|_| Status::internal("invalid encrypted nonce"))?;
-        if nonce.len() != NONCE_SIZE {
-            return Err(Status::internal("invalid encrypted nonce length"));
-        }
-        let tag = base64_url_decode(&payload.tag_b64u)
-            .map_err(|_| Status::internal("invalid encrypted tag"))?;
-        if tag.len() != TAG_SIZE {
-            return Err(Status::internal("invalid encrypted tag length"));
-        }
-        let ciphertext = base64_url_decode(&payload.ciphertext_b64u)
-            .map_err(|_| Status::internal("invalid encrypted ciphertext"))?;
-
-        let mut recipients = Vec::with_capacity(payload.recipients.len());
-        for recipient in &payload.recipients {
-            let enc = base64_url_decode(&recipient.enc_b64u)
-                .map_err(|_| Status::internal("invalid recipient enc"))?;
-            let wrapped = base64_url_decode(&recipient.ct_b64u)
-                .map_err(|_| Status::internal("invalid recipient wrapped_dek"))?;
-            recipients.push(v2::RecipientKey {
-                recipient_kid: recipient.recipient_kid,
-                ephemeral_public_key: enc,
-                wrapped_dek: wrapped,
-            });
-        }
-
-        Ok(v2::EncryptedPayload {
-            enc_version: payload.enc_version,
-            aead: payload.aead.clone(),
-            nonce,
-            ciphertext,
-            tag,
-            hpke: Some(v2::HpkeParams {
-                mode: payload.hpke.mode.clone(),
-                kem: payload.hpke.kem.clone(),
-                kdf: payload.hpke.kdf.clone(),
-                aead: payload.hpke.aead.clone(),
-            }),
-            recipients,
-            key_wrap_params: None,
-            recipient_wraps: Vec::new(),
-        })
-    }
-
-    /// Convert domain event to v2 proto event
-    fn to_proto_event(event: &SequencedVesEvent) -> Result<SequencedEvent, Status> {
-        let envelope = &event.envelope;
-        let payload_kind = match envelope.payload_kind {
-            PayloadKind::Plaintext => v2::PayloadKind::Plaintext as i32,
-            PayloadKind::Encrypted => v2::PayloadKind::Encrypted as i32,
-        };
-
-        let (payload, payload_encrypted) = match envelope.payload_kind {
-            PayloadKind::Plaintext => {
-                let payload = envelope
-                    .payload
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("missing plaintext payload"))?;
-                (
-                    serde_json::to_vec(payload).map_err(super::grpc_internal_error)?,
-                    None,
-                )
-            }
-            PayloadKind::Encrypted => {
-                let encrypted = envelope
-                    .payload_encrypted
-                    .as_ref()
-                    .ok_or_else(|| Status::internal("missing encrypted payload"))?;
-                (Vec::new(), Some(Self::encrypted_to_proto(encrypted)?))
-            }
-        };
-
-        let created_at = Self::rfc3339_to_timestamp(&envelope.created_at)?;
-        let sequenced_at = envelope.sequenced_at.unwrap_or_else(Utc::now);
-        let receipt_hash = compute_receipt_hash(
-            &envelope.tenant_id.0,
-            &envelope.store_id.0,
-            &envelope.event_id,
-            event.sequence_number(),
-            &event.compute_signing_hash(),
-        );
-
-        // Serialize PQC signature bundle for the EventEnvelope
-        let agent_signature_scheme = envelope.agent_signature_scheme.unwrap_or(0);
-        let agent_signature_bundle =
-            envelope
-                .agent_signature_bundle
-                .as_ref()
-                .map(|bundle| SignatureBundle {
-                    ed25519_signature: bundle.ed25519_signature.clone().unwrap_or_default(),
-                    ml_dsa_65_signature: bundle.ml_dsa_65_signature.clone().unwrap_or_default(),
-                });
-
-        // Receipt PQC signature fields — populated when apply_receipt_signature is called
-        let receipt_sig_scheme = 0i32;
-        let receipt_sig_bundle = None::<SignatureBundle>;
-
-        Ok(SequencedEvent {
-            envelope: Some(EventEnvelope {
-                event_id: envelope.event_id.to_string(),
-                command_id: envelope
-                    .command_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_default(),
-                tenant_id: envelope.tenant_id.0.to_string(),
-                store_id: envelope.store_id.0.to_string(),
-                entity_type: envelope.entity_type.0.clone(),
-                entity_id: envelope.entity_id.clone(),
-                event_type: envelope.event_type.0.clone(),
-                source_agent: envelope.source_agent_id.0.to_string(),
-                ves_version: envelope.ves_version,
-                payload_kind,
-                payload,
-                payload_encrypted,
-                payload_plain_hash: envelope.payload_plain_hash.to_vec(),
-                payload_cipher_hash: envelope.payload_cipher_hash.to_vec(),
-                agent_key_id: envelope.agent_key_id.as_u32(),
-                agent_signature: envelope.agent_signature.to_vec(),
-                base_version: envelope.base_version.unwrap_or(0),
-                created_at: Some(created_at),
-                agent_signature_scheme,
-                agent_signature_bundle,
-            }),
-            sequence_number: event.sequence_number(),
-            sequenced_at: Some(prost_types::Timestamp {
-                seconds: sequenced_at.timestamp(),
-                nanos: sequenced_at.timestamp_subsec_nanos() as i32,
-            }),
-            receipt_hash: receipt_hash.to_vec(),
-            receipt_signature_scheme: receipt_sig_scheme,
-            receipt_signature_bundle: receipt_sig_bundle,
-        })
-    }
-
-    /// Apply PQC receipt signature fields to a proto SequencedEvent.
-    ///
-    /// Called when a receipt with PQC signature data is available (e.g., after
-    /// ingestion). For pull/stream paths, receipt signatures are stored separately
-    /// and applied when the receipt is joined with the event.
-    #[allow(dead_code)]
-    pub fn apply_receipt_signature(
-        event: &mut SequencedEvent,
-        receipt: &crate::infra::postgres::VesSequencerReceipt,
-    ) {
-        event.receipt_signature_scheme = receipt.receipt_signature_scheme;
-        if let Some(ref bundle) = receipt.receipt_signature_bundle {
-            event.receipt_signature_bundle = Some(SignatureBundle {
-                ed25519_signature: bundle.ed25519_signature.clone().unwrap_or_default(),
-                ml_dsa_65_signature: bundle.ml_dsa_65_signature.clone().unwrap_or_default(),
-            });
-        }
-    }
-
-    /// Convert v2 proto event to VES event envelope
-    #[allow(clippy::result_large_err)]
-    fn from_proto_event(proto: &EventEnvelope) -> Result<VesEventEnvelope, Status> {
-        let ves_version = if proto.ves_version == 0 {
-            VES_VERSION
-        } else {
-            proto.ves_version
-        };
-        if !matches!(ves_version, 1 | 2) {
-            return Err(Status::invalid_argument("unsupported ves_version"));
-        }
-
-        let event_id = Uuid::parse_str(&proto.event_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid event_id: {}", e)))?;
-        let tenant_id = Uuid::parse_str(&proto.tenant_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid tenant_id: {}", e)))?;
-        let store_id = Uuid::parse_str(&proto.store_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid store_id: {}", e)))?;
-        let source_agent = Uuid::parse_str(&proto.source_agent)
-            .map_err(|e| Status::invalid_argument(format!("invalid source_agent: {}", e)))?;
-
-        let payload_kind = Self::payload_kind_from_proto(proto.payload_kind)?;
-
-        let created_at = match proto.created_at.as_ref() {
-            Some(ts) => Self::timestamp_to_rfc3339(ts)?,
-            None => return Err(Status::invalid_argument("created_at required")),
-        };
-
-        let command_id = if proto.command_id.is_empty() {
-            None
-        } else {
-            Some(
-                Uuid::parse_str(&proto.command_id)
-                    .map_err(|e| Status::invalid_argument(format!("invalid command_id: {}", e)))?,
-            )
-        };
-
-        let payload = match payload_kind {
-            PayloadKind::Plaintext => {
-                let payload: serde_json::Value =
-                    serde_json::from_slice(&proto.payload).map_err(|e| {
-                        Status::invalid_argument(format!("invalid payload JSON: {}", e))
-                    })?;
-                Some(payload)
-            }
-            PayloadKind::Encrypted => None,
-        };
-
-        if payload_kind == PayloadKind::Plaintext && proto.payload_encrypted.is_some() {
-            return Err(Status::invalid_argument(
-                "payload_encrypted must be omitted for plaintext events",
-            ));
-        }
-        if payload_kind == PayloadKind::Encrypted && !proto.payload.is_empty() {
-            return Err(Status::invalid_argument(
-                "payload must be omitted for encrypted events",
-            ));
-        }
-
-        let payload_encrypted = match payload_kind {
-            PayloadKind::Encrypted => {
-                let encrypted = proto.payload_encrypted.as_ref().ok_or_else(|| {
-                    Status::invalid_argument("payload_encrypted required for encrypted events")
-                })?;
-                Some(Self::encrypted_from_proto(encrypted)?)
-            }
-            PayloadKind::Plaintext => None,
-        };
-
-        let payload_plain_hash: [u8; 32] = match proto.payload_plain_hash.len() {
-            0 => {
-                if let Some(ref payload) = payload {
-                    payload_plain_hash(payload)
-                } else {
-                    return Err(Status::invalid_argument(
-                        "payload_plain_hash required for encrypted events",
-                    ));
-                }
-            }
-            32 => proto
-                .payload_plain_hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| Status::invalid_argument("payload_plain_hash must be 32 bytes"))?,
-            _ => {
-                return Err(Status::invalid_argument(
-                    "payload_plain_hash must be 32 bytes",
-                ))
-            }
-        };
-
-        // Validate string field lengths (matching HTTP-side limits)
-        if proto.entity_type.is_empty() || proto.entity_type.len() > 128 {
-            return Err(Status::invalid_argument(
-                "entity_type must be between 1 and 128 characters",
-            ));
-        }
-        if proto.entity_id.is_empty() || proto.entity_id.len() > 512 {
-            return Err(Status::invalid_argument(
-                "entity_id must be between 1 and 512 characters",
-            ));
-        }
-        if proto.event_type.is_empty() || proto.event_type.len() > 256 {
-            return Err(Status::invalid_argument(
-                "event_type must be between 1 and 256 characters",
-            ));
-        }
-
-        let payload_aad = payload_encrypted.as_ref().map(|_| {
-            compute_payload_aad(&PayloadAadParams {
-                tenant_id: &tenant_id,
-                store_id: &store_id,
-                event_id: &event_id,
-                source_agent_id: &source_agent,
-                agent_key_id: proto.agent_key_id,
-                entity_type: proto.entity_type.as_str(),
-                entity_id: &proto.entity_id,
-                event_type: proto.event_type.as_str(),
-                created_at: &created_at,
-                payload_plain_hash: &payload_plain_hash,
-            })
-        });
-
-        let payload_cipher_hash: [u8; 32] = match proto.payload_cipher_hash.len() {
-            0 => {
-                if let Some(ref encrypted) = payload_encrypted {
-                    let payload_aad = payload_aad
-                        .as_ref()
-                        .ok_or_else(|| Status::invalid_argument("invalid payload_encrypted"))?;
-                    compute_cipher_hash_from_encrypted(encrypted, payload_aad)
-                        .map_err(|_| Status::invalid_argument("invalid payload_encrypted"))?
-                } else {
-                    ZERO_HASH
-                }
-            }
-            32 => proto
-                .payload_cipher_hash
-                .as_slice()
-                .try_into()
-                .map_err(|_| Status::invalid_argument("payload_cipher_hash must be 32 bytes"))?,
-            _ => {
-                return Err(Status::invalid_argument(
-                    "payload_cipher_hash must be 32 bytes",
-                ))
-            }
-        };
-
-        // Parse PQC signature scheme and bundle
-        let sig_scheme = DomainSignatureScheme::from_i32(proto.agent_signature_scheme);
-
-        let agent_signature: [u8; 64] = match sig_scheme {
-            // For PQC-strict (ML-DSA-65 only), the legacy field may be empty
-            DomainSignatureScheme::MlDsa65 => {
-                if proto.agent_signature.is_empty() {
-                    [0u8; 64]
-                } else {
-                    proto.agent_signature.as_slice().try_into().map_err(|_| {
-                        Status::invalid_argument("agent_signature must be 64 bytes when present")
-                    })?
-                }
-            }
-            // Legacy and hybrid: Ed25519 signature is required in the legacy field
-            _ => proto
-                .agent_signature
-                .as_slice()
-                .try_into()
-                .map_err(|_| Status::invalid_argument("agent_signature must be 64 bytes"))?,
-        };
-
-        let agent_signature_scheme = if proto.agent_signature_scheme != 0 {
-            Some(proto.agent_signature_scheme)
-        } else {
-            None
-        };
-
-        let agent_signature_bundle =
-            proto
-                .agent_signature_bundle
-                .as_ref()
-                .map(|bundle| ParsedSignatureBundle {
-                    ed25519_signature: if bundle.ed25519_signature.is_empty() {
-                        None
-                    } else {
-                        Some(bundle.ed25519_signature.clone())
-                    },
-                    ml_dsa_65_signature: if bundle.ml_dsa_65_signature.is_empty() {
-                        None
-                    } else {
-                        Some(bundle.ml_dsa_65_signature.clone())
-                    },
-                });
-
-        Ok(VesEventEnvelope {
-            ves_version,
-            event_id,
-            tenant_id: TenantId(tenant_id),
-            store_id: StoreId(store_id),
-            source_agent_id: AgentId(source_agent),
-            agent_key_id: AgentKeyId::new(proto.agent_key_id),
-            entity_type: EntityType::from(proto.entity_type.as_str()),
-            entity_id: proto.entity_id.clone(),
-            event_type: EventType(proto.event_type.clone()),
-            created_at,
-            payload_kind,
-            payload,
-            payload_encrypted,
-            payload_plain_hash,
-            payload_cipher_hash,
-            agent_signature,
-            agent_signature_scheme,
-            agent_signature_bundle,
-            sequence_number: None,
-            sequenced_at: None,
-            command_id,
-            base_version: if proto.base_version > 0 {
-                Some(proto.base_version)
-            } else {
-                None
-            },
-        })
-    }
-
-    /// Convert VES commitment to v2 proto commitment
-    fn to_proto_commitment(commitment: &VesBatchCommitment) -> BatchCommitment {
-        let previous_root = if commitment.prev_state_root == [0u8; 32] {
-            Vec::new()
-        } else {
-            commitment.prev_state_root.to_vec()
-        };
-
-        BatchCommitment {
-            batch_id: commitment.batch_id.to_string(),
-            merkle_root: commitment.merkle_root.to_vec(),
-            start_sequence: commitment.sequence_range.0,
-            end_sequence: commitment.sequence_range.1,
-            event_count: commitment.leaf_count,
-            committed_at: Some(prost_types::Timestamp {
-                seconds: commitment.committed_at.timestamp(),
-                nanos: commitment.committed_at.timestamp_subsec_nanos() as i32,
-            }),
-            previous_root,
-        }
-    }
-
     /// Broadcast a new event to all subscribers
     pub fn broadcast_event(&self, event: SequencedEvent) {
         if let Err(e) = self.event_tx.send(event) {
@@ -688,7 +124,7 @@ impl SequencerServiceV2 {
             .map_err(super::grpc_sequencer_error)?;
 
         for event in events {
-            let proto_event = Self::to_proto_event(&event)?;
+            let proto_event = convert::to_proto_event(&event)?;
             let _ = event_tx.send(proto_event);
         }
 
@@ -741,7 +177,7 @@ impl SequencerTrait for SequencerServiceV2 {
         // Convert proto events to VES events
         let mut events = Vec::with_capacity(req.events.len());
         for proto_event in &req.events {
-            let event = Self::from_proto_event(proto_event)?;
+            let event = convert::from_proto_event(proto_event)?;
             if event.tenant_id.0 != tenant_id.0 || event.store_id.0 != store_id.0 {
                 return Err(Status::invalid_argument(
                     "event tenant_id/store_id must match push request",
@@ -763,7 +199,7 @@ impl SequencerTrait for SequencerServiceV2 {
                     .iter()
                     .map(|r| RejectedEvent {
                         event_id: r.event_id.to_string(),
-                        reason: Self::map_rejection_reason(&r.reason) as i32,
+                        reason: convert::map_rejection_reason(&r.reason) as i32,
                         message: r.message.clone(),
                     })
                     .collect();
@@ -938,7 +374,7 @@ impl SequencerTrait for SequencerServiceV2 {
         // Convert to proto events
         let proto_events: Vec<SequencedEvent> = filtered_events
             .iter()
-            .map(Self::to_proto_event)
+            .map(convert::to_proto_event)
             .collect::<Result<_, _>>()?;
 
         // Calculate next sequence
@@ -1063,7 +499,7 @@ impl SequencerTrait for SequencerServiceV2 {
             store_id: req.store_id,
             head_sequence: head,
             state_root,
-            latest_commitment: latest_commitment.as_ref().map(Self::to_proto_commitment),
+            latest_commitment: latest_commitment.as_ref().map(convert::to_proto_commitment),
             timestamp: Some(prost_types::Timestamp {
                 seconds: Utc::now().timestamp(),
                 nanos: 0,
@@ -1197,7 +633,7 @@ impl SequencerTrait for SequencerServiceV2 {
                         leaf_count: commitment.leaf_count as u64,
                         leaf_hash: proof.leaf_hash.to_vec(),
                     }),
-                    event: Some(Self::to_proto_event(&event)?),
+                    event: Some(convert::to_proto_event(&event)?),
                 }));
             }
         }
@@ -1220,7 +656,7 @@ impl SequencerTrait for SequencerServiceV2 {
                         leaf_count: commitment.leaf_count as u64,
                         leaf_hash: proof.leaf_hash.to_vec(),
                     }),
-                    event: Some(Self::to_proto_event(&event)?),
+                    event: Some(convert::to_proto_event(&event)?),
                 }));
             }
         }
@@ -1242,7 +678,7 @@ impl SequencerTrait for SequencerServiceV2 {
                             leaf_count: commitment.leaf_count as u64,
                             leaf_hash: proof.leaf_hash.to_vec(),
                         }),
-                        event: Some(Self::to_proto_event(&event)?),
+                        event: Some(convert::to_proto_event(&event)?),
                     }));
                 }
             }
@@ -1340,7 +776,7 @@ impl SequencerTrait for SequencerServiceV2 {
                 leaf_count: leaves.len() as u64,
                 leaf_hash: proof.leaf_hash.to_vec(),
             }),
-            event: Some(Self::to_proto_event(&event)?),
+            event: Some(convert::to_proto_event(&event)?),
         }))
     }
 
@@ -1471,7 +907,7 @@ impl SequencerTrait for SequencerServiceV2 {
             .insert(commitment.clone())
             .await;
 
-        Ok(Response::new(Self::to_proto_commitment(&commitment)))
+        Ok(Response::new(convert::to_proto_commitment(&commitment)))
     }
 
     /// Get entity event history
@@ -1557,7 +993,7 @@ impl SequencerTrait for SequencerServiceV2 {
         let proto_events: Vec<SequencedEvent> = page
             .events
             .iter()
-            .map(Self::to_proto_event)
+            .map(convert::to_proto_event)
             .collect::<Result<_, _>>()?;
 
         Ok(Response::new(GetEntityHistoryResponse {
@@ -1682,7 +1118,7 @@ impl SequencerTrait for SequencerServiceV2 {
                                 continue;
                             }
                         }
-                        let proto_event = match SequencerServiceV2::to_proto_event(event) {
+                        let proto_event = match convert::to_proto_event(event) {
                             Ok(proto_event) => proto_event,
                             Err(e) => {
                                 let _ = tx.send(Err(e)).await;
@@ -1830,7 +1266,7 @@ impl SequencerTrait for SequencerServiceV2 {
                                         let mut events = Vec::with_capacity(push_req.events.len());
                                         let mut has_error = false;
                                         for proto_event in &push_req.events {
-                                            match SequencerServiceV2::from_proto_event(proto_event) {
+                                            match convert::from_proto_event(proto_event) {
                                                 Ok(e) => {
                                                     if e.tenant_id.0 != tenant_id.0 || e.store_id.0 != store_id.0 {
                                                         let _ = tx.send(Err(Status::invalid_argument("event tenant_id/store_id must match push request"))).await;
@@ -1881,7 +1317,7 @@ impl SequencerTrait for SequencerServiceV2 {
                                                     .iter()
                                                     .map(|r| RejectedEvent {
                                                         event_id: r.event_id.to_string(),
-                                                        reason: SequencerServiceV2::map_rejection_reason(&r.reason) as i32,
+                                                        reason: convert::map_rejection_reason(&r.reason) as i32,
                                                         message: r.message.clone(),
                                                     })
                                                     .collect();
@@ -1986,7 +1422,7 @@ impl SequencerTrait for SequencerServiceV2 {
                                                     head.saturating_add(1)
                                                 };
                                                 let proto_events: Vec<SequencedEvent> =
-                                                    match filtered_events.iter().map(SequencerServiceV2::to_proto_event).collect::<Result<_, _>>() {
+                                                    match filtered_events.iter().map(convert::to_proto_event).collect::<Result<_, _>>() {
                                                         Ok(events) => events,
                                                         Err(e) => {
                                                             let _ = tx.send(Err(e)).await;
@@ -2045,7 +1481,7 @@ impl SequencerTrait for SequencerServiceV2 {
                                                 continue;
                                             }
                                         };
-                                        let acknowledged_sequence = match SequencerServiceV2::durable_ack_sequence(&ack, head) {
+                                        let acknowledged_sequence = match convert::durable_ack_sequence(&ack, head) {
                                             Ok(sequence) => sequence,
                                             Err(e) => {
                                                 let _ = tx.send(Err(e)).await;
@@ -2227,7 +1663,7 @@ impl SequencerTrait for SequencerServiceV2 {
                         break;
                     }
                     for event in &page.events {
-                        let proto_event = match SequencerServiceV2::to_proto_event(event) {
+                        let proto_event = match convert::to_proto_event(event) {
                             Ok(proto_event) => proto_event,
                             Err(e) => {
                                 let _ = tx.send(Err(e)).await;
@@ -2271,398 +1707,5 @@ impl SequencerTrait for SequencerServiceV2 {
         });
 
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
-    }
-}
-
-/// Key Management service implementation
-pub struct KeyManagementServiceV2 {
-    registry: Arc<PgAgentKeyRegistry>,
-}
-
-impl KeyManagementServiceV2 {
-    pub fn new(registry: Arc<PgAgentKeyRegistry>) -> Self {
-        Self { registry }
-    }
-
-    fn auth_context<T>(request: &Request<T>) -> Result<AuthContext, Status> {
-        request
-            .extensions()
-            .get::<AuthContext>()
-            .cloned()
-            .ok_or_else(|| Status::unauthenticated("missing auth context"))
-    }
-
-    fn require_admin(ctx: &AuthContext) -> Result<(), Status> {
-        if ctx.is_admin() {
-            Ok(())
-        } else {
-            Err(Status::permission_denied("admin permission required"))
-        }
-    }
-
-    fn authorize_tenant(ctx: &AuthContext, tenant_id: &TenantId) -> Result<(), Status> {
-        if !ctx.tenant_id.is_nil() && ctx.tenant_id != tenant_id.0 {
-            return Err(Status::permission_denied("tenant access denied"));
-        }
-        Ok(())
-    }
-
-    fn timestamp_to_datetime(
-        ts: &prost_types::Timestamp,
-        field: &str,
-    ) -> Result<DateTime<Utc>, Status> {
-        if ts.nanos < 0 || ts.nanos > 999_999_999 {
-            return Err(Status::invalid_argument(format!("invalid {} nanos", field)));
-        }
-        DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
-            .ok_or_else(|| Status::invalid_argument(format!("invalid {} timestamp", field)))
-    }
-
-    fn datetime_to_timestamp(dt: &DateTime<Utc>) -> prost_types::Timestamp {
-        prost_types::Timestamp {
-            seconds: dt.timestamp(),
-            nanos: dt.timestamp_subsec_nanos() as i32,
-        }
-    }
-}
-
-#[tonic::async_trait]
-impl KeyManagementTrait for KeyManagementServiceV2 {
-    async fn register_agent_key(
-        &self,
-        request: Request<RegisterKeyRequest>,
-    ) -> Result<Response<RegisterKeyResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request)?;
-        let req = request.into_inner();
-
-        info!(
-            tenant_id = %req.tenant_id,
-            agent_id = %req.agent_id,
-            key_id = req.key_id,
-            key_type = ?KeyType::try_from(req.key_type).unwrap_or(KeyType::Unspecified),
-            "Registering agent key"
-        );
-
-        Self::require_admin(&auth_ctx)?;
-
-        let tenant_id = Uuid::parse_str(&req.tenant_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid tenant_id: {}", e)))?;
-        let agent_id = Uuid::parse_str(&req.agent_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid agent_id: {}", e)))?;
-
-        let tenant_id = TenantId(tenant_id);
-        Self::authorize_tenant(&auth_ctx, &tenant_id)?;
-
-        let key_type = KeyType::try_from(req.key_type).unwrap_or(KeyType::Unspecified);
-        if key_type != KeyType::Signing {
-            return Err(Status::unimplemented("only signing keys are supported"));
-        }
-
-        // Parse key algorithm (VES-PQC-1)
-        let key_algorithm = DomainKeyAlgorithm::from_i32(req.key_algorithm);
-
-        // Parse public key (legacy Ed25519 field)
-        let public_key: [u8; 32] = if req.public_key.len() == 32 {
-            let mut pk = [0u8; 32];
-            pk.copy_from_slice(&req.public_key);
-            pk
-        } else if key_algorithm.has_ml_dsa() && !key_algorithm.has_ed25519() {
-            // PQC-strict (ML-DSA-65 only): legacy field may be empty
-            [0u8; 32]
-        } else {
-            return Err(Status::invalid_argument("public_key must be 32 bytes"));
-        };
-
-        // Parse PQC public key bundle
-        let public_key_bundle =
-            req.public_key_bundle
-                .as_ref()
-                .map(|bundle| DomainPublicKeyBundle {
-                    ed25519_public_key: if bundle.ed25519_public_key.len() == 32 {
-                        let mut pk = [0u8; 32];
-                        pk.copy_from_slice(&bundle.ed25519_public_key);
-                        Some(pk)
-                    } else {
-                        None
-                    },
-                    ml_dsa_65_public_key: if bundle.ml_dsa_65_public_key.is_empty() {
-                        None
-                    } else {
-                        Some(bundle.ml_dsa_65_public_key.clone())
-                    },
-                    x25519_public_key: if bundle.x25519_public_key.is_empty() {
-                        None
-                    } else {
-                        Some(bundle.x25519_public_key.clone())
-                    },
-                    ml_kem_768_public_key: if bundle.ml_kem_768_public_key.is_empty() {
-                        None
-                    } else {
-                        Some(bundle.ml_kem_768_public_key.clone())
-                    },
-                });
-
-        // Parse PQC proof-of-possession bundle
-        let pop_bundle =
-            req.proof_of_possession_bundle
-                .as_ref()
-                .map(|bundle| ParsedSignatureBundle {
-                    ed25519_signature: if bundle.ed25519_pop.is_empty() {
-                        None
-                    } else {
-                        Some(bundle.ed25519_pop.clone())
-                    },
-                    ml_dsa_65_signature: if bundle.ml_dsa_65_pop.is_empty() {
-                        None
-                    } else {
-                        Some(bundle.ml_dsa_65_pop.clone())
-                    },
-                });
-
-        // SECURITY: PoP is MANDATORY for hybrid and strict key algorithms.
-        let pop_required = matches!(
-            key_algorithm,
-            DomainKeyAlgorithm::Ed25519MlDsa65 | DomainKeyAlgorithm::MlDsa65
-        );
-        if pop_required && pop_bundle.is_none() && req.proof_of_possession.is_empty() {
-            return Err(Status::invalid_argument(
-                "proof_of_possession_bundle is required for hybrid and pqc-strict key registrations",
-            ));
-        }
-
-        if pop_bundle.is_some() || !req.proof_of_possession.is_empty() {
-            verify_proof_of_possession(
-                key_algorithm,
-                &public_key,
-                public_key_bundle.as_ref(),
-                &req.proof_of_possession,
-                pop_bundle.as_ref(),
-            )
-            .map_err(|e| {
-                Status::invalid_argument(format!("proof of possession verification failed: {e}"))
-            })?;
-        }
-
-        let valid_from = match req.valid_from.as_ref() {
-            Some(ts) => Some(Self::timestamp_to_datetime(ts, "valid_from")?),
-            None => None,
-        };
-        let valid_to = match req.valid_to.as_ref() {
-            Some(ts) => Some(Self::timestamp_to_datetime(ts, "valid_to")?),
-            None => None,
-        };
-        if let (Some(from), Some(to)) = (valid_from.as_ref(), valid_to.as_ref()) {
-            if from > to {
-                return Err(Status::invalid_argument(
-                    "valid_from must be less than or equal to valid_to",
-                ));
-            }
-        }
-
-        // Create key entry — PQC-aware when algorithm is specified
-        let mut entry = if key_algorithm != DomainKeyAlgorithm::Unspecified {
-            AgentKeyEntry::new_with_algorithm(public_key, key_algorithm, public_key_bundle)
-        } else {
-            AgentKeyEntry::new(public_key)
-        };
-        entry.valid_from = valid_from;
-        entry.valid_to = valid_to;
-
-        let lookup = AgentKeyLookup {
-            tenant_id: tenant_id.0,
-            agent_id,
-            key_id: req.key_id,
-        };
-
-        self.registry
-            .register_key(&lookup, entry)
-            .await
-            .map_err(|e| match e {
-                AgentKeyError::KeyAlreadyExists => Status::already_exists("key already exists"),
-                _ => super::grpc_internal_error(e),
-            })?;
-
-        Ok(Response::new(RegisterKeyResponse {
-            success: true,
-            message: "Key registered successfully".to_string(),
-            registered_at: Some(prost_types::Timestamp {
-                seconds: Utc::now().timestamp(),
-                nanos: 0,
-            }),
-        }))
-    }
-
-    async fn get_agent_keys(
-        &self,
-        request: Request<GetAgentKeysRequest>,
-    ) -> Result<Response<GetAgentKeysResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request)?;
-        let req = request.into_inner();
-
-        info!(
-            tenant_id = %req.tenant_id,
-            agent_id = %req.agent_id,
-            "Getting agent keys"
-        );
-
-        Self::require_admin(&auth_ctx)?;
-
-        let tenant_id = Uuid::parse_str(&req.tenant_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid tenant_id: {}", e)))?;
-        let agent_id = Uuid::parse_str(&req.agent_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid agent_id: {}", e)))?;
-        let tenant_id = TenantId(tenant_id);
-        Self::authorize_tenant(&auth_ctx, &tenant_id)?;
-
-        let key_type_filter =
-            KeyType::try_from(req.key_type_filter).unwrap_or(KeyType::Unspecified);
-        if key_type_filter == KeyType::Encryption {
-            return Ok(Response::new(GetAgentKeysResponse { keys: vec![] }));
-        }
-
-        let now = Utc::now();
-        let entries = self
-            .registry
-            .list_agent_keys(&tenant_id.0, &agent_id)
-            .await
-            .map_err(super::grpc_internal_error)?;
-
-        let mut keys = Vec::with_capacity(entries.len());
-        for (key_id, entry) in entries {
-            let status = entry.status_at(now);
-            if !req.include_revoked && status == DomainKeyStatus::Revoked {
-                continue;
-            }
-            let proto_status = match status {
-                DomainKeyStatus::Active => v2::KeyStatus::Active,
-                DomainKeyStatus::Expired => v2::KeyStatus::Expired,
-                DomainKeyStatus::Revoked => v2::KeyStatus::Revoked,
-                DomainKeyStatus::NotYetValid => v2::KeyStatus::Unspecified,
-            };
-
-            // Serialize PQC key metadata
-            let proto_key_algorithm = entry.key_algorithm as i32;
-            let proto_public_key_bundle =
-                entry
-                    .public_key_bundle
-                    .as_ref()
-                    .map(|bundle| ProtoPublicKeyBundle {
-                        ed25519_public_key: bundle
-                            .ed25519_public_key
-                            .map(|pk| pk.to_vec())
-                            .unwrap_or_default(),
-                        ml_dsa_65_public_key: bundle
-                            .ml_dsa_65_public_key
-                            .clone()
-                            .unwrap_or_default(),
-                        x25519_public_key: bundle.x25519_public_key.clone().unwrap_or_default(),
-                        ml_kem_768_public_key: bundle
-                            .ml_kem_768_public_key
-                            .clone()
-                            .unwrap_or_default(),
-                    });
-
-            keys.push(v2::AgentKey {
-                key_id,
-                key_type: KeyType::Signing as i32,
-                public_key: entry.public_key.to_vec(),
-                status: proto_status as i32,
-                created_at: Some(Self::datetime_to_timestamp(&entry.created_at)),
-                valid_from: entry.valid_from.as_ref().map(Self::datetime_to_timestamp),
-                valid_to: entry.valid_to.as_ref().map(Self::datetime_to_timestamp),
-                revoked_at: entry.revoked_at.as_ref().map(Self::datetime_to_timestamp),
-                key_algorithm: proto_key_algorithm,
-                public_key_bundle: proto_public_key_bundle,
-            });
-        }
-
-        Ok(Response::new(GetAgentKeysResponse { keys }))
-    }
-
-    async fn revoke_agent_key(
-        &self,
-        request: Request<RevokeKeyRequest>,
-    ) -> Result<Response<RevokeKeyResponse>, Status> {
-        let auth_ctx = Self::auth_context(&request)?;
-        let req = request.into_inner();
-
-        info!(
-            tenant_id = %req.tenant_id,
-            agent_id = %req.agent_id,
-            key_id = req.key_id,
-            reason = %req.reason,
-            "Revoking agent key"
-        );
-
-        Self::require_admin(&auth_ctx)?;
-
-        let tenant_id = Uuid::parse_str(&req.tenant_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid tenant_id: {}", e)))?;
-        let agent_id = Uuid::parse_str(&req.agent_id)
-            .map_err(|e| Status::invalid_argument(format!("invalid agent_id: {}", e)))?;
-
-        let tenant_id = TenantId(tenant_id);
-        Self::authorize_tenant(&auth_ctx, &tenant_id)?;
-
-        let lookup = AgentKeyLookup {
-            tenant_id: tenant_id.0,
-            agent_id,
-            key_id: req.key_id,
-        };
-
-        self.registry
-            .revoke_key(&lookup)
-            .await
-            .map_err(|e| match e {
-                AgentKeyError::KeyNotFound { .. } => Status::not_found("key not found"),
-                _ => super::grpc_internal_error(e),
-            })?;
-
-        Ok(Response::new(RevokeKeyResponse {
-            success: true,
-            revoked_at: Some(prost_types::Timestamp {
-                seconds: Utc::now().timestamp(),
-                nanos: 0,
-            }),
-        }))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ack(sequence_numbers: Vec<u64>, agent_head_sequence: u64) -> v2::EventAck {
-        v2::EventAck {
-            sequence_numbers,
-            agent_head_sequence,
-            tenant_id: Uuid::new_v4().to_string(),
-            store_id: Uuid::new_v4().to_string(),
-        }
-    }
-
-    #[test]
-    fn durable_ack_never_skips_a_gap() {
-        let ack = ack(vec![8, 10], 7);
-        assert_eq!(
-            SequencerServiceV2::durable_ack_sequence(&ack, 10).unwrap(),
-            7
-        );
-    }
-
-    #[test]
-    fn durable_ack_rejects_any_future_sequence() {
-        let ack = ack(vec![8, 11], 8);
-        let error = SequencerServiceV2::durable_ack_sequence(&ack, 10).unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    }
-
-    #[test]
-    fn durable_ack_accepts_empty_receipt_list() {
-        let ack = ack(Vec::new(), 10);
-        assert_eq!(
-            SequencerServiceV2::durable_ack_sequence(&ack, 10).unwrap(),
-            10
-        );
     }
 }

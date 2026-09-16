@@ -42,6 +42,14 @@ pub trait RejectionSink: Send + Sync {
     async fn emit_rejection(&self, rejection: RejectionEvent) -> Result<(), SequencerError>;
 }
 
+/// Optional durable transaction boundary for a bounded projection batch.
+#[async_trait]
+pub trait ProjectionBatchTransaction: Send + Sync {
+    async fn begin(&self, tenant: &TenantId, store: &StoreId) -> Result<(), SequencerError>;
+    async fn commit(&self) -> Result<(), SequencerError>;
+    async fn rollback(&self) -> Result<(), SequencerError>;
+}
+
 /// Projection runner configuration
 #[derive(Debug, Clone)]
 pub struct ProjectionRunnerConfig {
@@ -116,6 +124,7 @@ pub struct ProjectionRunner {
 
     /// Optional dead letter queue for failed projections
     dead_letter_queue: Option<Arc<PgDeadLetterQueue>>,
+    batch_transaction: Option<Arc<dyn ProjectionBatchTransaction>>,
 }
 
 impl ProjectionRunner {
@@ -136,12 +145,21 @@ impl ProjectionRunner {
             stats: RwLock::new(ProjectionStats::default()),
             running: RwLock::new(false),
             dead_letter_queue: None,
+            batch_transaction: None,
         }
     }
 
     /// Set the dead letter queue for failed projection handling
     pub fn with_dead_letter_queue(mut self, dlq: Arc<PgDeadLetterQueue>) -> Self {
         self.dead_letter_queue = Some(dlq);
+        self
+    }
+
+    pub fn with_batch_transaction(
+        mut self,
+        transaction: Arc<dyn ProjectionBatchTransaction>,
+    ) -> Self {
+        self.batch_transaction = Some(transaction);
         self
     }
 
@@ -166,7 +184,7 @@ impl ProjectionRunner {
         reason: DeadLetterReason,
         error_message: &str,
         payload: serde_json::Value,
-    ) {
+    ) -> Result<(), SequencerError> {
         if let Some(ref dlq) = self.dead_letter_queue {
             let reason_str = reason.to_string();
             let params = EnqueueParams {
@@ -190,6 +208,9 @@ impl ProjectionRunner {
                     error = %e,
                     "Failed to enqueue event to dead letter queue"
                 );
+                if self.batch_transaction.is_some() {
+                    return Err(e);
+                }
             } else {
                 info!(
                     event_id = %event.event_id(),
@@ -198,6 +219,7 @@ impl ProjectionRunner {
                 );
             }
         }
+        Ok(())
     }
 
     /// Convert projection rejection reason to dead letter reason
@@ -257,6 +279,14 @@ impl ProjectionRunner {
         );
 
         let result = async {
+            if let Some(transaction) = &self.batch_transaction {
+                if !single_batch {
+                    return Err(SequencerError::Configuration(
+                        "transactional projections require run_slice".into(),
+                    ));
+                }
+                transaction.begin(tenant_id, store_id).await?;
+            }
             // Get starting checkpoint
             let checkpoint = self
                 .checkpoint_store
@@ -324,6 +354,12 @@ impl ProjectionRunner {
                                 "Error processing event"
                             );
 
+                            // Durable batches must never checkpoint past a failed
+                            // write, even when legacy continue_on_error is enabled.
+                            if self.batch_transaction.is_some() {
+                                return Err(e);
+                            }
+
                             // Send to dead letter queue
                             self.send_to_dead_letter_queue(
                                 tenant_id,
@@ -333,7 +369,7 @@ impl ProjectionRunner {
                                 &e.to_string(),
                                 event.payload().clone(),
                             )
-                            .await;
+                            .await?;
 
                             {
                                 let mut stats = self.stats.write().await;
@@ -367,6 +403,19 @@ impl ProjectionRunner {
         }
         .await;
 
+        let result = if let Some(transaction) = &self.batch_transaction {
+            match result {
+                Ok(()) => transaction.commit().await,
+                Err(error) => {
+                    if let Err(rollback_error) = transaction.rollback().await {
+                        error!(%rollback_error, "projection rollback failed");
+                    }
+                    Err(error)
+                }
+            }
+        } else {
+            result
+        };
         *self.running.write().await = false;
         result
     }
@@ -444,7 +493,7 @@ impl ProjectionRunner {
                     ),
                     event.payload().clone(),
                 )
-                .await;
+                .await?;
 
                 warn!(
                     event_id = %event.event_id(),
@@ -486,6 +535,11 @@ impl ProjectionRunner {
                     .await?;
 
                 if !committed {
+                    if self.batch_transaction.is_some() {
+                        return Err(SequencerError::Internal(
+                            "projection version changed during a locked batch".into(),
+                        ));
+                    }
                     // The entity changed underneath us: another writer is active
                     // for this tenant/store. Treat as a version conflict rather
                     // than overwriting, and route to the DLQ for retry.
@@ -518,7 +572,7 @@ impl ProjectionRunner {
                         ),
                         event.payload().clone(),
                     )
-                    .await;
+                    .await?;
 
                     warn!(
                         event_id = %event.event_id(),
@@ -575,7 +629,7 @@ impl ProjectionRunner {
                     &message,
                     event.payload().clone(),
                 )
-                .await;
+                .await?;
 
                 warn!(
                     event_id = %event.event_id(),

@@ -659,6 +659,43 @@ mod tests {
         assert_eq!(unpushed[0].envelope.event_id, event.event_id);
     }
 
+    /// SQLite/Postgres parity: every field the server ingest path requires
+    /// for dedupe and verification must survive the local outbox round-trip.
+    /// If ingest gains a required field, this test forces the outbox schema
+    /// and mapping to carry it too.
+    #[tokio::test]
+    async fn test_outbox_preserves_ingest_critical_fields() {
+        let outbox = create_test_db().await;
+
+        let mut event = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-parity",
+            EventType::from("order.created"),
+            serde_json::json!({"customer_id": "cust-1"}),
+            AgentId::new(),
+        );
+        event.command_id = Some(Uuid::new_v4());
+        event.base_version = Some(3);
+        event.signature = Some(vec![7u8; 64]);
+
+        outbox.append(&event).await.unwrap();
+        let unpushed = outbox.get_unpushed().await.unwrap();
+        assert_eq!(unpushed.len(), 1);
+        let fetched = &unpushed[0].envelope;
+
+        assert_eq!(fetched.event_id, event.event_id);
+        assert_eq!(fetched.command_id, event.command_id);
+        assert_eq!(fetched.tenant_id, event.tenant_id);
+        assert_eq!(fetched.store_id, event.store_id);
+        assert_eq!(fetched.entity_id, event.entity_id);
+        assert_eq!(fetched.payload_hash, event.payload_hash);
+        assert_eq!(fetched.base_version, event.base_version);
+        assert_eq!(fetched.source_agent, event.source_agent);
+        assert_eq!(fetched.signature, event.signature);
+    }
+
     #[tokio::test]
     async fn test_mark_pushed_and_acked() {
         let outbox = create_test_db().await;

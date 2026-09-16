@@ -75,10 +75,6 @@ check: fmt-check clippy ## Check code quality (format + clippy)
 
 ## Docker
 docker-build: ## Build Docker image
-	@if [ ! -d ../stateset-stark ]; then \
-		echo "Missing sibling stateset-stark checkout at ../stateset-stark"; \
-		exit 1; \
-	fi
 	docker build -f Dockerfile -t stateset-sequencer:latest ..
 
 docker-up: ## Start services with docker-compose

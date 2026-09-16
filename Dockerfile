@@ -13,9 +13,9 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy manifests and local path dependencies for build caching
+# Copy manifests for build caching (STARK crates are pinned git dependencies
+# in Cargo.toml/Cargo.lock, so no local STARK checkout is staged here)
 COPY stateset-sequencer/Cargo.toml stateset-sequencer/Cargo.lock* ./stateset-sequencer/
-COPY stateset-stark ./stateset-stark
 
 # Create dummy source files to build dependencies (lib + bin + bench targets)
 WORKDIR /workspace/stateset-sequencer

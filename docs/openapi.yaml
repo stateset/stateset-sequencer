@@ -22,6 +22,28 @@ info:
     - Merkle tree commitments
     - L2 anchoring for finality
     - Inclusion proofs for any event
+
+    ## Legacy v1 Deprecation
+
+    The pre-VES **legacy v1 surface is formally deprecated** (planned removal:
+    2027-03-01): every legacy operation is marked `deprecated: true` below.
+    New integrations must use the VES `/v1/ves/*` endpoints (REST) or the
+    `stateset.sequencer.v2` gRPC service (`proto/sequencer_v2.proto`).
+
+    Legacy REST -> current successor:
+    - `POST /v1/events/ingest` -> `POST /v1/ves/events/ingest`
+    - `GET /v1/events` -> `GET /v1/ves/events`
+    - `GET /v1/head` -> `GET /v1/ves/head`
+    - `/v1/commitments*` -> `/v1/ves/commitments*`
+    - `/v1/proofs*` -> `/v1/ves/proofs*`
+    - `/v1/entities/*` -> `/v1/ves/entities/*`
+    - `/v1/anchor*` -> `/v1/ves/anchor*`
+    - gRPC `stateset.sequencer.v1` -> `stateset.sequencer.v2`
+
+    Every legacy REST response carries `Deprecation: true`,
+    `Sunset: Mon, 01 Mar 2027 00:00:00 GMT` and a
+    `Link: ...; rel="successor-version"` header, and every legacy call —
+    REST or gRPC v1 — emits a server-side deprecation warning log.
   version: 0.8.6
   contact:
     email: engineering@stateset.io
@@ -55,6 +77,8 @@ tags:
     description: Agent key management
   - name: Admin
     description: Admin dashboard and operational insights
+  - name: x402
+    description: x402 payment protocol endpoints
 
 security:
   - apiKey: []
@@ -66,8 +90,14 @@ paths:
   # ==========================================================================
   /v1/events/ingest:
     post:
-      summary: Ingest events (legacy)
-      description: Ingest a batch of events without signature verification
+      summary: Ingest events (legacy, deprecated)
+      description: |
+        Ingest a batch of events without signature verification.
+
+        DEPRECATED: use `POST /v1/ves/events/ingest` instead. Planned removal:
+        2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
       operationId: ingestEvents
       tags: [Events]
       requestBody:
@@ -142,6 +172,121 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ApiError'
+
+  /v1/ves/events:
+    get:
+      summary: List VES events
+      description: Read a bounded page from the canonical VES event stream
+      operationId: listVesEvents
+      tags: [VES, Events]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+        - name: from
+          in: query
+          description: Starting sequence number (1-based, default 1)
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: limit
+          in: query
+          description: Maximum number of events to return
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Bounded page of VES events with cursor
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SequencedEvent'
+                  count:
+                    type: integer
+                  next_sequence:
+                    type: integer
+                    format: int64
+                  head_sequence:
+                    type: integer
+                    format: int64
+                  has_more:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/ves/head:
+    get:
+      summary: Get VES head sequence
+      description: Get the canonical VES stream head sequence number
+      operationId: getVesHead
+      tags: [VES, Events]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+      responses:
+        '200':
+          description: Head sequence number
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  head_sequence:
+                    type: integer
+                    format: int64
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/ves/entities/{entity_type}/{entity_id}:
+    get:
+      summary: Read VES entity history
+      description: Read the bounded VES event history for one entity
+      operationId: getVesEntityHistory
+      tags: [VES, Events]
+      parameters:
+        - name: entity_type
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: entity_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+      responses:
+        '200':
+          description: Entity history page
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SequencedEvent'
+                  count:
+                    type: integer
+                  total:
+                    type: integer
+                  current_version:
+                    type: integer
+                  has_more:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
 
   /v1/ves/cursors/{agentId}:
     parameters:
@@ -241,8 +386,14 @@ paths:
   # ==========================================================================
   /v1/events:
     get:
-      summary: List events
-      description: Retrieve events for a tenant/store, optionally starting from a sequence number
+      summary: List events (legacy, deprecated)
+      description: |
+        Retrieve events for a tenant/store, optionally starting from a sequence number.
+
+        DEPRECATED: use `GET /v1/ves/events` instead. Planned removal:
+        2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
       operationId: listEvents
       tags: [Events]
       parameters:
@@ -278,8 +429,14 @@ paths:
 
   /v1/head:
     get:
-      summary: Get head sequence
-      description: Get the current head sequence number for a tenant/store
+      summary: Get head sequence (legacy, deprecated)
+      description: |
+        Get the current head sequence number for a tenant/store.
+
+        DEPRECATED: use `GET /v1/ves/head` instead. Planned removal:
+        2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
       operationId: getHead
       tags: [Events]
       parameters:
@@ -464,7 +621,7 @@ paths:
   /v1/ves/validity/{batch_id}/inputs:
     get:
       summary: Get validity proof public inputs
-      description: Get the public inputs needed to generate a validity proof for a batch
+      description: Get the public inputs needed to generate a validity proof for a batch. Requires the `stark` build feature.
       operationId: getVesValidityPublicInputs
       tags: [VES, Proofs]
       parameters:
@@ -483,7 +640,7 @@ paths:
   /v1/ves/validity/{batch_id}/proofs:
     get:
       summary: List validity proofs
-      description: List all validity proofs for a batch
+      description: List all validity proofs for a batch. Requires the `stark` build feature.
       operationId: listVesValidityProofs
       tags: [VES, Proofs]
       parameters:
@@ -500,7 +657,7 @@ paths:
 
     post:
       summary: Submit validity proof
-      description: Submit a validity proof for a batch
+      description: Submit a validity proof for a batch. Requires the `stark` build feature.
       operationId: submitVesValidityProof
       tags: [VES, Proofs]
       parameters:
@@ -521,13 +678,72 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
 
+  /v1/ves/validity/proofs/{proof_id}:
+    get:
+      summary: Get validity proof
+      description: |
+        Get a stored validity proof by ID.
+
+        Requires the `stark` build feature; the route is not mounted without it.
+      operationId: getVesValidityProof
+      tags: [VES, Proofs]
+      parameters:
+        - name: proof_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Proof details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidityProof'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/ves/validity/proofs/{proof_id}/verify:
+    get:
+      summary: Verify validity proof
+      description: |
+        Verify a stored validity proof, including STARK cryptographic verification.
+
+        Requires the `stark` build feature; the route is not mounted without it.
+      operationId: verifyVesValidityProof
+      tags: [VES, Proofs]
+      parameters:
+        - name: proof_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   # ==========================================================================
   # VES Compliance Proofs
   # ==========================================================================
   /v1/ves/compliance/{event_id}/inputs:
     post:
       summary: Get compliance proof public inputs
-      description: Get the canonical public inputs needed to generate a compliance proof for an event + policy.
+      description: Get the canonical public inputs needed to generate a compliance proof for an event + policy. Requires the `stark` build feature.
       operationId: getVesCompliancePublicInputs
       tags: [VES, Proofs]
       parameters:
@@ -561,7 +777,7 @@ paths:
   /v1/ves/compliance/{event_id}/proofs:
     get:
       summary: List compliance proofs
-      description: List all compliance proofs for an event.
+      description: List all compliance proofs for an event. Requires the `stark` build feature.
       operationId: listVesComplianceProofs
       tags: [VES, Proofs]
       parameters:
@@ -590,6 +806,7 @@ paths:
         Submit a compliance proof for an event + policy.
 
         For STARK proofs, callers must include `witnessCommitment`.
+        Requires the `stark` build feature.
       operationId: submitVesComplianceProof
       tags: [VES, Proofs]
       parameters:
@@ -629,7 +846,7 @@ paths:
   /v1/ves/compliance/proofs/{proof_id}:
     get:
       summary: Get compliance proof
-      description: Get a stored compliance proof by ID (includes proof bytes).
+      description: Get a stored compliance proof by ID (includes proof bytes). Requires the `stark` build feature.
       operationId: getVesComplianceProof
       tags: [VES, Proofs]
       parameters:
@@ -659,6 +876,7 @@ paths:
         Verify a stored compliance proof.
 
         For STARK proofs, this also performs cryptographic proof verification.
+        Requires the `stark` build feature.
       operationId: verifyVesComplianceProof
       tags: [VES, Proofs]
       parameters:
@@ -740,7 +958,14 @@ paths:
   # ==========================================================================
   /v1/commitments:
     get:
-      summary: List commitments (legacy)
+      summary: List commitments (legacy, deprecated)
+      description: |
+        List legacy commitments for a tenant/store.
+
+        DEPRECATED: use `GET /v1/ves/commitments` instead. Planned removal:
+        2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
       operationId: listCommitments
       tags: [Commitments]
       parameters:
@@ -757,7 +982,14 @@ paths:
                   $ref: '#/components/schemas/BatchCommitment'
 
     post:
-      summary: Create commitment (legacy)
+      summary: Create commitment (legacy, deprecated)
+      description: |
+        Create a legacy batch commitment for a sequence range.
+
+        DEPRECATED: use `POST /v1/ves/commitments` instead. Planned removal:
+        2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
       operationId: createCommitment
       tags: [Commitments]
       requestBody:
@@ -773,6 +1005,301 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/BatchCommitment'
+
+  /v1/commitments/{batch_id}:
+    get:
+      summary: Get commitment (legacy, deprecated)
+      description: |
+        Retrieve a specific legacy commitment by batch ID.
+
+        DEPRECATED: use `GET /v1/ves/commitments/{batch_id}` instead. Planned
+        removal: 2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
+      operationId: getCommitment
+      tags: [Commitments]
+      parameters:
+        - $ref: '#/components/parameters/batchId'
+      responses:
+        '200':
+          description: Commitment details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BatchCommitment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/commitments/pending:
+    get:
+      summary: List pending commitments (anchor-service compat)
+      description: |
+        Internal compatibility endpoint for the standalone Set Chain anchor
+        service: lists commitments awaiting anchoring. Root-mounted without the
+        `/api` prefix. Prefer the VES commitment endpoints for new integrations.
+      operationId: listPendingCommitments
+      tags: [Commitments, Anchoring]
+      responses:
+        '200':
+          description: Pending commitments
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BatchCommitment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/commitments/{batch_id}/anchored:
+    post:
+      summary: Notify commitment anchored (anchor-service compat)
+      description: |
+        Internal compatibility endpoint for the standalone Set Chain anchor
+        service: records that a commitment was anchored on-chain.
+        Root-mounted without the `/api` prefix.
+      operationId: notifyCommitmentAnchored
+      tags: [Commitments, Anchoring]
+      parameters:
+        - $ref: '#/components/parameters/batchId'
+      responses:
+        '200':
+          description: Anchor notification recorded
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ==========================================================================
+  # Legacy Proofs, Entities, Projections, Anchoring (deprecated)
+  # ==========================================================================
+  /v1/proofs/{sequence_number}:
+    get:
+      summary: Get inclusion proof (legacy, deprecated)
+      description: |
+        Get a Merkle inclusion proof for a legacy event at a sequence number.
+
+        DEPRECATED: use `GET /v1/ves/proofs/{sequence_number}` instead. Planned
+        removal: 2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
+      operationId: getInclusionProof
+      tags: [Proofs]
+      parameters:
+        - name: sequence_number
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+        - $ref: '#/components/parameters/batchIdQuery'
+      responses:
+        '200':
+          description: Inclusion proof
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MerkleProof'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/proofs/verify:
+    post:
+      summary: Verify inclusion proof (legacy, deprecated)
+      description: |
+        Verify a legacy Merkle inclusion proof.
+
+        DEPRECATED: use `POST /v1/ves/proofs/verify` instead. Planned removal:
+        2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
+      operationId: verifyProof
+      tags: [Proofs]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyProofRequest'
+      responses:
+        '200':
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  valid:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /v1/entities/{entity_type}/{entity_id}:
+    get:
+      summary: Get entity history (legacy, deprecated)
+      description: |
+        Get the legacy event history for one entity.
+
+        DEPRECATED: use `GET /v1/ves/entities/{entity_type}/{entity_id}`
+        instead. Planned removal: 2027-03-01. Responses carry
+        `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
+      operationId: getEntityHistory
+      tags: [Events]
+      parameters:
+        - name: entity_type
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: entity_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+      responses:
+        '200':
+          description: Entity history
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SequencedEvent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/projections/{entity_type}/{entity_id}:
+    get:
+      summary: Get projection (legacy, deprecated)
+      description: |
+        Get the materialized projection for one entity.
+
+        DEPRECATED: no direct VES successor; read entity history from
+        `GET /v1/ves/entities/{entity_type}/{entity_id}` and reduce locally.
+        Planned removal: 2027-03-01. Responses carry `Deprecation: true`,
+        `Sunset` and `Link: ...; rel="successor-version"` headers.
+      deprecated: true
+      operationId: getProjection
+      tags: [Events]
+      parameters:
+        - name: entity_type
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: entity_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/tenantId'
+        - $ref: '#/components/parameters/storeId'
+      responses:
+        '200':
+          description: Projected entity state
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/anchor/status:
+    get:
+      summary: Get anchor status (legacy, deprecated)
+      description: |
+        Get the legacy anchor service status.
+
+        DEPRECATED: use the VES anchoring endpoints instead. Planned removal:
+        2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
+      operationId: getAnchorStatus
+      tags: [Anchoring]
+      responses:
+        '200':
+          description: Anchor service status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnchorStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/anchor:
+    post:
+      summary: Anchor commitment (legacy, deprecated)
+      description: |
+        Anchor a legacy commitment Merkle root on-chain.
+
+        DEPRECATED: use `POST /v1/ves/anchor` instead. Planned removal:
+        2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
+      operationId: anchorCommitment
+      tags: [Anchoring]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AnchorRequest'
+      responses:
+        '200':
+          description: Anchoring initiated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnchorStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/anchor/{batch_id}/verify:
+    get:
+      summary: Verify anchor on-chain (legacy, deprecated)
+      description: |
+        Verify that a legacy commitment is anchored on-chain.
+
+        DEPRECATED: use `GET /v1/ves/anchor/{batch_id}/verify` instead. Planned
+        removal: 2027-03-01. Responses carry `Deprecation: true`, `Sunset` and
+        `Link: ...; rel="successor-version"` headers.
+      deprecated: true
+      operationId: verifyAnchorOnchain
+      tags: [Anchoring]
+      parameters:
+        - $ref: '#/components/parameters/batchId'
+      responses:
+        '200':
+          description: On-chain verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verified:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   # ==========================================================================
   # Schema Registry
@@ -889,6 +1416,92 @@ paths:
         '400':
           $ref: '#/components/responses/BadRequest'
 
+  /v1/schemas/{schema_id}/status:
+    put:
+      summary: Update schema status
+      description: Transition a schema between draft, active, deprecated and archived states
+      operationId: updateSchemaStatus
+      tags: [Schemas]
+      parameters:
+        - name: schema_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [draft, active, deprecated, archived]
+      responses:
+        '200':
+          description: Schema details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/schemas/event-type/{event_type}:
+    get:
+      summary: List schemas by event type
+      description: List all schema versions registered for one event type
+      operationId: getSchemasByEventType
+      tags: [Schemas]
+      parameters:
+        - name: event_type
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/tenantId'
+      responses:
+        '200':
+          description: Schema list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/schemas/event-type/{event_type}/latest:
+    get:
+      summary: Get latest schema for event type
+      description: Get the latest active schema version for one event type
+      operationId: getLatestSchema
+      tags: [Schemas]
+      parameters:
+        - name: event_type
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/tenantId'
+      responses:
+        '200':
+          description: Schema details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchemaResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   # ==========================================================================
   # Agent Registration
   # ==========================================================================
@@ -980,6 +1593,118 @@ paths:
           $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
+
+  /v1/agents/{agentId}:
+    get:
+      summary: Get agent details
+      description: Get an agent's details (agents may view themselves; admins may view any)
+      operationId: getAgent
+      tags: [Agents]
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Agent details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRegistrationResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/agents/{agentId}/api-keys:
+    get:
+      summary: List agent API keys
+      description: List an agent's API keys (the agent itself or an admin)
+      operationId: listAgentApiKeys
+      tags: [Agents]
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: API key list
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      summary: Create agent API key
+      description: Create a new API key for an existing agent (the agent itself or an admin)
+      operationId: createAgentApiKey
+      tags: [Agents]
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '201':
+          description: API key created (secret is returned once)
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/agents/{agentId}/api-keys/{keyPrefix}:
+    delete:
+      summary: Revoke agent API key
+      description: Revoke an agent's API key by key prefix (the agent itself or an admin)
+      operationId: revokeAgentApiKey
+      tags: [Agents]
+      parameters:
+        - name: agentId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: keyPrefix
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Key revoked
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   # ==========================================================================
   # Admin
@@ -1095,8 +1820,232 @@ paths:
                 $ref: '#/components/schemas/ApiError'
 
   # ==========================================================================
+  # x402 Payment Protocol
+  # ==========================================================================
+  /v1/x402/capabilities:
+    get:
+      summary: Get x402 payment capabilities
+      description: Advertise the x402 protocol version, supported assets/networks and settlement validation mode
+      operationId: x402Capabilities
+      tags: [x402]
+      responses:
+        '200':
+          description: Capability advertisement
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /v1/x402/payments:
+    get:
+      summary: List payment intents
+      description: List x402 payment intents for a tenant
+      operationId: listX402Payments
+      tags: [x402]
+      parameters:
+        - $ref: '#/components/parameters/tenantId'
+      responses:
+        '200':
+          description: Payment intent list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      summary: Submit payment intent
+      description: Verify, sequence and persist a signed x402 payment intent
+      operationId: submitX402Payment
+      tags: [x402]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Payment intent accepted
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/x402/payments/{intent_id}:
+    get:
+      summary: Get payment intent
+      description: Get one x402 payment intent by ID
+      operationId: getX402Payment
+      tags: [x402]
+      parameters:
+        - name: intent_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Payment intent
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/x402/payments/{intent_id}/receipt:
+    get:
+      summary: Get payment receipt
+      description: Get the Merkle receipt for a batched x402 payment intent
+      operationId: getX402Receipt
+      tags: [x402]
+      parameters:
+        - name: intent_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Payment receipt
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/x402/batches:
+    post:
+      summary: Create payment batch
+      description: Create a new x402 settlement batch for a tenant/store
+      operationId: createX402Batch
+      tags: [x402]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '201':
+          description: Batch created
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/x402/batches/{batch_id}:
+    get:
+      summary: Get payment batch
+      description: Get one x402 settlement batch by ID
+      operationId: getX402Batch
+      tags: [x402]
+      parameters:
+        - name: batch_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Batch details
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /v1/x402/batches/settle:
+    post:
+      summary: Settle payment batch
+      description: Submit the on-chain settlement transaction for an x402 batch
+      operationId: settleX402Batch
+      tags: [x402]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Settlement submitted
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /v1/x402/premium/insights:
+    get:
+      summary: Premium insights (payment-gated)
+      description: |
+        Demonstration endpoint gated by the x402 payment middleware: requests
+        must carry a valid signed payment intent in the `X-Payment` header or
+        they receive `402 Payment Required` with the payment requirements.
+      operationId: x402PremiumInsights
+      tags: [x402]
+      responses:
+        '200':
+          description: Premium insights payload
+          content:
+            application/json:
+              schema:
+                type: object
+        '402':
+          description: Payment required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ==========================================================================
   # Health & Metrics
   # ==========================================================================
+  /health/detailed:
+    get:
+      summary: Detailed health check
+      description: Authenticated deep health check (database, workers, dependencies)
+      operationId: detailedHealthCheck
+      tags: [Health]
+      responses:
+        '200':
+          description: Detailed health report
+          content:
+            application/json:
+              schema:
+                type: object
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
   /health:
     get:
       summary: Health check

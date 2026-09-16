@@ -9,10 +9,11 @@
 //! - Priority-based retry ordering
 //! - Alerting support for operations teams
 
+use super::postgres::projection_transaction::{projection_connection, PgProjectionTransaction};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPool;
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use uuid::Uuid;
 
 use crate::domain::{StoreId, TenantId};
@@ -196,6 +197,7 @@ impl DeadLetterEvent {
 pub struct PgDeadLetterQueue {
     pool: PgPool,
     config: DeadLetterRetryConfig,
+    enqueue_transaction: Option<Arc<PgProjectionTransaction>>,
 }
 
 impl PgDeadLetterQueue {
@@ -204,12 +206,25 @@ impl PgDeadLetterQueue {
         Self {
             pool,
             config: DeadLetterRetryConfig::default(),
+            enqueue_transaction: None,
         }
     }
 
     /// Create with custom retry config
     pub fn with_config(pool: PgPool, config: DeadLetterRetryConfig) -> Self {
-        Self { pool, config }
+        Self {
+            pool,
+            config,
+            enqueue_transaction: None,
+        }
+    }
+
+    pub(crate) fn with_enqueue_transaction(
+        mut self,
+        transaction: Arc<PgProjectionTransaction>,
+    ) -> Self {
+        self.enqueue_transaction = Some(transaction);
+        self
     }
 
     /// Initialize the dead letter queue table
@@ -352,7 +367,9 @@ impl PgDeadLetterQueue {
         .bind(&params.payload)
         .bind(&params.metadata)
         .bind(conflict_next_retry)
-        .execute(&self.pool)
+        .execute(
+            &mut *projection_connection(&self.pool, self.enqueue_transaction.as_deref()).await?,
+        )
         .await?;
 
         tracing::warn!(

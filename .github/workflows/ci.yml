@@ -26,21 +26,17 @@ env:
   COVERAGE_THRESHOLD: 28
   # Core feature set: `full` minus `stark`, so lint/test/coverage build the
   # whole sequencer except the STARK proof verifier (whose crates live in the
-  # private stateset-stark workspace). See the `stark` feature in Cargo.toml.
+  # separate stateset-starks repo). See the `stark` feature in Cargo.toml.
   # `integration` is appended per-step on the jobs that run database tests.
   CORE_FEATURES: pqc
-  # Exact stateset-stark commit this repo's Cargo.lock was resolved against.
-  # The ves-stark-* crates are path dependencies on a separate repo, so
-  # tracking its default branch meant every upstream commit silently
-  # invalidated Cargo.lock and failed every `--locked` job in this file.
-  # Bump this ref and re-resolve the ves-stark-* crates with `cargo update`
-  # in the same commit, so a STARK upgrade is always deliberate and atomic.
-  STARK_REF: "c2cd52c6511279c9c73ab6eb16c5389176f95752"
-  # Token with read access to the private stateset-stark repo. Add it under
-  # Settings → Secrets and variables → Actions. Required because the ves-stark-*
-  # crates are path dependencies that cargo must resolve even when the `stark`
-  # feature is off.
-  STARK_REPO_TOKEN: ${{ secrets.STARK_REPO_TOKEN }}
+  # Exact stateset-starks commit the ves-stark-* git dependencies in
+  # Cargo.toml are pinned to. Tracking its default branch would mean every
+  # upstream commit silently invalidated Cargo.lock and failed every
+  # `--locked` job in this file. Bump this ref, the `rev` pins in Cargo.toml
+  # and Cargo.lock together (see "Upgrading the STARK dependency" in the
+  # README), so a STARK upgrade is always deliberate and atomic.
+  # `tests/source_invariants_test.rs` asserts the pins match this ref.
+  STARK_REF: "4209d2623750242d680abc21d13f39ab80791c2b"
 
 jobs:
   node-sdk:
@@ -87,6 +83,8 @@ jobs:
       - run: python -m ruff check .
       - run: python -m mypy
       - run: python -m pytest
+      - name: Audit Python dependencies
+        run: python -m pip_audit --progress-spinner off
       - name: Verify distribution metadata
         run: |
           python -m build
@@ -97,24 +95,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Fetch local STARK dependency source
-        run: |
-          # The GitHub repo is stateset-starks (with an s) and is public, so no
-          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
-          # the repo is made private). Every CI run in this repository's
-          # history had failed here: the secret was never configured AND the
-          # URL pointed at stateset-stark.git, which does not exist.
-          if [ ! -d ../stateset-stark ]; then
-            if [ -n "$STARK_REPO_TOKEN" ]; then
-              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
-            else
-              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-            fi
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
-          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
@@ -184,24 +164,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Fetch local STARK dependency source
-        run: |
-          # The GitHub repo is stateset-starks (with an s) and is public, so no
-          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
-          # the repo is made private). Every CI run in this repository's
-          # history had failed here: the secret was never configured AND the
-          # URL pointed at stateset-stark.git, which does not exist.
-          if [ ! -d ../stateset-stark ]; then
-            if [ -n "$STARK_REPO_TOKEN" ]; then
-              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
-            else
-              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-            fi
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
-          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
-
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
       - name: Install protoc
@@ -260,24 +222,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Fetch local STARK dependency source
-        run: |
-          # The GitHub repo is stateset-starks (with an s) and is public, so no
-          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
-          # the repo is made private). Every CI run in this repository's
-          # history had failed here: the secret was never configured AND the
-          # URL pointed at stateset-stark.git, which does not exist.
-          if [ ! -d ../stateset-stark ]; then
-            if [ -n "$STARK_REPO_TOKEN" ]; then
-              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
-            else
-              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-            fi
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
-          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
-
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
       - name: Install protoc
@@ -327,24 +271,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
-
-      - name: Fetch local STARK dependency source
-        run: |
-          # The GitHub repo is stateset-starks (with an s) and is public, so no
-          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
-          # the repo is made private). Every CI run in this repository's
-          # history had failed here: the secret was never configured AND the
-          # URL pointed at stateset-stark.git, which does not exist.
-          if [ ! -d ../stateset-stark ]; then
-            if [ -n "$STARK_REPO_TOKEN" ]; then
-              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
-            else
-              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-            fi
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
-          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
@@ -428,13 +354,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Fetch local STARK dependency source
-        run: |
-          if [ ! -d ../stateset-stark ]; then
-            git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
       - name: Read rust-version from Cargo.toml
         id: msrv
         run: |
@@ -458,24 +377,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Fetch local STARK dependency source
-        run: |
-          # The GitHub repo is stateset-starks (with an s) and is public, so no
-          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
-          # the repo is made private). Every CI run in this repository's
-          # history had failed here: the secret was never configured AND the
-          # URL pointed at stateset-stark.git, which does not exist.
-          if [ ! -d ../stateset-stark ]; then
-            if [ -n "$STARK_REPO_TOKEN" ]; then
-              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
-            else
-              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-            fi
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
-          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
-
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
       - name: Install protoc
@@ -494,24 +395,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Fetch local STARK dependency source
-        run: |
-          # The GitHub repo is stateset-starks (with an s) and is public, so no
-          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
-          # the repo is made private). Every CI run in this repository's
-          # history had failed here: the secret was never configured AND the
-          # URL pointed at stateset-stark.git, which does not exist.
-          if [ ! -d ../stateset-stark ]; then
-            if [ -n "$STARK_REPO_TOKEN" ]; then
-              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
-            else
-              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-            fi
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
-          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
@@ -539,24 +422,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Fetch local STARK dependency source
-        run: |
-          # The GitHub repo is stateset-starks (with an s) and is public, so no
-          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
-          # the repo is made private). Every CI run in this repository's
-          # history had failed here: the secret was never configured AND the
-          # URL pointed at stateset-stark.git, which does not exist.
-          if [ ! -d ../stateset-stark ]; then
-            if [ -n "$STARK_REPO_TOKEN" ]; then
-              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
-            else
-              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-            fi
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
-          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
-
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
       - name: Install protoc
@@ -574,24 +439,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-
-      - name: Fetch local STARK dependency source
-        run: |
-          # The GitHub repo is stateset-starks (with an s) and is public, so no
-          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
-          # the repo is made private). Every CI run in this repository's
-          # history had failed here: the secret was never configured AND the
-          # URL pointed at stateset-stark.git, which does not exist.
-          if [ ! -d ../stateset-stark ]; then
-            if [ -n "$STARK_REPO_TOKEN" ]; then
-              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
-            else
-              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-            fi
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
-          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
 
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
@@ -712,24 +559,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Ensure local STARK dependency source for Docker build
-        run: |
-          # The GitHub repo is stateset-starks (with an s) and is public, so no
-          # token is needed; STARK_REPO_TOKEN is honoured if ever set (e.g. if
-          # the repo is made private). Every CI run in this repository's
-          # history had failed here: the secret was never configured AND the
-          # URL pointed at stateset-stark.git, which does not exist.
-          if [ ! -d ../stateset-stark ]; then
-            if [ -n "$STARK_REPO_TOKEN" ]; then
-              git clone --filter=blob:none --no-checkout "https://x-access-token:${STARK_REPO_TOKEN}@github.com/stateset/stateset-starks.git" ../stateset-stark
-            else
-              git clone --filter=blob:none --no-checkout "https://github.com/stateset/stateset-starks.git" ../stateset-stark
-            fi
-          fi
-          git -C ../stateset-stark fetch --depth 1 origin "$STARK_REF"
-          git -C ../stateset-stark checkout --detach "$STARK_REF"
-          echo "stateset-stark pinned at $(git -C ../stateset-stark rev-parse HEAD)"
-
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
       - name: Install protoc
@@ -755,16 +584,15 @@ jobs:
             type=sha,prefix=
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', 'main') || github.ref == format('refs/heads/{0}', 'master') }}
 
-      # The Dockerfile expects a parent directory containing both checkouts
-      # (COPY stateset-sequencer/... and COPY stateset-stark). Stage that
-      # layout explicitly inside the workspace: the action resolved the
-      # previous `context: ..` inconsistently and failed with
+      # The Dockerfile addresses the sequencer as stateset-sequencer/... (the
+      # STARK crates are pinned git dependencies, so no STARK checkout is
+      # staged). Stage that layout explicitly inside the workspace: the action
+      # resolved the previous `context: ..` inconsistently and failed with
       # "lstat stateset-sequencer: no such file or directory".
       - name: Stage Docker build context
         run: |
           mkdir -p docker-ctx/stateset-sequencer
           rsync -a --exclude target --exclude .git --exclude docker-ctx ./ docker-ctx/stateset-sequencer/
-          rsync -a --exclude .git ../stateset-stark/ docker-ctx/stateset-stark/
 
       - name: Build and push
         uses: docker/build-push-action@v7

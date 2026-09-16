@@ -78,11 +78,11 @@ sqlx migrate run
 
 ### Build and Run
 
-> Cargo requires the public
-> [`stateset-starks`](https://github.com/stateset/stateset-starks) checkout at
-> `../stateset-stark` to resolve the path dependencies, even when the `stark`
-> feature is disabled. See "Cargo features" in the
-> [README](README.md#cargo-features).
+> The optional `stark` feature pulls the `ves-stark-*` crates as pinned git
+> dependencies from the public
+> [`stateset-starks`](https://github.com/stateset/stateset-starks) repository;
+> cargo fetches them on demand, so no local checkout is needed. See
+> "Cargo features" in the [README](README.md#cargo-features).
 
 ```bash
 # Development build
