@@ -99,7 +99,7 @@ jobs:
       # tonic-build compiles the gRPC protos at build time and needs protoc,
       # which the hosted runners do not ship.
       - name: Install protoc
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler ripgrep
 
       - uses: dtolnay/rust-toolchain@1.90.0
         with:
