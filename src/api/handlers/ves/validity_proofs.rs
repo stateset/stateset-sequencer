@@ -82,7 +82,6 @@ const MAX_VALIDITY_PROOF_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
 const STARK_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 const STARK_VERIFY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
-const STARK_VERIFY_ON_SUBMIT_ENV: &str = "VES_STARK_VERIFY_ON_SUBMIT";
 const STARK_VERIFY_CONCURRENCY_ENV: &str = "VES_STARK_VERIFY_CONCURRENCY";
 
 #[derive(Debug, Deserialize)]
@@ -114,21 +113,6 @@ struct VesValidityBatchPublicInputs {
     policy_hash: String,
     #[serde(alias = "policy_limit")]
     policy_limit: u64,
-}
-
-fn stark_verify_on_submit_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var(STARK_VERIFY_ON_SUBMIT_ENV)
-            .ok()
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "" | "0" | "false" | "off"
-                )
-            })
-            .unwrap_or(true)
-    })
 }
 
 fn stark_verify_semaphore() -> &'static Semaphore {
@@ -482,7 +466,7 @@ pub async fn submit_ves_validity_proof(
 
     // Soundness: the batch proof's amounts are prover-supplied, so re-check the
     // claimed policy against the stored event payloads wherever they are
-    // recoverable. Runs even when verify-on-submit is disabled.
+    // recoverable.
     let amount_recheck = if is_stark {
         let Some(public_inputs) = public_inputs.as_ref() else {
             return Err(internal_error(
@@ -494,7 +478,8 @@ pub async fn submit_ves_validity_proof(
         None
     };
 
-    if is_stark && stark_verify_on_submit_enabled() {
+    // A stored STARK proof must have passed verification at admission.
+    if is_stark {
         let batch_public_inputs = parse_batch_public_inputs(public_inputs.as_ref().ok_or((
             StatusCode::INTERNAL_SERVER_ERROR,
             "Missing public inputs".to_string(),

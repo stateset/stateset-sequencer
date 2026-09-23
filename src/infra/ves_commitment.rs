@@ -515,6 +515,11 @@ impl PgVesCommitmentEngine {
                 SequencerError::Internal("invalid commitment new_state_root length".to_string())
             })?
         } else {
+            if start != 1 {
+                return Err(SequencerError::Internal(
+                    "first commitment range must start at sequence 1".to_string(),
+                ));
+            }
             [0u8; 32]
         };
 
@@ -650,6 +655,11 @@ impl PgVesCommitmentEngine {
                 SequencerError::Internal("invalid commitment new_state_root length".to_string())
             })?
         } else {
+            if start != 1 {
+                return Err(SequencerError::Internal(
+                    "first commitment range must start at sequence 1".to_string(),
+                ));
+            }
             [0u8; 32]
         };
 
@@ -1020,6 +1030,7 @@ impl PgVesCommitmentEngine {
                 chain_block_number = $3
             WHERE batch_id = $4
               AND anchored_at IS NULL
+              AND chain_tx_hash IS NULL
             "#,
         )
         .bind(chain_id as i32)

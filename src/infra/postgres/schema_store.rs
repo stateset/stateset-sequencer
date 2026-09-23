@@ -14,7 +14,7 @@ use crate::domain::{
     EventType, Schema, SchemaCompatibility, SchemaId, SchemaStatus, SchemaValidationError,
     SchemaValidationResult, TenantId,
 };
-use crate::infra::{Result, SchemaCache, SchemaStore, SequencerError, CACHE_STAMPEDE_DELAY};
+use crate::infra::{Result, SchemaCache, SchemaStore, SequencerError};
 
 /// PostgreSQL-backed schema registry
 pub struct PgSchemaStore {
@@ -180,23 +180,8 @@ impl SchemaStore for PgSchemaStore {
         tenant_id: &TenantId,
         event_type: &EventType,
     ) -> Result<Option<Schema>> {
-        let mut lock_acquired = false;
-        if let Some(cache) = &self.cache {
-            let (cached, lock) = cache
-                .get_latest_with_lock(&tenant_id.0, event_type.as_str())
-                .await;
-            if let Some(schema) = cached {
-                return Ok(Some(schema));
-            }
-            lock_acquired = lock;
-            if !lock_acquired {
-                tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
-                if let Some(schema) = cache.get_latest(&tenant_id.0, event_type.as_str()).await {
-                    return Ok(Some(schema));
-                }
-            }
-        }
-
+        // A schema can be archived by another replica. Admission must read
+        // authoritative status rather than an older active cache entry.
         let row: Option<(
             Uuid,
             Uuid,
@@ -209,7 +194,7 @@ impl SchemaStore for PgSchemaStore {
             DateTime<Utc>,
             DateTime<Utc>,
             Option<String>,
-        )> = match sqlx::query_as(
+        )> = sqlx::query_as(
             r#"
             SELECT id, tenant_id, event_type, version, schema_json, status, compatibility, description, created_at, updated_at, created_by
             FROM event_schemas
@@ -222,19 +207,7 @@ impl SchemaStore for PgSchemaStore {
         .bind(event_type.as_str())
         .fetch_optional(&self.pool)
         .await
-        {
-            Ok(row) => row,
-            Err(e) => {
-                if let Some(cache) = &self.cache {
-                    if lock_acquired {
-                        cache
-                            .release_latest_lock(&tenant_id.0, event_type.as_str())
-                            .await;
-                    }
-                }
-                return Err(SequencerError::Database(e));
-            }
-        };
+        .map_err(SequencerError::Database)?;
 
         let schema = row.map(
             |(
@@ -265,17 +238,6 @@ impl SchemaStore for PgSchemaStore {
                 )
             },
         );
-
-        if let Some(cache) = &self.cache {
-            if let Some(schema) = &schema {
-                cache.insert_latest(schema.clone()).await;
-            }
-            if lock_acquired {
-                cache
-                    .release_latest_lock(&tenant_id.0, event_type.as_str())
-                    .await;
-            }
-        }
 
         Ok(schema)
     }

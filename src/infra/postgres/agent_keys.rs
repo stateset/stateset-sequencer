@@ -101,7 +101,7 @@ impl PgAgentKeyRegistry {
             "active" => KeyStatus::Active,
             "revoked" => KeyStatus::Revoked,
             "expired" => KeyStatus::Expired,
-            _ => KeyStatus::Active,
+            _ => return Err(AgentKeyError::Internal("invalid agent key status".into())),
         };
 
         let algorithm = crate::crypto::pqc_signing::KeyAlgorithm::from_i32(i32::from(
@@ -264,7 +264,40 @@ impl AgentKeyRegistry for PgAgentKeyRegistry {
         lookup: &AgentKeyLookup,
         at: DateTime<Utc>,
     ) -> Result<AgentKeyEntry, AgentKeyError> {
-        let entry = self.get_key(lookup).await?;
+        let mut entry = self.get_key(lookup).await?;
+        // Cache entries may outlive a revocation made by another server.
+        // Validation must read the authoritative lifecycle fields on every
+        // signature check; key material itself is immutable after insertion.
+        let lifecycle: Option<(
+            String,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            "SELECT status, valid_from, valid_to, revoked_at FROM agent_signing_keys \
+             WHERE tenant_id = $1 AND agent_id = $2 AND key_id = $3",
+        )
+        .bind(lookup.tenant_id)
+        .bind(lookup.agent_id)
+        .bind(lookup.key_id as i32)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AgentKeyError::Internal(e.to_string()))?;
+        let (status, valid_from, valid_to, revoked_at) =
+            lifecycle.ok_or(AgentKeyError::KeyNotFound {
+                tenant_id: lookup.tenant_id,
+                agent_id: lookup.agent_id,
+                key_id: lookup.key_id,
+            })?;
+        entry.status = match status.as_str() {
+            "active" => KeyStatus::Active,
+            "revoked" => KeyStatus::Revoked,
+            "expired" => KeyStatus::Expired,
+            _ => return Err(AgentKeyError::Internal("invalid agent key status".into())),
+        };
+        entry.valid_from = valid_from;
+        entry.valid_to = valid_to;
+        entry.revoked_at = revoked_at;
 
         match entry.status_at(at) {
             KeyStatus::Active => Ok(entry),

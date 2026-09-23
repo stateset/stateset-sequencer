@@ -71,6 +71,9 @@ pub enum EncryptionError {
     #[error("no recipients specified")]
     NoRecipients,
 
+    #[error("duplicate recipient key ID: {0}")]
+    DuplicateRecipient(u32),
+
     #[error("recipient not found: {0}")]
     RecipientNotFound(u32),
 
@@ -227,6 +230,12 @@ pub fn compute_payload_aad(params: &PayloadAadParams) -> Hash256 {
 /// recipients_hash = SHA256(b"VES_RECIPIENTS_V1" || RECIP_ENTRY(0) || ... || RECIP_ENTRY(n-1))
 /// ```
 pub fn compute_recipients_hash(recipients: &[Recipient]) -> Result<Hash256, EncryptionError> {
+    let mut seen = std::collections::HashSet::new();
+    for recipient in recipients {
+        if !seen.insert(recipient.recipient_kid) {
+            return Err(EncryptionError::DuplicateRecipient(recipient.recipient_kid));
+        }
+    }
     let mut hasher = Sha256::new();
     hasher.update(DOMAIN_RECIPIENTS);
 
@@ -339,6 +348,12 @@ pub fn encrypt_payload_ves(
 ) -> Result<EncryptionResult, EncryptionError> {
     if recipient_keys.is_empty() {
         return Err(EncryptionError::NoRecipients);
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (kid, _) in recipient_keys {
+        if !seen.insert(*kid) {
+            return Err(EncryptionError::DuplicateRecipient(*kid));
+        }
     }
 
     // Generate random salt
@@ -460,6 +475,12 @@ pub fn decrypt_payload_ves(
     recipient_private_key: &[u8; 32],
     expected_plain_hash: &Hash256,
 ) -> Result<serde_json::Value, EncryptionError> {
+    let mut seen = std::collections::HashSet::new();
+    for recipient in &payload_encrypted.recipients {
+        if !seen.insert(recipient.recipient_kid) {
+            return Err(EncryptionError::DuplicateRecipient(recipient.recipient_kid));
+        }
+    }
     // Find recipient entry
     let recip = payload_encrypted
         .recipients
@@ -1028,6 +1049,36 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_recipient_ids_are_rejected() {
+        let (_, public_key) = generate_hpke_keypair();
+        let tenant = Uuid::new_v4();
+        let store = Uuid::new_v4();
+        let event = Uuid::new_v4();
+        let agent = Uuid::new_v4();
+        let plain_hash = [0u8; 32];
+        let aad = PayloadAadParams {
+            tenant_id: &tenant,
+            store_id: &store,
+            event_id: &event,
+            source_agent_id: &agent,
+            agent_key_id: 1,
+            entity_type: "order",
+            entity_id: "one",
+            event_type: "order.created",
+            created_at: "2025-12-20T18:31:22.123Z",
+            payload_plain_hash: &plain_hash,
+        };
+        assert!(matches!(
+            encrypt_payload_ves(
+                &json!({"amount": 1}),
+                &aad,
+                &[(7, &public_key), (7, &public_key)]
+            ),
+            Err(EncryptionError::DuplicateRecipient(7))
+        ));
+    }
+
+    #[test]
     fn test_encrypt_decrypt_ves_roundtrip() {
         let payload = json!({
             "item": "widget",
@@ -1056,8 +1107,9 @@ mod tests {
 
         // Generate recipient keys using proper HPKE keypair
         let (recipient_sk, recipient_pk) = generate_hpke_keypair();
+        let (second_sk, second_pk) = generate_hpke_keypair();
 
-        let recipient_keys = vec![(1u32, &recipient_pk)];
+        let recipient_keys = vec![(2u32, &second_pk), (1u32, &recipient_pk)];
 
         // Encrypt
         let result = encrypt_payload_ves(&payload, &aad_params, &recipient_keys).unwrap();
@@ -1084,6 +1136,37 @@ mod tests {
         .unwrap();
 
         assert_eq!(payload, decrypted);
+        assert_eq!(result.payload_encrypted.recipients[0].recipient_kid, 1);
+        assert_eq!(
+            decrypt_payload_ves(
+                &result.payload_encrypted,
+                &payload_aad,
+                2,
+                &second_sk,
+                &result.payload_plain_hash,
+            )
+            .unwrap(),
+            payload
+        );
+        let wrong_aad = [99u8; 32];
+        assert!(decrypt_payload_ves(
+            &result.payload_encrypted,
+            &wrong_aad,
+            1,
+            &recipient_sk,
+            &result.payload_plain_hash,
+        )
+        .is_err());
+        assert!(matches!(
+            decrypt_payload_ves(
+                &result.payload_encrypted,
+                &payload_aad,
+                3,
+                &recipient_sk,
+                &result.payload_plain_hash,
+            ),
+            Err(EncryptionError::RecipientNotFound(3))
+        ));
     }
 
     #[test]

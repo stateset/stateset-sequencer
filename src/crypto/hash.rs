@@ -627,6 +627,42 @@ mod tests {
     }
 
     #[test]
+    fn receipt_hash_matches_independent_sha256_vector_and_binds_every_field() {
+        // Computed independently from the documented preimage with Python's
+        // hashlib.sha256, including the eight big-endian sequence bytes.
+        let tenant = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let store = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+        let event = Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap();
+        let signing_hash = [0x11u8; 32];
+        let sequence = 0x0102_0304_0506_0708;
+        let expected =
+            hex::decode("5661e7587c1b1065e63e38e2a2b00ee7b95c7209e650f00d2110267704d8815e")
+                .unwrap();
+        let actual = compute_receipt_hash(&tenant, &store, &event, sequence, &signing_hash);
+        assert_eq!(actual.as_slice(), expected);
+        assert_ne!(
+            actual,
+            compute_receipt_hash(&store, &store, &event, sequence, &signing_hash)
+        );
+        assert_ne!(
+            actual,
+            compute_receipt_hash(&tenant, &tenant, &event, sequence, &signing_hash)
+        );
+        assert_ne!(
+            actual,
+            compute_receipt_hash(&tenant, &store, &tenant, sequence, &signing_hash)
+        );
+        assert_ne!(
+            actual,
+            compute_receipt_hash(&tenant, &store, &event, sequence + 1, &signing_hash)
+        );
+        assert_ne!(
+            actual,
+            compute_receipt_hash(&tenant, &store, &event, sequence, &[0x12u8; 32])
+        );
+    }
+
+    #[test]
     fn test_encode_string() {
         let encoded = encode_string("test");
         assert_eq!(encoded.len(), 4 + 4); // 4 bytes length + 4 bytes "test"
@@ -734,6 +770,111 @@ mod tests {
         // Same inputs should produce same output
         let signing_hash2 = compute_event_signing_hash(&params);
         assert_eq!(signing_hash, signing_hash2);
+    }
+
+    #[test]
+    fn shared_jcs_vectors_match_rust_canonicalization() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/vectors/ves_enc_1_test_vectors.json"
+        ))
+        .unwrap();
+        for vector in vectors["canonicalization"]["vectors"].as_array().unwrap() {
+            assert_eq!(
+                canonicalize_json(&vector["input"]),
+                vector["expected"].as_str().unwrap(),
+                "{}",
+                vector["name"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn shared_payload_hash_vectors_match_rust() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/vectors/ves_enc_1_test_vectors.json"
+        ))
+        .unwrap();
+        for vector in vectors["payload_plain_hash"]["vectors"].as_array().unwrap() {
+            let payload = &vector["payload"];
+            assert_eq!(
+                canonicalize_json(payload),
+                vector["canonical_json"].as_str().unwrap()
+            );
+            let hash = match vector["salt_hex"].as_str() {
+                Some(salt_hex) => {
+                    let salt: [u8; 16] = hex::decode(salt_hex).unwrap().try_into().unwrap();
+                    payload_plain_hash_salted(payload, &salt)
+                }
+                None => payload_plain_hash(payload),
+            };
+            assert_eq!(
+                hex::encode(hash),
+                vector["expected_hash"]
+                    .as_str()
+                    .unwrap()
+                    .trim_start_matches("0x"),
+                "{}",
+                vector["name"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn signing_hash_binds_every_v1_field_and_v2_execution_control() {
+        let ids: Vec<Uuid> = (1..=5).map(Uuid::from_u128).collect();
+        let zero = [0u8; 32];
+        let one = [1u8; 32];
+        let mut params = EventSigningParams {
+            ves_version: 1,
+            tenant_id: &ids[0],
+            store_id: &ids[1],
+            event_id: &ids[2],
+            source_agent_id: &ids[3],
+            agent_key_id: 1,
+            entity_type: "order",
+            entity_id: "one",
+            event_type: "created",
+            created_at: "2026-01-01T00:00:00Z",
+            payload_kind: 0,
+            payload_plain_hash: &zero,
+            payload_cipher_hash: &zero,
+        };
+        let base = compute_event_signing_hash(&params);
+        macro_rules! changed {
+            ($field:ident, $value:expr, $original:expr) => {{
+                params.$field = $value;
+                assert_ne!(
+                    compute_event_signing_hash(&params),
+                    base,
+                    stringify!($field)
+                );
+                params.$field = $original;
+            }};
+        }
+        changed!(ves_version, 2, 1);
+        changed!(tenant_id, &ids[4], &ids[0]);
+        changed!(store_id, &ids[4], &ids[1]);
+        changed!(event_id, &ids[4], &ids[2]);
+        changed!(source_agent_id, &ids[4], &ids[3]);
+        changed!(agent_key_id, 2, 1);
+        changed!(entity_type, "inventory", "order");
+        changed!(entity_id, "two", "one");
+        changed!(event_type, "updated", "created");
+        changed!(created_at, "2026-01-02T00:00:00Z", "2026-01-01T00:00:00Z");
+        changed!(payload_kind, 1, 0);
+        changed!(payload_plain_hash, &one, &zero);
+        changed!(payload_cipher_hash, &one, &zero);
+
+        let controls = bind_execution_controls(&base, None, None);
+        assert_ne!(
+            controls,
+            bind_execution_controls(&base, Some(&ids[4]), None)
+        );
+        assert_ne!(controls, bind_execution_controls(&base, None, Some(0)));
+        assert_ne!(
+            bind_execution_controls(&base, Some(&ids[4]), Some(1)),
+            bind_execution_controls(&base, Some(&ids[4]), Some(2))
+        );
     }
 
     #[test]

@@ -39,6 +39,94 @@ env:
   STARK_REF: "4209d2623750242d680abc21d13f39ab80791c2b"
 
 jobs:
+  formal:
+    name: Formal models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: formal
+          build: true
+          test: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Check TLA+ models
+        working-directory: formal/tla
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar \
+            --output /tmp/tla2tools.jar
+          echo '936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88  /tmp/tla2tools.jar' | sha256sum --check
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config SequencerIngest.cfg SequencerIngest.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config SequencerTransactions.cfg SequencerTransactions.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config SequencerReservations.cfg SequencerReservations.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config VesReplay.cfg VesReplay.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config EntityVersions.cfg EntityVersions.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config CommandLockOrder.cfg CommandLockOrder.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config CommandReservationRace.cfg CommandReservationRace.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config IngestSqlRefinement.cfg IngestSqlRefinement.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config SyncAndProjection.cfg SyncAndProjection.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config CommitmentChain.cfg CommitmentChain.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config LeaderFinality.cfg LeaderFinality.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config X402Settlement.cfg X402Settlement.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config AuthorizationIsolation.cfg AuthorizationIsolation.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config CrashRecovery.cfg CrashRecovery.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config KeyLifecycle.cfg KeyLifecycle.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config MigrationPreservation.cfg MigrationPreservation.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config ChainReconciliation.cfg ChainReconciliation.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config SharedRateLimits.cfg SharedRateLimits.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config SchemaPolicy.cfg SchemaPolicy.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config EncryptedPayloadLifecycle.cfg EncryptedPayloadLifecycle.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config AuditIntegrity.cfg AuditIntegrity.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config StarkAdmission.cfg StarkAdmission.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config AuditTransactions.cfg AuditTransactions.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config ProofJobLifecycle.cfg ProofJobLifecycle.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config DeadLetterClaims.cfg DeadLetterClaims.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config AtRestKeyRotation.cfg AtRestKeyRotation.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config ExternalEffectFencing.cfg ExternalEffectFencing.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config CacheReorgSafety.cfg CacheReorgSafety.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config ProjectionDiscovery.cfg ProjectionDiscovery.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config ProjectionReplay.cfg ProjectionReplay.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config NonceRetention.cfg NonceRetention.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config RollingKeyUpgrade.cfg RollingKeyUpgrade.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config ContractIdempotency.cfg ContractIdempotency.tla
+
   node-sdk:
     name: Node SDK
     runs-on: ubuntu-latest
@@ -609,11 +697,15 @@ jobs:
   all-checks:
     name: All Checks
     runs-on: ubuntu-latest
-    needs: [node-sdk, python-sdk, lint, test, test-stark, msrv, coverage, security, license-check, benchmark, build, load-smoke]
+    needs: [formal, node-sdk, python-sdk, lint, test, test-stark, msrv, coverage, security, license-check, benchmark, build, load-smoke]
     if: always()
     steps:
       - name: Check all jobs passed
         run: |
+          if [[ "${{ needs.formal.result }}" != "success" ]]; then
+            echo "Formal models failed"
+            exit 1
+          fi
           if [[ "${{ needs.node-sdk.result }}" != "success" ]]; then
             echo "Node SDK failed"
             exit 1

@@ -112,6 +112,11 @@ impl AuthContext {
         }
     }
 
+    /// Only the deliberate bootstrap context may cross tenant boundaries.
+    pub fn is_bootstrap_admin(&self) -> bool {
+        self.permissions.admin && self.tenant_id.is_nil()
+    }
+
     /// Check if this auth context allows access to a specific store
     pub fn can_access_store(&self, store_id: &Uuid) -> bool {
         self.store_ids.is_empty() || self.store_ids.contains(store_id)

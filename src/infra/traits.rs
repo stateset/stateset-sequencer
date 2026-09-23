@@ -60,9 +60,11 @@ pub trait IngestService: Send + Sync {
 #[cfg_attr(test, automock)]
 #[async_trait]
 pub trait Sequencer: Send + Sync {
-    /// Assign sequence numbers to events
+    /// Reserve a durable sequence range and assign its numbers to events.
     ///
     /// Sequence numbers are monotonically increasing per (tenant_id, store_id).
+    /// This does not store the events. A caller that fails to append them leaves
+    /// a gap, so the gap-free ingest guarantee does not apply to this method.
     async fn sequence(&self, events: Vec<EventEnvelope>) -> Result<Vec<SequencedEvent>>;
 
     /// Get the current head sequence for a tenant/store

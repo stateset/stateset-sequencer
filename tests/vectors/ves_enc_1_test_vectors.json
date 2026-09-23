@@ -76,7 +76,7 @@
         "salt_hex": null,
         "canonical_json": "{\"delta\":100}",
         "preimage_description": "DOMAIN_PAYLOAD_PLAIN || canonical_json",
-        "expected_hash": "0x7c3c0b8a1d2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f80"
+        "expected_hash": "0x9ac51a331894a0b6d3c0563f28384afd86115d5c9379370989044dfab89f3e5a"
       },
       {
         "name": "simple_payload_with_salt",
@@ -84,7 +84,7 @@
         "salt_hex": "0102030405060708090a0b0c0d0e0f10",
         "canonical_json": "{\"delta\":100,\"reason\":\"test\"}",
         "preimage_description": "DOMAIN_PAYLOAD_PLAIN || salt || canonical_json",
-        "expected_hash": "0x8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f90"
+        "expected_hash": "0xd9faf01d51a58f57acafb13ef03a055a9753350868c856795d4eb83ef42a32b7"
       }
     ]
   },

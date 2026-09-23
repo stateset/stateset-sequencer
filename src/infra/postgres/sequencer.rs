@@ -172,7 +172,7 @@ impl PgSequencer {
         Ok(())
     }
 
-    /// Get multiple sequence numbers atomically
+    /// Reserve multiple sequence numbers atomically, without inserting events.
     async fn get_sequence_range(
         &self,
         tenant_id: &TenantId,
@@ -388,16 +388,24 @@ impl PgSequencer {
         row.map(|(v,)| Self::decode_sequence(v)).transpose()
     }
 
-    async fn fetch_existing_command_id_tx(
+    async fn existing_event_owns_command_reservation_tx(
         tx: &mut Transaction<'_, Postgres>,
         event_id: Uuid,
-    ) -> Result<Option<Uuid>> {
-        let row: Option<(Option<Uuid>,)> =
-            sqlx::query_as("SELECT command_id FROM events WHERE event_id = $1")
-                .bind(event_id)
-                .fetch_optional(&mut **tx)
-                .await?;
-        Ok(row.and_then(|(cmd_id,)| cmd_id))
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        command_id: Uuid,
+    ) -> Result<bool> {
+        let row: Option<(Uuid, Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT tenant_id, store_id, command_id FROM events WHERE event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(matches!(
+            row,
+            Some((tenant, store, Some(command)))
+                if tenant == tenant_id.0 && store == store_id.0 && command == command_id
+        ))
     }
 
     async fn release_command_id_tx(
@@ -667,10 +675,15 @@ impl IngestService for PgSequencer {
             if !inserted {
                 if let Some(cmd_id) = sequenced.envelope.command_id {
                     if reserved_command_ids.contains(&cmd_id) {
-                        let existing_cmd_id =
-                            Self::fetch_existing_command_id_tx(&mut tx, sequenced.event_id())
-                                .await?;
-                        if existing_cmd_id != Some(cmd_id) {
+                        let owned = Self::existing_event_owns_command_reservation_tx(
+                            &mut tx,
+                            sequenced.event_id(),
+                            &tenant_id,
+                            &store_id,
+                            cmd_id,
+                        )
+                        .await?;
+                        if !owned {
                             Self::release_command_id_tx(&mut tx, &tenant_id, &store_id, cmd_id)
                                 .await?;
                         }

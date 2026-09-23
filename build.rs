@@ -14,6 +14,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("cargo:rerun-if-changed=proto/sequencer.proto");
     println!("cargo:rerun-if-changed=proto/sequencer_v2.proto");
+    // sqlx::migrate! embeds the migration list at compile time. Rebuild it
+    // when files are added, rather than shipping a binary with a stale list.
+    println!("cargo:rerun-if-changed=migrations/postgres");
+    println!("cargo:rerun-if-changed=migrations/sqlite");
 
     Ok(())
 }

@@ -519,6 +519,77 @@ mod integration {
     }
 
     #[tokio::test]
+    async fn nonce_cleanup_keeps_live_window_and_prunes_only_older_rows() {
+        let pool = get_test_pool().await;
+        let repo = PgX402Repository::new(pool.clone());
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let tenant = TenantId::new();
+        let store = StoreId::new();
+        let intent = create_test_intent(
+            &signing_key,
+            tenant,
+            store,
+            "0x0000000000000000000000000000000000000001",
+            1,
+        );
+        repo.insert_intent(&intent).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let old_nonce = intent.nonce;
+        let recent_nonce = old_nonce + 1;
+        assert!(repo
+            .reserve_nonce(
+                &mut tx,
+                &intent.tenant_id,
+                &intent.store_id,
+                &intent.payer_address,
+                old_nonce,
+                intent.intent_id
+            )
+            .await
+            .unwrap());
+        assert!(repo
+            .reserve_nonce(
+                &mut tx,
+                &intent.tenant_id,
+                &intent.store_id,
+                &intent.payer_address,
+                recent_nonce,
+                intent.intent_id
+            )
+            .await
+            .unwrap());
+        tx.commit().await.unwrap();
+
+        let retention = (stateset_sequencer::domain::X402_MAX_VALIDITY_SECS * 2) as i64;
+        sqlx::query("UPDATE x402_nonce_tracking SET created_at = NOW() - make_interval(secs => $1) WHERE intent_id=$2 AND nonce=$3")
+            .bind((retention + 60) as f64).bind(intent.intent_id).bind(old_nonce as i64)
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE x402_nonce_tracking SET created_at = NOW() - make_interval(secs => $1) WHERE intent_id=$2 AND nonce=$3")
+            .bind((retention - 60) as f64).bind(intent.intent_id).bind(recent_nonce as i64)
+            .execute(&pool).await.unwrap();
+
+        assert!(repo.cleanup_expired_nonces(retention - 1).await.is_ok());
+        assert!(!repo
+            .is_nonce_used(
+                &intent.tenant_id,
+                &intent.store_id,
+                &intent.payer_address,
+                old_nonce
+            )
+            .await
+            .unwrap());
+        assert!(repo
+            .is_nonce_used(
+                &intent.tenant_id,
+                &intent.store_id,
+                &intent.payer_address,
+                recent_nonce
+            )
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn test_sequence_assignment() {
         let pool = get_test_pool().await;
         let repo = Arc::new(PgX402Repository::new(pool));
@@ -749,6 +820,116 @@ mod integration {
         assert_eq!(second.block_number, first.block_number);
         let settled_intent = repo.get_intent(intent.intent_id).await.unwrap().unwrap();
         assert_eq!(settled_intent.status, X402IntentStatus::Settled);
+    }
+
+    #[tokio::test]
+    async fn test_partial_settlement_partitions_committed_total() {
+        let pool = get_test_pool().await;
+        let repo = PgX402Repository::new(pool);
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+        let first = create_test_intent(
+            &signing_key,
+            tenant_id.clone(),
+            store_id.clone(),
+            "0x00000000000000000000000000000000000000a1",
+            100,
+        );
+        let second = loop {
+            let candidate = create_test_intent(
+                &signing_key,
+                tenant_id.clone(),
+                store_id.clone(),
+                "0x00000000000000000000000000000000000000a2",
+                200,
+            );
+            if candidate.nonce != first.nonce {
+                break candidate;
+            }
+        };
+        for intent in [&first, &second] {
+            repo.insert_intent(intent).await.unwrap();
+            repo.assign_sequence_number(intent.intent_id, &tenant_id, &store_id)
+                .await
+                .unwrap();
+        }
+
+        let mut batch =
+            X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
+        batch.add_payment(&first);
+        batch.add_payment(&second);
+        repo.insert_batch(&batch).await.unwrap();
+        repo.commit_batch_with_merkle(
+            batch.batch_id,
+            &[first.intent_id, second.intent_id],
+            &tenant_id,
+            &store_id,
+        )
+        .await
+        .unwrap();
+        repo.settle_batch_with_results(batch.batch_id, "0x123", 100, None, &[first.intent_id])
+            .await
+            .unwrap();
+
+        let stored_batch = repo.get_batch(batch.batch_id).await.unwrap().unwrap();
+        let failed = repo.get_intent(first.intent_id).await.unwrap().unwrap();
+        let settled = repo.get_intent(second.intent_id).await.unwrap().unwrap();
+        assert_eq!(failed.status, X402IntentStatus::Failed);
+        assert_eq!(settled.status, X402IntentStatus::Settled);
+        assert_eq!(failed.amount + settled.amount, 300);
+        assert_eq!(stored_batch.total_amounts.len(), 1);
+        assert_eq!(stored_batch.total_amounts[0].total_amount, 300);
+    }
+
+    #[tokio::test]
+    async fn test_commit_rejects_overflowing_batch_total_atomically() {
+        let pool = get_test_pool().await;
+        let repo = PgX402Repository::new(pool);
+        let tenant_id = TenantId::new();
+        let store_id = StoreId::new();
+        let mut intents = Vec::new();
+        for index in 0..3 {
+            let key = SigningKey::generate(&mut OsRng);
+            let intent = create_test_intent(
+                &key,
+                tenant_id.clone(),
+                store_id.clone(),
+                &format!("0x{:040x}", index + 1),
+                X402_MAX_AMOUNT,
+            );
+            repo.insert_intent(&intent).await.unwrap();
+            repo.assign_sequence_number(intent.intent_id, &tenant_id, &store_id)
+                .await
+                .unwrap();
+            intents.push(intent);
+        }
+        let mut batch =
+            X402PaymentBatch::new(tenant_id.clone(), store_id.clone(), X402Network::SetChain);
+        for intent in &intents {
+            batch.add_payment(intent);
+        }
+        repo.insert_batch(&batch).await.unwrap();
+        let ids: Vec<Uuid> = intents.iter().map(|intent| intent.intent_id).collect();
+        assert!(repo
+            .commit_batch_with_merkle(batch.batch_id, &ids, &tenant_id, &store_id)
+            .await
+            .is_err());
+        let stored = repo.get_batch(batch.batch_id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.status,
+            stateset_sequencer::domain::X402BatchStatus::Pending
+        );
+        for intent in &intents {
+            assert_eq!(
+                repo.get_intent(intent.intent_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                X402IntentStatus::Sequenced
+            );
+        }
     }
 
     #[tokio::test]

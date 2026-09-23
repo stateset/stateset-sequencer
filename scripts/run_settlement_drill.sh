@@ -70,6 +70,15 @@ implementation="$(deploy "$payment_artifact")"
 initializer="$("${cast_cmd[@]}" calldata 'initialize(address,address,address,address,address)' "$settler" "$settler" "$token" "$zero" "$zero")"
 proxy_args="$("${cast_cmd[@]}" abi-encode 'constructor(address,bytes)' "$implementation" "$initializer")"
 payment="$(deploy "$proxy_artifact" "$proxy_args")"
+slot=0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc
+stored_impl="$("${cast_cmd[@]}" storage "$payment" "$slot" --rpc-url "$rpc")"
+[[ "0x${stored_impl: -40}" == "${implementation,,}" ]] || {
+  echo "Payment proxy points to unexpected implementation" >&2; exit 1;
+}
+proxy_runtime="$("${cast_cmd[@]}" code "$payment" --rpc-url "$rpc")"
+printf '%s' "$proxy_runtime" | python3 scripts/compare_contract_runtime.py "$proxy_artifact" "$implementation"
+payment_runtime="$("${cast_cmd[@]}" code "$implementation" --rpc-url "$rpc")"
+printf '%s' "$payment_runtime" | python3 scripts/compare_contract_runtime.py "$payment_artifact" "$implementation"
 "${cast_cmd[@]}" send --rpc-url "$rpc" --private-key "$settler_key" "$token" 'mint(address,uint256)' "$payer" 100000000 --json >"$drill_dir/mint.json"
 "${cast_cmd[@]}" send --rpc-url "$rpc" --private-key "$payer_key" "$token" 'approve(address,uint256)' "$payment" 100000000 --json >"$drill_dir/approve.json"
 

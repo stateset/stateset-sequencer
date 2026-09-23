@@ -126,7 +126,7 @@ impl AgentKeyEntry {
 
     /// Check if the key is valid at the given time
     pub fn is_valid_at(&self, at: DateTime<Utc>) -> bool {
-        if self.status == KeyStatus::Revoked {
+        if self.status != KeyStatus::Active {
             return false;
         }
 
@@ -155,6 +155,12 @@ impl AgentKeyEntry {
     pub fn status_at(&self, at: DateTime<Utc>) -> KeyStatus {
         if self.status == KeyStatus::Revoked {
             return KeyStatus::Revoked;
+        }
+        if self.status == KeyStatus::Expired {
+            return KeyStatus::Expired;
+        }
+        if self.status == KeyStatus::NotYetValid {
+            return KeyStatus::NotYetValid;
         }
 
         if let Some(valid_from) = self.valid_from {
@@ -508,6 +514,20 @@ mod tests {
         let after = valid_to + chrono::Duration::hours(1);
         let result = registry.get_valid_key_at(&lookup, after).await;
         assert!(matches!(result, Err(AgentKeyError::KeyExpired)));
+    }
+
+    #[test]
+    fn explicit_inactive_status_cannot_be_overridden_by_validity_window() {
+        let mut entry = AgentKeyEntry::new(AgentSigningKey::generate().public_key_bytes());
+        for status in [
+            KeyStatus::Expired,
+            KeyStatus::NotYetValid,
+            KeyStatus::Revoked,
+        ] {
+            entry.status = status;
+            assert_eq!(entry.status_at(Utc::now()), status);
+            assert!(!entry.is_valid_at(Utc::now()));
+        }
     }
 
     #[tokio::test]

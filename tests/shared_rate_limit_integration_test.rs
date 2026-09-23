@@ -52,6 +52,12 @@ async fn shared_admission_is_atomic_bounded_and_fail_closed() {
     .execute(&pool_a)
     .await
     .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../migrations/postgres/025_rate_limit_configuration.sql"
+    ))
+    .execute(&pool_a)
+    .await
+    .unwrap();
     let a = limiter(pool_a.clone(), 7, 2, 60);
     let b = limiter(pool_b.clone(), 7, 2, 60);
     let mut attempts = tokio::task::JoinSet::new();
@@ -68,6 +74,12 @@ async fn shared_admission_is_atomic_bounded_and_fail_closed() {
         }
     }
     assert_eq!(allowed, 7, "replicas must share one atomic budget");
+    assert!(matches!(
+        limiter(pool_b.clone(), 8, 2, 60)
+            .check_async("tenant:hot")
+            .await,
+        Err(AuthError::BackendUnavailable(_))
+    ));
     let restarted = limiter(pool_b.clone(), 7, 2, 60);
     assert!(matches!(
         restarted.check_async("tenant:hot").await,

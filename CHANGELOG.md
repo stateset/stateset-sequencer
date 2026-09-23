@@ -5,6 +5,32 @@ All notable changes to stateset-sequencer will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.10.0] - 2026-09-23
+
+### Added
+
+- TLA+ models and Lean proofs for sequencing, replay, authorization, recovery,
+  key rotation, projections, nonce retention, receipt encoding, and external
+  effects. CI checks the finite models and builds the Lean proofs.
+- Database and local-chain drills for migration preservation, projection
+  recovery, proof jobs, auditing, anchoring, and settlement idempotency.
+- Key retirement verification for encrypted event and proof rows, plus a
+  read-only script to compare deployed contract bytecode with local artifacts.
+
+### Fixed
+
+- Production projection batches now use one PostgreSQL transaction for documents,
+  versions, checkpoints, rejection records, and DLQ enqueues. Per-stream row locks
+  serialize competing workers; failed writes roll back instead of being skipped.
+- Python SDK requires `cryptography>=50.0.1,<51`, replacing the vulnerable
+  dependency range. Build/test tooling also requires patched setuptools and
+  pytest releases. CI now audits Python dependencies without advisory ignores.
+- Settlement reconciliation checks on-chain root, tenant/store key, and sequence
+  range before accepting a previously submitted batch. Mutable commitment
+  reads use the primary to avoid stale anchoring status.
+
 ## [0.9.0] - 2026-09-16
 
 ### Changed
@@ -21,17 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added an SQLite outbox round-trip parity test covering every
   ingest-critical field; removed the obsolete STARK fetch from the
   performance workflow.
-
-## [Unreleased]
-
-### Fixed
-
-- Production projection batches now use one PostgreSQL transaction for documents,
-  versions, checkpoints, rejection records, and DLQ enqueues. Per-stream row locks
-  serialize competing workers; failed writes roll back instead of being skipped.
-- Python SDK requires `cryptography>=50.0.1,<51`, replacing the vulnerable
-  dependency range. Build/test tooling also requires patched setuptools and
-  pytest releases. CI now audits Python dependencies without advisory ignores.
 
 ## [0.8.6] - 2026-09-05
 

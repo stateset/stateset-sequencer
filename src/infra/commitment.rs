@@ -270,6 +270,11 @@ impl PgCommitmentEngine {
 
             last_commitment.new_state_root
         } else {
+            if start != 1 {
+                return Err(SequencerError::Internal(
+                    "First commitment range must start at sequence 1".to_string(),
+                ));
+            }
             [0u8; 32]
         };
 
@@ -440,6 +445,10 @@ impl CommitmentEngine for PgCommitmentEngine {
                     expected_start, prev.sequence_range.1
                 )));
             }
+        } else if start != 1 {
+            return Err(SequencerError::Internal(
+                "First commitment range must start at sequence 1".to_string(),
+            ));
         }
         let prev_state_root = prev_commitment
             .map(|c| c.new_state_root)

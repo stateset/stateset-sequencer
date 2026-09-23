@@ -535,11 +535,17 @@ stateset-sequencer/
 
 ## Cryptographic Guarantees
 
-1. **Gap-Free Sequences**: No missing sequence numbers within a stream
+1. **Gap-Free Ingest Sequences**: No missing sequence numbers within a stream
+   when it is used only for ingest
 2. **Linearizable Ordering**: Total ordering via PostgreSQL `SELECT FOR UPDATE`
 3. **Verifiable History**: Merkle proofs for event inclusion verification
 4. **Domain Separation**: All hashes include domain separators per VES spec
 5. **Immutable Log**: Append-only event storage with no mutations
+
+The ingest ordering model and Lean proof, including their scope and run commands,
+are in [formal/README.md](formal/README.md). The gap-free ingest claim assumes
+the same stream is not used by the range-reservation `sequence()` API, which
+advances its counter without storing events.
 
 ## Testing
 
@@ -602,6 +608,7 @@ cargo run --bin stateset-sequencer-admin -- help <command>   # per-command help
 | `reencrypt-events` | Re-encrypt event payloads under a new key |
 | `reencrypt-ves-validity-proofs` | Re-encrypt stored validity proofs |
 | `reencrypt-ves-compliance-proofs` | Re-encrypt stored compliance proofs |
+| `verify-key-retirement` | Fail if any stored event or VES proof needs an old at-rest key |
 | `backfill-ves-state-roots` | Backfill VES state roots (upgrades from older versions) |
 | `ves-commit-and-anchor` | Create a VES commitment and anchor it on-chain |
 | `commands` | List available commands |

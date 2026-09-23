@@ -173,7 +173,10 @@ pub struct DeadLetterEvent {
 impl DeadLetterEvent {
     /// Check if this event can be retried
     pub fn can_retry(&self) -> bool {
-        self.status == DeadLetterStatus::Pending && self.retry_count < self.max_retries
+        matches!(
+            self.status,
+            DeadLetterStatus::Pending | DeadLetterStatus::Retrying
+        ) && self.retry_count < self.max_retries
     }
 
     /// Check if this event is due for retry
@@ -181,9 +184,12 @@ impl DeadLetterEvent {
         if !self.can_retry() {
             return false;
         }
-        match self.next_retry_at {
-            Some(next) => Utc::now() >= next,
-            None => true,
+        match self.status {
+            DeadLetterStatus::Pending => self.next_retry_at.is_none_or(|next| Utc::now() >= next),
+            DeadLetterStatus::Retrying => self
+                .last_retry_at
+                .is_some_and(|last| last < Utc::now() - ChronoDuration::minutes(5)),
+            DeadLetterStatus::Failed | DeadLetterStatus::Resolved => false,
         }
     }
 
@@ -249,6 +255,7 @@ impl PgDeadLetterQueue {
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 payload JSONB NOT NULL,
                 metadata JSONB,
+                claim_token UUID,
 
                 CONSTRAINT uq_dead_letter_event_id UNIQUE (event_id)
             )
@@ -256,6 +263,9 @@ impl PgDeadLetterQueue {
         )
         .execute(&self.pool)
         .await?;
+        sqlx::query("ALTER TABLE dead_letter_events ADD COLUMN IF NOT EXISTS claim_token UUID")
+            .execute(&self.pool)
+            .await?;
 
         sqlx::query(
             r#"
@@ -352,6 +362,7 @@ impl PgDeadLetterQueue {
                     ELSE dead_letter_events.status
                 END,
                 metadata = COALESCE(EXCLUDED.metadata, dead_letter_events.metadata)
+            WHERE dead_letter_events.status = 'pending'
             "#,
         )
         .bind(id)
@@ -410,9 +421,11 @@ impl PgDeadLetterQueue {
                    reason, status, error_message, retry_count, max_retries,
                    last_retry_at, next_retry_at, created_at, payload, metadata
             FROM dead_letter_events
-            WHERE status = 'pending'
-              AND retry_count < max_retries
-              AND (next_retry_at IS NULL OR next_retry_at <= NOW())
+            WHERE retry_count < max_retries
+              AND ((status = 'pending' AND
+                    (next_retry_at IS NULL OR next_retry_at <= NOW()))
+                OR (status = 'retrying' AND
+                    last_retry_at < NOW() - INTERVAL '5 minutes'))
             ORDER BY next_retry_at ASC NULLS FIRST, created_at ASC
             LIMIT $1
             "#,
@@ -424,55 +437,69 @@ impl PgDeadLetterQueue {
         Ok(rows.into_iter().map(DeadLetterEvent::from).collect())
     }
 
-    /// Mark an event as being retried (claim it for processing)
-    pub async fn mark_retrying(&self, id: Uuid) -> Result<bool> {
+    /// Claim a due retry. The token fences a worker whose lease expires while
+    /// another worker reclaims the row.
+    pub async fn mark_retrying(&self, id: Uuid) -> Result<Option<Uuid>> {
+        let token = Uuid::new_v4();
         let result = sqlx::query(
             r#"
             UPDATE dead_letter_events
             SET status = 'retrying',
-                last_retry_at = NOW()
+                last_retry_at = NOW(), claim_token = $2
             WHERE id = $1
-              AND status = 'pending'
+              AND retry_count < max_retries
+              AND ((status = 'pending' AND
+                    (next_retry_at IS NULL OR next_retry_at <= NOW()))
+                OR (status = 'retrying' AND
+                    last_retry_at < NOW() - INTERVAL '5 minutes'))
             "#,
         )
         .bind(id)
+        .bind(token)
         .execute(&self.pool)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok((result.rows_affected() > 0).then_some(token))
     }
 
     /// Mark a retry as successful (resolve the event)
-    pub async fn mark_resolved(&self, id: Uuid) -> Result<()> {
-        sqlx::query(
+    pub async fn mark_resolved(&self, id: Uuid, token: Uuid) -> Result<bool> {
+        let result = sqlx::query(
             r#"
             UPDATE dead_letter_events
             SET status = 'resolved',
-                next_retry_at = NULL
-            WHERE id = $1
+                next_retry_at = NULL, claim_token = NULL
+            WHERE id = $1 AND status = 'retrying' AND claim_token = $2
             "#,
         )
         .bind(id)
+        .bind(token)
         .execute(&self.pool)
         .await?;
 
-        tracing::info!(dead_letter_id = %id, "Dead letter event resolved");
-        Ok(())
+        if result.rows_affected() > 0 {
+            tracing::info!(dead_letter_id = %id, "Dead letter event resolved");
+        }
+        Ok(result.rows_affected() > 0)
     }
 
     /// Mark a retry as failed and schedule next attempt
-    pub async fn mark_retry_failed(&self, id: Uuid, error: &str) -> Result<()> {
+    pub async fn mark_retry_failed(&self, id: Uuid, token: Uuid, error: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
         // Fetch current retry_count so we can compute the Rust-side delay with
         // the correct attempt number, jitter, and configured multiplier/cap.
-        let row: Option<(i32, i32)> =
-            sqlx::query_as("SELECT retry_count, max_retries FROM dead_letter_events WHERE id = $1")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
+        let row: Option<(i32, i32)> = sqlx::query_as(
+            "SELECT retry_count, max_retries FROM dead_letter_events \
+             WHERE id = $1 AND status = 'retrying' AND claim_token = $2 FOR UPDATE",
+        )
+        .bind(id)
+        .bind(token)
+        .fetch_optional(&mut *tx)
+        .await?;
 
         let (retry_count, max_retries) = match row {
             Some(r) => r,
-            None => return Ok(()), // event not found – nothing to update
+            None => return Ok(false),
         };
 
         let new_count = retry_count + 1;
@@ -495,8 +522,8 @@ impl PgDeadLetterQueue {
             SET status = $2,
                 retry_count = $3,
                 error_message = $4,
-                next_retry_at = $5
-            WHERE id = $1
+                next_retry_at = $5, claim_token = NULL
+            WHERE id = $1 AND claim_token = $6 AND status = 'retrying'
             "#,
         )
         .bind(id)
@@ -504,11 +531,13 @@ impl PgDeadLetterQueue {
         .bind(new_count)
         .bind(error)
         .bind(next_retry_at)
-        .execute(&self.pool)
+        .bind(token)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         tracing::warn!(dead_letter_id = %id, error = %error, "Dead letter retry failed");
-        Ok(())
+        Ok(true)
     }
 
     /// Mark an event as permanently failed
@@ -700,6 +729,7 @@ impl PgDeadLetterQueue {
             r#"
             DELETE FROM dead_letter_events
             WHERE created_at < NOW() - make_interval(days => $1)
+              AND status IN ('resolved', 'failed')
             "#,
         )
         .bind(older_than_days)

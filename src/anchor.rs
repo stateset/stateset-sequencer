@@ -5,7 +5,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use alloy::primitives::{Address, FixedBytes};
-use alloy::providers::ProviderBuilder;
+use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol;
 use tracing::{info, warn};
@@ -205,8 +205,8 @@ fn is_retryable_anchor_error(err: &SequencerError) -> bool {
 
 /// Transaction hash returned by [`AnchorService::anchor_ves_commitment`] when
 /// the commitment was found already anchored on-chain and no transaction was
-/// sent. Callers should confirm the anchor locally rather than wait for a
-/// receipt that does not exist.
+/// sent. Callers record the observation block and wait for the configured
+/// confirmation depth before marking it finalized locally.
 pub const ALREADY_ANCHORED_TX_HASH: Hash256 = [0u8; 32];
 
 /// On-chain anchor service with retry and circuit breaker protection
@@ -305,6 +305,9 @@ impl AnchorService {
                                 .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {e}")))?;
                             let receipt = pending.get_receipt().await
                                 .map_err(|e| SequencerError::Internal(format!("Failed to get receipt: {e}")))?;
+                            if !receipt.status() {
+                                return Err(SequencerError::Internal("Anchor transaction reverted".into()));
+                            }
                             Ok::<_, SequencerError>((receipt.transaction_hash.0, receipt.block_number))
                         }
                     },
@@ -357,7 +360,13 @@ impl AnchorService {
         // The worker only reconciles commitments that already carry a tx hash,
         // so without this the same commitment would be re-sent every tick,
         // revert with BatchAlreadyCommitted, and stall the tick -- forever.
-        if self.verify_anchored(batch_id_uuid).await.unwrap_or(false) {
+        if self.verify_anchored(batch_id_uuid).await? {
+            if !self.verify_ves_commitment(commitment).await? {
+                return Err(SequencerError::InvariantViolation {
+                    invariant: "onchain_commitment_match".into(),
+                    message: format!("batch {batch_id_uuid} exists on-chain with different fields"),
+                });
+            }
             warn!(
                 batch_id = %batch_id_uuid,
                 "Commitment already anchored on-chain; reconciling local state without sending"
@@ -396,6 +405,9 @@ impl AnchorService {
                                 .map_err(|e| SequencerError::Internal(format!("Failed to send transaction: {e}")))?;
                             let receipt = pending.get_receipt().await
                                 .map_err(|e| SequencerError::Internal(format!("Failed to get receipt: {e}")))?;
+                            if !receipt.status() {
+                                return Err(SequencerError::Internal("VES anchor transaction reverted".into()));
+                            }
                             Ok::<_, SequencerError>((receipt.transaction_hash.0, receipt.block_number))
                         }
                     },
@@ -449,6 +461,51 @@ impl AnchorService {
         Ok(result)
     }
 
+    /// Check that a batch ID names the exact local commitment, not merely any
+    /// on-chain entry with that ID. The deployed registry exposes these fields.
+    pub async fn verify_ves_commitment(&self, commitment: &VesBatchCommitment) -> Result<bool> {
+        if !self.verify_anchored(commitment.batch_id).await? {
+            return Ok(false);
+        }
+        let provider = ProviderBuilder::new().connect_http(
+            self.config
+                .rpc_url
+                .parse()
+                .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?,
+        );
+        let contract = IStateSetAnchor::new(self.config.registry_address, &provider);
+        let stored = contract
+            .getBatchCommitment(Self::uuid_to_bytes32(commitment.batch_id))
+            .call()
+            .await
+            .map_err(|e| SequencerError::Internal(format!("Contract call failed: {e}")))?;
+        Ok(stored.timestamp != 0
+            && stored.eventsRoot == Self::to_bytes32(&commitment.merkle_root)
+            && stored.newStateRoot == Self::to_bytes32(&commitment.new_state_root)
+            && stored.sequenceStart == commitment.sequence_range.0
+            && stored.sequenceEnd == commitment.sequence_range.1
+            && stored.eventCount == commitment.leaf_count)
+    }
+
+    /// A missing or moved receipt means the recorded inclusion block is stale.
+    /// The zero hash is a reconciled observation without an original receipt.
+    pub async fn recorded_tx_is_current(&self, tx_hash: Hash256, block: u64) -> Result<bool> {
+        if tx_hash == ALREADY_ANCHORED_TX_HASH {
+            return Ok(true);
+        }
+        let provider = ProviderBuilder::new().connect_http(
+            self.config
+                .rpc_url
+                .parse()
+                .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?,
+        );
+        let receipt = provider
+            .get_transaction_receipt(alloy::primitives::B256::from(tx_hash))
+            .await
+            .map_err(|e| SequencerError::Internal(format!("Failed to get receipt: {e}")))?;
+        Ok(receipt.is_some_and(|receipt| receipt.status() && receipt.block_number == Some(block)))
+    }
+
     /// Get the on-chain head sequence for a tenant/store
     pub async fn get_chain_head(&self, tenant_id: uuid::Uuid, store_id: uuid::Uuid) -> Result<u64> {
         let provider = ProviderBuilder::new().connect_http(
@@ -470,6 +527,20 @@ impl AnchorService {
             .map_err(|e| SequencerError::Internal(format!("Contract call failed: {}", e)))?;
 
         Ok(head)
+    }
+
+    /// Current chain block height for confirmation-depth checks.
+    pub async fn get_latest_block_number(&self) -> Result<u64> {
+        let provider = ProviderBuilder::new().connect_http(
+            self.config
+                .rpc_url
+                .parse()
+                .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?,
+        );
+        provider
+            .get_block_number()
+            .await
+            .map_err(|e| SequencerError::Internal(format!("Failed to get block number: {e}")))
     }
 
     /// Verify an events root against on-chain data

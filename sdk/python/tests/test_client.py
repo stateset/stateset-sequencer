@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -17,6 +19,39 @@ from stateset_sequencer import (
     create_tool_executor,
     verify_inclusion_proof_locally,
 )
+
+
+def test_shared_jcs_vectors_match_python_canonicalization():
+    vectors_path = (
+        Path(__file__).resolve().parents[3]
+        / "tests"
+        / "vectors"
+        / "ves_enc_1_test_vectors.json"
+    )
+    vectors = json.loads(vectors_path.read_text())
+    for vector in vectors["canonicalization"]["vectors"]:
+        assert canonicalize_json(vector["input"]).decode() == vector["expected"], vector["name"]
+
+
+def test_shared_payload_hash_vectors_match_python():
+    vectors_path = (
+        Path(__file__).resolve().parents[3]
+        / "tests"
+        / "vectors"
+        / "ves_enc_1_test_vectors.json"
+    )
+    vectors = json.loads(vectors_path.read_text())
+    for vector in vectors["payload_plain_hash"]["vectors"]:
+        payload = vector["payload"]
+        canonical = canonicalize_json(payload)
+        assert canonical.decode() == vector["canonical_json"]
+        if vector["salt_hex"] is None:
+            digest = compute_payload_plain_hash(payload)
+        else:
+            digest = hashlib.sha256(
+                b"VES_PAYLOAD_PLAIN_V1" + bytes.fromhex(vector["salt_hex"]) + canonical
+            ).digest()
+        assert digest.hex() == vector["expected_hash"].removeprefix("0x"), vector["name"]
 
 
 def test_offline_inclusion_binds_trusted_root_leaf_and_position():

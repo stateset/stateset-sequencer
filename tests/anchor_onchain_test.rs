@@ -92,6 +92,15 @@ async fn anchoring_is_idempotent_across_a_lost_local_record() {
         second_tx, ALREADY_ANCHORED_TX_HASH,
         "must report already-anchored"
     );
+    let mut conflicting = commitment.clone();
+    conflicting.merkle_root = [0x33u8; 32];
+    assert!(
+        matches!(
+            service.anchor_ves_commitment(&conflicting).await,
+            Err(stateset_sequencer::infra::SequencerError::InvariantViolation { .. })
+        ),
+        "a reused batch ID with different roots must not reconcile"
+    );
     assert!(
         took < std::time::Duration::from_secs(15),
         "reconciling an already-anchored commitment must be a quick read, took {took:?}"

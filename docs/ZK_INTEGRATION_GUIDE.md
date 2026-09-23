@@ -140,8 +140,7 @@ Request (STARK):
 Notes:
 - `proofVersion` must match `ves_stark_verifier::PROOF_VERSION` (currently `2`).
 - `witnessCommitment` is required for STARK proofs and is stored alongside the proof.
-- The sequencer verifies the STARK proof at submission time by default.
-  - Disable with `VES_STARK_VERIFY_ON_SUBMIT=false` (not recommended for production).
+- The sequencer verifies every STARK proof before storing it.
 
 ### 4) Verify a Stored Proof
 
@@ -166,9 +165,6 @@ Migration:
 
 ## Operational Knobs (Sequencer)
 
-- `VES_STARK_VERIFY_ON_SUBMIT`:
-  - default: `true`
-  - when `false`, the sequencer stores STARK proofs without cryptographic verification at submission time.
 - `VES_STARK_VERIFY_CONCURRENCY`:
   - default: `min(4, available_parallelism)`
   - caps concurrent STARK verifications to reduce CPU exhaustion risk.

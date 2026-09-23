@@ -355,6 +355,15 @@ async fn check_lost_record_replay(funded: bool) {
         second.already_settled,
         "second attempt must detect the on-chain settlement and reconcile"
     );
+    let mut conflicting = batch.clone();
+    conflicting.merkle_root = Some([0x43u8; 32]);
+    assert!(
+        matches!(
+            recovered_service.settle_batch(&conflicting, &intents).await,
+            Err(stateset_sequencer::infra::SequencerError::InvariantViolation { .. })
+        ),
+        "a reused batch ID with different fields must not reconcile"
+    );
     assert_eq!(
         second.tx_hash, [0u8; 32],
         "reconciliation must not send a second transaction"

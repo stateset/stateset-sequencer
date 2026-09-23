@@ -716,6 +716,11 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             && existing.envelope.payload_plain_hash == incoming.payload_plain_hash
             && existing.envelope.payload_cipher_hash == incoming.payload_cipher_hash
             && existing.envelope.agent_signature == incoming.agent_signature
+            // The database stores legacy `None` as scheme 0. Compare the
+            // normalized value, but do not ignore PQC signature material.
+            && existing.envelope.agent_signature_scheme.unwrap_or(0)
+                == incoming.agent_signature_scheme.unwrap_or(0)
+            && existing.envelope.agent_signature_bundle == incoming.agent_signature_bundle
             && existing.envelope.command_id == incoming.command_id
             && existing.envelope.base_version == incoming.base_version
     }
@@ -1268,17 +1273,25 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
         Ok(())
     }
 
-    async fn fetch_existing_command_id_tx(
+    async fn existing_event_owns_command_reservation_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         event_id: Uuid,
-    ) -> Result<Option<Uuid>> {
-        let row: Option<(Option<Uuid>,)> =
-            sqlx::query_as("SELECT command_id FROM ves_events WHERE event_id = $1")
-                .bind(event_id)
-                .fetch_optional(&mut **tx)
-                .await?;
-        Ok(row.and_then(|(cmd_id,)| cmd_id))
+        tenant_id: &TenantId,
+        store_id: &StoreId,
+        command_id: Uuid,
+    ) -> Result<bool> {
+        let row: Option<(Uuid, Uuid, Option<Uuid>)> = sqlx::query_as(
+            "SELECT tenant_id, store_id, command_id FROM ves_events WHERE event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(matches!(
+            row,
+            Some((tenant, store, Some(command)))
+                if tenant == tenant_id.0 && store == store_id.0 && command == command_id
+        ))
     }
 
     async fn release_command_id_tx(
@@ -1682,10 +1695,16 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 let replay = self.classify_replay(&mut tx, &sequenced.envelope).await?;
                 if let Some(cmd_id) = sequenced.envelope.command_id {
                     if reserved_command_ids.contains(&cmd_id) {
-                        let existing_cmd_id = self
-                            .fetch_existing_command_id_tx(&mut tx, sequenced.event_id())
+                        let owned = self
+                            .existing_event_owns_command_reservation_tx(
+                                &mut tx,
+                                sequenced.event_id(),
+                                &tenant_id,
+                                &store_id,
+                                cmd_id,
+                            )
                             .await?;
-                        if existing_cmd_id != Some(cmd_id) {
+                        if !owned {
                             self.release_command_id_tx(&mut tx, &tenant_id, &store_id, cmd_id)
                                 .await?;
                         }
@@ -2638,6 +2657,37 @@ mod tests {
 
         assert!(!VesSequencer::<InMemoryAgentKeyRegistry>::is_exact_replay(
             &existing, &replay
+        ));
+    }
+
+    #[test]
+    fn exact_replay_checks_pqc_signature_metadata() {
+        use crate::crypto::pqc_signing::ParsedSignatureBundle;
+
+        let signing_key = AgentSigningKey::generate();
+        let event = build_encrypted_event(&signing_key, valid_payload_encrypted());
+        let mut existing = SequencedVesEvent::new(event.clone(), 42);
+        // PostgreSQL stores the default legacy scheme as 0.
+        existing.envelope.agent_signature_scheme = Some(0);
+        assert!(VesSequencer::<InMemoryAgentKeyRegistry>::is_exact_replay(
+            &existing, &event
+        ));
+
+        let mut changed_scheme = event.clone();
+        changed_scheme.agent_signature_scheme = Some(2);
+        assert!(!VesSequencer::<InMemoryAgentKeyRegistry>::is_exact_replay(
+            &existing,
+            &changed_scheme
+        ));
+
+        let mut changed_bundle = event;
+        changed_bundle.agent_signature_bundle = Some(ParsedSignatureBundle {
+            ed25519_signature: Some(vec![1; 64]),
+            ml_dsa_65_signature: None,
+        });
+        assert!(!VesSequencer::<InMemoryAgentKeyRegistry>::is_exact_replay(
+            &existing,
+            &changed_bundle
         ));
     }
 }

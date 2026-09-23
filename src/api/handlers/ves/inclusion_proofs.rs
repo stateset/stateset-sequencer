@@ -58,11 +58,13 @@ pub async fn get_ves_inclusion_proof(
         .get(&tenant_id.0, &store_id.0, sequence_number)
         .await
     {
-        if state.ves_commitment_reader.verify_inclusion(
-            proof.leaf_hash,
-            &proof,
-            commitment.merkle_root,
-        ) {
+        if proof.leaf_index == leaf_index
+            && state.ves_commitment_reader.verify_inclusion(
+                proof.leaf_hash,
+                &proof,
+                commitment.merkle_root,
+            )
+        {
             return Ok(Json(serde_json::json!({
                 "sequence_number": sequence_number,
                 "batch_id": commitment.batch_id,
@@ -79,11 +81,13 @@ pub async fn get_ves_inclusion_proof(
         .get_with_lock(&tenant_id.0, &store_id.0, sequence_number)
         .await;
     if let Some(proof) = cached {
-        if state.ves_commitment_reader.verify_inclusion(
-            proof.leaf_hash,
-            &proof,
-            commitment.merkle_root,
-        ) {
+        if proof.leaf_index == leaf_index
+            && state.ves_commitment_reader.verify_inclusion(
+                proof.leaf_hash,
+                &proof,
+                commitment.merkle_root,
+            )
+        {
             return Ok(Json(serde_json::json!({
                 "sequence_number": sequence_number,
                 "batch_id": commitment.batch_id,
@@ -102,11 +106,13 @@ pub async fn get_ves_inclusion_proof(
             .get(&tenant_id.0, &store_id.0, sequence_number)
             .await
         {
-            if state.ves_commitment_reader.verify_inclusion(
-                proof.leaf_hash,
-                &proof,
-                commitment.merkle_root,
-            ) {
+            if proof.leaf_index == leaf_index
+                && state.ves_commitment_reader.verify_inclusion(
+                    proof.leaf_hash,
+                    &proof,
+                    commitment.merkle_root,
+                )
+            {
                 return Ok(Json(serde_json::json!({
                     "sequence_number": sequence_number,
                     "batch_id": commitment.batch_id,

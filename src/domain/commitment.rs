@@ -289,10 +289,10 @@ mod promoted_node_tests {
                 .map(|i: usize| Sha256::hash(&i.to_be_bytes()))
                 .collect();
             let tree = MerkleTree::<Sha256>::from_leaves(&leaves);
-            for index in 0..count {
+            for (index, leaf) in leaves.iter().enumerate().take(count) {
                 let path = tree.proof(&[index]).proof_hashes().to_vec();
-                let proof = MerkleProof::with_leaf_count(leaves[index], path.clone(), index, count)
-                    .unwrap();
+                let proof =
+                    MerkleProof::with_leaf_count(*leaf, path.clone(), index, count).unwrap();
                 let rebuild = |leaf| {
                     proof.proof_path.iter().zip(&proof.directions).fold(
                         leaf,

@@ -54,6 +54,7 @@ const X402_MAX_DESCRIPTION_LEN: usize = 8192;
 /// single settleBatch calldata from being griefed into an unsubmittable size.
 const X402_MAX_AUTHORIZATION_LEN: usize = 2048;
 
+#[allow(clippy::result_large_err)]
 fn resolve_client_intent_id(
     client_id: Option<Uuid>,
     has_authorization: bool,
@@ -72,6 +73,7 @@ fn resolve_client_intent_id(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_payment_replay(
     existing: &X402PaymentIntent,
     proposed: &X402PaymentIntent,
@@ -1453,7 +1455,8 @@ mod tests {
         let mut legacy = existing.clone();
         legacy.intent_id = Uuid::new_v4();
         assert!(validate_payment_replay(&existing, &legacy, None).is_ok());
-        let mutations: Vec<Box<dyn Fn(&mut X402PaymentIntent)>> = vec![
+        type IntentMutation = Box<dyn Fn(&mut X402PaymentIntent)>;
+        let mutations: Vec<IntentMutation> = vec![
             Box::new(|p| p.amount += 1),
             Box::new(|p| p.payee_address = "other".into()),
             Box::new(|p| p.nonce += 1),

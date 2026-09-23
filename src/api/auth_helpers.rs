@@ -7,7 +7,7 @@ use crate::auth::AuthContext;
 
 /// Check if the auth context represents a bootstrap admin (nil tenant, admin perms).
 pub fn is_bootstrap_admin(auth: &AuthContext) -> bool {
-    auth.is_admin() && auth.tenant_id.is_nil()
+    auth.is_bootstrap_admin()
 }
 
 /// Ensure the caller can access the given tenant/store, considering bootstrap admin.

@@ -15,9 +15,23 @@ use crate::crypto::Hash256;
 use crate::domain::{
     AgentId, AgentKeyId, StoreId, TenantId, X402Asset, X402BatchStatus, X402BatchTotal,
     X402IntentStatus, X402Network, X402PaymentBatch, X402PaymentIntent, X402PaymentIntentFilter,
-    X402PaymentReceipt, X402_DOMAIN_SEPARATOR,
+    X402PaymentReceipt, X402_DOMAIN_SEPARATOR, X402_MAX_VALIDITY_SECS,
 };
 use crate::infra::{Result, SequencerError};
+
+/// The model assumes both submitting and replaying nodes differ from the
+/// database clock by at most this much. Operators must keep clocks synchronized.
+const X402_NONCE_CLOCK_SKEW_ALLOWANCE_SECS: u64 = 300;
+
+fn validate_nonce_retention(retention_secs: i64) -> Result<()> {
+    let minimum = X402_MAX_VALIDITY_SECS + 2 * X402_NONCE_CLOCK_SKEW_ALLOWANCE_SECS;
+    if retention_secs < i64::try_from(minimum).unwrap_or(i64::MAX) {
+        return Err(SequencerError::Configuration(format!(
+            "x402 nonce retention must be at least {minimum} seconds"
+        )));
+    }
+    Ok(())
+}
 
 /// Database row for x402 payment intents
 #[derive(sqlx::FromRow)]
@@ -467,9 +481,11 @@ impl PgX402Repository {
     /// a nonce row is older than the maximum validity window, any replay of its
     /// intent is already rejected by the expiry check — the row is dead weight.
     ///
-    /// `retention_secs` should be at least `X402_MAX_VALIDITY_SECS`; callers add a
-    /// safety margin for clock skew. Returns the number of rows deleted.
+    /// Retention must include the maximum validity window and a margin for
+    /// opposite-direction clock skew on the admitting and replaying nodes.
+    /// Returns the number of rows deleted.
     pub async fn cleanup_expired_nonces(&self, retention_secs: i64) -> Result<u64> {
+        validate_nonce_retention(retention_secs)?;
         let result = sqlx::query(
             r#"
             DELETE FROM x402_nonce_tracking
@@ -1290,6 +1306,41 @@ impl PgX402Repository {
             intents.push(Self::row_to_intent(row)?);
         }
 
+        // Draft batch totals may have saturated while assembling a large
+        // batch. Commit only exact totals computed from the claimed rows.
+        let mut totals: Vec<X402BatchTotal> = Vec::new();
+        for intent in &intents {
+            if let Some(total) = totals.iter_mut().find(|total| total.asset == intent.asset) {
+                total.total_amount =
+                    total
+                        .total_amount
+                        .checked_add(intent.amount)
+                        .ok_or_else(|| SequencerError::InvariantViolation {
+                            invariant: "x402_batch_total".to_string(),
+                            message: "batch amount exceeds u64".to_string(),
+                        })?;
+                total.payment_count = total.payment_count.checked_add(1).ok_or_else(|| {
+                    SequencerError::InvariantViolation {
+                        invariant: "x402_batch_count".to_string(),
+                        message: "batch payment count exceeds u32".to_string(),
+                    }
+                })?;
+            } else {
+                totals.push(X402BatchTotal {
+                    asset: intent.asset,
+                    total_amount: intent.amount,
+                    payment_count: 1,
+                });
+            }
+        }
+        let payment_count =
+            i32::try_from(intents.len()).map_err(|_| SequencerError::InvariantViolation {
+                invariant: "x402_batch_count".to_string(),
+                message: "batch payment count exceeds PostgreSQL INTEGER".to_string(),
+            })?;
+        let total_amounts_json =
+            serde_json::to_value(&totals).map_err(|e| SequencerError::Internal(e.to_string()))?;
+
         // Compute Merkle root
         let merkle_root = Self::compute_merkle_root(&intents)
             .ok_or_else(|| SequencerError::Internal("No intents in batch".to_string()))?;
@@ -1314,6 +1365,8 @@ impl PgX402Repository {
             SET status = 'committed',
                 merkle_root = $2,
                 new_state_root = $3,
+                total_amounts = $4,
+                payment_count = $5,
                 committed_at = NOW()
             WHERE batch_id = $1
               AND status = 'pending'
@@ -1322,6 +1375,8 @@ impl PgX402Repository {
         .bind(batch_id)
         .bind(merkle_root.as_slice())
         .bind(new_state_root.as_slice())
+        .bind(total_amounts_json)
+        .bind(payment_count)
         .execute(&mut *tx)
         .await?;
 
@@ -1679,5 +1734,13 @@ mod tests {
         );
 
         assert_eq!(hash, hash2);
+    }
+
+    #[test]
+    fn nonce_cleanup_requires_validity_and_two_clock_margins() {
+        let minimum = (X402_MAX_VALIDITY_SECS + 2 * X402_NONCE_CLOCK_SKEW_ALLOWANCE_SECS) as i64;
+        assert!(validate_nonce_retention(-1).is_err());
+        assert!(validate_nonce_retention(minimum - 1).is_err());
+        assert!(validate_nonce_retention(minimum).is_ok());
     }
 }

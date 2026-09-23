@@ -347,9 +347,8 @@ impl SettlementService {
         // crashed before recording it, reconcile from on-chain state instead of
         // sending a second (revert-guaranteed) transaction.
         if self
-            .is_batch_settled_onchain(batch.batch_id)
-            .await
-            .unwrap_or(false)
+            .settled_batch_matches_onchain(batch, merkle_root)
+            .await?
         {
             warn!(batch_id = %batch.batch_id, "Batch already settled on-chain; reconciling local state");
             let (settled_ids, failed_ids) = self.classify_intents(intents).await?;
@@ -439,9 +438,8 @@ impl SettlementService {
                 // or prior attempt could have won the race, and a second send
                 // reverts with BatchAlreadySettled). If so, reconcile.
                 if self
-                    .is_batch_settled_onchain(batch.batch_id)
-                    .await
-                    .unwrap_or(false)
+                    .settled_batch_matches_onchain(batch, merkle_root)
+                    .await?
                 {
                     warn!(batch_id = %batch.batch_id, "settleBatch send failed but batch is settled on-chain; reconciling");
                     let (settled_ids, failed_ids) = self.classify_intents(intents).await?;
@@ -497,6 +495,44 @@ impl SettlementService {
             .await
             .map_err(|e| SequencerError::Internal(format!("getBatch call failed: {e}")))?;
         Ok(batch.settledAt != 0)
+    }
+
+    /// Reconcile only the same immutable batch. A reused batch ID with a
+    /// different root or stream/range must never be reported as settled.
+    async fn settled_batch_matches_onchain(
+        &self,
+        batch: &X402PaymentBatch,
+        merkle_root: [u8; 32],
+    ) -> Result<bool> {
+        let provider = ProviderBuilder::new().connect_http(
+            self.config
+                .rpc_url
+                .parse()
+                .map_err(|e| SequencerError::Internal(format!("Invalid RPC URL: {e}")))?,
+        );
+        let contract = ISetPaymentBatch::new(self.config.contract_address, &provider);
+        let stored = contract
+            .getBatch(Self::uuid_to_bytes32(batch.batch_id))
+            .call()
+            .await
+            .map_err(|e| SequencerError::Internal(format!("getBatch call failed: {e}")))?;
+        if stored.settledAt == 0 {
+            return Ok(false);
+        }
+        if stored.merkleRoot != FixedBytes::<32>::from(merkle_root)
+            || stored.tenantStoreKey != Self::tenant_store_key(&batch.tenant_id, &batch.store_id)
+            || stored.sequenceStart != batch.sequence_start
+            || stored.sequenceEnd != batch.sequence_end
+        {
+            return Err(SequencerError::InvariantViolation {
+                invariant: "onchain_settlement_match".into(),
+                message: format!(
+                    "batch {} exists on-chain with different fields",
+                    batch.batch_id
+                ),
+            });
+        }
+        Ok(true)
     }
 
     /// Classify batch intents into (settled, failed) by querying the contract's

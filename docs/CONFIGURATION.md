@@ -157,6 +157,15 @@ process; shared storage utilization is in `sequencer_rate_limit_budgets`.
 | `PAYLOAD_ENCRYPTION_KEYS` | (unset) | Comma-separated keyring (current first) |
 | `PAYLOAD_ENCRYPTION_KEYS_BY_TENANT` | (unset) | JSON map of tenant-specific keyrings |
 
+For a rolling key change, first deploy `old,new` to every node so all readers
+can open ciphertext written with either key while writes still use `old`.
+Then deploy `new,old` to every node. After all writers use `new`, run all three
+`reencrypt-*` admin commands and `verify-key-retirement` against the primary
+database with the same keyring. The check reads every event and VES proof under a
+repeatable-read snapshot and fails on plaintext or ciphertext that the current
+key cannot decrypt. Quiesce writes during the final check and key removal;
+the snapshot cannot cover rows written after it starts.
+
 ## VES Sequencer
 
 | Variable | Default | Description |
@@ -275,7 +284,7 @@ automatically receive the production worker's transaction boundary.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VES_STARK_VERIFY_ON_SUBMIT` | `true` | Verify STARK proofs at submission time |
+| STARK proof submission | always | STARK proofs are verified before storage; invalid proofs are rejected |
 | `VES_STARK_ALLOW_UNVERIFIED_AMOUNT_BINDING` | `false` | Accept prover-attested amounts when the sequencer cannot re-extract the amount from the payload |
 
 ### Automated proof generation

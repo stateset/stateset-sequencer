@@ -131,8 +131,12 @@ async fn projection_worker_materializes_and_checkpoints_new_stream() {
             ..ProjectionRunnerConfig::default()
         },
     };
-    let (task, control) =
-        stateset_sequencer::infra::spawn_projection_worker(config, pool.clone(), event_store, None);
+    let (task, control) = stateset_sequencer::infra::spawn_projection_worker(
+        config.clone(),
+        pool.clone(),
+        event_store.clone(),
+        None,
+    );
 
     let document = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -177,6 +181,23 @@ async fn projection_worker_materializes_and_checkpoints_new_stream() {
     .await
     .unwrap();
     assert_eq!(checkpoint, 1);
+
+    // A fresh runner must resume from the committed checkpoint, not apply the
+    // same event twice or change the materialized document/version.
+    let (restarted, stop_restarted) =
+        stateset_sequencer::infra::spawn_projection_worker(config, pool.clone(), event_store, None);
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    stop_restarted
+        .send(ProjectionWorkerMessage::Shutdown)
+        .await
+        .unwrap();
+    restarted.await.unwrap();
+    let replayed: (serde_json::Value, i64) = sqlx::query_as(
+        "SELECT document, version FROM projection_documents WHERE tenant_id = $1 AND store_id = $2 AND entity_type = 'order' AND entity_id = $3",
+    )
+    .bind(tenant_id.0).bind(store_id.0).bind(&order_id)
+    .fetch_one(&pool).await.unwrap();
+    assert_eq!(replayed, document);
 }
 
 #[tokio::test]

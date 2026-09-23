@@ -57,23 +57,7 @@ const MAX_COMPLIANCE_PROOF_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
 const STARK_VERIFY_TIMEOUT: Duration = Duration::from_secs(15);
 const STARK_VERIFY_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
-const STARK_VERIFY_ON_SUBMIT_ENV: &str = "VES_STARK_VERIFY_ON_SUBMIT";
 const STARK_VERIFY_CONCURRENCY_ENV: &str = "VES_STARK_VERIFY_CONCURRENCY";
-
-fn stark_verify_on_submit_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var(STARK_VERIFY_ON_SUBMIT_ENV)
-            .ok()
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "" | "0" | "false" | "off"
-                )
-            })
-            .unwrap_or(true)
-    })
-}
 
 fn stark_verify_semaphore() -> &'static Semaphore {
     static SEM: OnceLock<Semaphore> = OnceLock::new();
@@ -303,8 +287,7 @@ pub async fn submit_ves_compliance_proof(
     // does not parse the payload, so the sequencer re-extracts the amount from
     // the payload it stored at ingest and rejects proofs whose witness
     // commitment commits to a different amount. This check is independent of
-    // (and much cheaper than) full proof verification, so it runs even when
-    // verify-on-submit is disabled.
+    // (and much cheaper than) full proof verification.
     let amount_binding_check: Option<AmountBindingCheck> = if is_stark {
         let Some(wc) = witness_commitment.as_ref() else {
             return Err(internal_error(
@@ -336,8 +319,8 @@ pub async fn submit_ves_compliance_proof(
         None
     };
 
-    // Optional: reject invalid STARK proofs at submission time.
-    if is_stark && stark_verify_on_submit_enabled() {
+    // A stored STARK proof must have passed verification at admission.
+    if is_stark {
         let public_inputs: ves_stark_primitives::public_inputs::CompliancePublicInputs =
             serde_json::from_value(canonical_inputs.clone()).map_err(|e| {
                 (

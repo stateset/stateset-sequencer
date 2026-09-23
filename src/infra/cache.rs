@@ -1602,8 +1602,8 @@ mod tests {
 
         // An older batch must not displace the latest pointer.
         let mut older = test_batch_commitment((1, 5));
-        older.tenant_id = first.tenant_id.clone();
-        older.store_id = first.store_id.clone();
+        older.tenant_id = first.tenant_id;
+        older.store_id = first.store_id;
         cache.insert(older, [4u8; 32]).await;
 
         let latest = cache

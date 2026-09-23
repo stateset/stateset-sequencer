@@ -14,7 +14,7 @@ use stateset_sequencer::crypto::{
 use stateset_sequencer::infra::{PayloadEncryption, PayloadEncryptionMode};
 use stateset_sequencer::{StoreId, TenantId};
 
-const ADMIN_COMMANDS: [&str; 13] = [
+const ADMIN_COMMANDS: [&str; 14] = [
     "migrate",
     "verify-proof",
     "export-events",
@@ -23,6 +23,7 @@ const ADMIN_COMMANDS: [&str; 13] = [
     "reencrypt-events",
     "reencrypt-ves-validity-proofs",
     "reencrypt-ves-compliance-proofs",
+    "verify-key-retirement",
     "backfill-ves-state-roots",
     "ves-commit-and-anchor",
     "commands",
@@ -51,6 +52,7 @@ COMMANDS:
   reencrypt-events                Re-encrypt event payloads with new key
   reencrypt-ves-validity-proofs   Re-encrypt validity proofs
   reencrypt-ves-compliance-proofs Re-encrypt compliance proofs
+  verify-key-retirement          Check all at-rest rows use the current key
   backfill-ves-state-roots        Backfill VES state roots
   ves-commit-and-anchor           Create and anchor a VES commitment
   commands                       List available commands
@@ -109,6 +111,9 @@ reencrypt-ves-compliance-proofs OPTIONS:
   --dry-run
   --force                         (reencrypt even if current key decrypts)
 
+verify-key-retirement OPTIONS:
+  --database-url <postgres_url>  Scan all event and VES proof rows
+
 backfill-ves-state-roots OPTIONS:
   --tenant-id <uuid>              (optional; otherwise all streams)
   --store-id <uuid>               (optional; requires --tenant-id)
@@ -138,6 +143,7 @@ fn command_synopsis(command: &str) -> Option<&'static str> {
         "reencrypt-events" => Some("Re-encrypt event payloads with new key"),
         "reencrypt-ves-validity-proofs" => Some("Re-encrypt validity proofs"),
         "reencrypt-ves-compliance-proofs" => Some("Re-encrypt compliance proofs"),
+        "verify-key-retirement" => Some("Check all at-rest rows use the current key"),
         "backfill-ves-state-roots" => Some("Backfill VES state roots"),
         "ves-commit-and-anchor" => Some("Create and anchor a VES commitment"),
         "commands" => Some("List available commands"),
@@ -171,6 +177,7 @@ fn command_usage_hint(command: &str) -> Option<&'static str> {
         "reencrypt-ves-compliance-proofs" => Some(
             "reencrypt-ves-compliance-proofs [--tenant-id <uuid>] [--store-id <uuid>] [--batch-size <n>] [--limit <n>] [--dry-run] [--force] [--database-url <postgres_url>]",
         ),
+        "verify-key-retirement" => Some("verify-key-retirement [--database-url <postgres_url>]"),
         "backfill-ves-state-roots" => Some(
             "backfill-ves-state-roots [--tenant-id <uuid>] [--store-id <uuid>] [--dry-run] [--force] [--database-url <postgres_url>]",
         ),
@@ -402,6 +409,7 @@ async fn main() -> anyhow::Result<()> {
         "reencrypt-events" => cmd_reencrypt_events(args).await,
         "reencrypt-ves-validity-proofs" => cmd_reencrypt_ves_validity_proofs(args).await,
         "reencrypt-ves-compliance-proofs" => cmd_reencrypt_ves_compliance_proofs(args).await,
+        "verify-key-retirement" => cmd_verify_key_retirement(args).await,
         "backfill-ves-state-roots" => cmd_backfill_ves_state_roots(args).await,
         "verify-proof" => cmd_verify_proof(args).await,
         "export-events" => cmd_export_events(args).await,
@@ -454,6 +462,185 @@ async fn cmd_migrate(mut args: VecDeque<String>) -> anyhow::Result<()> {
         .await?;
     stateset_sequencer::migrations::run_postgres(&pool).await?;
     println!("ok: migrations applied");
+    Ok(())
+}
+
+/// Verify that every durable at-rest payload can be read using only the first
+/// configured encryption key. Run after re-encryption and before retiring old
+/// keys. A repeatable-read snapshot keeps the scan internally consistent.
+async fn cmd_verify_key_retirement(mut args: VecDeque<String>) -> anyhow::Result<()> {
+    let mut database_url = None;
+    while let Some(arg) = args.pop_front() {
+        match arg.as_str() {
+            "--database-url" => {
+                database_url = Some(
+                    args.pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("missing value for --database-url"))?,
+                );
+            }
+            "-h" | "--help" => {
+                print_help();
+                return Ok(());
+            }
+            other => anyhow::bail!("unexpected argument: {other}"),
+        }
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&require_database_url(database_url)?)
+        .await?;
+    let encryption = PayloadEncryption::from_env_with_mode(PayloadEncryptionMode::Required)
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let mut counts = [0u64; 3];
+    let mut last_id = None;
+    loop {
+        let rows: Vec<EventRow> = sqlx::query_as(
+            "SELECT event_id, tenant_id, store_id, sequence_number, entity_type, entity_id, event_type, payload_encrypted \
+             FROM events WHERE ($1::uuid IS NULL OR event_id > $1) ORDER BY event_id LIMIT 500",
+        )
+        .bind(last_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            last_id = Some(row.event_id);
+            let sequence_number: u64 = row.sequence_number.try_into()?;
+            let aad = PayloadEncryption::aad_for_row(
+                &row.tenant_id,
+                &row.store_id,
+                &row.event_id,
+                sequence_number,
+                &row.entity_type,
+                &row.entity_id,
+                &row.event_type,
+            );
+            require_current_key(
+                &encryption,
+                row.tenant_id,
+                &aad,
+                &row.payload_encrypted,
+                "events",
+                row.event_id,
+            )
+            .await?;
+            counts[0] += 1;
+        }
+    }
+
+    last_id = None;
+    loop {
+        let rows: Vec<VesValidityProofRow> = sqlx::query_as(
+            "SELECT proof_id, batch_id, tenant_id, store_id, proof_type, proof_version, proof, proof_hash \
+             FROM ves_validity_proofs WHERE ($1::uuid IS NULL OR proof_id > $1) ORDER BY proof_id LIMIT 500",
+        )
+        .bind(last_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            last_id = Some(row.proof_id);
+            let aad = compute_ves_validity_proof_at_rest_aad(
+                &row.tenant_id,
+                &row.store_id,
+                &row.batch_id,
+                &row.proof_id,
+                &row.proof_type,
+                row.proof_version as u32,
+                &bytes32("proof_hash", &row.proof_hash)?,
+            );
+            require_current_key(
+                &encryption,
+                row.tenant_id,
+                &aad,
+                &row.proof,
+                "ves_validity_proofs",
+                row.proof_id,
+            )
+            .await?;
+            counts[1] += 1;
+        }
+    }
+
+    last_id = None;
+    loop {
+        let rows: Vec<VesComplianceProofRow> = sqlx::query_as(
+            "SELECT proof_id, event_id, tenant_id, store_id, proof_type, proof_version, \
+             policy_id, policy_params, policy_hash, proof, proof_hash FROM ves_compliance_proofs \
+             WHERE ($1::uuid IS NULL OR proof_id > $1) ORDER BY proof_id LIMIT 500",
+        )
+        .bind(last_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            last_id = Some(row.proof_id);
+            let policy_hash = bytes32("policy_hash", &row.policy_hash)?;
+            if compute_ves_compliance_policy_hash(&row.policy_id, &row.policy_params) != policy_hash
+            {
+                anyhow::bail!(
+                    "policy hash mismatch in ves_compliance_proofs {}",
+                    row.proof_id
+                );
+            }
+            let proof_hash = bytes32("proof_hash", &row.proof_hash)?;
+            let aad = compute_ves_compliance_proof_at_rest_aad(&ComplianceProofAadParams {
+                tenant_id: &row.tenant_id,
+                store_id: &row.store_id,
+                event_id: &row.event_id,
+                proof_id: &row.proof_id,
+                policy_hash: &policy_hash,
+                proof_type: &row.proof_type,
+                proof_version: row.proof_version as u32,
+                proof_hash: &proof_hash,
+            });
+            require_current_key(
+                &encryption,
+                row.tenant_id,
+                &aad,
+                &row.proof,
+                "ves_compliance_proofs",
+                row.proof_id,
+            )
+            .await?;
+            counts[2] += 1;
+        }
+    }
+    tx.commit().await?;
+    println!(
+        "ok: current key decrypts events={} validity_proofs={} compliance_proofs={}",
+        counts[0], counts[1], counts[2]
+    );
+    Ok(())
+}
+
+async fn require_current_key(
+    encryption: &PayloadEncryption,
+    tenant_id: Uuid,
+    aad: &Hash256,
+    ciphertext: &[u8],
+    table: &str,
+    row_id: Uuid,
+) -> anyhow::Result<()> {
+    if !is_payload_at_rest_encrypted(ciphertext) {
+        anyhow::bail!("{table} {row_id} is not encrypted at rest");
+    }
+    encryption
+        .decrypt_payload_with_current_key(&tenant_id, aad, ciphertext)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("{table} {row_id} cannot be decrypted with the current key: {e}")
+        })?;
     Ok(())
 }
 
@@ -1898,4 +2085,50 @@ async fn cmd_ves_commit_and_anchor(mut args: VecDeque<String>) -> anyhow::Result
             .unwrap_or_else(|| "unknown".to_string())
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod key_retirement_tests {
+    use super::*;
+    use stateset_sequencer::crypto::{InMemoryKeyManager, KeyManager};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn retirement_gate_rejects_old_key_and_plaintext() {
+        let tenant = Uuid::new_v4();
+        let aad = [9u8; 32];
+        let manager = Arc::new(InMemoryKeyManager::new());
+        let encryption = PayloadEncryption::new(PayloadEncryptionMode::Required, manager.clone());
+        let old_ciphertext = encryption
+            .encrypt_payload(&tenant, &aad, b"old")
+            .await
+            .unwrap();
+        manager.rotate_tenant_key(&tenant).await.unwrap();
+        let current_ciphertext = encryption
+            .encrypt_payload(&tenant, &aad, b"new")
+            .await
+            .unwrap();
+        let row_id = Uuid::new_v4();
+
+        assert!(
+            require_current_key(&encryption, tenant, &aad, &old_ciphertext, "events", row_id)
+                .await
+                .is_err()
+        );
+        assert!(
+            require_current_key(&encryption, tenant, &aad, b"plaintext", "events", row_id)
+                .await
+                .is_err()
+        );
+        require_current_key(
+            &encryption,
+            tenant,
+            &aad,
+            &current_ciphertext,
+            "events",
+            row_id,
+        )
+        .await
+        .unwrap();
+    }
 }

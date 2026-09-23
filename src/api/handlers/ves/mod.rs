@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::api::utils::internal_error;
 use crate::domain::{Hash256, VesBatchCommitment};
-use crate::infra::{VesComplianceEventInputs, CACHE_STAMPEDE_DELAY};
+use crate::infra::VesComplianceEventInputs;
 use crate::server::AppState;
 
 /// Generate canonical public inputs for VES validity proofs.
@@ -80,62 +80,17 @@ pub fn ves_compliance_public_inputs(
     })
 }
 
-/// Fetch a VES commitment with cache and replica fallback.
+/// Fetch mutable anchoring state from the primary. A cached commitment can
+/// retain a finalized chain status after a reorg on another replica.
 #[instrument(skip(state), fields(batch_id = %batch_id))]
 pub async fn get_ves_commitment_cached(
     state: &AppState,
     batch_id: Uuid,
 ) -> Result<VesBatchCommitment, (StatusCode, String)> {
-    let cache = &state.cache_manager.ves_commitments;
-    if let Some(commitment) = cache.get_by_batch_id(&batch_id).await {
-        return Ok(commitment);
-    }
-
-    let (cached, lock_acquired) = cache.get_by_batch_id_with_lock(&batch_id).await;
-    if let Some(commitment) = cached {
-        return Ok(commitment);
-    }
-
-    if !lock_acquired {
-        tokio::time::sleep(CACHE_STAMPEDE_DELAY).await;
-        if let Some(commitment) = cache.get_by_batch_id(&batch_id).await {
-            return Ok(commitment);
-        }
-    }
-
-    let commitment = match state.ves_commitment_reader.get_commitment(batch_id).await {
-        Ok(Some(commitment)) => Some(commitment),
-        Ok(None) => match state.ves_commitment_engine.get_commitment(batch_id).await {
-            Ok(commitment) => commitment,
-            Err(e) => {
-                if lock_acquired {
-                    cache.release_batch_id_lock(&batch_id).await;
-                }
-                return Err(internal_error(e));
-            }
-        },
-        Err(_) => match state.ves_commitment_engine.get_commitment(batch_id).await {
-            Ok(commitment) => commitment,
-            Err(e) => {
-                if lock_acquired {
-                    cache.release_batch_id_lock(&batch_id).await;
-                }
-                return Err(internal_error(e));
-            }
-        },
-    };
-
-    let Some(commitment) = commitment else {
-        if lock_acquired {
-            cache.release_batch_id_lock(&batch_id).await;
-        }
-        return Err((StatusCode::NOT_FOUND, "Commitment not found".to_string()));
-    };
-
-    cache.insert(commitment.clone()).await;
-    if lock_acquired {
-        cache.release_batch_id_lock(&batch_id).await;
-    }
-
-    Ok(commitment)
+    state
+        .ves_commitment_engine
+        .get_commitment(batch_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or((StatusCode::NOT_FOUND, "Commitment not found".to_string()))
 }

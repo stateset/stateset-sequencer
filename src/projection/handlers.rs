@@ -1530,6 +1530,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn order_projection_matches_after_restart_at_checkpoint() {
+        let events = [
+            create_test_event(
+                "order",
+                "replay-order",
+                "order.created",
+                json!({
+                    "customer_id": "customer", "total_amount": 10.0, "currency": "USD"
+                }),
+            ),
+            create_test_event("order", "replay-order", "order.confirmed", json!({})),
+            create_test_event("order", "replay-order", "order.processing", json!({})),
+        ];
+        let uninterrupted_store = Arc::new(InMemoryOrderStore::new());
+        let uninterrupted = OrderProjector::new(uninterrupted_store.clone());
+        for (index, event) in events.iter().enumerate() {
+            assert!(matches!(
+                uninterrupted
+                    .apply(event, (index > 0).then_some(index as u64))
+                    .await
+                    .unwrap(),
+                ApplyResult::Applied { .. }
+            ));
+        }
+
+        let restarted_store = Arc::new(InMemoryOrderStore::new());
+        OrderProjector::new(restarted_store.clone())
+            .apply(&events[0], None)
+            .await
+            .unwrap();
+        let restarted = OrderProjector::new(restarted_store.clone());
+        for (index, event) in events.iter().enumerate().skip(1) {
+            assert!(matches!(
+                restarted.apply(event, Some(index as u64)).await.unwrap(),
+                ApplyResult::Applied { .. }
+            ));
+        }
+        let uninterrupted_doc = uninterrupted_store
+            .get("replay-order")
+            .await
+            .unwrap()
+            .unwrap();
+        let restarted_doc = restarted_store.get("replay-order").await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(uninterrupted_doc).unwrap(),
+            serde_json::to_value(restarted_doc).unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn test_order_created_already_exists() {
         let store = Arc::new(InMemoryOrderStore::new());
         let projector = OrderProjector::new(store.clone());

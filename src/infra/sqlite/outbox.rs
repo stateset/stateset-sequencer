@@ -194,12 +194,33 @@ impl SqliteOutbox {
         let now = Utc::now().to_rfc3339();
 
         for (event_id, sequence) in acks {
-            sqlx::query("UPDATE outbox SET acked_at = ?, remote_sequence = ? WHERE event_id = ?")
-                .bind(&now)
-                .bind(*sequence as i64)
-                .bind(event_id.to_string())
-                .execute(&mut *tx)
-                .await?;
+            let sequence = i64::try_from(*sequence)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| SequencerError::InvariantViolation {
+                    invariant: "outbox_ack_sequence".to_string(),
+                    message: "acknowledged sequence must be positive and fit SQLite INTEGER"
+                        .to_string(),
+                })?;
+            let result = sqlx::query(
+                "UPDATE outbox SET acked_at = COALESCE(acked_at, ?), remote_sequence = ? \
+                 WHERE event_id = ? AND pushed_at IS NOT NULL \
+                 AND (remote_sequence IS NULL OR remote_sequence = ?)",
+            )
+            .bind(&now)
+            .bind(sequence)
+            .bind(event_id.to_string())
+            .bind(sequence)
+            .execute(&mut *tx)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(SequencerError::InvariantViolation {
+                    invariant: "outbox_ack_state".to_string(),
+                    message: format!(
+                        "event {event_id} must be pushed and cannot change its remote sequence"
+                    ),
+                });
+            }
         }
 
         tx.commit().await?;
@@ -723,6 +744,71 @@ mod tests {
         // Mark as acked with sequence number
         outbox.mark_acked(&[(event.event_id, 42)]).await.unwrap();
         assert_eq!(outbox.unacked_count().await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_ack_sequence_rejects_zero_and_overflow() {
+        let outbox = create_test_db().await;
+        let event = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "ack-bounds",
+            EventType::from("order.updated"),
+            serde_json::json!({"state": "new"}),
+            AgentId::new(),
+        );
+        outbox.append(&event).await.unwrap();
+        outbox.mark_pushed(&[event.event_id]).await.unwrap();
+
+        assert!(outbox.mark_acked(&[(event.event_id, 0)]).await.is_err());
+        assert!(outbox
+            .mark_acked(&[(event.event_id, u64::MAX)])
+            .await
+            .is_err());
+        assert_eq!(outbox.unacked_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_ack_requires_push_and_preserves_first_remote_sequence() {
+        let outbox = create_test_db().await;
+        let make_event = |entity_id| {
+            EventEnvelope::new(
+                TenantId::new(),
+                StoreId::new(),
+                EntityType::order(),
+                entity_id,
+                EventType::from("order.updated"),
+                serde_json::json!({"state": "new"}),
+                AgentId::new(),
+            )
+        };
+        let pushed = make_event("pushed");
+        let queued = make_event("queued");
+        outbox.append(&pushed).await.unwrap();
+        outbox.append(&queued).await.unwrap();
+        outbox.mark_pushed(&[pushed.event_id]).await.unwrap();
+
+        // A failed acknowledgement in a batch must roll back earlier updates.
+        assert!(outbox
+            .mark_acked(&[(pushed.event_id, 7), (queued.event_id, 8)])
+            .await
+            .is_err());
+        assert_eq!(outbox.unacked_count().await.unwrap(), 1);
+        assert!(outbox.mark_acked(&[(queued.event_id, 8)]).await.is_err());
+        assert!(outbox.mark_acked(&[(Uuid::new_v4(), 8)]).await.is_err());
+
+        outbox.mark_acked(&[(pushed.event_id, 7)]).await.unwrap();
+        outbox.mark_acked(&[(pushed.event_id, 7)]).await.unwrap();
+        assert!(outbox.mark_acked(&[(pushed.event_id, 9)]).await.is_err());
+        let recorded: (Option<i64>, Option<String>) =
+            sqlx::query_as("SELECT remote_sequence, acked_at FROM outbox WHERE event_id = ?")
+                .bind(pushed.event_id.to_string())
+                .fetch_one(&outbox.pool)
+                .await
+                .unwrap();
+        assert_eq!(recorded.0, Some(7));
+        assert!(recorded.1.is_some());
     }
 
     /// Build a pulled (remotely-sequenced) event. `seq = None` simulates the

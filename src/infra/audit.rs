@@ -459,24 +459,29 @@ impl PgAuditLogger {
         Ok(count.0)
     }
 
-    /// Cleanup old audit logs
-    pub async fn cleanup(&self, older_than_days: i32) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
-            r#"
-            DELETE FROM audit_log
-            WHERE timestamp < NOW() - make_interval(days => $1)
-            "#,
+    /// Audit records are append-only. Retention requires a separately
+    /// checkpointed archive; deleting a prefix would break chain verification.
+    pub async fn cleanup(&self, _older_than_days: i32) -> Result<u64, sqlx::Error> {
+        Ok(0)
+    }
+
+    /// Check the persisted sequence, links, and hashes before exporting an
+    /// audit trail. A database owner can still rewrite the entire chain;
+    /// external checkpoints are required to detect that class of attack.
+    pub async fn verify_chain(&self) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar("SELECT sequencer_verify_audit_chain()")
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    /// Export this pair to an independent checkpoint store to detect a
+    /// database administrator rewriting the entire chain.
+    pub async fn chain_head(&self) -> Result<Option<(i64, Vec<u8>)>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT chain_seq, entry_hash FROM audit_log ORDER BY chain_seq DESC LIMIT 1",
         )
-        .bind(older_than_days)
-        .execute(&self.pool)
-        .await?;
-
-        let deleted = result.rows_affected();
-        if deleted > 0 {
-            tracing::info!(deleted = deleted, "Cleaned up old audit log entries");
-        }
-
-        Ok(deleted)
+        .fetch_optional(&self.pool)
+        .await
     }
 }
 
@@ -548,6 +553,7 @@ fn parse_audit_action(s: &str) -> AuditAction {
         "agent_key_registered" => AuditAction::AgentKeyRegistered,
         "agent_key_rotated" => AuditAction::AgentKeyRotated,
         "agent_key_revoked" => AuditAction::AgentKeyRevoked,
+        "agent_policy_updated" => AuditAction::AgentPolicyUpdated,
         "config_updated" => AuditAction::ConfigUpdated,
         "events_purged" => AuditAction::EventsPurged,
         "commitment_deleted" => AuditAction::CommitmentDeleted,

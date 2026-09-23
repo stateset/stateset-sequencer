@@ -21,8 +21,8 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use stateset_sequencer::auth::{
-    AgentKeyEntry, AgentKeyLookup, AgentKeyRegistry, ApiKeyValidator, AuthMiddlewareState,
-    Authenticator, RateLimiter, RequestLimits,
+    AgentKeyEntry, AgentKeyError, AgentKeyLookup, AgentKeyRegistry, ApiKeyValidator,
+    AuthMiddlewareState, Authenticator, RateLimiter, RequestLimits,
 };
 use stateset_sequencer::crypto::{is_payload_at_rest_encrypted, AgentSigningKey, StaticKeyManager};
 use stateset_sequencer::domain::{
@@ -30,8 +30,8 @@ use stateset_sequencer::domain::{
     VesEventEnvelope,
 };
 use stateset_sequencer::infra::{
-    EventStore, IngestService, PayloadEncryption, PayloadEncryptionMode, PgAgentKeyRegistry,
-    PgCommitmentEngine, PgEventStore, PgSequencer, PgVesCommitmentEngine,
+    AgentKeyCache, EventStore, IngestService, PayloadEncryption, PayloadEncryptionMode,
+    PgAgentKeyRegistry, PgCommitmentEngine, PgEventStore, PgSequencer, PgVesCommitmentEngine,
     PgVesComplianceProofStore, PgVesValidityProofStore, SchemaValidationMode, Sequencer,
     SequencerError, VesSequencer,
 };
@@ -41,6 +41,74 @@ mod common;
 
 async fn connect_db() -> Option<sqlx::PgPool> {
     common::connect_test_db(20).await
+}
+
+async fn wait_for_blocked_command_insert(pool: &sqlx::PgPool, table: &str) {
+    let query_pattern = format!("%{table}%");
+    for _ in 0..200 {
+        let (blocked,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE $1",
+        )
+        .bind(&query_pattern)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        if blocked > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("ingest did not reach the blocked {table} reservation");
+}
+
+#[tokio::test]
+#[ignore]
+async fn cached_key_validation_observes_remote_revocation_and_rotation() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+    let tenant = TenantId::new();
+    let agent = AgentId::new();
+    let old_key = AgentSigningKey::generate();
+    let new_key = AgentSigningKey::generate();
+    let lookup = AgentKeyLookup::new(&tenant, &agent, AgentKeyId::default());
+    let writer = PgAgentKeyRegistry::new(pool.clone());
+    writer
+        .register_key(&lookup, AgentKeyEntry::new(old_key.public_key_bytes()))
+        .await
+        .unwrap();
+
+    let cached = PgAgentKeyRegistry::new(pool.clone()).with_cache(Arc::new(AgentKeyCache::new(
+        8,
+        std::time::Duration::from_secs(3600),
+    )));
+    cached
+        .get_valid_key_at(&lookup, chrono::Utc::now())
+        .await
+        .unwrap();
+    writer.revoke_key(&lookup).await.unwrap();
+    assert!(matches!(
+        cached.get_valid_key_at(&lookup, chrono::Utc::now()).await,
+        Err(AgentKeyError::KeyRevoked)
+    ));
+
+    let new_id = writer
+        .rotate_key(&tenant.0, &agent.0, new_key.public_key_bytes())
+        .await
+        .unwrap();
+    let new_lookup = AgentKeyLookup {
+        key_id: new_id,
+        ..lookup.clone()
+    };
+    assert_eq!(
+        cached
+            .get_valid_key_at(&new_lookup, chrono::Utc::now())
+            .await
+            .unwrap()
+            .public_key,
+        new_key.public_key_bytes()
+    );
 }
 
 #[tokio::test]
@@ -191,6 +259,289 @@ async fn postgres_sequencer_concurrent_ingest_has_no_gaps() {
     for (idx, event) in events.iter().enumerate() {
         assert_eq!(event.sequence_number(), (idx as u64) + 1);
     }
+}
+
+#[tokio::test]
+#[ignore]
+async fn postgres_legacy_partial_batch_keeps_accepted_sequences_dense() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let sequencer = PgSequencer::new(pool.clone(), Arc::new(PayloadEncryption::disabled()));
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let make_event = |entity: &str, tag: &str| {
+        EventEnvelope::new(
+            tenant_id.clone(),
+            store_id.clone(),
+            EntityType::order(),
+            entity,
+            EventType::new("order.updated"),
+            json!({"tag": tag}),
+            agent_id.clone(),
+        )
+        .with_base_version(0)
+    };
+    let first = make_event("same-order", "first");
+    let stale = make_event("same-order", "stale");
+    let second = make_event("other-order", "second");
+    let duplicate = first.clone();
+
+    let receipt = sequencer
+        .ingest(EventBatch::new(
+            agent_id,
+            vec![first.clone(), stale, second.clone(), duplicate],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(receipt.events_accepted, 2);
+    assert_eq!(receipt.events_rejected.len(), 2);
+    assert_eq!(receipt.assigned_sequence_start, Some(1));
+    assert_eq!(receipt.assigned_sequence_end, Some(2));
+    assert_eq!(receipt.head_sequence, 2);
+    assert_eq!(sequencer.head(&tenant_id, &store_id).await.unwrap(), 2);
+
+    let stored: Vec<(Uuid, i64)> = sqlx::query_as(
+        "SELECT event_id, sequence_number FROM events WHERE tenant_id = $1 AND store_id = $2 ORDER BY sequence_number",
+    )
+    .bind(tenant_id.0)
+    .bind(store_id.0)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![(first.event_id, 1), (second.event_id, 2)]);
+}
+
+#[tokio::test]
+#[ignore]
+async fn postgres_ves_commitments_start_at_one_and_chain_contiguously() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let key = AgentSigningKey::generate();
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    registry
+        .register_key(
+            &AgentKeyLookup::new(&tenant_id, &agent_id, AgentKeyId::default()),
+            AgentKeyEntry::new(key.public_key_bytes()),
+        )
+        .await
+        .unwrap();
+    let ves = VesSequencer::new(pool.clone(), registry);
+    let events = (0..3)
+        .map(|index| {
+            VesEventEnvelope::new_plaintext(
+                tenant_id.clone(),
+                store_id.clone(),
+                agent_id.clone(),
+                AgentKeyId::default(),
+                EntityType::order(),
+                format!("commitment-{index}"),
+                EventType::new("order.created"),
+                json!({"index": index}),
+                &key,
+            )
+        })
+        .collect();
+    assert_eq!(ves.ingest(events).await.unwrap().events_accepted, 3);
+
+    let engine = PgVesCommitmentEngine::new(pool);
+    assert!(engine
+        .create_and_store_commitment(&tenant_id, &store_id, (2, 2))
+        .await
+        .is_err());
+    let first = engine
+        .create_and_store_commitment(&tenant_id, &store_id, (1, 1))
+        .await
+        .unwrap();
+    let retry = engine
+        .create_and_store_commitment(&tenant_id, &store_id, (1, 1))
+        .await
+        .unwrap();
+    assert_eq!(retry.batch_id, first.batch_id);
+    assert!(engine
+        .create_and_store_commitment(&tenant_id, &store_id, (3, 3))
+        .await
+        .is_err());
+    let second = engine
+        .create_and_store_commitment(&tenant_id, &store_id, (2, 2))
+        .await
+        .unwrap();
+    assert_eq!(second.prev_state_root, first.new_state_root);
+    assert_eq!(second.sequence_range, (2, 2));
+
+    engine
+        .update_chain_tx_pending(first.batch_id, 1, [1u8; 32], Some(10))
+        .await
+        .unwrap();
+    engine
+        .update_chain_tx_pending(first.batch_id, 1, [2u8; 32], Some(11))
+        .await
+        .unwrap();
+    let pending = engine
+        .get_commitment(first.batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.chain_tx_hash, Some([1u8; 32]));
+    assert_eq!(pending.chain_block_number, Some(10));
+    assert!(pending.anchored_at.is_none());
+    engine.confirm_anchored(first.batch_id).await.unwrap();
+    let finalized = engine
+        .get_commitment(first.batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(finalized.anchored_at.is_some());
+    engine.clear_chain_tx(first.batch_id).await.unwrap();
+    let reorged = engine
+        .get_commitment(first.batch_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(reorged.chain_tx_hash.is_none());
+    assert!(reorged.anchored_at.is_none());
+}
+
+#[tokio::test]
+#[ignore]
+async fn postgres_legacy_commitments_start_at_one_and_chain_contiguously() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let sequencer = PgSequencer::new(pool.clone(), Arc::new(PayloadEncryption::disabled()));
+    let events = (0..2)
+        .map(|index| {
+            EventEnvelope::new(
+                tenant_id.clone(),
+                store_id.clone(),
+                EntityType::order(),
+                format!("legacy-commitment-{index}"),
+                EventType::new("order.created"),
+                json!({"index": index}),
+                agent_id.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sequencer
+            .ingest(EventBatch::new(agent_id, events))
+            .await
+            .unwrap()
+            .events_accepted,
+        2
+    );
+    let engine = PgCommitmentEngine::new(pool);
+    assert!(engine
+        .create_and_store_commitment(&tenant_id, &store_id, (2, 2))
+        .await
+        .is_err());
+    let first = engine
+        .create_and_store_commitment(&tenant_id, &store_id, (1, 1))
+        .await
+        .unwrap();
+    let second = engine
+        .create_and_store_commitment(&tenant_id, &store_id, (2, 2))
+        .await
+        .unwrap();
+    assert_eq!(second.prev_state_root, first.new_state_root);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn postgres_sequence_reservations_are_disjoint_and_advance_shared_head() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let sequencer = Arc::new(PgSequencer::new(
+        pool.clone(),
+        Arc::new(PayloadEncryption::disabled()),
+    ));
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let barrier = Arc::new(Barrier::new(3));
+    let mut handles = Vec::new();
+
+    for writer in 0..2 {
+        let sequencer = sequencer.clone();
+        let tenant_id = tenant_id.clone();
+        let store_id = store_id.clone();
+        let agent_id = agent_id.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            let events = (0..2)
+                .map(|index| {
+                    EventEnvelope::new(
+                        tenant_id.clone(),
+                        store_id.clone(),
+                        EntityType::order(),
+                        format!("reservation-{writer}-{index}"),
+                        EventType::new("order.created"),
+                        json!({"writer": writer, "index": index}),
+                        agent_id.clone(),
+                    )
+                })
+                .collect();
+            barrier.wait().await;
+            sequencer
+                .sequence(events)
+                .await
+                .unwrap()
+                .iter()
+                .map(|event| event.sequence_number())
+                .collect::<Vec<_>>()
+        }));
+    }
+    barrier.wait().await;
+
+    let mut ranges = Vec::new();
+    for handle in handles {
+        ranges.push(handle.await.unwrap());
+    }
+    ranges.sort();
+    assert_eq!(ranges, vec![vec![1, 2], vec![3, 4]]);
+    assert_eq!(sequencer.head(&tenant_id, &store_id).await.unwrap(), 4);
+
+    let event = EventEnvelope::new(
+        tenant_id.clone(),
+        store_id.clone(),
+        EntityType::order(),
+        "after-reservations",
+        EventType::new("order.created"),
+        json!({"kind": "ingest"}),
+        agent_id.clone(),
+    );
+    let receipt = sequencer
+        .ingest(EventBatch::new(agent_id, vec![event]))
+        .await
+        .unwrap();
+    assert_eq!(receipt.events_accepted, 1);
+    assert_eq!(receipt.assigned_sequence_start, Some(5));
+    assert_eq!(sequencer.head(&tenant_id, &store_id).await.unwrap(), 5);
+
+    let stored: Vec<(i64,)> = sqlx::query_as(
+        "SELECT sequence_number FROM events WHERE tenant_id = $1 AND store_id = $2 ORDER BY sequence_number",
+    )
+    .bind(tenant_id.0)
+    .bind(store_id.0)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![(5,)]);
 }
 
 #[tokio::test]
@@ -1106,6 +1457,424 @@ async fn postgres_ves_sequencer_concurrent_exact_replay_returns_existing_receipt
         .unwrap();
     assert_eq!(stored.len(), 1);
     assert_eq!(stored[0].event_id(), event_id);
+
+    // A replay with changed signature metadata must not receive the original
+    // receipt. Replay classification happens before normal signature checks.
+    let mut changed_scheme = event.clone();
+    changed_scheme.agent_signature_scheme = Some(2);
+    let changed = ves_sequencer.ingest(vec![changed_scheme]).await.unwrap();
+    assert_eq!(changed.events_accepted, 0);
+    assert!(changed.receipts.is_empty());
+    assert!(matches!(
+        changed.events_rejected[0].reason,
+        stateset_sequencer::infra::VesRejectionReason::DuplicateEventId
+    ));
+
+    let mut changed_bundle = event;
+    changed_bundle.agent_signature_bundle = Some(
+        stateset_sequencer::crypto::pqc_signing::ParsedSignatureBundle {
+            ed25519_signature: Some(vec![1; 64]),
+            ml_dsa_65_signature: None,
+        },
+    );
+    let changed = ves_sequencer.ingest(vec![changed_bundle]).await.unwrap();
+    assert_eq!(changed.events_accepted, 0);
+    assert!(changed.receipts.is_empty());
+    assert!(matches!(
+        changed.events_rejected[0].reason,
+        stateset_sequencer::infra::VesRejectionReason::DuplicateEventId
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn postgres_ves_version_conflict_does_not_consume_sequence_or_command() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let key = AgentSigningKey::generate();
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    registry
+        .register_key(
+            &AgentKeyLookup::new(&tenant_id, &agent_id, AgentKeyId::default()),
+            AgentKeyEntry::new(key.public_key_bytes()),
+        )
+        .await
+        .unwrap();
+    let ves =
+        Arc::new(VesSequencer::new(pool.clone(), registry).with_required_execution_binding(true));
+
+    let make_event = |tag: &str, command_id: Uuid, base_version: u64| {
+        let mut event = VesEventEnvelope::new_plaintext(
+            tenant_id.clone(),
+            store_id.clone(),
+            agent_id.clone(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            "shared-order",
+            EventType::new("order.updated"),
+            json!({"tag": tag}),
+            &key,
+        )
+        .with_command_id(command_id)
+        .with_base_version(base_version);
+        event.sign_execution_controls(&key);
+        event
+    };
+
+    let commands = [Uuid::new_v4(), Uuid::new_v4()];
+    let events = [
+        make_event("first", commands[0], 0),
+        make_event("second", commands[1], 0),
+    ];
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let ves = ves.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                (index, ves.ingest(vec![event]).await.unwrap())
+            })
+        })
+        .collect();
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+    assert_eq!(
+        results.iter().map(|(_, r)| r.events_accepted).sum::<u32>(),
+        1
+    );
+    let failed_index = results
+        .iter()
+        .find_map(|(index, result)| {
+            if result.events_accepted == 0 {
+                assert!(result.receipts.is_empty());
+                assert!(matches!(
+                    result.events_rejected[0].reason,
+                    stateset_sequencer::infra::VesRejectionReason::VersionConflict {
+                        expected: 0,
+                        actual: 1
+                    }
+                ));
+                Some(*index)
+            } else {
+                None
+            }
+        })
+        .expect("one stale writer must be rejected");
+    assert_eq!(ves.head(&tenant_id, &store_id).await.unwrap(), 1);
+
+    let retry = make_event("retry", commands[failed_index], 1);
+    let retried = ves.ingest(vec![retry]).await.unwrap();
+    assert_eq!(retried.events_accepted, 1);
+    assert_eq!(retried.assigned_sequence_start, Some(2));
+    assert_eq!(ves.head(&tenant_id, &store_id).await.unwrap(), 2);
+
+    let version: (i64,) = sqlx::query_as(
+        "SELECT version FROM entity_versions WHERE tenant_id = $1 AND store_id = $2 AND entity_type = $3 AND entity_id = $4",
+    )
+    .bind(tenant_id.0)
+    .bind(store_id.0)
+    .bind("order")
+    .bind("shared-order")
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(version.0, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn postgres_ves_cross_stream_event_id_race_releases_losing_command() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_a = TenantId::new();
+    let store_a = StoreId::new();
+    let tenant_b = TenantId::new();
+    let store_b = StoreId::new();
+    let agent_id = AgentId::new();
+    let key = AgentSigningKey::generate();
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    for tenant in [&tenant_a, &tenant_b] {
+        registry
+            .register_key(
+                &AgentKeyLookup::new(tenant, &agent_id, AgentKeyId::default()),
+                AgentKeyEntry::new(key.public_key_bytes()),
+            )
+            .await
+            .unwrap();
+    }
+    let ves = Arc::new(VesSequencer::new(pool.clone(), registry));
+    let command_id = Uuid::new_v4();
+    let event_id = Uuid::new_v4();
+    let make_event = |tenant: TenantId, store: StoreId, tag: &str, id: Uuid| {
+        let mut event = VesEventEnvelope::new_plaintext(
+            tenant,
+            store,
+            agent_id.clone(),
+            AgentKeyId::default(),
+            EntityType::order(),
+            tag,
+            EventType::new("order.updated"),
+            json!({"tag": tag}),
+            &key,
+        )
+        .with_command_id(command_id);
+        event.event_id = id;
+        event.sign_execution_controls(&key);
+        event
+    };
+
+    // Hold B's command reservation so its event lookup sees no existing ID,
+    // then let A commit the same global ID in a different stream.
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO ves_command_dedupe (tenant_id, store_id, command_id) VALUES ($1, $2, $3)",
+    )
+    .bind(tenant_b.0)
+    .bind(store_b.0)
+    .bind(command_id)
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+    let ves_b = ves.clone();
+    let losing_event = make_event(tenant_b.clone(), store_b.clone(), "loser", event_id);
+    let loser = tokio::spawn(async move { ves_b.ingest(vec![losing_event]).await.unwrap() });
+    wait_for_blocked_command_insert(&pool, "ves_command_dedupe").await;
+
+    let winner = ves
+        .ingest(vec![make_event(tenant_a, store_a, "winner", event_id)])
+        .await
+        .unwrap();
+    assert_eq!(winner.events_accepted, 1);
+    blocker.rollback().await.unwrap();
+    let lost = loser.await.unwrap();
+    assert_eq!(lost.events_accepted, 0);
+    assert!(matches!(
+        lost.events_rejected[0].reason,
+        stateset_sequencer::infra::VesRejectionReason::DuplicateEventId
+    ));
+
+    let (reservations,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM ves_command_dedupe WHERE tenant_id = $1 AND store_id = $2 AND command_id = $3",
+    )
+    .bind(tenant_b.0)
+    .bind(store_b.0)
+    .bind(command_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reservations, 0, "losing stream retained an orphan command");
+
+    let retry = ves
+        .ingest(vec![make_event(tenant_b, store_b, "retry", Uuid::new_v4())])
+        .await
+        .unwrap();
+    assert_eq!(retry.events_accepted, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn postgres_legacy_cross_stream_event_id_race_releases_losing_command() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_a = TenantId::new();
+    let store_a = StoreId::new();
+    let tenant_b = TenantId::new();
+    let store_b = StoreId::new();
+    let agent_id = AgentId::new();
+    let sequencer = Arc::new(PgSequencer::new(
+        pool.clone(),
+        Arc::new(PayloadEncryption::disabled()),
+    ));
+    let command_id = Uuid::new_v4();
+    let event_id = Uuid::new_v4();
+    let make_event = |tenant: TenantId, store: StoreId, tag: &str, id: Uuid| {
+        let mut event = EventEnvelope::new(
+            tenant,
+            store,
+            EntityType::order(),
+            tag,
+            EventType::new("order.updated"),
+            json!({"tag": tag}),
+            agent_id.clone(),
+        )
+        .with_command_id(command_id);
+        event.event_id = id;
+        event
+    };
+
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO event_command_dedupe (tenant_id, store_id, command_id) VALUES ($1, $2, $3)",
+    )
+    .bind(tenant_b.0)
+    .bind(store_b.0)
+    .bind(command_id)
+    .execute(&mut *blocker)
+    .await
+    .unwrap();
+    let losing_event = make_event(tenant_b.clone(), store_b.clone(), "loser", event_id);
+    let sequencer_b = sequencer.clone();
+    let agent_b = agent_id.clone();
+    let loser = tokio::spawn(async move {
+        sequencer_b
+            .ingest(EventBatch::new(agent_b, vec![losing_event]))
+            .await
+            .unwrap()
+    });
+    wait_for_blocked_command_insert(&pool, "event_command_dedupe").await;
+
+    let winner = sequencer
+        .ingest(EventBatch::new(
+            agent_id.clone(),
+            vec![make_event(tenant_a, store_a, "winner", event_id)],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(winner.events_accepted, 1);
+    blocker.rollback().await.unwrap();
+    let lost = loser.await.unwrap();
+    assert_eq!(lost.events_accepted, 0);
+    assert!(matches!(
+        lost.events_rejected[0].reason,
+        stateset_sequencer::domain::RejectionReason::DuplicateEventId
+    ));
+
+    let (reservations,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM event_command_dedupe WHERE tenant_id = $1 AND store_id = $2 AND command_id = $3",
+    )
+    .bind(tenant_b.0)
+    .bind(store_b.0)
+    .bind(command_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reservations, 0, "losing stream retained an orphan command");
+
+    let retry = sequencer
+        .ingest(EventBatch::new(
+            agent_id.clone(),
+            vec![make_event(tenant_b, store_b, "retry", Uuid::new_v4())],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(retry.events_accepted, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn postgres_legacy_version_conflict_does_not_consume_sequence_or_command() {
+    let pool = connect_db().await.expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+
+    let tenant_id = TenantId::new();
+    let store_id = StoreId::new();
+    let agent_id = AgentId::new();
+    let sequencer = Arc::new(PgSequencer::new(
+        pool.clone(),
+        Arc::new(PayloadEncryption::disabled()),
+    ));
+    let make_event = |tag: &str, command_id: Uuid, base_version: u64| {
+        EventEnvelope::new(
+            tenant_id.clone(),
+            store_id.clone(),
+            EntityType::order(),
+            "shared-legacy-order",
+            EventType::new("order.updated"),
+            json!({"tag": tag}),
+            agent_id.clone(),
+        )
+        .with_command_id(command_id)
+        .with_base_version(base_version)
+    };
+
+    let commands = [Uuid::new_v4(), Uuid::new_v4()];
+    let events = [
+        make_event("first", commands[0], 0),
+        make_event("second", commands[1], 0),
+    ];
+    let barrier = Arc::new(Barrier::new(2));
+    let handles: Vec<_> = events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let sequencer = sequencer.clone();
+            let agent_id = agent_id.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                (
+                    index,
+                    sequencer
+                        .ingest(EventBatch::new(agent_id, vec![event]))
+                        .await
+                        .unwrap(),
+                )
+            })
+        })
+        .collect();
+
+    let mut results = Vec::new();
+    for handle in handles {
+        results.push(handle.await.unwrap());
+    }
+    assert_eq!(
+        results.iter().map(|(_, r)| r.events_accepted).sum::<u32>(),
+        1
+    );
+    let failed_index = results
+        .iter()
+        .find_map(|(index, result)| {
+            if result.events_accepted == 0 {
+                assert!(matches!(
+                    result.events_rejected[0].reason,
+                    stateset_sequencer::domain::RejectionReason::VersionConflict
+                ));
+                Some(*index)
+            } else {
+                None
+            }
+        })
+        .expect("one stale writer must be rejected");
+    assert_eq!(sequencer.head(&tenant_id, &store_id).await.unwrap(), 1);
+
+    let retry = make_event("retry", commands[failed_index], 1);
+    let retried = sequencer
+        .ingest(EventBatch::new(agent_id, vec![retry]))
+        .await
+        .unwrap();
+    assert_eq!(retried.events_accepted, 1);
+    assert_eq!(retried.assigned_sequence_start, Some(2));
+    assert_eq!(sequencer.head(&tenant_id, &store_id).await.unwrap(), 2);
+
+    let stored: Vec<(i64,)> = sqlx::query_as(
+        "SELECT sequence_number FROM events WHERE tenant_id = $1 AND store_id = $2 ORDER BY sequence_number",
+    )
+    .bind(tenant_id.0)
+    .bind(store_id.0)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![(1,), (2,)]);
 }
 
 /// N callers migrating a *fresh* database at once must all succeed.

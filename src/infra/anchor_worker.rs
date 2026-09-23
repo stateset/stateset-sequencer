@@ -230,15 +230,27 @@ impl AnchorWorker {
 
             match self.anchor_service.anchor_ves_commitment(commitment).await {
                 Ok((tx_hash, _)) if tx_hash == crate::anchor::ALREADY_ANCHORED_TX_HASH => {
-                    // Already on-chain from a prior attempt whose local record
-                    // was lost; there is no new transaction to await.
-                    info!(batch_id = %commitment.batch_id, "Commitment already anchored; confirming locally");
-                    if let Err(e) = self
-                        .commitment_engine
-                        .confirm_anchored(commitment.batch_id)
-                        .await
-                    {
-                        warn!(batch_id = %commitment.batch_id, error = ?e, "Failed to confirm already-anchored commitment");
+                    // The original tx receipt was lost. Start a conservative
+                    // confirmation window at the first observed chain block.
+                    // The zero hash marks this as a reconciled observation.
+                    match self.anchor_service.get_latest_block_number().await {
+                        Ok(observed_block) => {
+                            if let Err(e) = self
+                                .commitment_engine
+                                .update_chain_tx_pending(
+                                    commitment.batch_id,
+                                    self.anchor_service.chain_id() as u32,
+                                    tx_hash,
+                                    Some(observed_block),
+                                )
+                                .await
+                            {
+                                warn!(batch_id = %commitment.batch_id, error = ?e, "Failed to record reconciled anchor observation");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(batch_id = %commitment.batch_id, error = ?e, "Failed to read block number for reconciled anchor");
+                        }
                     }
                 }
                 Ok((tx_hash, block_number)) => {
@@ -301,39 +313,44 @@ impl AnchorWorker {
                 Some(bn) => bn,
                 None => continue,
             };
-
-            // Get current chain head to check confirmation depth
+            let tx_hash = match commitment.chain_tx_hash {
+                Some(hash) => hash,
+                None => continue,
+            };
             match self
                 .anchor_service
-                .get_chain_head(commitment.tenant_id.0, commitment.store_id.0)
+                .recorded_tx_is_current(tx_hash, block_number)
                 .await
             {
-                Ok(chain_head_seq) => {
-                    // Use the on-chain latest sequence as a proxy for chain progress.
-                    // A more precise check would use block numbers, but the contract's
-                    // getLatestSequence confirms the commitment is recognized on-chain.
-                    let _ = chain_head_seq; // Used for logging; finality uses block depth
-
-                    // Verify the commitment is still anchored (not reorged)
-                    match self
-                        .anchor_service
-                        .verify_anchored(commitment.batch_id)
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(batch_id = %commitment.batch_id, "Recorded anchor receipt moved or disappeared; clearing pending state");
+                    if let Err(e) = self
+                        .commitment_engine
+                        .clear_chain_tx(commitment.batch_id)
                         .await
                     {
+                        error!(batch_id = %commitment.batch_id, error = ?e, "Failed to clear stale anchor receipt");
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    warn!(batch_id = %commitment.batch_id, error = ?e, "Failed to inspect anchor receipt");
+                    continue;
+                }
+            }
+
+            // Finality is measured from the transaction's inclusion block.
+            match self.anchor_service.get_latest_block_number().await {
+                Ok(chain_block_number) => {
+                    // Verify the commitment is still anchored (not reorged)
+                    match self.anchor_service.verify_ves_commitment(commitment).await {
                         Ok(true) => {
-                            // Commitment is on-chain. Check block depth for finality.
-                            // For simplicity, we check if enough time has passed since submission.
-                            // A production implementation would compare current block number
-                            // against submission block number.
-                            let submitted_at = commitment.committed_at;
-                            let elapsed = chrono::Utc::now()
-                                .signed_duration_since(submitted_at)
-                                .num_seconds();
-
-                            // ~2s block time * finality_confirmations
-                            let finality_secs = (self.config.finality_confirmations * 2) as i64;
-
-                            if elapsed >= finality_secs {
+                            if has_required_confirmations(
+                                block_number,
+                                chain_block_number,
+                                self.config.finality_confirmations,
+                            ) {
                                 info!(
                                     batch_id = %commitment.batch_id,
                                     block_number,
@@ -405,11 +422,7 @@ impl AnchorWorker {
 
         let mut cleared = 0u32;
         for commitment in &anchored {
-            match self
-                .anchor_service
-                .verify_anchored(commitment.batch_id)
-                .await
-            {
+            match self.anchor_service.verify_ves_commitment(commitment).await {
                 Ok(true) => {
                     // Still on-chain, good
                 }
@@ -451,6 +464,13 @@ impl AnchorWorker {
     }
 }
 
+fn has_required_confirmations(inclusion_block: u64, chain_block: u64, required: u64) -> bool {
+    chain_block
+        .checked_sub(inclusion_block)
+        .and_then(|distance| distance.checked_add(1))
+        .is_some_and(|confirmations| confirmations >= required.max(1))
+}
+
 /// Spawn the anchor worker as a background task
 pub fn spawn_anchor_worker(
     config: AnchorWorkerConfig,
@@ -478,5 +498,14 @@ mod tests {
         assert_eq!(config.finality_confirmations, 6);
         assert_eq!(config.finality_poll_interval, Duration::from_secs(30));
         assert_eq!(config.reconcile_interval, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn confirmation_depth_uses_chain_blocks() {
+        assert!(!has_required_confirmations(100, 99, 1));
+        assert!(has_required_confirmations(100, 100, 1));
+        assert!(!has_required_confirmations(100, 104, 6));
+        assert!(has_required_confirmations(100, 105, 6));
+        assert!(!has_required_confirmations(100, u64::MAX, u64::MAX));
     }
 }

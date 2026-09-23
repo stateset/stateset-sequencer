@@ -205,6 +205,7 @@ impl PgVesComplianceProofStore {
                 last_error = $3,
                 next_attempt_at = NOW() + make_interval(secs => $5),
                 updated_at = NOW()
+            WHERE ves_proof_jobs.status = 'retryable'
             "#,
         )
         .bind(event_id)
@@ -237,6 +238,7 @@ impl PgVesComplianceProofStore {
                 last_error = EXCLUDED.last_error,
                 next_attempt_at = EXCLUDED.next_attempt_at,
                 updated_at = NOW()
+            WHERE ves_proof_jobs.status = 'retryable'
             "#,
         )
         .bind(event_id)

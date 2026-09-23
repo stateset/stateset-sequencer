@@ -385,5 +385,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plaintext, b"hello");
+
+        let new_ciphertext = enc.encrypt_payload(&tenant, &aad, b"new").await.unwrap();
+        assert_eq!(
+            crate::crypto::decrypt_payload_at_rest(&key_new, &aad, &new_ciphertext).unwrap(),
+            b"new"
+        );
+        assert!(crate::crypto::decrypt_payload_at_rest(&key_old, &aad, &new_ciphertext).is_err());
+
+        let retired = PayloadEncryption::new(
+            PayloadEncryptionMode::Required,
+            Arc::new(EnvKeyManager::new(vec![key_new], Default::default())),
+        );
+        assert!(retired
+            .decrypt_payload(&tenant, &aad, &ciphertext)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn mixed_version_writer_blocks_safe_old_key_retirement() {
+        let tenant = Uuid::new_v4();
+        let aad = [7u8; 32];
+        let old = [1u8; 32];
+        let new = [2u8; 32];
+        let old_node = PayloadEncryption::new(
+            PayloadEncryptionMode::Required,
+            Arc::new(EnvKeyManager::new(vec![old], Default::default())),
+        );
+        let prepared_old_node = PayloadEncryption::new(
+            PayloadEncryptionMode::Required,
+            Arc::new(EnvKeyManager::new(vec![old, new], Default::default())),
+        );
+        let upgraded_node = PayloadEncryption::new(
+            PayloadEncryptionMode::Required,
+            Arc::new(EnvKeyManager::new(vec![new, old], Default::default())),
+        );
+        let retired_node = PayloadEncryption::new(
+            PayloadEncryptionMode::Required,
+            Arc::new(EnvKeyManager::new(vec![new], Default::default())),
+        );
+        let late_old_write = old_node
+            .encrypt_payload(&tenant, &aad, b"late")
+            .await
+            .unwrap();
+        let new_write = upgraded_node
+            .encrypt_payload(&tenant, &aad, b"new")
+            .await
+            .unwrap();
+        assert_eq!(
+            prepared_old_node
+                .decrypt_payload(&tenant, &aad, &new_write)
+                .await
+                .unwrap(),
+            b"new"
+        );
+        assert!(old_node
+            .decrypt_payload(&tenant, &aad, &new_write)
+            .await
+            .is_err());
+        assert_eq!(
+            upgraded_node
+                .decrypt_payload(&tenant, &aad, &late_old_write)
+                .await
+                .unwrap(),
+            b"late"
+        );
+        assert!(upgraded_node
+            .decrypt_payload_with_current_key(&tenant, &aad, &late_old_write)
+            .await
+            .is_err());
+        assert!(retired_node
+            .decrypt_payload(&tenant, &aad, &late_old_write)
+            .await
+            .is_err());
+        let rewritten = upgraded_node
+            .encrypt_payload(&tenant, &aad, b"late")
+            .await
+            .unwrap();
+        assert_eq!(
+            retired_node
+                .decrypt_payload(&tenant, &aad, &rewritten)
+                .await
+                .unwrap(),
+            b"late"
+        );
     }
 }

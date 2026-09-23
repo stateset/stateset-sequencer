@@ -180,7 +180,7 @@ impl VerificationKey {
 }
 
 /// Parsed signature bundle for multi-algorithm verification.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ParsedSignatureBundle {
     pub ed25519_signature: Option<Vec<u8>>,
     pub ml_dsa_65_signature: Option<Vec<u8>>,

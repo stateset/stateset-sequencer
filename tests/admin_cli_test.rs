@@ -25,6 +25,7 @@ fn help_exits_zero_and_lists_every_command() {
         "reencrypt-events",
         "reencrypt-ves-validity-proofs",
         "reencrypt-ves-compliance-proofs",
+        "verify-key-retirement",
         "backfill-ves-state-roots",
         "ves-commit-and-anchor",
     ] {
