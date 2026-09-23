@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Python SDK requires `cryptography>=50.0.1,<51`, replacing the vulnerable
   dependency range. Build/test tooling also requires patched setuptools and
   pytest releases. CI now audits Python dependencies without advisory ignores.
+- Updated `rustls` to 0.23.45 to address RUSTSEC-2026-0285.
 - Settlement reconciliation checks on-chain root, tenant/store key, and sequence
   range before accepting a previously submitted batch. Mutable commitment
   reads use the primary to avoid stale anchoring status.

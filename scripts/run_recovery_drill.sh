@@ -4,7 +4,7 @@ set -euo pipefail
 umask 077
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-for tool in docker jq sha256sum rg; do
+for tool in docker jq sha256sum grep; do
   command -v "$tool" >/dev/null || { echo "Missing tool: $tool" >&2; exit 1; }
 done
 drill_image="${RECOVERY_POSTGRES_IMAGE:-postgres:16-alpine}"
@@ -70,7 +70,7 @@ echo "Recovery drill artifacts: $drill_dir"
 start_database "$drill_source"
 wait_database "$drill_source"
 fixture "$drill_source" seed | tee "$drill_dir/seed.log"
-[[ "$(rg -c '^PROJECTION_ATOMICITY_VERIFIED:' "$drill_dir/seed.log")" == 2 ]] || {
+[[ "$(grep -c '^PROJECTION_ATOMICITY_VERIFIED:' "$drill_dir/seed.log")" == 2 ]] || {
   echo "Both in-flight projection rollback checks must run" >&2; exit 1;
 }
 fixture "$drill_source" verify | tee "$drill_dir/baseline.log"
@@ -105,7 +105,7 @@ docker exec "$drill_source" pg_dump -U sequencer -d sequencer_review -Fc -f /tmp
 docker cp "$drill_source:/tmp/recovery.dump" "$drill_dir/backup.dump"
 # Preserve the lagging checkpoint in the backup before either database catches up.
 fixture "$drill_source" resume | tee "$drill_dir/crash-projection-resume.log"
-rg -q '^PROJECTION_RECOVERY_VERIFIED:' "$drill_dir/crash-projection-resume.log"
+grep -q '^PROJECTION_RECOVERY_VERIFIED:' "$drill_dir/crash-projection-resume.log"
 restore_start="$(date +%s)"
 start_database "$drill_restore"
 wait_database "$drill_restore"
@@ -115,7 +115,7 @@ docker exec "$drill_restore" pg_restore --exit-on-error --no-owner -U sequencer 
 fixture "$drill_restore" verify | tee "$drill_dir/backup-restore.log"
 restore_seconds=$(( $(date +%s) - restore_start ))
 fixture "$drill_restore" resume | tee "$drill_dir/restore-projection-resume.log"
-rg -q '^PROJECTION_RECOVERY_VERIFIED:' "$drill_dir/restore-projection-resume.log"
+grep -q '^PROJECTION_RECOVERY_VERIFIED:' "$drill_dir/restore-projection-resume.log"
 
 jq -n --arg image "$drill_image" --arg commit "$(git rev-parse HEAD)" \
   --arg binary_sha256 "$(sha256sum "$drill_binary" | cut -d ' ' -f 1)" \
