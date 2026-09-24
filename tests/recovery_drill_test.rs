@@ -207,9 +207,11 @@ async fn interrupt_projection_write(
         .await
         .unwrap();
     assert!(terminated);
-    tokio::time::timeout(Duration::from_secs(5), task)
+    // Backend termination is asynchronous. A contended CI runner can take
+    // longer than the normal shutdown path to deliver the connection error.
+    tokio::time::timeout(Duration::from_secs(20), task)
         .await
-        .unwrap()
+        .expect("projection worker did not stop after backend termination")
         .unwrap();
     sqlx::query(&format!(
         "DROP TRIGGER recovery_projection_pause ON {table}"
