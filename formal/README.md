@@ -127,8 +127,11 @@ rollback leave committed ordering state unchanged.
   entries advance together. Migration 027 installs same-transaction triggers
   on API keys, agent signing and encryption keys, encryption groups and members,
   event schemas, agent policies, rotation policies, and scheduled rotations.
-  Actor-rich API entries remain supplemental. Other durable admin tables still
-  need transactional coverage before claiming complete auditing.
+  Actor-rich API entries remain supplemental. These nine privileged
+  configuration tables have same-transaction coverage; operational state
+  tables have separate mutation and recovery rules. The audit chain still
+  needs an external checkpoint to expose a database owner's complete rewrite;
+  `audit-checkpoint` and `verify-audit-checkpoint` export and check one.
 - [Proof job model](tla/ProofJobLifecycle.tla): two workers may select the same
   event, fail, crash, or race to submit. Migration 029 records the `proved`
   job outcome in the same transaction as a `stark-compliance` proof insert;
@@ -158,7 +161,10 @@ rollback leave committed ordering state unchanged.
 - [Projection replay model](tla/ProjectionReplay.tla): document bytes and
   checkpoint commit as the same event prefix. A crash drops the working copy,
   and replay from the committed checkpoint cannot duplicate an event. The
-  PostgreSQL worker test restarts a runner and checks its document and version.
+  production worker uses one PostgreSQL transaction for each bounded batch.
+  The recovery drill terminates its database backend after document and version
+  writes, before commit, and checks that no partial projection state survives;
+  it also restarts the worker and checks documents, versions, and checkpoints.
 - [Nonce retention model](tla/NonceRetention.tla): replay remains blocked after
   cleanup when retention covers the maximum validity window plus two clock
   skew margins. The repository enforces at least 87,000 seconds (24 hours plus
@@ -219,7 +225,12 @@ correspond to `src/infra/postgres/sequencer.rs` and
 `tests/postgres_integration_test.rs` exercise concurrent ingest, duplicate IDs,
 partial batch rejection, exact replay, randomized multi-stream sequencing, concurrent range
 reservations, version conflicts, overlapping command ID batches, and the
-cross-stream event ID collision against PostgreSQL. The same suite checks
+cross-stream event ID collision against PostgreSQL. The independent state
+oracle in `tests/ves_model_trace_test.rs` checks an eleven-call replay trace
+against responses and committed rows after every step, including command
+reuse, version conflict, mixed-batch rejection, and cross-stream identity.
+These are bounded conformance checks, not a Rust/SQL refinement proof. The
+PostgreSQL integration suite also checks
 commitment range starts, retries, root chaining, pending-anchor recording, and
 reorg clearing. SQLite outbox tests check acknowledgement bounds, and the
 `x402_integration_test.rs` suite checks partial settlement and atomic rejection

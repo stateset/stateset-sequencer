@@ -1,6 +1,6 @@
 # Production readiness gates
 
-The hardening changes in Unreleased improve correctness; they do not establish
+The hardening changes described here improve correctness; they do not establish
 an A+ production reliability rating on their own. A release should attach the
 following evidence to its exact commit and deployment configuration.
 
@@ -19,6 +19,13 @@ following evidence to its exact commit and deployment configuration.
   PostgreSQL tests inject session termination and supervisor cancellation;
   these are lifecycle tests, not external-write fencing or crash-durability drills.
 - Rate-limit capacity pressure cannot reset existing live budgets.
+- Audit chain checkpoints can be exported and verified with the admin CLI.
+  Persist each checkpoint outside PostgreSQL in an independently controlled,
+  append-only store; a checkpoint left only in the same database cannot expose
+  a database owner's complete chain rewrite.
+- A deterministic PostgreSQL ingest trace checks responses and committed state
+  against a separate reference state machine after each step. Concurrent ingest
+  and randomized multi-stream cases remain covered by the integration suite.
 - HTTP and gRPC share tenant and credential budgets. The opt-in PostgreSQL
   backend uses atomic shared counters with bounded storage and fail-closed
   admission; memory mode remains per process.
@@ -40,11 +47,13 @@ following evidence to its exact commit and deployment configuration.
    restore drills with production durability settings. Verify no acknowledged
    events are lost, ordering stays contiguous, replays preserve receipts, and
    proofs and projection checkpoints remain consistent. Record recovery time.
-   The local process-crash/logical-restore drill is now automated in CI; standby
-   failover, WAL/PITR, crashes within projection writes, and deployment-scale drills remain.
-   In particular, projection document persistence, version compare-and-set, and
-   checkpoint persistence are separate operations. Inject faults between those
-   operations before claiming atomic or exactly-once projection recovery.
+   The local process-crash/logical-restore drill is automated in CI. Production
+   projection batches commit document writes, version compare-and-set, rejection
+   records, dead letters, and checkpoint updates in one PostgreSQL transaction.
+   The local drill terminates the backend after a document write and after a
+   version write, before commit, and checks that no partial state survives.
+   Standby failover, WAL/PITR, deployment-scale drills, and downstream external
+   side effects remain to verify.
 4. **Sustained capacity:** publish throughput, latency percentiles, projection
    lag, memory, connection use, and rejection rates under an agreed production
    workload, including hot tenants and corrupt streams. Define numeric SLOs
@@ -55,11 +64,32 @@ following evidence to its exact commit and deployment configuration.
    do not substitute for this matrix.
 6. **Independent security review:** review V2 encoding, downgrade controls,
    authorization boundaries, and key rotation; track findings to closure.
+7. **External audit checkpoints:** schedule checkpoint export, retain outputs
+   outside the database, and verify a saved checkpoint after restore and before
+   accepting a new checkpoint. Exercise a deliberate rewrite in staging.
+
+Export and later verify a checkpoint (both commands scan the complete chain):
+
+```sh
+stateset-sequencer-admin audit-checkpoint --database-url "$DATABASE_URL"
+stateset-sequencer-admin verify-audit-checkpoint --sequence "$SAVED_CHAIN_SEQ" --hash "$SAVED_ENTRY_HASH" --database-url "$DATABASE_URL"
+```
 
 SDK registry publication and production rollout are separate release steps.
 Passing local tests does not establish either one.
 
-## Local evidence (2026-09-05 working tree)
+## Current local recovery check (2026-09-23 working tree)
+
+- `scripts/run_recovery_drill.sh` passed against disposable PostgreSQL 16 with
+  `fsync`, `full_page_writes`, and `synchronous_commit` enabled. It recovered all
+  128 acknowledged events after a process crash and a logical restore, checked
+  receipt replay and inclusion proofs, and resumed projections from sequence 64
+  to 128 without duplicate application. Backend termination after document and
+  version writes left no partial projection state. The local crash and restore
+  checks took 37 and 13 seconds respectively, excluding projection catch-up;
+  these are observations, not RTO or RPO commitments.
+
+## Earlier local evidence (2026-09-05 working tree)
 
 - Full-feature unit suite: 592 passing tests with STARK and PQC enabled, using
   the locked CI dependency commit `c2cd52c6511279c9c73ab6eb16c5389176f95752`

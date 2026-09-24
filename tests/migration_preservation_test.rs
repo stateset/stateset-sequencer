@@ -88,6 +88,36 @@ async fn upgrading_v13_preserves_ves_event_receipt_and_commitment_bytes() {
     stateset_sequencer::migrations::run_postgres(&pool)
         .await
         .unwrap();
+    // Every durable privileged configuration table must keep its enabled,
+    // row-level INSERT/UPDATE/DELETE audit trigger after an upgrade.
+    for table in [
+        "event_schemas",
+        "agent_event_policies",
+        "agent_signing_keys",
+        "agent_encryption_keys",
+        "encryption_key_groups",
+        "encryption_key_group_members",
+        "api_keys",
+        "key_rotation_policies",
+        "scheduled_key_rotations",
+    ] {
+        let triggers: Vec<(i16, String, String)> = sqlx::query_as(
+            "SELECT tgtype, tgenabled::text, tgfoid::regproc::text \
+             FROM pg_trigger WHERE tgrelid = $1::regclass \
+             AND tgname LIKE '%transaction_audit' AND NOT tgisinternal",
+        )
+        .bind(table)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(triggers.len(), 1, "{table} must have one audit trigger");
+        assert_eq!(triggers[0].0, 29, "{table} must audit every row mutation");
+        assert_eq!(triggers[0].1, "O", "{table} trigger must be enabled");
+        assert_eq!(
+            triggers[0].2, "sequencer_audit_privileged_change",
+            "{table} must invoke the audit function"
+        );
+    }
     let dead_letter_table_exists: bool =
         sqlx::query_scalar("SELECT to_regclass('dead_letter_events') IS NOT NULL")
             .fetch_one(&pool)

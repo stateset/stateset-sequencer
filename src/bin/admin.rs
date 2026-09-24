@@ -11,10 +11,10 @@ use stateset_sequencer::crypto::{
     compute_ves_validity_proof_hash, is_payload_at_rest_encrypted, ComplianceProofAadParams,
     Hash256,
 };
-use stateset_sequencer::infra::{PayloadEncryption, PayloadEncryptionMode};
+use stateset_sequencer::infra::{PayloadEncryption, PayloadEncryptionMode, PgAuditLogger};
 use stateset_sequencer::{StoreId, TenantId};
 
-const ADMIN_COMMANDS: [&str; 14] = [
+const ADMIN_COMMANDS: [&str; 16] = [
     "migrate",
     "verify-proof",
     "export-events",
@@ -24,6 +24,8 @@ const ADMIN_COMMANDS: [&str; 14] = [
     "reencrypt-ves-validity-proofs",
     "reencrypt-ves-compliance-proofs",
     "verify-key-retirement",
+    "audit-checkpoint",
+    "verify-audit-checkpoint",
     "backfill-ves-state-roots",
     "ves-commit-and-anchor",
     "commands",
@@ -53,6 +55,8 @@ COMMANDS:
   reencrypt-ves-validity-proofs   Re-encrypt validity proofs
   reencrypt-ves-compliance-proofs Re-encrypt compliance proofs
   verify-key-retirement          Check all at-rest rows use the current key
+  audit-checkpoint               Export a verified audit chain checkpoint
+  verify-audit-checkpoint        Verify a previously exported checkpoint
   backfill-ves-state-roots        Backfill VES state roots
   ves-commit-and-anchor           Create and anchor a VES commitment
   commands                       List available commands
@@ -114,6 +118,10 @@ reencrypt-ves-compliance-proofs OPTIONS:
 verify-key-retirement OPTIONS:
   --database-url <postgres_url>  Scan all event and VES proof rows
 
+verify-audit-checkpoint OPTIONS:
+  --sequence <n>                 (required) Saved chain sequence
+  --hash <hex>                   (required) Saved 32-byte entry hash
+
 backfill-ves-state-roots OPTIONS:
   --tenant-id <uuid>              (optional; otherwise all streams)
   --store-id <uuid>               (optional; requires --tenant-id)
@@ -144,6 +152,8 @@ fn command_synopsis(command: &str) -> Option<&'static str> {
         "reencrypt-ves-validity-proofs" => Some("Re-encrypt validity proofs"),
         "reencrypt-ves-compliance-proofs" => Some("Re-encrypt compliance proofs"),
         "verify-key-retirement" => Some("Check all at-rest rows use the current key"),
+        "audit-checkpoint" => Some("Export a verified audit chain checkpoint"),
+        "verify-audit-checkpoint" => Some("Verify a saved audit chain checkpoint"),
         "backfill-ves-state-roots" => Some("Backfill VES state roots"),
         "ves-commit-and-anchor" => Some("Create and anchor a VES commitment"),
         "commands" => Some("List available commands"),
@@ -178,6 +188,8 @@ fn command_usage_hint(command: &str) -> Option<&'static str> {
             "reencrypt-ves-compliance-proofs [--tenant-id <uuid>] [--store-id <uuid>] [--batch-size <n>] [--limit <n>] [--dry-run] [--force] [--database-url <postgres_url>]",
         ),
         "verify-key-retirement" => Some("verify-key-retirement [--database-url <postgres_url>]"),
+        "audit-checkpoint" => Some("audit-checkpoint [--database-url <postgres_url>]"),
+        "verify-audit-checkpoint" => Some("verify-audit-checkpoint --sequence <n> --hash <hex> [--database-url <postgres_url>]"),
         "backfill-ves-state-roots" => Some(
             "backfill-ves-state-roots [--tenant-id <uuid>] [--store-id <uuid>] [--dry-run] [--force] [--database-url <postgres_url>]",
         ),
@@ -410,6 +422,8 @@ async fn main() -> anyhow::Result<()> {
         "reencrypt-ves-validity-proofs" => cmd_reencrypt_ves_validity_proofs(args).await,
         "reencrypt-ves-compliance-proofs" => cmd_reencrypt_ves_compliance_proofs(args).await,
         "verify-key-retirement" => cmd_verify_key_retirement(args).await,
+        "audit-checkpoint" => cmd_audit_checkpoint(args).await,
+        "verify-audit-checkpoint" => cmd_verify_audit_checkpoint(args).await,
         "backfill-ves-state-roots" => cmd_backfill_ves_state_roots(args).await,
         "verify-proof" => cmd_verify_proof(args).await,
         "export-events" => cmd_export_events(args).await,
@@ -462,6 +476,85 @@ async fn cmd_migrate(mut args: VecDeque<String>) -> anyhow::Result<()> {
         .await?;
     stateset_sequencer::migrations::run_postgres(&pool).await?;
     println!("ok: migrations applied");
+    Ok(())
+}
+
+/// Print a verified chain head for an independent, append-only checkpoint store.
+async fn cmd_audit_checkpoint(mut args: VecDeque<String>) -> anyhow::Result<()> {
+    let mut database_url = None;
+    while let Some(arg) = args.pop_front() {
+        match arg.as_str() {
+            "--database-url" => {
+                database_url = Some(
+                    args.pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("missing value for --database-url"))?,
+                )
+            }
+            "-h" | "--help" => {
+                print_command_help_hint("audit-checkpoint");
+                return Ok(());
+            }
+            other => anyhow::bail!("unexpected argument: {other}"),
+        }
+    }
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&require_database_url(database_url)?)
+        .await?;
+    let head = PgAuditLogger::new(pool).verified_checkpoint().await?;
+    let (sequence, hash) = head.unwrap_or((0, vec![0; 32]));
+    println!(
+        "{}",
+        serde_json::json!({"chain_seq": sequence, "entry_hash": hex::encode(hash)})
+    );
+    Ok(())
+}
+
+async fn cmd_verify_audit_checkpoint(mut args: VecDeque<String>) -> anyhow::Result<()> {
+    let (mut database_url, mut sequence, mut hash) = (None, None, None);
+    while let Some(arg) = args.pop_front() {
+        match arg.as_str() {
+            "--database-url" => {
+                database_url = Some(
+                    args.pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("missing value for --database-url"))?,
+                )
+            }
+            "--sequence" => {
+                sequence = Some(
+                    args.pop_front()
+                        .ok_or_else(|| anyhow::anyhow!("missing value for --sequence"))?
+                        .parse::<i64>()?,
+                )
+            }
+            "--hash" => {
+                hash =
+                    Some(hex::decode(args.pop_front().ok_or_else(|| {
+                        anyhow::anyhow!("missing value for --hash")
+                    })?)?)
+            }
+            "-h" | "--help" => {
+                print_command_help_hint("verify-audit-checkpoint");
+                return Ok(());
+            }
+            other => anyhow::bail!("unexpected argument: {other}"),
+        }
+    }
+    let sequence = sequence.ok_or_else(|| anyhow::anyhow!("--sequence is required"))?;
+    let hash = hash.ok_or_else(|| anyhow::anyhow!("--hash is required"))?;
+    anyhow::ensure!(sequence >= 0, "--sequence must be non-negative");
+    anyhow::ensure!(hash.len() == 32, "--hash must be 32 bytes");
+    let pool = PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&require_database_url(database_url)?)
+        .await?;
+    anyhow::ensure!(
+        PgAuditLogger::new(pool)
+            .verify_checkpoint(sequence, &hash)
+            .await?,
+        "audit checkpoint does not match the verified chain"
+    );
+    println!("ok: audit checkpoint verified");
     Ok(())
 }
 

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-23
+
+### Added
+
+- Verified audit-chain checkpoint export and verification commands, with a
+  database rewrite regression and upgrade checks for all privileged audit
+  triggers.
+- A deterministic PostgreSQL ingest trace that checks replay, command reuse,
+  version conflicts, and committed state against an independent reference
+  model after each step.
+- Separate ingest and head request counts and latency metrics in the sustained
+  load workload.
+
+### Changed
+
+- Documented the transactional projection recovery evidence and the measured
+  scope of the legacy HTTP load workload. Corrected the ingestion guarantee to
+  idempotent retries.
+- SDK registry publication now runs only on an explicit release workflow
+  dispatch for an existing tag.
+
 ## [0.10.0] - 2026-09-23
 
 ### Added

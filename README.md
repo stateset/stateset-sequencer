@@ -19,7 +19,7 @@ The StateSet Sequencer is the **central truth clock** for distributed commerce s
 ### Key Features
 
 - **Deterministic Event Ordering**: Monotonic sequence numbers per (tenant, store) pair
-- **Exactly-Once Delivery**: Idempotent event ingestion with event_id and command_id deduplication
+- **Idempotent Ingestion**: Retries with the same event_id return the original receipt; command_id can deduplicate an intent
 - **Cryptographic Commitments**: Merkle trees with domain-separated hashing for audit trails
 - **Agent Signatures**: Ed25519 signature verification for event authenticity
 - **STARK Compliance Proofs**: Zero-knowledge proofs for regulatory compliance

@@ -1,12 +1,17 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 import crypto from 'k6/crypto';
+import { Counter, Trend } from 'k6/metrics';
 
 const BASE_URL = __ENV.SEQUENCER_BASE_URL || 'http://localhost:8080';
 const API_KEY = __ENV.API_KEY;
 const TENANT_ID = __ENV.TENANT_ID || '00000000-0000-0000-0000-000000000000';
 const STORE_ID = __ENV.STORE_ID || '00000000-0000-0000-0000-000000000000';
 const AGENT_ID = __ENV.AGENT_ID || '00000000-0000-0000-0000-000000000000';
+const ingestRequests = new Counter('ingest_requests');
+const headRequests = new Counter('head_requests');
+const ingestDuration = new Trend('ingest_duration', true);
+const headDuration = new Trend('head_duration', true);
 
 function uuidv4() {
   const bytes = new Uint8Array(crypto.randomBytes(16));
@@ -46,21 +51,29 @@ function ingestEvent() {
     ],
   };
 
-  return http.post(`${BASE_URL}/api/v1/events/ingest`, JSON.stringify(payload), {
+  const res = http.post(`${BASE_URL}/api/v1/events/ingest`, JSON.stringify(payload), {
     headers: {
       'Content-Type': 'application/json',
       Authorization: `ApiKey ${API_KEY}`,
     },
+    tags: { operation: 'ingest' },
   });
+  ingestRequests.add(1);
+  ingestDuration.add(res.timings.duration);
+  return res;
 }
 
 function queryHead() {
   const url = `${BASE_URL}/api/v1/head?tenant_id=${TENANT_ID}&store_id=${STORE_ID}`;
-  return http.get(url, {
+  const res = http.get(url, {
     headers: {
       Authorization: `ApiKey ${API_KEY}`,
     },
+    tags: { operation: 'head' },
   });
+  headRequests.add(1);
+  headDuration.add(res.timings.duration);
+  return res;
 }
 
 export default function () {
@@ -69,11 +82,14 @@ export default function () {
   }
 
   const roll = Math.random();
-  const res = roll < 0.7 ? ingestEvent() : queryHead();
+  const operation = roll < 0.7 ? 'ingest' : 'head';
+  const res = operation === 'ingest' ? ingestEvent() : queryHead();
 
-  check(res, {
-    'status is 200': (r) => r.status === 200,
-  });
+  check(
+    res,
+    { 'status is 200': (r) => r.status === 200 },
+    { operation },
+  );
 
   sleep(0.1);
 }

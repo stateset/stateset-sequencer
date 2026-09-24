@@ -3,8 +3,8 @@ name: release
 # A release is derived only from a fully successful CI run on the default
 # branch. This prevents publishing a tag or binary from a partially validated
 # revision. Bumping Cargo.toml and adding the matching changelog section is the
-# release request; this workflow is the sole publisher. Manual dispatch is
-# limited to retrying missing SDK packages for an existing release tag.
+# server release request; this workflow is the sole publisher. SDK registry
+# publication requires a separate manual dispatch for the existing release tag.
 on:
   workflow_run:
     workflows: [ci]
@@ -165,7 +165,7 @@ jobs:
   publish-node-sdk:
     name: Publish Node SDK
     needs: release
-    if: needs.release.outputs.publish_sdks == 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.release.outputs.publish_sdks == 'true'
     runs-on: ubuntu-latest
     environment: npm
     permissions:
@@ -219,7 +219,7 @@ jobs:
   publish-python-sdk:
     name: Publish Python SDK
     needs: release
-    if: needs.release.outputs.publish_sdks == 'true'
+    if: github.event_name == 'workflow_dispatch' && needs.release.outputs.publish_sdks == 'true'
     runs-on: ubuntu-latest
     environment: pypi
     permissions:

@@ -259,7 +259,7 @@ VES defines two levels of finality that agents must understand when deciding how
 
 **Practical guidance:** For most commerce operations — displaying an order confirmation, reserving inventory, sending a shipping notification — soft finality is sufficient. The signed receipt provides strong guarantees against sequencer misbehavior. Hard finality is required for high-stakes external verification: trade finance disbursement, regulatory audit trails, cross-organizational proof of existence.
 
-### 7.4 Exactly-Once Delivery
+### 7.4 Idempotent Ingestion
 
 Events are idempotent by `event_id`. If the same `event_id` is re-submitted with identical signed content, the sequencer returns the previously assigned `sequence_number`. If the same `event_id` is submitted with different content, the sequencer rejects it. An optional `command_id` field provides intent-level deduplication for higher-level operations.
 

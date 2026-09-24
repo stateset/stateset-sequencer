@@ -483,6 +483,56 @@ impl PgAuditLogger {
         .fetch_optional(&self.pool)
         .await
     }
+
+    /// Verify the full chain and return a stable head for storage outside the
+    /// database. The append lock prevents a concurrent writer changing the
+    /// head between verification and export.
+    pub async fn verified_checkpoint(&self) -> Result<Option<(i64, Vec<u8>)>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(6004514665705169237)")
+            .execute(&mut *tx)
+            .await?;
+        let valid: bool = sqlx::query_scalar("SELECT sequencer_verify_audit_chain()")
+            .fetch_one(&mut *tx)
+            .await?;
+        if !valid {
+            return Err(sqlx::Error::Protocol(
+                "audit chain verification failed".into(),
+            ));
+        }
+        let head = sqlx::query_as(
+            "SELECT chain_seq, entry_hash FROM audit_log ORDER BY chain_seq DESC LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(head)
+    }
+
+    /// Check a previously exported checkpoint against the full chain. A
+    /// database owner cannot silently rewrite a checkpoint kept elsewhere.
+    pub async fn verify_checkpoint(&self, sequence: i64, hash: &[u8]) -> Result<bool, sqlx::Error> {
+        if sequence < 0 || hash.len() != 32 {
+            return Ok(false);
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(6004514665705169237)")
+            .execute(&mut *tx)
+            .await?;
+        let valid: bool = sqlx::query_scalar("SELECT sequencer_verify_audit_chain()")
+            .fetch_one(&mut *tx)
+            .await?;
+        let stored: Option<Vec<u8>> = if sequence == 0 {
+            Some(vec![0; 32])
+        } else {
+            sqlx::query_scalar("SELECT entry_hash FROM audit_log WHERE chain_seq = $1")
+                .bind(sequence)
+                .fetch_optional(&mut *tx)
+                .await?
+        };
+        tx.commit().await?;
+        Ok(valid && stored.as_deref() == Some(hash))
+    }
 }
 
 /// Query filters for audit logs

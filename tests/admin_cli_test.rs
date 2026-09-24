@@ -26,11 +26,23 @@ fn help_exits_zero_and_lists_every_command() {
         "reencrypt-ves-validity-proofs",
         "reencrypt-ves-compliance-proofs",
         "verify-key-retirement",
+        "audit-checkpoint",
+        "verify-audit-checkpoint",
         "backfill-ves-state-roots",
         "ves-commit-and-anchor",
     ] {
         assert!(text.contains(cmd), "help must list `{cmd}`:\n{text}");
     }
+}
+
+#[test]
+fn checkpoint_arguments_fail_before_connecting() {
+    let out = admin()
+        .args(["verify-audit-checkpoint", "--sequence", "1", "--hash", "ab"])
+        .output()
+        .expect("run admin");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("32 bytes"));
 }
 
 #[test]

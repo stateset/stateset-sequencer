@@ -1,18 +1,19 @@
 # Releasing StateSet Sequencer
 
-One sequencer release publishes the server binary, container, Node SDK, and
-Python SDK from the same CI-validated commit. Keep the versions in `Cargo.toml`,
+The automatic sequencer release publishes the server binary and container from
+the same CI-validated commit. Keep the versions in `Cargo.toml`,
 `cli/package.json`, `cli/package-lock.json`, and `sdk/python/pyproject.toml`
 identical, and add the matching dated section to `CHANGELOG.md`.
 
-The release workflow runs only after every CI job succeeds on the default
-branch. It creates an annotated `v<version>` tag when one is absent, publishes
-the GitHub release with checksums and provenance, then publishes:
+The automatic release run starts only after every CI job succeeds on the default
+branch. It creates an annotated `v<version>` tag when one is absent and publishes
+the GitHub release with checksums and provenance. SDK registry publication is
+optional and requires a manual `release` workflow dispatch for that existing tag:
 
 - `@stateset/sequencer-sdk` to npm from the protected `npm` environment.
 - `stateset-sequencer-sdk` to PyPI from the protected `pypi` environment.
 
-## One-time registry setup
+## Optional one-time registry setup
 
 1. Create the GitHub environments `npm` and `pypi`; require reviewer approval
    for both.
@@ -30,11 +31,12 @@ the GitHub release with checksums and provenance, then publishes:
 
 Never publish a package locally from an unvalidated working tree.
 
-## Retry a partial release
+## Publish or retry SDK packages
 
-If an SDK publication fails after the GitHub release exists, correct the
-registry configuration and manually run the `release` workflow with the
-existing `v<version>` tag. The workflow checks each registry independently,
+When registry publication is desired, configure the registries and manually
+run the `release` workflow with the existing `v<version>` tag. If a publication
+fails, correct the registry configuration and dispatch the same tag again.
+The workflow checks each registry independently,
 skips versions that are already present, and publishes only missing packages
 from the commit referenced by that tag. It then verifies that both packages
 can be resolved from their public registries.

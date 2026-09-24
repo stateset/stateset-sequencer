@@ -59,6 +59,17 @@ async fn audit_chain_is_serialized_and_append_only() {
     let head = logger.chain_head().await.unwrap().unwrap();
     assert_eq!(head.0, 25);
     assert_eq!(head.1.len(), 32);
+    assert!(logger.verify_checkpoint(head.0, &head.1).await.unwrap());
+    assert_eq!(
+        logger.verified_checkpoint().await.unwrap(),
+        Some(head.clone())
+    );
+    logger
+        .log(AuditLogBuilder::new(AuditAction::ApiKeyRevoked, "later", "test").build())
+        .await
+        .unwrap();
+    assert!(logger.verify_checkpoint(head.0, &head.1).await.unwrap());
+    assert!(!logger.verify_checkpoint(head.0, &[1; 32]).await.unwrap());
     assert_eq!(logger.cleanup(0).await.unwrap(), 0);
     assert!(sqlx::query("DELETE FROM audit_log WHERE chain_seq = 1")
         .execute(&pool)
@@ -89,6 +100,37 @@ async fn audit_chain_is_serialized_and_append_only() {
     );
     tampered.rollback().await.unwrap();
     assert!(logger.verify_chain().await.unwrap());
+
+    // A database owner can rewrite the last entry and recompute its hash so
+    // local chain verification passes. The externally saved head detects it.
+    let saved_head = logger.verified_checkpoint().await.unwrap().unwrap();
+    sqlx::query("ALTER TABLE audit_log DISABLE TRIGGER audit_log_immutable")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE audit_log SET actor = 'rewritten' WHERE chain_seq = $1")
+        .bind(saved_head.0)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE audit_log a SET entry_hash = digest(previous_hash || convert_to(\
+         (to_jsonb(a) - 'previous_hash' - 'entry_hash')::text, 'UTF8'), 'sha256') \
+         WHERE chain_seq = $1",
+    )
+    .bind(saved_head.0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE audit_log ENABLE TRIGGER audit_log_immutable")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(logger.verify_chain().await.unwrap());
+    assert!(!logger
+        .verify_checkpoint(saved_head.0, &saved_head.1)
+        .await
+        .unwrap());
     pool.close().await;
     sqlx::raw_sql(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&admin)

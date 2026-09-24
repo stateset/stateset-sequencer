@@ -1,203 +1,59 @@
-# k6 Load Test Configuration for StateSet Sequencer
+# Sequencer load tests
 
-This directory contains load tests for the StateSet Sequencer API.
+The k6 workloads exercise the legacy HTTP event API and head query on a
+disposable PostgreSQL service. They measure request behavior for a specified
+profile; they do not establish production capacity or a VES signed-ingest SLO.
 
-## Prerequisites
+## Workloads
 
-```bash
-# Install k6 (macOS)
-brew install k6
+| Script | Requests per iteration | Notes |
+| --- | --- | --- |
+| `sequencer_ingest.js` | One legacy event ingest | One new event ID and entity per request; no VES signature. |
+| `sequencer_query.js` | One head query | Reads the configured tenant and store. |
+| `mixed_workload.js` | One request, about 70% ingest and 30% head query | Sleeps 100 ms after each iteration. Reports operation counts and latency separately. |
+| `agents_register.js` | Public agent registration | Requires `ALLOW_PUBLIC_REGISTRATION_LOAD=true`; use only on an authorized test target. |
 
-# Install k6 (Linux)
-sudo gpg -k
-sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
-echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
-sudo apt-get update
-sudo apt-get install k6
-```
+The mixed workload records `ingest_requests`, `head_requests`,
+`ingest_duration`, and `head_duration` in addition to k6's HTTP metrics. It
+tags each request with `operation=ingest` or `operation=head`. A successful HTTP
+response is not by itself proof that a signed VES event was accepted.
 
-## Running Tests
+## Profiles and execution
 
-### Quick Test
+| Profile | Load | Duration |
+| --- | --- | --- |
+| `ci.json` | 5 virtual users | 20 seconds |
+| `smoke.json` | 5 virtual users | 1 minute |
+| `sustained.json` | Ramp to 25, then 50, then zero | 14 minutes |
+| `stress.json` | Ramp to 50, 100, 200, then zero | 6 minutes |
 
-```bash
-k6 run --config load/profiles/ci.json load/sequencer_ingest.js
-```
+The JSON thresholds are regression gates for these fixtures, not agreed
+production SLOs. The scheduled `performance` workflow runs `mixed_workload.js`
+with `sustained.json` on a single GitHub hosted runner, with authentication and
+payload encryption disabled and one configured tenant and store. It uploads
+the k6 summary and server log. Pull requests run the shorter `ci.json` ingest
+profile against the release binary.
 
-### Custom Configuration
+To run with a local k6 installation and an authorized test service:
 
-```bash
-k6 run --config load/runner.json load/sequencer_ingest.js
-```
-
-The workload scripts intentionally do not embed execution settings. Select a
-profile (or pass k6 CLI options) so the requested VU, duration, stage, and
-threshold settings remain authoritative.
-
-### Standard Profiles (Recommended)
-
-We ship ready-to-use profiles in `load/profiles`:
-
-- `smoke.json` — quick validation (1m, 5 VUs)
-- `sustained.json` — steady-state (14m total, up to 50 VUs)
-- `stress.json` — ramp to 200 VUs
-
-Run via helper script:
-
-```bash
-./scripts/run_load_test.sh load/sequencer_ingest.js smoke
-./scripts/run_load_test.sh load/mixed_workload.js sustained
-./scripts/run_load_test.sh load/sequencer_query.js stress
-```
-
-The `performance` GitHub Actions workflow runs the thresholded sustained
-profile every Monday and can run smoke, sustained, or stress on demand. It
-uploads the k6 JSON summary and server log as 30-day evidence. Every pull
-request also runs the shorter `ci.json` profile against the release binary.
-
-### Environment Variables
-
-Set environment variables before running:
-
-```bash
+```sh
 export SEQUENCER_BASE_URL=http://localhost:8080
 export API_KEY=your_test_api_key
-export TENANT_ID=00000000-0000-0000-0000-000000000000
-export STORE_ID=00000000-0000-0000-0000-000000000000
-
-k6 run load/sequencer_ingest.js
+export TENANT_ID=10000000-0000-4000-8000-000000000001
+export STORE_ID=20000000-0000-4000-8000-000000000002
+export AGENT_ID=30000000-0000-4000-8000-000000000003
+./scripts/run_load_test.sh load/mixed_workload.js sustained
 ```
 
-## Test Scenarios
+The helper writes a k6 summary and raw time series to `load/results/`.
 
-### 1. Event Ingestion (sequencer_ingest.js)
+## Existing measured run
 
-Tests the `/api/v1/ves/events/ingest` endpoint with:
-- Batch sizes: 10, 50, 100, 500 events
-- Concurrent users: 10, 50, 100 VUs
-- Duration: 30s - 5m
-
-Note: The provided `sequencer_ingest.js` script targets the legacy `/api/v1/events/ingest` endpoint
-to avoid signature requirements. Use VES ingest only when you can generate valid signatures.
-
-### 2. Query Performance (sequencer_query.js)
-
-Tests read endpoints:
-- `/api/v1/events` - Event listing
-- `/api/v1/head` - Head sequence
-- `/api/v1/entities/{type}/{id}` - Entity history
-- `/api/v1/ves/commitments` - Commitments
-
-### 3. Mixed Workload (mixed_workload.js)
-
-Tests realistic production traffic patterns:
-- 70% event ingestion
-- 20% queries
-- 10% commitments/proof generation
-
-### 4. Public Registration (agents_register.js)
-
-Tests `/api/v1/agents/register` (staging only). Requires:
-
-```bash
-export ALLOW_PUBLIC_REGISTRATION_LOAD=true
-```
-
-## Interpreting Results
-
-Key metrics to monitor:
-
-- **http_req_duration**: Request latency (p95, p99)
-- **http_req_failed**: Failed requests (should be 0)
-- **vus**: Active virtual users
-- **iterations_completed**: Total iterations
-
-### Example Output
-
-```
-✓ checks....................................... 100%  ✓ 45096  ✗ 0
-
-     data_received......................: 55 MB  2.0 MB/s
-     data_sent..........................: 82 MB  3.0 MB/s
-     http_req_blocked....................: avg=2.34ms min=1µs    med=2µs    max=342ms   p(90)=5µs    p(95)=6µs
-     http_req_connecting.................: avg=2.32ms min=0s     med=0s     max=341ms   p(90)=0s     p(95)=0s
-     http_req_duration...................: avg=23.4ms  min=15.6ms med=22.3ms max=876ms   p(90)=34.2ms p(95)=42.1ms
-       { expected_response:true }..........: avg=23.4ms  min=15.6ms med=22.3ms max=876ms   p(90)=34.2ms p(95)=42.1ms
-     http_req_failed......................: 0.00%  ✓ 0     ✗ 45096
-     http_req_receiving...................: avg=450µs  min=54µs   med=345µs  max=12.3ms  p(90)=890µs  p(95)=1.1ms
-     http_req_sending.....................: avg=23.1ms  min=1.2ms  med=21.3ms max=123ms   p(90)=32ms   p(95)=38ms
-     http_req_tls_handshaking.............: avg=0s      min=0s     med=0s     max=0s      p(90)=0s     p(95)=0s
-     http_req_waiting.....................: avg=160µs  min=123µs  med=158µs  max=2.3ms   p(90)=210µs  p(95)=245µs
-     http_reqs...........................: 45096  1669/s
-     iteration_duration...................: avg=601ms   min=16.5ms med=602ms  max=980ms   p(90)=765ms  p(95)=834ms
-     iterations...........................: 45096  1669/s
-     vus..................................: 100    min=100 max=100
-```
-
-## Benchmark Targets
-
-For production readiness:
-
-| Metric | Target | Notes |
-|--------|--------|-------|
-| P50 latency | < 20ms | Average response time |
-| P95 latency | < 50ms | 95th percentile |
-| P99 latency | < 100ms | 99th percentile |
-| Error rate | 0% | No failed requests |
-| TPS | 1000+ | Transactions per second |
-| Batch size | 100 events | Optimal batch size |
-
-## Output Artifacts
-
-The helper script writes JSON output to `load/results/`:
-
-- `*-summary.json` — k6 summary export
-- `*.json` — raw timeseries output
-
-## CI/CD Integration
-
-Add to GitHub Actions:
-
-```yaml
-- name: Run load tests
-  run: |
-    docker run --rm -i \
-      --network host \
-      -v $PWD:/workdir \
-      -w /workdir \
-      grafana/k6:latest \
-      run --out json=load-test-results.json load/sequencer_ingest.js
-
-- name: Upload load test results
-  uses: actions/upload-artifact@v4
-  with:
-    name: load-test-results
-    path: load-test-results.json
-```
-
-## Troubleshooting
-
-### Connection Refused
-
-```bash
-# Ensure sequencer is running
-docker-compose ps
-curl http://localhost:8080/health
-```
-
-### Rate Limiting
-
-Adjust `RATE_LIMIT_PER_MINUTE` in your sequencer configuration:
-
-```bash
-export RATE_LIMIT_PER_MINUTE=10000
-```
-
-### Database Connection Pool
-
-If seeing connection errors, increase pool size:
-
-```bash
-export MAX_DB_CONNECTIONS=20
-export MIN_DB_CONNECTIONS=5
-```
+The [2026-09-21 sustained workflow](https://github.com/stateset/stateset-sequencer/actions/runs/35596164261)
+passed at commit `360203c9f59cd25b9218e536428fa0b959e6c34d`: 256,470 HTTP
+requests in 14 minutes (305.3 requests/s overall), 28.12 ms overall p95
+response time, and zero HTTP failures. This was the 70/30 legacy ingest and
+head workload, capped at 50 virtual users. The result does not measure signed
+VES ingest throughput, production replica behavior, hot tenants, failover,
+memory use, database connection pressure, or projection lag. The new separate
+operation metrics will first appear in a run using this updated script.
