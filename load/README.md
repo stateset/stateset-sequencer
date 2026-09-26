@@ -3,6 +3,8 @@
 The k6 workloads exercise the legacy HTTP event API and head query on a
 disposable PostgreSQL service. They measure request behavior for a specified
 profile; they do not establish production capacity or a VES signed-ingest SLO.
+The separate [signed VES harness](../docs/PERFORMANCE_BENCHMARKS.md#run-the-signed-ves-workload)
+uses the Node SDK and checks verified receipts, replay, and sequence continuity.
 
 ## Workloads
 
@@ -30,9 +32,12 @@ response is not by itself proof that a signed VES event was accepted.
 The JSON thresholds are regression gates for these fixtures, not agreed
 production SLOs. The scheduled `performance` workflow runs `mixed_workload.js`
 with `sustained.json` on a single GitHub hosted runner, with authentication and
-payload encryption disabled and one configured tenant and store. It uploads
-the k6 summary and server log. Pull requests run the shorter `ci.json` ingest
-profile against the release binary.
+payload encryption disabled and one configured tenant and store. It then runs
+a five-minute signed VES workload on a separate stream and uploads both
+summaries and the server log. Manual smoke and stress profiles use one and
+three minutes of signed VES traffic respectively. Pull requests run the
+shorter `ci.json` legacy ingest profile and a ten-second signed VES check
+against the release binary.
 
 To run with a local k6 installation and an authorized test service:
 

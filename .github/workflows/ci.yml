@@ -573,6 +573,24 @@ jobs:
           name: stateset-sequencer
           path: dist
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+
+      - name: Install signed VES load client
+        run: npm ci --prefix cli
+
+      - name: Refuse unsigned VES receipts in production
+        run: |
+          chmod +x dist/stateset-sequencer
+          if SEQUENCER_ENV=production dist/stateset-sequencer > production-signing-check.log 2>&1; then
+            echo "Production started without a receipt signing key" >&2
+            exit 1
+          fi
+          grep -q 'VES_SEQUENCER_SIGNING_KEY is required in production' production-signing-check.log
+
       - name: Start the release binary
         env:
           DATABASE_URL: postgres://sequencer:sequencer@127.0.0.1:5432/stateset_sequencer
@@ -580,6 +598,9 @@ jobs:
           AUTH_MODE: disabled
           ALLOW_AUTH_DISABLED: "true"
           PAYLOAD_ENCRYPTION_MODE: disabled
+          REQUIRE_SIGNED_EXECUTION_CONTROLS: "true"
+          # Public fixture seed only; never use this key outside disposable CI.
+          VES_SEQUENCER_SIGNING_KEY: "0x1111111111111111111111111111111111111111111111111111111111111111"
           SEQUENCER_ENV: test
           RUST_LOG: info
         run: |
@@ -613,6 +634,14 @@ jobs:
             --summary-export load/results/load-smoke-summary.json \
             load/sequencer_ingest.js
 
+      - name: Check signed VES ingest and receipt load
+        env:
+          SEQUENCER_BASE_URL: http://127.0.0.1:8080
+          API_KEY: ci-auth-disabled
+          VES_RECEIPT_PUBLIC_KEY: d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737
+          VES_LOAD_SUMMARY: load/results/ves-signed-load-summary.json
+        run: node cli/bench/ves-signed-load.mjs
+
       - name: Stop release binary
         if: always()
         run: |
@@ -627,6 +656,8 @@ jobs:
           name: load-smoke-evidence
           path: |
             load/results/load-smoke-summary.json
+            load/results/ves-signed-load-summary.json
+            production-signing-check.log
             sequencer-load-smoke.log
           if-no-files-found: warn
 

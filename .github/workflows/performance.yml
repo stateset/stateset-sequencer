@@ -44,6 +44,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: cli/package-lock.json
+
+      - name: Install signed VES load client
+        run: npm ci --prefix cli
+
       - name: Validate selected profile
         run: test -f "load/profiles/${PROFILE}.json"
 
@@ -66,6 +75,9 @@ jobs:
           AUTH_MODE: disabled
           ALLOW_AUTH_DISABLED: "true"
           PAYLOAD_ENCRYPTION_MODE: disabled
+          REQUIRE_SIGNED_EXECUTION_CONTROLS: "true"
+          # Public fixture seed only; never use this key outside disposable CI.
+          VES_SEQUENCER_SIGNING_KEY: "0x1111111111111111111111111111111111111111111111111111111111111111"
           SEQUENCER_ENV: test
           PROJECTION_WORKER_ENABLED: "true"
         run: |
@@ -95,6 +107,20 @@ jobs:
             --config "load/profiles/${PROFILE}.json" \
             --summary-export "load/results/performance-${PROFILE}.json" \
             load/mixed_workload.js
+
+      - name: Execute signed VES workload
+        env:
+          SEQUENCER_BASE_URL: http://127.0.0.1:8080
+          API_KEY: performance-auth-disabled
+          VES_RECEIPT_PUBLIC_KEY: d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737
+          VES_LOAD_SUMMARY: load/results/performance-ves-signed.json
+        run: |
+          case "$PROFILE" in
+            smoke) export VES_LOAD_DURATION_MS=60000 VES_LOAD_CONCURRENCY=4 ;;
+            sustained) export VES_LOAD_DURATION_MS=300000 VES_LOAD_CONCURRENCY=8 ;;
+            stress) export VES_LOAD_DURATION_MS=180000 VES_LOAD_CONCURRENCY=16 ;;
+          esac
+          node cli/bench/ves-signed-load.mjs
 
       - name: Stop sequencer
         if: always()

@@ -79,6 +79,12 @@ pub async fn run() -> anyhow::Result<()> {
 
     // Auth configuration
     let is_production = is_production_env();
+    let receipt_signing_key = load_ves_sequencer_signing_key(secrets.as_ref())?;
+    if is_production && receipt_signing_key.is_none() {
+        anyhow::bail!(
+            "VES_SEQUENCER_SIGNING_KEY is required in production; unsigned VES receipts cannot be verified"
+        );
+    }
     let auth_mode = parse_auth_mode()?;
     let allow_auth_disabled = parse_bool_env("ALLOW_AUTH_DISABLED", false)?;
     let require_auth = match auth_mode {
@@ -502,7 +508,7 @@ pub async fn run() -> anyhow::Result<()> {
     } else {
         info!("VES sequencer id not configured (set VES_SEQUENCER_ID to pin)");
     }
-    if let Some(signing_key) = load_ves_sequencer_signing_key(secrets.as_ref())? {
+    if let Some(signing_key) = receipt_signing_key {
         info!("VES sequencer receipt signing enabled");
 
         // Build PQC-aware signing config if ML-DSA seed is available

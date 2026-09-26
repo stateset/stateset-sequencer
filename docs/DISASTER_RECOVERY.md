@@ -77,8 +77,9 @@ rollback, exact replay, receipt signatures, persisted commitments, and every
 inclusion proof. It materializes 64 orders before leaving another 64 events pending.
 Both recovered databases must preserve those documents, entity versions, and the
 checkpoint, then independently catch up to 128 and remain unchanged after a worker
-restart. The backup is captured before catch-up. This exercises recovery between
-completed projection batches, not a crash inside a projection write.
+restart. The backup is captured before catch-up. The fixture also terminates a
+projection's PostgreSQL backend after a document write and after a version write,
+before transaction commit, and checks that no partial projection state survives.
 Both containers and their volumes are removed on exit; logs,
 the synthetic acknowledgement oracle, backup, binary hash, and JSON results
 remain under the printed `/tmp/sequencer-recovery.*` directory. CI runs the same

@@ -170,7 +170,7 @@ the snapshot cannot cover rows written after it starts.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VES_SEQUENCER_SIGNING_KEY` | (unset) | Ed25519 private key for receipt signing |
+| `VES_SEQUENCER_SIGNING_KEY` | (unset) | Ed25519 private key for receipt signing; required when `SEQUENCER_ENV` is production/live |
 | `REQUIRE_SIGNED_EXECUTION_CONTROLS` | `false` | Reject new V1 events; require V2 signatures binding command ID and base version. Enable after upgrading agents. Exact stored replays remain supported. |
 | `SCHEMA_VALIDATION_MODE` | `warn` | `disabled`, `warn`, or `strict` |
 

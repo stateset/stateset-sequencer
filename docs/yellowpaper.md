@@ -1897,43 +1897,42 @@ All errors include structured headers:
 
 The critical path for sequencing is the `SELECT ... FOR UPDATE` on the sequence counter. This serializes writes per stream but allows parallel writes across different streams.
 
-**Per-stream throughput**: Limited by PostgreSQL transaction round-trip latency. A single event incurs ~1-5ms latency; batches of up to 1000 events amortize the lock acquisition overhead. Practical per-stream throughput is 200-1000 events/second depending on batch size, network latency, and payload encryption overhead.
+**Per-stream throughput**: Limited by PostgreSQL transaction round-trip latency and the time spent holding the sequence-counter lock. Batching can amortize lock acquisition, but the gain depends on event size, signature verification, network latency, and transaction duration. Measure the proposed workload before assigning a throughput number.
 
-**Per-stream ceiling**: The `FOR UPDATE` lock is the fundamental bottleneck. A single stream cannot exceed the throughput of one serialized PostgreSQL connection. For workloads requiring > 1000 TPS on a single stream (e.g., flash sale event bursts), the recommended approach is to shard by sub-store (e.g., `store_id` per product category or warehouse zone) rather than funneling all events through a single `(tenant_id, store_id)` stream. A future optimization path would be an in-memory sequence allocator (e.g., Redis-backed or process-local) that reserves sequence number ranges and flushes to PostgreSQL asynchronously, trading strict linearizability for higher throughput.
+**Per-stream ceiling**: The `FOR UPDATE` lock serializes transactions on one stream. A workload that exceeds measured single-stream capacity can use separate stores where that split matches the business ordering requirement. An asynchronous sequence allocator would change the current transactional guarantee and would need a new specification and verification.
 
-**Cross-stream throughput**: Linear scaling with the number of concurrent streams, limited by connection pool size and database IOPS. With the default PostgreSQL pool configuration, the system supports hundreds of concurrent streams.
+**Cross-stream throughput**: Independent streams can progress concurrently, subject to connection pool, database CPU, storage, and worker limits. No linear scaling claim is established by the current fixtures.
 
 ### 21.2 Commitment Generation
 
 Merkle tree construction is $O(n)$ where $n$ is the number of events:
-- $n$ leaf hash computations (each ~1 $\mu$s for SHA-256)
+- $n$ leaf hash computations
 - $n - 1$ internal node computations
 - Total: $\approx 2n$ hash operations
 
-For a batch of 1000 events: ~2ms for tree construction.
+See [performance evidence](PERFORMANCE_BENCHMARKS.md) for measured CPU benchmarks.
 
 ### 21.3 Proof Generation
 
 Inclusion proof generation is $O(\log n)$:
 - $\log_2 n$ sibling lookups from pre-computed tree layers
-- For 1000 events: 10 lookups, < 1ms
+- For 1000 events: approximately 10 sibling positions; wall-clock latency depends on storage and cache behavior
 
 ### 21.4 Anchoring Latency
 
-On-chain anchoring latency depends on:
-- L2 block time: ~2s on SET Chain
-- Transaction confirmation: 1-2 blocks
-- Total: 2-6s per anchor
+On-chain anchoring latency depends on the deployed chain's block time,
+confirmation policy, transaction inclusion, and RPC availability. No deployed
+anchor latency has been measured for this repository.
 
 ### 21.5 Storage Costs
 
 | Component | Size per Event | Notes |
 |-----------|---------------|-------|
-| Event record | ~1 KB | Compressed, encrypted payload |
-| Leaf hash | 32 B | Cached in commitment |
-| Commitment | ~500 B | Per batch, not per event |
-| Validity proof | ~53 KB | Per batch (amortized ~54 B/event at 1000 events) |
-| Compliance proof | ~36 KB | Per event (opt-in) |
+| Event record | Workload-dependent | Payload, metadata, indexes, and storage overhead |
+| Leaf hash | 32 B | Hash value before database overhead |
+| Commitment | Workload-dependent | One per batch |
+| Validity proof | Proof-system-dependent | Store an actual proof artifact to size it |
+| Compliance proof | Proof-system-dependent | Optional and workload-dependent |
 
 ---
 

@@ -36,7 +36,7 @@ This document covers security best practices for deploying and operating the Sta
 |---------|-----------|----------|-------|
 | Agent Signing | Ed25519 | 256-bit | Fast, secure, deterministic |
 | Hashing | SHA-256 | 256-bit | Domain-separated |
-| Payload Encryption | AES-256-GCM | 256-bit | AEAD, nonce-misuse resistant |
+| Payload Encryption | AES-256-GCM | 256-bit | AEAD; each encryption under a key requires a unique nonce |
 | Key Exchange | X25519 | 256-bit | For HPKE |
 
 ### Encryption-at-Rest (Legacy `events` Table)
