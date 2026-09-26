@@ -31,6 +31,15 @@ rollback leave committed ordering state unchanged.
   returns that receipt without advancing the counter. A changed event body or
   reused command receives no receipt. The abstract body includes the signature
   scheme and signature bundle as well as the event payload.
+- [VES batch reservation TLA+ model](tla/VesBatchReservation.tla): one writer
+  processes up to two fresh events for one entity in a transaction. TLC checks
+  that version conflicts release their command reservations, accepted members
+  retain theirs, and capacity failures or aborts roll back all staged changes.
+  Committed events, head, and entity version advance together. The model assumes
+  signature and policy validation already succeeded, distinct command IDs in a
+  request, and PostgreSQL transaction atomicity; it does not cover replay or
+  concurrent writers. The PostgreSQL trace test covers both orders of a mixed
+  accepted and version-conflicted batch.
 - [Entity version TLA+ model](tla/EntityVersions.tla): two writers compete on
   one stream with two entities and independently chosen base versions. TLC
   checks that only a matching base version advances the sequence and entity
@@ -270,6 +279,7 @@ java -cp /path/to/tla2tools.jar tlc2.TLC -config SequencerIngest.cfg SequencerIn
 java -cp /path/to/tla2tools.jar tlc2.TLC -config SequencerTransactions.cfg SequencerTransactions.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config SequencerReservations.cfg SequencerReservations.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config VesReplay.cfg VesReplay.tla
+java -cp /path/to/tla2tools.jar tlc2.TLC -config VesBatchReservation.cfg VesBatchReservation.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config EntityVersions.cfg EntityVersions.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config CommandLockOrder.cfg CommandLockOrder.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config CommandReservationRace.cfg CommandReservationRace.tla
@@ -301,7 +311,7 @@ java -cp /path/to/tla2tools.jar tlc2.TLC -config RollingKeyUpgrade.cfg RollingKe
 java -cp /path/to/tla2tools.jar tlc2.TLC -config ContractIdempotency.cfg ContractIdempotency.tla
 ```
 
-The `formal` CI job runs all thirty-five checks. TLC writes temporary state files
+The `formal` CI job runs all thirty-four TLA+ checks and builds the Lean proofs. TLC writes temporary state files
 under `formal/tla/states/`, which Git ignores.
 
 For destination idempotency, run the owned local EVM drills with the compiled
