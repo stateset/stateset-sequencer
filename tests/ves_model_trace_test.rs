@@ -183,9 +183,20 @@ async fn postgres_ves_ingest_refines_sequential_replay_trace() {
         vec![cross_stream_collision],
         vec![second_stream],
     ];
+    assert_trace(&pool, &ves, &fixture, trace, "fixed").await;
+}
+
+async fn assert_trace(
+    pool: &sqlx::PgPool,
+    ves: &VesSequencer<PgAgentKeyRegistry>,
+    fixture: &TraceFixture,
+    trace: impl IntoIterator<Item = Vec<Input>>,
+    label: &str,
+) {
     let mut model = Model::default();
     let mut receipt_hashes = HashMap::new();
-    for (step, inputs) in trace.into_iter().enumerate() {
+    for (step_index, inputs) in trace.into_iter().enumerate() {
+        let step = format!("{label}/{step_index}");
         let stream = inputs[0].stream;
         let expected: Vec<_> = inputs.iter().map(|input| model.apply(input)).collect();
         let result = ves
@@ -271,15 +282,15 @@ async fn postgres_ves_ingest_refines_sequential_replay_trace() {
             "step {step}"
         );
 
-        for (index, store) in stores.iter().enumerate() {
+        for (index, store) in fixture.stores.iter().enumerate() {
             assert_eq!(
-                ves.head(&tenant, store).await.unwrap(),
+                ves.head(&fixture.tenant, store).await.unwrap(),
                 model.head[index],
                 "step {step}"
             );
             let rows: Vec<(Uuid, i64)> = sqlx::query_as(
                 "SELECT event_id, sequence_number FROM ves_events WHERE tenant_id=$1 AND store_id=$2 ORDER BY sequence_number"
-            ).bind(tenant.0).bind(store.0).fetch_all(&pool).await.unwrap();
+            ).bind(fixture.tenant.0).bind(store.0).fetch_all(pool).await.unwrap();
             assert_eq!(rows.len(), model.rows[index].len(), "step {step}");
             for (position, (event_id, sequence)) in rows.iter().enumerate() {
                 assert_eq!(
@@ -290,7 +301,7 @@ async fn postgres_ves_ingest_refines_sequential_replay_trace() {
             }
             let version: Option<i64> = sqlx::query_scalar(
                 "SELECT version FROM entity_versions WHERE tenant_id=$1 AND store_id=$2 AND entity_type='order' AND entity_id='trace-order'"
-            ).bind(tenant.0).bind(store.0).fetch_optional(&pool).await.unwrap();
+            ).bind(fixture.tenant.0).bind(store.0).fetch_optional(pool).await.unwrap();
             assert_eq!(
                 version.unwrap_or(0),
                 model.version[index] as i64,
@@ -299,9 +310,9 @@ async fn postgres_ves_ingest_refines_sequential_replay_trace() {
             let commands: Vec<(Uuid,)> = sqlx::query_as(
                 "SELECT command_id FROM ves_command_dedupe WHERE tenant_id=$1 AND store_id=$2",
             )
-            .bind(tenant.0)
+            .bind(fixture.tenant.0)
             .bind(store.0)
-            .fetch_all(&pool)
+            .fetch_all(pool)
             .await
             .unwrap();
             let expected_commands: std::collections::HashSet<_> = model
@@ -317,8 +328,56 @@ async fn postgres_ves_ingest_refines_sequential_replay_trace() {
             );
             let receipts: Vec<(Uuid, i64)> = sqlx::query_as(
                 "SELECT r.event_id, r.sequence_number FROM ves_sequencer_receipts r JOIN ves_events e USING (event_id) WHERE e.tenant_id=$1 AND e.store_id=$2 ORDER BY r.sequence_number"
-            ).bind(tenant.0).bind(store.0).fetch_all(&pool).await.unwrap();
+            ).bind(fixture.tenant.0).bind(store.0).fetch_all(pool).await.unwrap();
             assert_eq!(receipts, rows, "step {step}: persisted receipts");
         }
+    }
+}
+
+/// Exhaust every three-call word over a small replay/version/stream alphabet.
+/// Each word uses a fresh tenant, so its initial database state matches the
+/// model's empty state. This broadens the fixed trace without random seeds or
+/// relying on a duplicate copy of the SQL implementation as the oracle.
+#[tokio::test]
+#[ignore]
+async fn postgres_ves_ingest_refines_generated_sequential_traces() {
+    let pool = common::connect_test_db(5)
+        .await
+        .expect("test database is required");
+    stateset_sequencer::migrations::run_postgres(&pool)
+        .await
+        .unwrap();
+    let registry = Arc::new(PgAgentKeyRegistry::new(pool.clone()));
+    let ves =
+        VesSequencer::new(pool.clone(), registry.clone()).with_required_execution_binding(true);
+
+    for case in 0..125 {
+        let fixture = TraceFixture {
+            tenant: TenantId::new(),
+            stores: [StoreId::new(), StoreId::new()],
+            agent: AgentId::new(),
+            key: AgentSigningKey::generate(),
+        };
+        registry
+            .register_key(
+                &AgentKeyLookup::new(&fixture.tenant, &fixture.agent, AgentKeyId::default()),
+                AgentKeyEntry::new(fixture.key.public_key_bytes()),
+            )
+            .await
+            .unwrap();
+        let [c0, c1, c2] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        let alphabet = [
+            make_input(&fixture, 0, "first-at-zero", c0, 0),
+            make_input(&fixture, 0, "next-at-one", c1, 1),
+            make_input(&fixture, 0, "reused-command", c0, 1),
+            make_input(&fixture, 1, "other-stream", c0, 0),
+            make_input(&fixture, 0, "competing-at-zero", c2, 0),
+        ];
+        let trace = [
+            vec![alphabet[case / 25].clone()],
+            vec![alphabet[(case / 5) % 5].clone()],
+            vec![alphabet[case % 5].clone()],
+        ];
+        assert_trace(&pool, &ves, &fixture, trace, &format!("generated-{case}")).await;
     }
 }
