@@ -273,12 +273,18 @@ jobs:
       - name: Verify crash and logical-backup recovery
         run: bash scripts/run_recovery_drill.sh
 
+      - name: Verify physical-backup and WAL point-in-time recovery
+        run: bash scripts/run_pitr_drill.sh
+
       - name: Upload recovery drill evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: recovery-drill-evidence
-          path: /tmp/sequencer-recovery.*/
+          path: |
+            /tmp/sequencer-recovery.*/
+            /tmp/sequencer-pitr.*/result.json
+            /tmp/sequencer-pitr.*/*.log
           if-no-files-found: ignore
           retention-days: 7
 
