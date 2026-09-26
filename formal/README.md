@@ -81,6 +81,13 @@ rollback leave committed ordering state unchanged.
   checks that receipts and outbox rows commit with ledger events and projection
   documents commit with their checkpoint. The CI recovery drill exercises
   process crashes and a logical backup against PostgreSQL.
+- [WAL point-in-time recovery model](tla/WalPointInTimeRecovery.tla): a physical
+  base backup captures a consistent committed prefix, completed archived WAL
+  records retain their order and bytes, and a named recovery target selects a
+  later prefix. TLC checks that replay preserves every event and receipt through
+  the target and excludes commits after it, even when archiving lags. The model
+  assumes PostgreSQL's physical backup and WAL replay semantics and does not
+  prove that an operator has copied all required WAL to independent storage.
 - [Key lifecycle model](tla/KeyLifecycle.tla): registration, rotation by a
   distinct key ID, validity windows, revocation, expiry, and stale caches. TLC
   checks accepted signatures used the authoritative status and bound scheme.
@@ -187,6 +194,12 @@ rollback leave committed ordering state unchanged.
   signing-hash fields. A Rust test checks the actual receipt hash against an
   independently computed SHA-256 vector. SHA-256 collision resistance and
   the Rust-to-Lean refinement remain assumptions.
+- [WAL recovery proof](lean/WalRecovery.lean): for arbitrary record types and
+  lengths, a consistent base prefix followed by complete archived WAL through
+  a selected target reconstructs exactly that prefix. Records may include
+  events and receipts, so the theorem preserves both bytes and order. The
+  proof assumes backup consistency and complete, ordered archive publication;
+  it does not establish those PostgreSQL or storage properties.
 - [Lean proof](lean/Sequencer.lean): for any event type and any stream length,
   appending a fresh event or a batch of distinct, fresh events preserves
   `head = length(events)` and event ID uniqueness. Induction extends the result
@@ -280,6 +293,7 @@ java -cp /path/to/tla2tools.jar tlc2.TLC -config LeaderFinality.cfg LeaderFinali
 java -cp /path/to/tla2tools.jar tlc2.TLC -config X402Settlement.cfg X402Settlement.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config AuthorizationIsolation.cfg AuthorizationIsolation.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config CrashRecovery.cfg CrashRecovery.tla
+java -cp /path/to/tla2tools.jar tlc2.TLC -config WalPointInTimeRecovery.cfg WalPointInTimeRecovery.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config KeyLifecycle.cfg KeyLifecycle.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config MigrationPreservation.cfg MigrationPreservation.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config ChainReconciliation.cfg ChainReconciliation.tla
@@ -301,7 +315,8 @@ java -cp /path/to/tla2tools.jar tlc2.TLC -config RollingKeyUpgrade.cfg RollingKe
 java -cp /path/to/tla2tools.jar tlc2.TLC -config ContractIdempotency.cfg ContractIdempotency.tla
 ```
 
-The `formal` CI job runs all thirty-five checks. TLC writes temporary state files
+The `formal` CI job runs all thirty-four TLA+ checks and builds the Lean proofs.
+TLC writes temporary state files
 under `formal/tla/states/`, which Git ignores.
 
 For destination idempotency, run the owned local EVM drills with the compiled

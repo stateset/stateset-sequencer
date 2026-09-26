@@ -89,6 +89,8 @@ jobs:
           java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
             -config CrashRecovery.cfg CrashRecovery.tla
           java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config WalPointInTimeRecovery.cfg WalPointInTimeRecovery.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
             -config KeyLifecycle.cfg KeyLifecycle.tla
           java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
             -config MigrationPreservation.cfg MigrationPreservation.tla
