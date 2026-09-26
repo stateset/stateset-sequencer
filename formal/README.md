@@ -11,11 +11,13 @@ rollback leave committed ordering state unchanged.
 ## What is checked
 
 - [Ingest TLA+ model](tla/SequencerIngest.tla): TLC explores all reachable states for
-  two streams, three event IDs, batches of one or two, and a maximum sequence
-  of three. It checks `head = length(log)`, the bound, and uniqueness of event
-  IDs within and across streams. Each `Commit` is the linearization point of
-  one database transaction; concurrent transactions are represented by their
-  possible commit orders.
+  two streams, three event IDs, requests of one or two, and a maximum sequence
+  of three. Accepted members form an ordered subsequence of the request;
+  capacity is charged to that subsequence after rejection. TLC checks
+  `head = length(log)`, the bound, and uniqueness of event IDs within and
+  across streams. Each `Commit` is the linearization point of one database
+  transaction; concurrent transactions are represented by their possible
+  commit orders.
 - [Transaction TLA+ model](tla/SequencerTransactions.tla): two writers start
   requests, acquire per-stream locks, accept or reject, then commit or abort.
   TLC checks lock ownership, committed counter consistency, bounds, and global
@@ -242,6 +244,13 @@ reorg clearing. SQLite outbox tests check acknowledgement bounds, and the
   examples still contain descriptive placeholders. These tests check that
   the implementation continues to follow the model assumptions;
 the formal models do not replace them.
+
+`tests/ves_capacity_boundary_test.rs` uses synthetic BIGINT-limit counter rows
+to verify that a stale-version member consumes no sequence slot and releases
+its command reservation, while an overflowing later accepted member rolls the
+entire batch back. The synthetic counters do not represent a complete event
+history, so this is a capacity and transaction-boundary check, not a proof of
+gap-free ordering at those sequence values.
 
 The models do not cover cryptographic primitive security, receipt hash
 contents, arbitrary process recovery schedules, PostgreSQL internals, or a
