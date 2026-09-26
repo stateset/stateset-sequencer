@@ -154,7 +154,9 @@ async fn postgres_ves_ingest_refines_sequential_replay_trace() {
         agent,
         key,
     };
-    let [c1, c2, c3, c4] = [
+    let [c1, c2, c3, c4, c5, c6] = [
+        Uuid::new_v4(),
+        Uuid::new_v4(),
         Uuid::new_v4(),
         Uuid::new_v4(),
         Uuid::new_v4(),
@@ -179,6 +181,11 @@ async fn postgres_ves_ingest_refines_sequential_replay_trace() {
         vec![new(0, "recovered-command", c2, 1)],
         vec![new(0, "batch-first", c3, 2), new(0, "batch-stale", c4, 2)],
         vec![new(0, "batch-retry", c4, 3)],
+        vec![
+            new(0, "batch-stale-first", c5, 3),
+            new(0, "batch-valid-second", c6, 4),
+        ],
+        vec![new(0, "batch-stale-retry", c5, 5)],
         vec![second_stream.clone()],
         vec![cross_stream_collision],
         vec![second_stream],
