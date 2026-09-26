@@ -229,6 +229,11 @@ cross-stream event ID collision against PostgreSQL. The independent state
 oracle in `tests/ves_model_trace_test.rs` checks an eleven-call replay trace
 against responses and committed rows after every step, including command
 reuse, version conflict, mixed-batch rejection, and cross-stream identity.
+The same oracle checks all 125 three-call traces over a five-event alphabet
+covering exact replay, competing base versions, command reuse, and two-stream
+isolation. Each generated trace starts with a fresh tenant and compares the
+response, receipt rows, event order, entity versions, and command reservations
+after every call.
 These are bounded conformance checks, not a Rust/SQL refinement proof. The
 PostgreSQL integration suite also checks
 commitment range starts, retries, root chaining, pending-anchor recording, and
