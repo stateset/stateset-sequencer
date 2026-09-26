@@ -4,6 +4,12 @@ EXTENDS FiniteSets, Integers, Sequences, TLC
 CONSTANTS Streams, Events, MaxSeq
 Batches == {<<e>> : e \in Events} \cup
            {<<e, f>> : e \in Events, f \in Events}
+\* The accepted members retain request order. Validation, replay, or version
+\* checks may discard either member of a two-event request.
+AcceptedFrom(request) ==
+  IF Len(request) = 1
+  THEN {<<>>, request}
+  ELSE {<<>>, <<request[1]>>, <<request[2]>>, request}
 ASSUME /\ Streams # {}
        /\ Events # {}
        /\ MaxSeq \in Nat
@@ -19,20 +25,23 @@ Init == /\ log = [s \in Streams |-> <<>>]
 
 \* A PostgreSQL transaction holds the stream counter lock, accepts the
 \* eligible members of a request, then atomically commits log and counter.
-\* Batches are the finite, configured outcomes after validation/rejection.
-Commit(s, batch) ==
+\* Capacity is charged to accepted members, not every submitted candidate.
+Commit(s, request, accepted) ==
   /\ s \in Streams
-  /\ batch \in Batches
-  /\ Len(batch) > 0
-  /\ Cardinality(SeqSet(batch)) = Len(batch)
-  /\ SeqSet(batch) \cap Committed = {}
-  /\ head[s] + Len(batch) <= MaxSeq
-  /\ log' = [log EXCEPT ![s] = @ \o batch]
-  /\ head' = [head EXCEPT ![s] = @ + Len(batch)]
+  /\ request \in Batches
+  /\ accepted \in AcceptedFrom(request)
+  /\ Len(accepted) > 0
+  /\ Cardinality(SeqSet(accepted)) = Len(accepted)
+  /\ SeqSet(accepted) \cap Committed = {}
+  /\ head[s] + Len(accepted) <= MaxSeq
+  /\ log' = [log EXCEPT ![s] = @ \o accepted]
+  /\ head' = [head EXCEPT ![s] = @ + Len(accepted)]
 
 \* Rejection, replay, and rollback have no committed effect.
 NoCommit == UNCHANGED vars
-Next == (\E s \in Streams, batch \in Batches : Commit(s, batch)) \/ NoCommit
+Next == (\E s \in Streams : \E request \in Batches :
+           \E accepted \in AcceptedFrom(request) : Commit(s, request, accepted))
+        \/ NoCommit
 Spec == Init /\ [][Next]_vars
 
 TypeOK == /\ log \in [Streams -> Seq(Events)]

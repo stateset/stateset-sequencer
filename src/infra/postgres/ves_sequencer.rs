@@ -1633,16 +1633,12 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
             valid_events.push(event);
         }
 
-        let valid_events_len = valid_events.len();
         // Lock sequence counter only after validation/dedupe to minimize lock duration.
-        let mut head = if valid_events_len == 0 {
+        let mut head = if valid_events.is_empty() {
             self.head_tx(&mut tx, &tenant_id, &store_id).await?
         } else {
-            let head = self
-                .lock_sequence_counter(&mut tx, &tenant_id, &store_id)
-                .await?;
-            Self::ensure_sequence_capacity(head, valid_events_len)?;
-            head
+            self.lock_sequence_counter(&mut tx, &tenant_id, &store_id)
+                .await?
         };
 
         for event in valid_events {
@@ -1682,6 +1678,10 @@ impl<R: AgentKeyRegistry> VesSequencer<R> {
                 }
             }
 
+            // Only a member that passed its version check consumes a sequence.
+            // Preflighting the whole candidate count would reject a batch near
+            // BIGINT capacity even when enough members will be rejected.
+            Self::ensure_sequence_capacity(head, 1)?;
             let next_seq =
                 head.checked_add(1)
                     .ok_or_else(|| SequencerError::InvariantViolation {
