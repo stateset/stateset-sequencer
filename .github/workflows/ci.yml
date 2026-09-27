@@ -69,6 +69,8 @@ jobs:
           java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
             -config VesReplay.cfg VesReplay.tla
           java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
+            -config VesBatchReservation.cfg VesBatchReservation.tla
+          java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
             -config EntityVersions.cfg EntityVersions.tla
           java -XX:+UseParallelGC -cp /tmp/tla2tools.jar tlc2.TLC \
             -config CommandLockOrder.cfg CommandLockOrder.tla
