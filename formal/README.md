@@ -235,8 +235,8 @@ rollback leave committed ordering state unchanged.
   records at most one effect. These pure proofs assume the corresponding Rust
   encoders and hash functions implement the abstract operations.
 - [VES batch Lean proof](lean/VesBatch.lean): for any finite list of prevalidated
-  events for one entity, the version scan accounts for every input as accepted
-  or rejected and advances the version by exactly the accepted count. A single
+  events for one entity, the accepted and rejected lists are a permutation of
+  the inputs, and the version advances by exactly the accepted count. A single
   commit preserves alignment among the log, head, entity version, command rows,
   and receipt rows; abort leaves the state unchanged. The proof assumes the
   initial rows are aligned and models PostgreSQL atomicity at the commit step.
