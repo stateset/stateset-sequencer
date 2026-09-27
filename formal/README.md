@@ -11,11 +11,13 @@ rollback leave committed ordering state unchanged.
 ## What is checked
 
 - [Ingest TLA+ model](tla/SequencerIngest.tla): TLC explores all reachable states for
-  two streams, three event IDs, batches of one or two, and a maximum sequence
-  of three. It checks `head = length(log)`, the bound, and uniqueness of event
-  IDs within and across streams. Each `Commit` is the linearization point of
-  one database transaction; concurrent transactions are represented by their
-  possible commit orders.
+  two streams, three event IDs, requests of one or two, and a maximum sequence
+  of three. Accepted members form an ordered subsequence of the request;
+  capacity is charged to that subsequence after rejection. TLC checks
+  `head = length(log)`, the bound, and uniqueness of event IDs within and
+  across streams. Each `Commit` is the linearization point of one database
+  transaction; concurrent transactions are represented by their possible
+  commit orders.
 - [Transaction TLA+ model](tla/SequencerTransactions.tla): two writers start
   requests, acquire per-stream locks, accept or reject, then commit or abort.
   TLC checks lock ownership, committed counter consistency, bounds, and global
@@ -31,6 +33,18 @@ rollback leave committed ordering state unchanged.
   returns that receipt without advancing the counter. A changed event body or
   reused command receives no receipt. The abstract body includes the signature
   scheme and signature bundle as well as the event payload.
+- [VES batch reservation TLA+ model](tla/VesBatchReservation.tla): one writer
+  processes up to two fresh events for one entity in a transaction, including
+  events with no base version. TLC checks
+  that version conflicts release their command reservations, accepted members
+  retain theirs, and capacity failures or aborts roll back all staged changes.
+  Committed events, head, and entity version advance together. The model assumes
+  signature and policy validation already succeeded, distinct command IDs in a
+  request, and PostgreSQL transaction atomicity; it does not cover replay or
+  concurrent writers. The PostgreSQL trace test covers both orders of a mixed
+  accepted and version-conflicted batch, then exhausts all sixteen pairs of
+  absent or `{0, 1, 2}` base versions for a fresh two-event batch and retries
+  rejected commands.
 - [Entity version TLA+ model](tla/EntityVersions.tla): two writers compete on
   one stream with two entities and independently chosen base versions. TLC
   checks that only a matching base version advances the sequence and entity
@@ -81,6 +95,13 @@ rollback leave committed ordering state unchanged.
   checks that receipts and outbox rows commit with ledger events and projection
   documents commit with their checkpoint. The CI recovery drill exercises
   process crashes and a logical backup against PostgreSQL.
+- [WAL point-in-time recovery model](tla/WalPointInTimeRecovery.tla): a physical
+  base backup captures a consistent committed prefix, completed archived WAL
+  records retain their order and bytes, and a named recovery target selects a
+  later prefix. TLC checks that replay preserves every event and receipt through
+  the target and excludes commits after it, even when archiving lags. The model
+  assumes PostgreSQL's physical backup and WAL replay semantics and does not
+  prove that an operator has copied all required WAL to independent storage.
 - [Key lifecycle model](tla/KeyLifecycle.tla): registration, rotation by a
   distinct key ID, validity windows, revocation, expiry, and stale caches. TLC
   checks accepted signatures used the authoritative status and bound scheme.
@@ -187,6 +208,12 @@ rollback leave committed ordering state unchanged.
   signing-hash fields. A Rust test checks the actual receipt hash against an
   independently computed SHA-256 vector. SHA-256 collision resistance and
   the Rust-to-Lean refinement remain assumptions.
+- [WAL recovery proof](lean/WalRecovery.lean): for arbitrary record types and
+  lengths, a consistent base prefix followed by complete archived WAL through
+  a selected target reconstructs exactly that prefix. Records may include
+  events and receipts, so the theorem preserves both bytes and order. The
+  proof assumes backup consistency and complete, ordered archive publication;
+  it does not establish those PostgreSQL or storage properties.
 - [Lean proof](lean/Sequencer.lean): for any event type and any stream length,
   appending a fresh event or a batch of distinct, fresh events preserves
   `head = length(events)` and event ID uniqueness. Induction extends the result
@@ -209,6 +236,14 @@ rollback leave committed ordering state unchanged.
   readability and that any finite sequence of idempotent destination submits
   records at most one effect. These pure proofs assume the corresponding Rust
   encoders and hash functions implement the abstract operations.
+- [VES batch Lean proof](lean/VesBatch.lean): for any finite list of prevalidated
+  events for one entity, including absent base versions, the accepted and
+  rejected lists are a permutation of the inputs, and the version advances by
+  exactly the accepted count. A single
+  commit preserves alignment among the log, head, entity version, command rows,
+  and receipt rows; abort leaves the state unchanged. The proof assumes the
+  initial rows are aligned and models PostgreSQL atomicity at the commit step.
+  It does not establish Rust-to-Lean refinement or BIGINT overflow behavior.
 
 These are proofs about an abstraction. They depend on the Rust ingest paths
 continuing to use one transaction for event inserts and counter updates,
@@ -229,6 +264,11 @@ cross-stream event ID collision against PostgreSQL. The independent state
 oracle in `tests/ves_model_trace_test.rs` checks an eleven-call replay trace
 against responses and committed rows after every step, including command
 reuse, version conflict, mixed-batch rejection, and cross-stream identity.
+The same oracle checks all 125 three-call traces over a five-event alphabet
+covering exact replay, competing base versions, command reuse, and two-stream
+isolation. Each generated trace starts with a fresh tenant and compares the
+response, receipt rows, event order, entity versions, and command reservations
+after every call.
 These are bounded conformance checks, not a Rust/SQL refinement proof. The
 PostgreSQL integration suite also checks
 commitment range starts, retries, root chaining, pending-anchor recording, and
@@ -242,6 +282,13 @@ reorg clearing. SQLite outbox tests check acknowledgement bounds, and the
   examples still contain descriptive placeholders. These tests check that
   the implementation continues to follow the model assumptions;
 the formal models do not replace them.
+
+`tests/ves_capacity_boundary_test.rs` uses synthetic BIGINT-limit counter rows
+to verify that a stale-version member consumes no sequence slot and releases
+its command reservation, while an overflowing later accepted member rolls the
+entire batch back. The synthetic counters do not represent a complete event
+history, so this is a capacity and transaction-boundary check, not a proof of
+gap-free ordering at those sequence values.
 
 The models do not cover cryptographic primitive security, receipt hash
 contents, arbitrary process recovery schedules, PostgreSQL internals, or a
@@ -270,6 +317,7 @@ java -cp /path/to/tla2tools.jar tlc2.TLC -config SequencerIngest.cfg SequencerIn
 java -cp /path/to/tla2tools.jar tlc2.TLC -config SequencerTransactions.cfg SequencerTransactions.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config SequencerReservations.cfg SequencerReservations.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config VesReplay.cfg VesReplay.tla
+java -cp /path/to/tla2tools.jar tlc2.TLC -config VesBatchReservation.cfg VesBatchReservation.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config EntityVersions.cfg EntityVersions.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config CommandLockOrder.cfg CommandLockOrder.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config CommandReservationRace.cfg CommandReservationRace.tla
@@ -280,6 +328,7 @@ java -cp /path/to/tla2tools.jar tlc2.TLC -config LeaderFinality.cfg LeaderFinali
 java -cp /path/to/tla2tools.jar tlc2.TLC -config X402Settlement.cfg X402Settlement.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config AuthorizationIsolation.cfg AuthorizationIsolation.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config CrashRecovery.cfg CrashRecovery.tla
+java -cp /path/to/tla2tools.jar tlc2.TLC -config WalPointInTimeRecovery.cfg WalPointInTimeRecovery.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config KeyLifecycle.cfg KeyLifecycle.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config MigrationPreservation.cfg MigrationPreservation.tla
 java -cp /path/to/tla2tools.jar tlc2.TLC -config ChainReconciliation.cfg ChainReconciliation.tla
@@ -301,7 +350,8 @@ java -cp /path/to/tla2tools.jar tlc2.TLC -config RollingKeyUpgrade.cfg RollingKe
 java -cp /path/to/tla2tools.jar tlc2.TLC -config ContractIdempotency.cfg ContractIdempotency.tla
 ```
 
-The `formal` CI job runs all thirty-five checks. TLC writes temporary state files
+The `formal` CI job runs all thirty-five TLA+ checks and builds the Lean proofs.
+TLC writes temporary state files
 under `formal/tla/states/`, which Git ignores.
 
 For destination idempotency, run the owned local EVM drills with the compiled
