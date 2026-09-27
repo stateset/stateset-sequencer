@@ -1,12 +1,14 @@
 ------------------------ MODULE VesBatchReservation ------------------------
 EXTENDS FiniteSets, Integers, Sequences
 
-CONSTANTS Events, Commands, MaxSeq
+CONSTANTS Events, Commands, MaxSeq, NoBase
 ASSUME /\ IsFiniteSet(Events) /\ Events # {}
        /\ IsFiniteSet(Commands) /\ Commands # {}
-       /\ MaxSeq \in Nat
+       /\ MaxSeq \in Nat /\ NoBase \notin 0..MaxSeq
 
-Inputs == [event : Events, command : Commands, base : 0..MaxSeq]
+Inputs == [event : Events, command : Commands, base : {NoBase} \cup 0..MaxSeq]
+VersionAllowed(input, current) ==
+  input.base = NoBase \/ input.base = current
 Requests == {<<input>> : input \in Inputs} \cup
             {<<first, second>> : first \in Inputs, second \in Inputs}
 EventIds(xs) == {xs[i].event : i \in 1..Len(xs)}
@@ -42,11 +44,11 @@ Begin(batch) ==
   /\ UNCHANGED <<log, commands, receipts, head, version,
                  lastStart, lastAccepted, lastRejected>>
 
-\* A matching base version stages an event. Its command remains claimed until
+\* An absent or matching base version stages an event. Its command remains claimed until
 \* the whole SQL transaction commits. A committed head is not changed yet.
 Accept ==
   /\ phase = "processing" /\ index <= Len(request)
-  /\ request[index].base = version + Len(working)
+  /\ VersionAllowed(request[index], version + Len(working))
   /\ head + Len(working) < MaxSeq
   /\ working' = Append(working, request[index])
   /\ index' = index + 1
@@ -57,7 +59,7 @@ Accept ==
 \* another member of the same batch has already been staged successfully.
 RejectVersion ==
   /\ phase = "processing" /\ index <= Len(request)
-  /\ request[index].base # version + Len(working)
+  /\ ~VersionAllowed(request[index], version + Len(working))
   /\ claimed' = claimed \ {request[index].command}
   /\ index' = index + 1
   /\ UNCHANGED <<log, commands, receipts, head, version, phase, request, working,
@@ -66,7 +68,7 @@ RejectVersion ==
 \* A matching member with no remaining BIGINT slot aborts the entire batch.
 Overflow ==
   /\ phase = "processing" /\ index <= Len(request)
-  /\ request[index].base = version + Len(working)
+  /\ VersionAllowed(request[index], version + Len(working))
   /\ head + Len(working) = MaxSeq
   /\ phase' = "idle" /\ request' = <<>> /\ claimed' = {}
   /\ working' = <<>> /\ index' = 1

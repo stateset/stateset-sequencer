@@ -34,15 +34,17 @@ rollback leave committed ordering state unchanged.
   reused command receives no receipt. The abstract body includes the signature
   scheme and signature bundle as well as the event payload.
 - [VES batch reservation TLA+ model](tla/VesBatchReservation.tla): one writer
-  processes up to two fresh events for one entity in a transaction. TLC checks
+  processes up to two fresh events for one entity in a transaction, including
+  events with no base version. TLC checks
   that version conflicts release their command reservations, accepted members
   retain theirs, and capacity failures or aborts roll back all staged changes.
   Committed events, head, and entity version advance together. The model assumes
   signature and policy validation already succeeded, distinct command IDs in a
   request, and PostgreSQL transaction atomicity; it does not cover replay or
   concurrent writers. The PostgreSQL trace test covers both orders of a mixed
-  accepted and version-conflicted batch, then exhausts the nine base-version
-  pairs in `{0, 1, 2}` for a fresh two-event batch and retries rejected commands.
+  accepted and version-conflicted batch, then exhausts all sixteen pairs of
+  absent or `{0, 1, 2}` base versions for a fresh two-event batch and retries
+  rejected commands.
 - [Entity version TLA+ model](tla/EntityVersions.tla): two writers compete on
   one stream with two entities and independently chosen base versions. TLC
   checks that only a matching base version advances the sequence and entity
@@ -235,8 +237,9 @@ rollback leave committed ordering state unchanged.
   records at most one effect. These pure proofs assume the corresponding Rust
   encoders and hash functions implement the abstract operations.
 - [VES batch Lean proof](lean/VesBatch.lean): for any finite list of prevalidated
-  events for one entity, the accepted and rejected lists are a permutation of
-  the inputs, and the version advances by exactly the accepted count. A single
+  events for one entity, including absent base versions, the accepted and
+  rejected lists are a permutation of the inputs, and the version advances by
+  exactly the accepted count. A single
   commit preserves alignment among the log, head, entity version, command rows,
   and receipt rows; abort leaves the state unchanged. The proof assumes the
   initial rows are aligned and models PostgreSQL atomicity at the commit step.

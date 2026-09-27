@@ -126,6 +126,21 @@ fn make_input(
     }
 }
 
+fn make_optional_input(
+    fixture: &TraceFixture,
+    stream: usize,
+    body: &'static str,
+    command: Uuid,
+    base: Option<u64>,
+) -> Input {
+    let mut input = make_input(fixture, stream, body, command, base.unwrap_or(0));
+    if base.is_none() {
+        input.event.base_version = None;
+        input.event.sign_execution_controls(&fixture.key);
+    }
+    input
+}
+
 #[tokio::test]
 #[ignore]
 async fn postgres_ves_ingest_refines_sequential_replay_trace() {
@@ -389,7 +404,7 @@ async fn postgres_ves_ingest_refines_generated_sequential_traces() {
     }
 }
 
-/// Exhaust the three small base-version choices for both positions of a fresh
+/// Exhaust the absent and three small base-version choices for both positions of a fresh
 /// two-event batch. The oracle computes the second event's version from the
 /// first decision, independent of the SQL implementation.
 #[tokio::test]
@@ -414,8 +429,8 @@ async fn postgres_ves_two_event_batch_version_matrix() {
         .unwrap();
     let ves = VesSequencer::new(pool.clone(), registry).with_required_execution_binding(true);
 
-    for first_base in 0..=2_u64 {
-        for second_base in 0..=2_u64 {
+    for first_base in [None, Some(0_u64), Some(1), Some(2)] {
+        for second_base in [None, Some(0_u64), Some(1), Some(2)] {
             let store = StoreId::new();
             let fixture = TraceFixture {
                 tenant,
@@ -425,12 +440,12 @@ async fn postgres_ves_two_event_batch_version_matrix() {
             };
             let commands = [Uuid::new_v4(), Uuid::new_v4()];
             let inputs = [
-                make_input(&fixture, 0, "matrix-first", commands[0], first_base),
-                make_input(&fixture, 0, "matrix-second", commands[1], second_base),
+                make_optional_input(&fixture, 0, "matrix-first", commands[0], first_base),
+                make_optional_input(&fixture, 0, "matrix-second", commands[1], second_base),
             ];
-            let first_ok = first_base == 0;
+            let first_ok = first_base.map_or(true, |base| base == 0);
             let second_actual = u64::from(first_ok);
-            let second_ok = second_base == second_actual;
+            let second_ok = second_base.map_or(true, |base| base == second_actual);
             let accepted = [first_ok, second_ok];
             let actual_versions = [0, second_actual];
             let expected_head = u64::from(first_ok) + u64::from(second_ok);
@@ -438,7 +453,7 @@ async fn postgres_ves_two_event_batch_version_matrix() {
                 .ingest(inputs.iter().map(|input| input.event.clone()).collect())
                 .await
                 .unwrap();
-            let case = format!("bases ({first_base}, {second_base})");
+            let case = format!("bases ({first_base:?}, {second_base:?})");
             assert_eq!(result.events_accepted as u64, expected_head, "{case}");
             assert_eq!(
                 result.events_rejected.len() as u64,
@@ -474,7 +489,8 @@ async fn postgres_ves_two_event_batch_version_matrix() {
                     assert_eq!(
                         rejection.reason,
                         VesRejectionReason::VersionConflict {
-                            expected: [first_base, second_base][position],
+                            expected: [first_base, second_base][position]
+                                .expect("only specified base versions can conflict"),
                             actual: actual_versions[position],
                         },
                         "{case}"

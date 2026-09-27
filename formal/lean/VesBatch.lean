@@ -14,19 +14,33 @@ namespace VesBatch
 structure Input (Event Command : Type) where
   eventId : Event
   commandId : Command
-  baseVersion : Nat
+  baseVersion : Option Nat
 
 structure Scan (Event Command : Type) where
   accepted : List (Input Event Command)
   rejected : List (Input Event Command)
   nextVersion : Nat
 
+def VersionAllowed (expected : Option Nat) (current : Nat) : Prop :=
+  expected = none ∨ expected = some current
+
+instance (expected : Option Nat) (current : Nat) :
+    Decidable (VersionAllowed expected current) := by
+  unfold VersionAllowed
+  infer_instance
+
 def step {Event Command : Type} (scan : Scan Event Command)
     (input : Input Event Command) : Scan Event Command :=
-  if input.baseVersion = scan.nextVersion then
+  if VersionAllowed input.baseVersion scan.nextVersion then
     { scan with accepted := scan.accepted ++ [input], nextVersion := scan.nextVersion + 1 }
   else
     { scan with rejected := scan.rejected ++ [input] }
+
+theorem unversioned_input_is_accepted {Event Command : Type}
+    (scan : Scan Event Command) (input : Input Event Command)
+    (unversioned : input.baseVersion = none) :
+    (step scan input).accepted = scan.accepted ++ [input] := by
+  simp [step, VersionAllowed, unversioned]
 
 def run {Event Command : Type} (startVersion : Nat)
     (inputs : List (Input Event Command)) : Scan Event Command :=
@@ -41,9 +55,10 @@ theorem step_preserves_count {Event Command : Type} (startVersion : Nat)
     (correct : ScanCorrect startVersion scan) :
     ScanCorrect startVersion (step scan input) := by
   unfold ScanCorrect at correct ⊢
-  by_cases hmatch : input.baseVersion = scan.nextVersion
-  · simp [step, hmatch, correct, Nat.add_assoc]
-  · simpa [step, hmatch] using correct
+  by_cases hmatch : VersionAllowed input.baseVersion scan.nextVersion
+  · simp only [step, if_pos hmatch, List.length_append, List.length_singleton]
+    omega
+  · simpa only [step, if_neg hmatch] using correct
 
 theorem fold_preserves_count {Event Command : Type} (startVersion : Nat)
     (inputs : List (Input Event Command)) (scan : Scan Event Command)
@@ -66,7 +81,7 @@ theorem step_accounts_for_input {Event Command : Type}
     (scan : Scan Event Command) (input : Input Event Command) :
     (step scan input).accepted.length + (step scan input).rejected.length =
       scan.accepted.length + scan.rejected.length + 1 := by
-  by_cases hmatch : input.baseVersion = scan.nextVersion
+  by_cases hmatch : VersionAllowed input.baseVersion scan.nextVersion
   · simp [step, hmatch, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
   · simp [step, hmatch, Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]
 
@@ -93,7 +108,7 @@ theorem step_preserves_inputs {Event Command : Type}
     (scan : Scan Event Command) (input : Input Event Command) :
     List.Perm ((step scan input).accepted ++ (step scan input).rejected)
       ((scan.accepted ++ scan.rejected) ++ [input]) := by
-  by_cases hmatch : input.baseVersion = scan.nextVersion
+  by_cases hmatch : VersionAllowed input.baseVersion scan.nextVersion
   · have reordered :
         List.Perm (scan.accepted ++ ([input] ++ scan.rejected))
           (scan.accepted ++ (scan.rejected ++ [input])) :=
