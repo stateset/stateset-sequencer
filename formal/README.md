@@ -39,7 +39,8 @@ rollback leave committed ordering state unchanged.
   signature and policy validation already succeeded, distinct command IDs in a
   request, and PostgreSQL transaction atomicity; it does not cover replay or
   concurrent writers. The PostgreSQL trace test covers both orders of a mixed
-  accepted and version-conflicted batch.
+  accepted and version-conflicted batch, then exhausts the nine base-version
+  pairs in `{0, 1, 2}` for a fresh two-event batch and retries rejected commands.
 - [Entity version TLA+ model](tla/EntityVersions.tla): two writers compete on
   one stream with two entities and independently chosen base versions. TLC
   checks that only a matching base version advances the sequence and entity
