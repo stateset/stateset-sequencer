@@ -14,3 +14,7 @@ lean_lib ReceiptEncoding where
 @[default_target]
 lean_lib WalRecovery where
   srcDir := "lean"
+
+@[default_target]
+lean_lib VesBatch where
+  srcDir := "lean"
