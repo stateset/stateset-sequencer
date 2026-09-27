@@ -89,6 +89,40 @@ theorem run_accounts_for_inputs {Event Command : Type} (startVersion : Nat)
   simpa [run] using fold_accounts_for_inputs inputs
     { accepted := [], rejected := [], nextVersion := startVersion }
 
+theorem step_preserves_inputs {Event Command : Type}
+    (scan : Scan Event Command) (input : Input Event Command) :
+    List.Perm ((step scan input).accepted ++ (step scan input).rejected)
+      ((scan.accepted ++ scan.rejected) ++ [input]) := by
+  by_cases hmatch : input.baseVersion = scan.nextVersion
+  · have reordered :
+        List.Perm (scan.accepted ++ ([input] ++ scan.rejected))
+          (scan.accepted ++ (scan.rejected ++ [input])) :=
+      (List.perm_append_comm : List.Perm ([input] ++ scan.rejected)
+        (scan.rejected ++ [input])).append_left scan.accepted
+    simpa [step, hmatch, List.append_assoc] using reordered
+  · simp [step, hmatch, List.append_assoc]
+
+theorem fold_preserves_inputs {Event Command : Type}
+    (inputs : List (Input Event Command)) (scan : Scan Event Command) :
+    List.Perm
+      ((inputs.foldl step scan).accepted ++ (inputs.foldl step scan).rejected)
+      ((scan.accepted ++ scan.rejected) ++ inputs) := by
+  induction inputs generalizing scan with
+  | nil => simp
+  | cons input rest ih =>
+      simp only [List.foldl_cons]
+      have prior := (step_preserves_inputs scan input).append_right rest
+      exact (ih (step scan input)).trans (by
+        simpa [List.append_assoc] using prior)
+
+/-- Every original input appears exactly once in the accepted or rejected list. -/
+theorem run_partitions_inputs {Event Command : Type} (startVersion : Nat)
+    (inputs : List (Input Event Command)) :
+    List.Perm ((run startVersion inputs).accepted ++
+      (run startVersion inputs).rejected) inputs := by
+  simpa [run] using fold_preserves_inputs inputs
+    { accepted := [], rejected := [], nextVersion := startVersion }
+
 structure State (Event Command : Type) where
   log : List (Input Event Command)
   commands : List Command
