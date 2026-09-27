@@ -90,6 +90,22 @@ This verifies local PostgreSQL process-crash and logical-backup recovery only.
 It is not a host-power-loss, standby failover, WAL/PITR, or
 production RTO measurement. It does not simulate writes made after the backup.
 
+### Automated physical-backup and WAL recovery drill
+
+Run `bash scripts/run_pitr_drill.sh` with the same local prerequisites. The
+drill creates only labelled, loopback-only disposable PostgreSQL 16 containers.
+It takes a physical base backup before writing 128 signed events, archives the
+subsequent WAL, creates a named restore point, and commits a deliberately wrong
+sequence counter after that point. It restores the base backup and replays WAL
+to the named point. The recovered database must retain all acknowledged events,
+signed receipts, keys, commitments, and inclusion proofs, exclude the later
+counter update, and resume its projection from 64 to 128. It records a JSON
+result and logs under `/tmp/sequencer-pitr.*`; CI uploads the evidence.
+
+This establishes a local PITR mechanism check. It does not establish standby
+failover, resilience to host loss, or production RPO/RTO. A deployment must
+separately verify that WAL and base backups reach independent durable storage.
+
 ### PostgreSQL Backups
 
 #### Automatic Daily Backups
@@ -269,27 +285,19 @@ sqlx migrate run --database-url postgres://...
 
 #### PostgreSQL Point-in-Time Recovery
 
-```bash
-# Stop PostgreSQL
-sudo systemctl stop postgresql
+On PostgreSQL 12 and later, recovery uses `recovery.signal` and recovery
+parameters in `postgresql.conf` or server command options. `recovery.conf` is
+obsolete. Restore a verified physical base backup to a **new, isolated** data
+directory, make its matching WAL archive available, configure `restore_command`
+for that archive, choose one `recovery_target_time`, `recovery_target_lsn`, or
+`recovery_target_name`, and create `recovery.signal` before starting PostgreSQL.
+Inspect the recovery log to confirm the requested target was reached. Validate
+event heads, signed receipts, commitments, projections, and downstream effects
+before routing traffic to the recovered instance. Reconcile acknowledged writes
+after the chosen recovery point; PITR can deliberately discard them.
 
-# Identify the recovery point
-# Use WAL archives to find the target time or transaction ID
-
-# Configure recovery.conf (or postgresql.conf for PostgreSQL 12+)
-cat >> /var/lib/postgresql/data/recovery.conf <<EOF
-restore_command = 'cp /var/lib/pgbackrest/wal/%f %p'
-recovery_target_time = '2025-01-28 14:30:00 UTC'
-# OR
-recovery_target_xid = '123456789'  # Use transaction ID
-EOF
-
-# Start PostgreSQL
-sudo systemctl start postgresql
-
-# Monitor recovery logs
-tail -f /var/log/postgresql/*.log | grep "database system is ready to accept connections"
-```
+Run the local mechanism test above before writing a deployment-specific restore
+runbook. Its archive and restore commands operate only on disposable containers.
 
 #### Restore Events from Agent Outboxes
 
