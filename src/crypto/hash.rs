@@ -475,18 +475,31 @@ pub fn compute_ves_compliance_policy_hash(
     hasher.finalize().into()
 }
 
-/// Compute SHA-256 hash of canonical JSON (legacy, no domain prefix)
-/// Use payload_plain_hash() for VES-compliant hashing
+/// Compute SHA-256 hash of RFC 8785 (JCS) canonical JSON, without a domain prefix.
+/// Use payload_plain_hash() for VES-compliant hashing.
 #[inline]
 // RFC 8785 canonicalization can only fail on NaN/Infinity, which serde_json
 // cannot represent in a `Value`; unreachable by construction, not an
 // input-dependent panic.
 #[allow(clippy::expect_used)]
 pub fn canonical_json_hash(value: &serde_json::Value) -> Hash256 {
-    // Serialize to Vec then hash in one call. Since serde_json::Map uses
-    // BTreeMap (keys already sorted), serde_json::to_vec produces output
-    // identical to JCS. Serializing to a contiguous buffer then hashing
-    // once is faster than streaming many small writes through the hasher.
+    let mut writer = Sha256Write(Sha256::new());
+    serde_json_canonicalizer::to_writer(value, &mut writer)
+        .expect("Failed to canonicalize JSON - contains invalid values (NaN or Infinity)");
+    writer.0.finalize().into()
+}
+
+/// SHA-256 of `serde_json::to_vec(value)`.
+///
+/// Matches [`canonical_json_hash`] except for floats with an integral value
+/// (`1.0` vs JCS `1`) and object keys outside the Basic Multilingual Plane
+/// (UTF-8 vs JCS UTF-16 ordering). Only for accepting hashes produced by
+/// clients that predate JCS canonicalization; never use it to produce hashes.
+#[inline]
+// Serializing a `Value` cannot fail: all map keys are strings and there are
+// no non-finite numbers.
+#[allow(clippy::expect_used)]
+pub fn legacy_serde_json_hash(value: &serde_json::Value) -> Hash256 {
     let bytes = serde_json::to_vec(value).expect("Failed to serialize JSON");
     sha256(&bytes)
 }
@@ -567,6 +580,25 @@ pub fn next_power_of_two(n: usize) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_canonical_json_hash_matches_jcs_for_floats_and_astral_keys() {
+        let cases = [
+            json!({"a": 1.0, "b": 1e100, "c": -0.0}),
+            serde_json::from_str::<serde_json::Value>("{\"\u{10000}\":1,\"\u{fffd}\":2}").unwrap(),
+        ];
+        for value in cases {
+            let jcs = sha256(canonicalize_json(&value).as_bytes());
+            assert_eq!(canonical_json_hash(&value), jcs);
+            assert_ne!(legacy_serde_json_hash(&value), jcs);
+        }
+    }
+
+    #[test]
+    fn test_legacy_serde_json_hash_matches_jcs_for_plain_payloads() {
+        let value = json!({"b": [1, "x", null, true], "a": {"d": -3, "c": "\u{e9}"}});
+        assert_eq!(legacy_serde_json_hash(&value), canonical_json_hash(&value));
+    }
 
     #[test]
     fn test_canonical_json_key_ordering() {

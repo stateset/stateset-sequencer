@@ -160,6 +160,7 @@ fn create_paid_router(state: AppState, config: PaymentRequiredConfig) -> axum::R
         agent_id: None,
         active: true,
         rate_limit: None,
+        expires_at: None,
     });
 
     let authenticator = Arc::new(Authenticator::new(api_key_validator));

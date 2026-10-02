@@ -1623,8 +1623,8 @@ impl PgX402Repository {
         let status = Self::parse_x402_batch_status(&row.status)?;
         let network = Self::parse_x402_network(&row.network)?;
 
-        let total_amounts: Vec<X402BatchTotal> =
-            serde_json::from_value(row.total_amounts).unwrap_or_default();
+        let total_amounts: Vec<X402BatchTotal> = serde_json::from_value(row.total_amounts)
+            .map_err(|e| SequencerError::Internal(format!("invalid batch total_amounts: {e}")))?;
 
         Ok(X402PaymentBatch {
             batch_id: row.batch_id,

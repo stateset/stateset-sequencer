@@ -195,6 +195,12 @@ fn cors_layer_from_env() -> anyhow::Result<Option<CorsLayer>> {
     }
 
     let allow_origin = if origins == "*" {
+        if super::config::is_production_env() {
+            anyhow::bail!(
+                "CORS_ALLOW_ORIGINS=* is refused in production (SEQUENCER_ENV/ENVIRONMENT); \
+                 list explicit origins instead"
+            );
+        }
         AllowOrigin::any()
     } else {
         let origins: Vec<HeaderValue> = origins
@@ -500,6 +506,20 @@ mod tests {
         assert!(allowlist.iter().any(|entry| entry.matches(cidr_match)));
 
         std::env::remove_var("ADMIN_IP_ALLOWLIST");
+    }
+
+    #[test]
+    #[serial]
+    fn cors_wildcard_is_refused_in_production() {
+        std::env::set_var("CORS_ALLOW_ORIGINS", "*");
+        std::env::set_var("SEQUENCER_ENV", "production");
+        assert!(cors_layer_from_env().is_err());
+
+        std::env::set_var("SEQUENCER_ENV", "dev");
+        assert!(cors_layer_from_env().unwrap().is_some());
+
+        std::env::remove_var("SEQUENCER_ENV");
+        std::env::remove_var("CORS_ALLOW_ORIGINS");
     }
 
     #[tokio::test]

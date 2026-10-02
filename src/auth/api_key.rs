@@ -4,6 +4,7 @@
 //! Keys are formatted as: `ss_<tenant_prefix>_<random>`
 
 use super::{AuthContext, AuthError, Permissions};
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPool;
 use std::collections::HashMap;
@@ -40,9 +41,17 @@ pub struct ApiKeyRecord {
 
     /// Rate limit (requests per minute)
     pub rate_limit: Option<u32>,
+
+    /// Instant after which the key is rejected (`None` = never expires)
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl ApiKeyRecord {
+    /// Whether the key is active and not expired at `now`.
+    pub fn is_usable_at(&self, now: DateTime<Utc>) -> bool {
+        self.active && self.expires_at.is_none_or(|expires_at| now < expires_at)
+    }
+
     pub fn to_auth_context(&self) -> AuthContext {
         AuthContext {
             tenant_id: self.tenant_id,
@@ -125,8 +134,7 @@ impl ApiKeyValidator {
         let keys = self.keys.read().unwrap_or_else(|e| e.into_inner());
         let record = keys.get(&key_hash).ok_or(AuthError::InvalidApiKey)?;
 
-        // Check if key is active
-        if !record.active {
+        if !record.is_usable_at(Utc::now()) {
             return Err(AuthError::InvalidApiKey);
         }
 
@@ -192,6 +200,7 @@ struct ApiKeyRow {
     agent_id: Option<Uuid>,
     active: bool,
     rate_limit: Option<i32>,
+    expires_at: Option<DateTime<Utc>>,
 }
 
 impl ApiKeyRow {
@@ -208,6 +217,7 @@ impl ApiKeyRow {
             agent_id: self.agent_id,
             active: self.active,
             rate_limit: self.rate_limit.map(|v| v as u32),
+            expires_at: self.expires_at,
         }
     }
 }
@@ -218,7 +228,7 @@ impl ApiKeyStore for PgApiKeyStore {
         let row = sqlx::query_as::<_, ApiKeyRow>(
             r#"
             SELECT key_hash, tenant_id, store_ids, can_read, can_write, can_admin,
-                   agent_id, active, rate_limit
+                   agent_id, active, rate_limit, expires_at
             FROM api_keys
             WHERE key_hash = $1
             "#,
@@ -237,12 +247,12 @@ impl ApiKeyStore for PgApiKeyStore {
             INSERT INTO api_keys (
                 key_hash, tenant_id, store_ids,
                 can_read, can_write, can_admin,
-                agent_id, active, rate_limit,
+                agent_id, active, rate_limit, expires_at,
                 created_at, updated_at
             ) VALUES (
                 $1, $2, $3,
                 $4, $5, $6,
-                $7, $8, $9,
+                $7, $8, $9, $10,
                 NOW(), NOW()
             )
             ON CONFLICT (key_hash) DO UPDATE SET
@@ -254,6 +264,7 @@ impl ApiKeyStore for PgApiKeyStore {
                 agent_id = EXCLUDED.agent_id,
                 active = EXCLUDED.active,
                 rate_limit = EXCLUDED.rate_limit,
+                expires_at = EXCLUDED.expires_at,
                 updated_at = NOW()
             "#,
         )
@@ -266,6 +277,7 @@ impl ApiKeyStore for PgApiKeyStore {
         .bind(record.agent_id)
         .bind(record.active)
         .bind(record.rate_limit.map(|v| v as i32))
+        .bind(record.expires_at)
         .execute(&self.pool)
         .await
         .map_err(|e| backend_unavailable("failed to store api key", e))?;
@@ -294,7 +306,7 @@ impl ApiKeyStore for PgApiKeyStore {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
             r#"
             SELECT key_hash, tenant_id, store_ids, can_read, can_write, can_admin,
-                   agent_id, active, rate_limit
+                   agent_id, active, rate_limit, expires_at
             FROM api_keys
             WHERE tenant_id = $1
             ORDER BY updated_at DESC
@@ -312,7 +324,7 @@ impl ApiKeyStore for PgApiKeyStore {
         let rows = sqlx::query_as::<_, ApiKeyRow>(
             r#"
             SELECT key_hash, tenant_id, store_ids, can_read, can_write, can_admin,
-                   agent_id, active, rate_limit
+                   agent_id, active, rate_limit, expires_at
             FROM api_keys
             WHERE agent_id = $1
             ORDER BY updated_at DESC
@@ -327,11 +339,13 @@ impl ApiKeyStore for PgApiKeyStore {
     }
 
     async fn has_any_active(&self) -> Result<bool, AuthError> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT 1 FROM api_keys WHERE active = TRUE LIMIT 1")
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| backend_unavailable("failed to check active api keys", e))?;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT 1 FROM api_keys \
+                 WHERE active = TRUE AND (expires_at IS NULL OR expires_at > NOW()) LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| backend_unavailable("failed to check active api keys", e))?;
 
         Ok(row.is_some())
     }
@@ -365,6 +379,7 @@ mod tests {
             agent_id: None,
             active: true,
             rate_limit: None,
+            expires_at: None,
         });
 
         let context = validator.validate(&key).unwrap();
@@ -396,6 +411,7 @@ mod tests {
             agent_id: None,
             active: true,
             rate_limit: None,
+            expires_at: None,
         });
 
         // Key works initially
@@ -406,5 +422,41 @@ mod tests {
 
         // Key no longer works
         assert!(validator.validate(&key).is_err());
+    }
+
+    #[test]
+    fn test_expired_key() {
+        let validator = ApiKeyValidator::new();
+        let tenant_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let (expired_key, expired_hash) = ApiKeyValidator::generate_key(&tenant_id);
+        validator.register_key(ApiKeyRecord {
+            key_hash: expired_hash,
+            tenant_id,
+            store_ids: vec![],
+            permissions: Permissions::read_write(),
+            agent_id: None,
+            active: true,
+            rate_limit: None,
+            expires_at: Some(now - chrono::Duration::seconds(1)),
+        });
+        assert!(matches!(
+            validator.validate(&expired_key),
+            Err(AuthError::InvalidApiKey)
+        ));
+
+        let (live_key, live_hash) = ApiKeyValidator::generate_key(&tenant_id);
+        validator.register_key(ApiKeyRecord {
+            key_hash: live_hash,
+            tenant_id,
+            store_ids: vec![],
+            permissions: Permissions::read_write(),
+            agent_id: None,
+            active: true,
+            rate_limit: None,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+        });
+        assert!(validator.validate(&live_key).is_ok());
     }
 }

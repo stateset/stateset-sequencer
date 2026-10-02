@@ -127,6 +127,7 @@ fn create_test_router(state: AppState, require_auth: bool) -> axum::Router<()> {
         agent_id: None,
         active: true,
         rate_limit: None,
+        expires_at: None,
     });
 
     let store_scoped_tenant = Uuid::parse_str(STORE_SCOPED_TENANT).unwrap();
@@ -140,6 +141,7 @@ fn create_test_router(state: AppState, require_auth: bool) -> axum::Router<()> {
         agent_id: None,
         active: true,
         rate_limit: None,
+        expires_at: None,
     });
 
     let authenticator = Arc::new(Authenticator::new(api_key_validator));
@@ -2024,6 +2026,7 @@ fn create_tenant_scoped_router(
         agent_id,
         active: true,
         rate_limit: None,
+        expires_at: None,
     });
 
     let authenticator = Arc::new(Authenticator::new(api_key_validator));
@@ -2168,6 +2171,7 @@ async fn test_cross_tenant_schema_delete_denied() {
         agent_id: None,
         active: true,
         rate_limit: None,
+        expires_at: None,
     });
 
     let authenticator = Arc::new(Authenticator::new(api_key_validator));
