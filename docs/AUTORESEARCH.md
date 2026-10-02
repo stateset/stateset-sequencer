@@ -166,6 +166,8 @@ This was the single biggest win: **payload_hash went from 22µs to 5.2µs (4.2x)
 
 **Caveat:** This optimization is correct only because `serde_json` is compiled without the `preserve_order` feature (which would use `IndexMap` instead of `BTreeMap`). If that feature is ever enabled, the keys would no longer be sorted and the hashes would silently change. The existing test suite catches this — `test_payload_hash_key_order_independence` verifies that `{"a":1,"b":2}` and `{"b":2,"a":1}` produce the same hash. The public `canonicalize_json()` function still uses the JCS canonicalizer for strict RFC 8785 compliance with external systems.
 
+**Reverted:** sorted keys are not sufficient for RFC 8785. `serde_json` emits integral floats as `1.0` (JCS: `1`) and orders non-BMP keys by UTF-8 bytes (JCS: UTF-16 code units), so `canonical_json_hash()` diverged from the JCS mandated by `VES_SPEC.md`. It is JCS again; the `serde_json` form survives only as `legacy_serde_json_hash()`, accepted by `EventEnvelope::verify_payload_hash()` for older clients.
+
 **2. `serde_json::to_vec` + single `sha256()` call (+41%)**
 
 Instead of streaming many small writes through a `Sha256Write` wrapper (each `write()` call has per-call overhead), serialize the entire JSON to a contiguous `Vec<u8>` first, then hash it in one `sha256()` call.

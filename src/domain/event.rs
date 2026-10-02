@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::crypto::canonical_json_hash;
+use crate::crypto::{canonical_json_hash, legacy_serde_json_hash};
 
 use super::{hash256_hex, AgentId, EntityType, EventType, Hash256, StoreId, TenantId};
 
@@ -162,11 +162,15 @@ impl EventEnvelope {
         bytes
     }
 
-    /// Verify the payload hash matches the payload
+    /// Verify the payload hash matches the payload.
+    ///
+    /// Accepts the RFC 8785 hash and, for older clients, the pre-JCS
+    /// `serde_json` hash; the two differ only for integral floats and
+    /// non-BMP object keys.
     #[inline]
     pub fn verify_payload_hash(&self) -> bool {
-        let computed = Self::compute_payload_hash(&self.payload);
-        computed == self.payload_hash
+        Self::compute_payload_hash(&self.payload) == self.payload_hash
+            || legacy_serde_json_hash(&self.payload) == self.payload_hash
     }
 }
 
@@ -427,6 +431,32 @@ mod tests {
 
         let sequenced = SequencedEvent::new(envelope, 42);
         assert_eq!(sequenced.sequence_number(), 42);
+    }
+
+    #[test]
+    fn test_payload_hash_is_jcs_and_accepts_legacy_hash() {
+        let payload = serde_json::json!({"amount": 1.0});
+        let mut envelope = EventEnvelope::new(
+            TenantId::new(),
+            StoreId::new(),
+            EntityType::order(),
+            "order-1".to_string(),
+            EventType::from("order.created"),
+            payload.clone(),
+            AgentId::new(),
+        );
+        assert_eq!(
+            envelope.payload_hash,
+            crate::crypto::sha256(br#"{"amount":1}"#)
+        );
+        assert!(envelope.verify_payload_hash());
+
+        envelope.payload_hash = legacy_serde_json_hash(&payload);
+        assert_ne!(envelope.payload_hash, canonical_json_hash(&payload));
+        assert!(envelope.verify_payload_hash());
+
+        envelope.payload_hash = [0u8; 32];
+        assert!(!envelope.verify_payload_hash());
     }
 
     #[test]

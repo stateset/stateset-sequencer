@@ -95,7 +95,7 @@ impl Authenticator {
             return Err(AuthError::InvalidApiKey);
         };
 
-        if !record.active {
+        if !record.is_usable_at(chrono::Utc::now()) {
             return Err(AuthError::InvalidApiKey);
         }
 
@@ -806,6 +806,7 @@ mod tests {
             agent_id: None,
             active: true,
             rate_limit: Some(1),
+            expires_at: None,
         });
 
         let app =

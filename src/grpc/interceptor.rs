@@ -228,6 +228,7 @@ mod tests {
                 agent_id: None,
                 active: true,
                 rate_limit: None,
+                expires_at: None,
             });
             let state = AuthMiddlewareState {
                 authenticator: Arc::new(Authenticator::new(validator)),
@@ -307,6 +308,7 @@ mod tests {
             agent_id: None,
             active: true,
             rate_limit: Some(1),
+            expires_at: None,
         });
 
         let interceptor = GrpcAuthInterceptor::new(

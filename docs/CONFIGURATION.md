@@ -343,7 +343,7 @@ proved, skipped, non-compliant, retryable, and terminal-failure outcomes in
 | `OTEL_SERVICE_NAME` | | Service name reported in traces |
 | `OTEL_SERVICE_VERSION` | | Service version reported in traces |
 | `OTEL_SAMPLE_RATE` | | Trace sampling rate |
-| `CORS_ALLOW_ORIGINS` | (unset) | CORS origins (`*` or comma-separated) |
+| `CORS_ALLOW_ORIGINS` | (unset) | CORS origins (`*` or comma-separated); `*` is refused in production |
 
 `GET /metrics` returns Prometheus text exposition and requires an **admin**
 credential. It is additionally subject to `ADMIN_IP_ALLOWLIST` when that is set.

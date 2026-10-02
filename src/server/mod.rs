@@ -131,6 +131,7 @@ pub async fn run() -> anyhow::Result<()> {
             agent_id: None,
             active: true,
             rate_limit: None,
+            expires_at: None,
         };
         api_key_validator.register_key(record.clone());
         bootstrap_record = Some(record);

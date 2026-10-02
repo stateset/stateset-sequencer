@@ -154,6 +154,7 @@ async fn shared_admission_is_atomic_bounded_and_fail_closed() {
         agent_id: None,
         active: true,
         rate_limit: Some(1),
+        expires_at: None,
     });
     let auth = Arc::new(Authenticator::new(validator));
     let app = Router::new().route("/", get(|| async { "ok" })).layer(

@@ -334,6 +334,7 @@ fn test_api_key_validation() {
         agent_id: None,
         active: true,
         rate_limit: None,
+        expires_at: None,
     });
 
     // Validate should succeed
@@ -361,6 +362,7 @@ fn test_api_key_revocation() {
         agent_id: None,
         active: true,
         rate_limit: None,
+        expires_at: None,
     });
 
     // Key works initially

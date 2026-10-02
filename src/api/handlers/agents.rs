@@ -425,6 +425,7 @@ pub async fn register_agent(
         agent_id: Some(agent_id),
         active: true,
         rate_limit: request.rate_limit,
+        expires_at: None,
     };
 
     // Store in database
@@ -769,6 +770,7 @@ pub async fn create_agent_api_key(
         agent_id: Some(agent_id),
         active: true,
         rate_limit,
+        expires_at: None,
     };
 
     if let Err(e) = state.api_key_store.store(&api_key_record).await {
